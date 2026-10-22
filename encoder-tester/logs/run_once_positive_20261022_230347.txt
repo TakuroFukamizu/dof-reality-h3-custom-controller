@@ -1,0 +1,30 @@
+方向トークン: positive
+方向の意味: USB トークン。positive は DIR Low、negative は DIR High。機構のどちらへ動くかは未測定。
+RUN コマンド: RUN duty_pct=5 direction=positive duration_ms=100
+RUN: 受理 OK state=RUNNING
+ARM 応答: OK state=POWER_WAIT
+DIR level (RUNNING 中): 0
+適用 Duty (RUNNING 中): 5
+PWM 生値 (RUNNING 中): 51
+PWM が出た: yes
+駆動時間 ms (EVT run→pwm_off): 101.001
+駆動時間 ms (CSV elapsed 最大): 91
+RUN 前 count_total: 2
+最終 count_total: -258
+EVT run 開始カウント: 2
+EVT pwm_off カウント: 2
+trial 駆動差分 (pwm_off-start): 0
+PWM 停止後カウント変化 (coast): 0
+trial 停止差分 (stop-start): 0
+count/s 最大: 19
+count/s 最小: -2476
+count/s サンプル数: 93
+count/s 注記: 受信した CSV velocity_count_s（100 ms 窓）。内部ピークは USB に出ない。
+停止理由: duration
+最終状態: DISARMED
+最終 stop: duration
+失敗: なし
+GPIO エラー行: 0
+ARM 送信回数: 1
+RUN 送信回数: 1
+STOP 送信回数: 0

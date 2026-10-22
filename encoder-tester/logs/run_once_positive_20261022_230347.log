@@ -1,0 +1,808 @@
+REOPEN 1
+REOPEN 2
+>>> STATUS
+STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=-1
+STAT lock=limits_unset fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+STAT missing=MAX_DUTY_PERCENT,MAX_RUN_MS,MAX_TRAVEL_COUNTS,POWER_SETTLE_MS,BRAKE_RELEASE_WAIT_MS,BRAKE_APPLY_WAIT_MS,STOP_SPEED_THRESHOLD,STOP_CONFIRM_MS,STOP_TIMEOUT_MS,READY_HOLD_MS,START_GRACE_MS,MAX_COUNT_PER_S,UI_TIMEOUT_MS,LEASE_MS,JOG_STALE_MS
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> CONFIG
+CFG MAX_DUTY_PERCENT=-1 percent_of_1023
+CFG MAX_RUN_MS=-1 ms
+CFG MAX_TRAVEL_COUNTS=-1 count
+CFG POWER_SETTLE_MS=-1 ms
+CFG BRAKE_RELEASE_WAIT_MS=-1 ms
+CFG BRAKE_APPLY_WAIT_MS=-1 ms
+CFG STOP_SPEED_THRESHOLD=-1 count_per_s
+CFG STOP_CONFIRM_MS=-1 ms
+CFG STOP_TIMEOUT_MS=-1 ms
+CFG READY_HOLD_MS=-1 ms
+CFG START_GRACE_MS=-1 ms
+CFG MAX_COUNT_PER_S=-1 count_per_s
+CFG UI_TIMEOUT_MS=-1 ms
+CFG LEASE_MS=-1 ms
+CFG JOG_STALE_MS=-1 ms
+CFG JOG_DUTY=-1 percent_of_1023
+CFG ENCODER_SIGN=1 sign
+CFG GLITCH_NS=0 ns
+CFG AUTHORITY=local LOCK=limits_unset
+CFG MISSING=MAX_DUTY_PERCENT,MAX_RUN_MS,MAX_TRAVEL_COUNTS,POWER_SETTLE_MS,BRAKE_RELEASE_WAIT_MS,BRAKE_APPLY_WAIT_MS,STOP_SPEED_THRESHOLD,STOP_CONFIRM_MS,STOP_TIMEOUT_MS,READY_HOLD_MS,START_GRACE_MS,MAX_COUNT_PER_S,UI_TIMEOUT_MS,LEASE_MS,JOG_STALE_MS
+CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+CFG -1 means UNCONFIGURED
+>>> SET MAX_DUTY_PERCENT 5
+OK set
+>>> SET MAX_RUN_MS 100
+OK set
+>>> SET MAX_TRAVEL_COUNTS 200
+OK set
+>>> SET POWER_SETTLE_MS 1000
+OK set
+>>> SET BRAKE_RELEASE_WAIT_MS 300
+OK set
+>>> SET BRAKE_APPLY_WAIT_MS 300
+OK set
+>>> SET STOP_SPEED_THRESHOLD 0
+OK set
+>>> SET STOP_CONFIRM_MS 200
+OK set
+>>> SET STOP_TIMEOUT_MS 1500
+OK set
+>>> SET READY_HOLD_MS 3000
+OK set
+>>> SET START_GRACE_MS 200
+OK set
+>>> SET MAX_COUNT_PER_S 10000
+OK set
+>>> SET UI_TIMEOUT_MS 1000
+OK set
+>>> SET LEASE_MS 2000
+OK set
+>>> SET JOG_STALE_MS 150
+OK set
+>>> SET JOG_DUTY 5
+OK set
+>>> CONFIG
+CFG MAX_DUTY_PERCENT=5 percent_of_1023
+CFG MAX_RUN_MS=100 ms
+CFG MAX_TRAVEL_COUNTS=200 count
+CFG POWER_SETTLE_MS=1000 ms
+CFG BRAKE_RELEASE_WAIT_MS=300 ms
+CFG BRAKE_APPLY_WAIT_MS=300 ms
+CFG STOP_SPEED_THRESHOLD=0 count_per_s
+CFG STOP_CONFIRM_MS=200 ms
+CFG STOP_TIMEOUT_MS=1500 ms
+CFG READY_HOLD_MS=3000 ms
+CFG START_GRACE_MS=200 ms
+CFG MAX_COUNT_PER_S=10000 count_per_s
+CFG UI_TIMEOUT_MS=1000 ms
+CFG LEASE_MS=2000 ms
+CFG JOG_STALE_MS=150 ms
+CFG JOG_DUTY=5 percent_of_1023
+CFG ENCODER_SIGN=1 sign
+CFG GLITCH_NS=0 ns
+CFG AUTHORITY=local LOCK=
+CFG MISSING=
+CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+CFG -1 means UNCONFIGURED
+>>> AUTHORITY USB
+>>> HEARTBEAT
+OK heartbeat
+OK authority=usb
+>>> STATUS
+STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=0 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STREAM ON
+OK stream=on
+>>> ARM
+seq,t_us,trial_id,axis,state,power_on_cmd,power_gpio_level,brake_release_cmd,brake_gpio_level,requested_command,requested_unit,applied_duty_pct,pwm_raw,pwm_full_scale,pwm_hz,dir_level,count_total_x4,count_trial_x4,velocity_count_s,a_level,b_level,elapsed_ms,stop_reason,log_drop_count
+1,165378320,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,0,0,0,,0
+2,165398320,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,0,0,0,,0
+3,165423319,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,0,0,0,,0
+OK state=POWER_WAIT
+>>> STATUS
+EVT,165438320,power_on_cmd,1
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=19 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+4,165448320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,19,0,0,0,,0
+5,165468320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,19,0,0,0,,0
+6,165493319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,19,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=19 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=19 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=19 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=19 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+OK heartbeat
+7,165518319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,19,0,0,0,,0
+8,165543319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,19,0,0,0,,0
+9,165563319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+10,165583319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+11,165603320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+12,165628319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+13,165653319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+14,165673319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+15,165693319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+OK heartbeat
+>>> STATUS
+16,165718319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+17,165738319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+18,165758319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+19,165778319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+20,165798320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+21,165823319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+22,165843325,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+23,165868320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+24,165893319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+OK heartbeat
+25,165913319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+26,165933320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+27,165958319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+28,165978319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+29,165998321,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+30,166023319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+31,166048318,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+32,166068318,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+33,166088319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+OK heartbeat
+34,166113320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+35,166133320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+36,166158319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+37,166178319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+38,166198320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+39,166223319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+40,166243320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+41,166263321,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+42,166288319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+OK heartbeat
+43,166313320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+44,166333320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+45,166358319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+46,166378320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+47,166398320,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+48,166423319,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=POWER_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+EVT,166438318,brake_release_cmd,1
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+49,166443319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+50,166463319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+51,166483319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+52,166508105,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+>>> HEARTBEAT
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+OK heartbeat
+53,166528319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+54,166548319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+55,166573318,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+56,166593320,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+57,166618319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+58,166643318,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+59,166663320,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+60,166688319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+STAT state=BRAKE_WAIT stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+>>> STATUS
+>>> HEARTBEAT
+STAT state=READY stop= power_on_cmd=1 power_gpio=1 brake_release_cmd=1 brake_gpio=1 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=2 count_display=2 count_trial=0 count_per_s=0 a=0 b=0 stable=1 trial=0 rem_ms=0 ready_ms=2975 travel=0 max_travel=200
+>>> RUN duty_pct=5 direction=positive duration_ms=100
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+OK heartbeat
+61,166713319,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+62,166738319,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+63,166758319,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,2,0,0,0,0,0,,0
+OK state=RUNNING
+EVT,166773318,run,1,5,2
+64,166778319,1,1,RUNNING,1,1,1,1,5,duty_percent,5,51,1023,20000,0,2,0,0,0,0,5,,0
+65,166799320,1,1,RUNNING,1,1,1,1,5,duty_percent,5,51,1023,20000,0,2,0,0,0,0,26,,0
+66,166824319,1,1,RUNNING,1,1,1,1,5,duty_percent,5,51,1023,20000,0,2,0,0,0,0,51,,0
+EVT,166874319,pwm_off,duration,2
+67,166844319,1,1,RUNNING,1,1,1,1,5,duty_percent,5,51,1023,20000,0,2,0,0,0,0,71,,0
+68,166864319,1,1,RUNNING,1,1,1,1,5,duty_percent,5,51,1023,20000,0,2,0,0,0,0,91,,0
+69,166884319,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,111,duration,0
+>>> HEARTBEAT
+OK heartbeat
+70,166909320,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,136,duration,0
+71,166934318,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,161,duration,0
+72,166954319,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,181,duration,0
+73,166974320,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,201,duration,0
+74,166994320,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,221,duration,0
+75,167019319,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,246,duration,0
+EVT,167079319,trial_done,1,0,0,0
+EVT,167079319,brake_release_cmd,0
+76,167044320,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,271,duration,0
+77,167069319,1,1,STOPPING,1,1,1,1,5,duty_percent,0,0,1023,20000,0,2,0,0,0,0,296,duration,0
+78,167089319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,316,duration,0
+>>> HEARTBEAT
+OK heartbeat
+79,167109320,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,336,duration,0
+80,167134319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,361,duration,0
+81,167154319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,381,duration,0
+82,167179318,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,406,duration,0
+>>> STATUS
+83,167199318,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,-2476,0,0,426,duration,0
+84,167219319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,-2476,0,0,446,duration,0
+STAT state=BRAKE_APPLY stop=duration power_on_cmd=1 power_gpio=1 brake_release_cmd=0 brake_gpio=0 requested=5 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=-258 count_display=-258 count_trial=-260 count_per_s=-2476 a=0 b=0 stable=0 trial=1 rem_ms=0 ready_ms=0 travel=260 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
+85,167239319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,-2476,0,0,466,duration,0
+86,167259321,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,-2476,0,0,486,duration,0
+87,167284319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,-2476,0,0,511,duration,0
+>>> HEARTBEAT
+OK heartbeat
+88,167304320,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,531,duration,0
+89,167329318,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,556,duration,0
+90,167349319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,576,duration,0
+EVT,167379319,power_on_cmd,0
+91,167374319,1,1,BRAKE_APPLY,1,1,0,0,5,duty_percent,0,0,1023,20000,0,-258,-260,0,0,0,601,duration,0
+92,167399319,1,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,-258,0,0,0,0,0,duration,0
+>>> STATUS
+93,167419319,1,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,-258,0,0,0,0,0,duration,0
+STAT state=DISARMED stop=duration power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+STAT count_total=-258 count_display=-258 count_trial=0 count_per_s=0 a=0 b=0 stable=0 trial=1 rem_ms=0 ready_ms=0 travel=0 max_travel=200
+STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+STAT missing=
+STAT ppr=UNKNOWN
+STAT cal=PPR UNKNOWN angle UNKNOWN
