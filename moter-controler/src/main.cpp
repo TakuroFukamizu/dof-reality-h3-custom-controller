@@ -15,6 +15,7 @@ constexpr uint32_t kDutyMax = (1u << PWM_BITS) - 1;
 int requested_speed = 0;
 int applied_speed = 0;
 bool relay_on = false;
+bool brake_on = false;
 uint32_t relay_on_ms = 0;
 bool was_live = false;
 bool ui_dirty = true;
@@ -94,9 +95,10 @@ void writeMotor(int percent) {
 void applyOutput() { writeMotor(outputLive() ? requested_speed : 0); }
 
 void publish(const char* prefix) {
-  Serial.printf("%s R=%d S=%d OUT=%d DIR=%d RLY_PIN=%d LIVE=%d\n", prefix,
-                relay_on ? 1 : 0, requested_speed, applied_speed,
-                digitalRead(PIN_MD13S_DIR), digitalRead(PIN_POWER_RELAY),
+  Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d\n",
+                prefix, relay_on ? 1 : 0, brake_on ? 1 : 0, requested_speed,
+                applied_speed, digitalRead(PIN_MD13S_DIR),
+                digitalRead(PIN_POWER_RELAY), digitalRead(PIN_MOTOR_BRAKE),
                 outputLive() ? 1 : 0);
 }
 
@@ -113,6 +115,17 @@ void setRelay(bool on) {
   relay_on = on;
   relay_on_ms = millis();
   was_live = false;
+  ui_dirty = true;
+  publish("OK");
+}
+
+void setBrake(bool on) {
+  if (on == brake_on) {
+    publish("OK");
+    return;
+  }
+  digitalWrite(PIN_MOTOR_BRAKE, on ? RELAY_ON_LEVEL : relayOffLevel());
+  brake_on = on;
   ui_dirty = true;
   publish("OK");
 }
@@ -141,23 +154,26 @@ void estop() {
   requested_speed = 0;
   writeMotor(0);
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
   relay_on = false;
+  brake_on = false;
   was_live = false;
   ui_dirty = true;
   publish("ESTOP");
 }
 
 void printHelp() {
-  Serial.println("MD13S sign-magnitude / power relay");
+  Serial.println("MD13S sign-magnitude / power relay / motor brake");
   Serial.println("  R 0|1  or  RELAY ON|OFF");
+  Serial.println("  B 0|1  or  BRAKE ON|OFF");
   Serial.println("  S -100..100  or  SPEED n");
-  Serial.println("  X or STOP     speed 0, relay stays");
-  Serial.println("  E or ESTOP    speed 0 and relay off");
+  Serial.println("  X or STOP     speed 0, relays stay");
+  Serial.println("  E or ESTOP    speed 0, power off, brake off");
   Serial.println("  ? or STATUS");
   Serial.printf("PortB IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
-  Serial.printf("PortA IO2/White GPIO%d = relay, ON level %d\n",
-                PIN_POWER_RELAY, RELAY_ON_LEVEL);
+  Serial.printf("PortA Yellow/G2 GPIO%d = power, White/G1 GPIO%d = brake, ON level %d\n",
+                PIN_POWER_RELAY, PIN_MOTOR_BRAKE, RELAY_ON_LEVEL);
 }
 
 const char* skipSpace(const char* s) {
@@ -205,6 +221,16 @@ void handleLine(char* line) {
       setRelay(false);
     } else {
       Serial.println("ERR relay_arg");
+    }
+    return;
+  }
+  if (strcasecmp(cmd, "B") == 0 || strcasecmp(cmd, "BRAKE") == 0) {
+    if (strcmp(cursor, "1") == 0 || strcasecmp(cursor, "ON") == 0) {
+      setBrake(true);
+    } else if (strcmp(cursor, "0") == 0 || strcasecmp(cursor, "OFF") == 0) {
+      setBrake(false);
+    } else {
+      Serial.println("ERR brake_arg");
     }
     return;
   }
@@ -264,7 +290,7 @@ constexpr uint16_t kGreen = rgb565(0, 255, 100);
 constexpr uint16_t kGray = rgb565(60, 60, 60);
 constexpr uint16_t kRed = rgb565(255, 0, 0);
 
-enum class Action : uint8_t { Io2Off, Io2On, Speed, Stop, Estop };
+enum class Action : uint8_t { Power, Brake, Speed, Stop, Estop };
 
 struct Button {
   int x;
@@ -279,6 +305,8 @@ struct Button {
 };
 
 Button buttons[8];
+char power_label[20];
+char brake_label[24];
 char notice[32];
 uint32_t notice_until_ms = 0;
 
@@ -294,9 +322,11 @@ void layoutButtons(int width) {
   const int half_w = (width - margin * 2 - gap) / 2;
   const int speed_w = (width - margin * 2 - gap * 3) / 4;
 
-  buttons[0] = {margin, 32, half_w, 40, "IO2 切", true, false, 0, Action::Io2Off};
-  buttons[1] = {margin + half_w + gap, 32, half_w, 40, "IO2 入", true, false, 0,
-                Action::Io2On};
+  snprintf(power_label, sizeof(power_label), "電源 切");
+  snprintf(brake_label, sizeof(brake_label), "ブレーキ 切");
+  buttons[0] = {margin, 32, half_w, 40, power_label, true, false, 0, Action::Power};
+  buttons[1] = {margin + half_w + gap, 32, half_w, 40, brake_label, true, false, 0,
+                Action::Brake};
 
   const int deltas[4] = {-10, -1, 1, 10};
   const char* labels[4] = {"-10", "-1", "+1", "+10"};
@@ -346,15 +376,15 @@ const Button* hitButton(int x, int y) {
 
 void onButton(const Button& button) {
   switch (button.action) {
-    case Action::Io2Off:
-      setRelay(false);
+    case Action::Power:
+      setRelay(!relay_on);
       break;
-    case Action::Io2On:
-      setRelay(true);
+    case Action::Brake:
+      setBrake(!brake_on);
       break;
     case Action::Speed:
       if (!button.enabled) {
-        showNotice("先にIO2をON");
+        showNotice("先に電源をON");
         return;
       }
       setSpeed(requested_speed + button.speed_delta);
@@ -394,10 +424,13 @@ void render() {
 
   const bool live = outputLive();
   const int width = canvas.width();
-  const bool io2_high = digitalRead(PIN_POWER_RELAY) != 0;
+  const bool power_high = digitalRead(PIN_POWER_RELAY) != 0;
+  const bool brake_high = digitalRead(PIN_MOTOR_BRAKE) != 0;
 
-  buttons[0].selected = !relay_on;
-  buttons[1].selected = relay_on;
+  snprintf(power_label, sizeof(power_label), "電源 %s", relay_on ? "入" : "切");
+  snprintf(brake_label, sizeof(brake_label), "ブレーキ %s", brake_on ? "入" : "切");
+  buttons[0].selected = relay_on;
+  buttons[1].selected = brake_on;
   for (int i = 2; i <= 5; ++i) {
     buttons[i].enabled = relay_on;
   }
@@ -459,11 +492,15 @@ void render() {
     direction = "逆転";
   }
   canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  canvas.drawString(direction, 52, 222);
+  canvas.drawString(direction, 48, 222);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("IO2", 112, 222);
-  canvas.setTextColor(io2_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(io2_high ? "HIGH" : "LOW", 148, 222);
+  canvas.drawString("電源", 96, 222);
+  canvas.setTextColor(power_high ? kGreen : kGray, TFT_BLACK);
+  canvas.drawString(power_high ? "H" : "L", 136, 222);
+  canvas.setTextColor(kOrange, TFT_BLACK);
+  canvas.drawString("ブレーキ", 156, 222);
+  canvas.setTextColor(brake_high ? kGreen : kGray, TFT_BLACK);
+  canvas.drawString(brake_high ? "H" : "L", 228, 222);
 
   canvas.pushSprite(0, 0);
 }
@@ -472,6 +509,7 @@ void render() {
 
 void setup() {
   driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
+  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), relayOffLevel());
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
@@ -483,7 +521,7 @@ void setup() {
   cfg.internal_spk = false;
   cfg.external_imu = false;
   cfg.external_rtc = false;
-  // Port A を外部機器の探索に使わせない。GPIO1 がリレーなので、I2C の High で入れたくない。
+  // Port A を外部機器の探索に使わせない。GPIO1 と GPIO2 がリレーなので、I2C の High で入れたくない。
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
@@ -495,6 +533,8 @@ void setup() {
 
   pinMode(PIN_POWER_RELAY, OUTPUT);
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
+  pinMode(PIN_MOTOR_BRAKE, OUTPUT);
+  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
   pinMode(PIN_MD13S_DIR, OUTPUT);
   digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
   setupPwm();

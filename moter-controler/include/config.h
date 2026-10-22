@@ -4,7 +4,8 @@
 //   Black = GND, Red = 5V, Yellow = IO1, White = IO2
 //
 // Port A は Core 本体側面の Grove。DIN Base が出すのは Port B と Port C。
-//   Port A IO1 Yellow = GPIO2,  IO2 White = GPIO1
+//   Port A Yellow G2 = GPIO2 = モーター電源
+//   Port A White  G1 = GPIO1 = モーターブレーキ
 // Port B は DIN Base の Grove。
 //   Port B IO1 Yellow = GPIO9,  IO2 White = GPIO8
 //
@@ -19,7 +20,8 @@
 
 constexpr int PIN_MD13S_PWM = 9;    // Port B IO1 Yellow
 constexpr int PIN_MD13S_DIR = 8;    // Port B IO2 White
-constexpr int PIN_POWER_RELAY = 1;  // Port A IO2 White
+constexpr int PIN_POWER_RELAY = 2;  // Port A Yellow G2  モーター電源
+constexpr int PIN_MOTOR_BRAKE = 1;  // Port A White  G1  モーターブレーキ
 
 // 速度 > 0 のときの DIR。真理値表では Low が MA=High。
 constexpr int DIR_POSITIVE_LEVEL = 0;
