@@ -1,0 +1,30 @@
+方向トークン: positive
+方向の意味: USB トークン。positive は DIR Low、negative は DIR High。機構のどちらへ動くかは未測定。
+RUN コマンド: RUN duty_pct=5 direction=positive duration_ms=100
+RUN: 未送信
+ARM 応答: なし
+DIR level (RUNNING 中): 受信なし
+適用 Duty (RUNNING 中): 受信なし
+PWM 生値 (RUNNING 中): 受信なし
+PWM が出た: 受信なし
+駆動時間 ms (EVT run→pwm_off): 受信なし
+駆動時間 ms (CSV elapsed 最大): 受信なし
+RUN 前 count_total: 受信なし
+最終 count_total: 受信なし
+EVT run 開始カウント: 受信なし
+EVT pwm_off カウント: 受信なし
+trial 駆動差分 (pwm_off-start): 受信なし
+PWM 停止後カウント変化 (coast): 受信なし
+trial 停止差分 (stop-start): 受信なし
+count/s 最大: 受信なし
+count/s 最小: 受信なし
+count/s サンプル数: 0
+count/s 注記: 受信した CSV velocity_count_s（100 ms 窓）。内部ピークは USB に出ない。
+停止理由: 受信なし
+最終状態: 受信なし
+最終 stop: 受信なし
+失敗: reply_timeout:failed
+GPIO エラー行: 0
+ARM 送信回数: 0
+RUN 送信回数: 0
+STOP 送信回数: 0

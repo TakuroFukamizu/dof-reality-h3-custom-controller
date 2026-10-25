@@ -1,0 +1,14 @@
+.pio
+.vscode
+.cache
+*.log
+*.csv
+*.png
+tools/__pycache__/
+tools/.venv/
+
+# 実施の生ログは検証記録として残す。親を無視したままだと中のファイルは戻せない。
+!logs/
+!logs/*.log
+!logs/*.csv
+!logs/*.txt
