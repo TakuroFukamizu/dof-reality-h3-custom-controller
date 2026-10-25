@@ -1,0 +1,44 @@
+# moter-controler
+
+M5Stack CoreS3 SE で MD13S・主電源リレー・ブレーキリレーを操作し、フィードバックセンサーを読んで、系統ごとの原点復帰・定位置移動を行う。設計は `docs/superpowers/specs/2026-10-25-moter-controler-homing-design.md`、実機記録は [docs/acceptance_homing.md](docs/acceptance_homing.md)。
+
+## ビルド
+
+PATH の `pio` は使わない。
+
+```sh
+cd moter-controler
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3            # DIN Base 12V から給電する本番設定
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower   # USB のみ給電（開発用。12V は接続しない。Issue #1）
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower -t upload --upload-port /dev/cu.usbmodem2101
+tests/run_tests.sh   # ホストテスト（状態機械とプロファイル）
+```
+
+## 画面
+
+上から: 系統 `#n`（タップで切替。電源 OFF 時のみ）と状態 / 電源・ブレーキ（解除/作動） / センサー行（原点基準のカウント、count/s、A/B、原点・校正の有無） / 速度 −10 −1 [n] +1 +10 / 自動移動（下限へ・上限へ・中立へ・校正。#3 は右端へ・左端へ） / 停止・非常停止 / フッター（DIR、ピンのレベル、行程・中立・符号）。
+
+## シリアル（115200）
+
+`R 0|1` `B 0|1` `S -100..100` `X` `E` `?` `HELP` に加えて:
+
+| コマンド | 動作 |
+| --- | --- |
+| `M 1\|2\|3` | 系統の選択（電源 OFF 時のみ）。NVS に保存し、原点は無効になる |
+| `HOME` | P 端（速度 + で当たる端）へ 10 % で当て、原点 0 にする |
+| `UPPER` | N 端へ。原点が必要。到達位置が実測ストローク |
+| `NEUTRAL` | 中立へ比例制御。原点と校正が必要 |
+| `CAL` | HOME → UPPER → 保存 → NEUTRAL |
+| `UNCAL` | 選択中の系統の校正を消す（電源 OFF 時のみ） |
+
+`?` は `STAT` 行と `ENC` 行を出す。自動移動中は 500 ms ごとに `ENC`、状態が変わると `AUTO <kind> <phase> <reason> pos=`。校正完了で `AUTO saved ...`。要求が拒否されると `ERR auto_<reason>`。
+
+## 座標と保存値
+
+- P 端 = 原点 0。N 端へ向かって増える。`ENCODER_SIGN=+1` で速度 − のときカウント増。系統ごとに校正時に符号を判定して保存する。
+- NVS `h3`: `motor`、`m{n}_stroke`、`m{n}_neutral`、`m{n}_cal`、`m{n}_sign`。
+- 2026-10-25 時点: #3 校正済み（stroke 6160、neutral 3080、sign +1）。#1・#2 は未校正。
+
+## 安全
+
+自動移動は、主電源 ON（settle 後）・ブレーキ解除・手動速度 0 のときだけ始まり、STOP・非常停止・電源 OFF・ブレーキ作動・速度操作で即中止。無パルス 200 ms、移動量 12000、時間 45 s で止まる。画面と USB の非常停止はソフトのラッチで、物理の非常停止ではない。電流監視は無い。
