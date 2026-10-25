@@ -842,8 +842,11 @@ void loop() {
       ui_dirty = true;
     }
     if (snap.position != previous.position || snap.origin_valid != previous.origin_valid ||
-        snap.profile.calibrated != previous.profile.calibrated || snap.a_level != previous.a_level ||
-        snap.b_level != previous.b_level || snap.count_per_s != previous.count_per_s) {
+        snap.profile.calibrated != previous.profile.calibrated || snap.profile.motor != previous.profile.motor ||
+        snap.profile.stroke != previous.profile.stroke || snap.profile.neutral != previous.profile.neutral ||
+        snap.working_sign != previous.working_sign || snap.phase != previous.phase ||
+        snap.a_level != previous.a_level || snap.b_level != previous.b_level ||
+        snap.count_per_s != previous.count_per_s) {
       ui_dirty = true;
     }
     if (result_until_ms != 0 && static_cast<int32_t>(millis() - result_until_ms) >= 0) {
