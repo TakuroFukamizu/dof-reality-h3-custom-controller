@@ -23,7 +23,10 @@ struct Inputs {
   bool profile_pulse = false;
   MotorProfile profile{};
   bool clear_dirty_pulse = false;
+  uint32_t fed_ms = 0;  // main が入力を更新した時刻。古ければ出力を止める
 };
+
+constexpr uint32_t kInputStaleMs = 200;
 
 constexpr uint32_t kPeriodMs = 5;
 constexpr uint32_t kVelocityWindowMs = 100;
@@ -68,6 +71,12 @@ void task_main(void*) {
 
     const uint32_t now = millis();
     const int64_t raw = encoder_count();
+    // UI ループが止まると入力が更新されない。古い入力は「主電源 OFF・手動 0」として扱い、出力を止める。
+    const bool inputs_fresh = now - in.fed_ms <= kInputStaleMs;
+    if (!inputs_fresh) {
+      in.relay_live = false;
+      in.manual_speed = 0;
+    }
     AutoInputs ai;
     ai.now_ms = now;
     ai.raw_count = raw;
@@ -142,6 +151,7 @@ void control_begin(const MotorProfile& initial) {
 void control_set_relay_live(bool live) {
   portENTER_CRITICAL(&g_mux);
   g_in.relay_live = live;
+  g_in.fed_ms = millis();
   portEXIT_CRITICAL(&g_mux);
 }
 

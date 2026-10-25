@@ -82,16 +82,15 @@ int64_t encoder_count() {
   if (!g_ready) {
     return 0;
   }
-  // counter → overflow → counter の順に読み、間にリミットを跨いだら読み直す。
-  for (int i = 0; i < 3; ++i) {
-    int16_t before = 0;
-    int16_t after = 0;
-    pcnt_get_counter_value(kUnit, &before);
-    const int64_t overflow = g_overflow;
-    pcnt_get_counter_value(kUnit, &after);
-    const bool wrapped = (before > kLimit / 2 && after < -kLimit / 2) || (before < -kLimit / 2 && after > kLimit / 2);
-    if (!wrapped) {
-      return overflow + after;
+  // overflow → counter → overflow の順に読み、間にリミット ISR が走っていたら読み直す。
+  // legacy PCNT はリミット到達でカウンタを 0 に戻すので、カウンタ値だけでは跨ぎを判定できない。
+  for (int i = 0; i < 4; ++i) {
+    const int64_t before = g_overflow;
+    int16_t value = 0;
+    pcnt_get_counter_value(kUnit, &value);
+    const int64_t after = g_overflow;
+    if (before == after) {
+      return after + value;
     }
   }
   int16_t value = 0;

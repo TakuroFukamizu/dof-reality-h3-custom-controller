@@ -249,7 +249,8 @@ struct AutoMachine {
       *dist = pos;
       return true;
     }
-    if (leg == AutoKind::HomeN && profile.calibrated && profile.stroke > 0) {
+    // 校正中は保存ストロークを信じない（再校正で保存値が実際より大きいと 15 % で端に当たる）。
+    if (leg == AutoKind::HomeN && kind != AutoKind::Cal && profile.calibrated && profile.stroke > 0) {
       *dist = profile.stroke - pos;
       return true;
     }
@@ -340,8 +341,12 @@ struct AutoMachine {
       return;
     }
     if (phase == AutoPhase::Dwell) {
+      // 惰性で帯を出た。Dwell 中の静止を速度窓に含めると偽の slow になるので、窓も取り直す。
       phase = AutoPhase::Moving;
       last_change_ms = in.now_ms;
+      rate_anchor_raw = in.raw_count;
+      rate_anchor_ms = in.now_ms;
+      slow_event = false;
     }
     compute_duty(in);
     if (stalled(in)) {

@@ -232,6 +232,34 @@ void test_neutral_p_control() {
   CHECK(std::string(s.m.reason) == "ok");
 }
 
+void test_neutral_resume_after_dwell_is_not_slow() {
+  // Dwell 中は duty 0 で静止する。惰性で帯を出て再始動した直後に速度窓が閉じても slow 失敗にしない。
+  Sim s = calibrated_sim();
+  s.step(20, 2778);  // 中立に居る
+  CHECK(s.request(AutoKind::Neutral));
+  s.step(20, 0);
+  CHECK(s.m.phase == AutoPhase::Dwell);
+  s.steps(3, 50, 0);  // 150 ms 静止（Dwell 継続）
+  s.step(20, 30);     // 2808、帯の外へ → Moving
+  CHECK(s.m.phase == AutoPhase::Moving);
+  s.steps(4, 20, -5);  // 再始動後 250 count/s で戻る（7 % の実測相当）。修正前はここで slow 失敗になった
+  CHECK(s.m.phase == AutoPhase::Moving || s.m.phase == AutoPhase::Dwell);
+  CHECK(std::string(s.m.reason) != "slow");
+}
+
+void test_cal_n_leg_does_not_trust_saved_stroke() {
+  // 再校正では保存ストロークが実際より大きいかもしれない。校正中の N 端行程は常に HOME_DUTY で当てる。
+  Sim s = calibrated_sim();
+  s.m.profile.stroke = 6160;  // 実際は 5556 かもしれない保存値
+  CHECK(s.request(AutoKind::Cal));
+  s.steps(50, 20, -12);
+  s.steps(6, 50, 0);  // P 端到達
+  CHECK(s.m.cal_step == CalStep::ToN);
+  CHECK(s.m.duty_signed == -HOME_DUTY);
+  s.steps(100, 20, 12);  // 1200 進んでも
+  CHECK(s.m.duty_signed == -HOME_DUTY);
+}
+
 void test_slow_zone() {
   Sim s = calibrated_sim();
   s.step(20, 1000);
@@ -328,6 +356,8 @@ int main() {
   test_home_n_rejected_without_origin();
   test_neutral_rejected_uncalibrated();
   test_neutral_p_control();
+  test_neutral_resume_after_dwell_is_not_slow();
+  test_cal_n_leg_does_not_trust_saved_stroke();
   test_slow_zone();
   test_cancel_reasons();
   test_travel_and_timeout();

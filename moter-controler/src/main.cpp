@@ -130,6 +130,8 @@ void setBrake(bool on) {
   publish("OK");
 }
 
+void showNotice(const char* text);
+
 bool setSpeed(int percent) {
   if (percent > SPEED_MAX) {
     percent = SPEED_MAX;
@@ -139,6 +141,16 @@ bool setSpeed(int percent) {
   if (percent != 0 && !relay_on) {
     Serial.println("ERR relay_off");
     return false;
+  }
+  if (autoBusy() && percent != 0) {
+    // 自動移動中の速度操作は「中止」であって手動への乗り換えではない（仕様: PWM 0）。
+    control_pulse_stop();
+    requested_speed = 0;
+    control_set_manual_speed(0);
+    showNotice("自動移動を中止");
+    publish("OK");
+    ui_dirty = true;
+    return true;
   }
   if (percent == requested_speed) {
     return true;
