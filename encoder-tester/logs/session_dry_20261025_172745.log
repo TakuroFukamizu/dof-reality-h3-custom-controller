@@ -1,0 +1,369 @@
+   0.002  # opened /dev/cu.usbmodem2101
+  15.006  # no banner; asking STATUS
+  15.006  >>> STATUS
+  15.008  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  15.008  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=-1
+  15.009  STAT lock=limits_unset fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  15.009  STAT missing=MAX_DUTY_PERCENT,MAX_RUN_MS,MAX_TRAVEL_COUNTS,POWER_SETTLE_MS,BRAKE_RELEASE_WAIT_MS,BRAKE_APPLY_WAIT_MS,STOP_SPEED_THRESHOLD,STOP_CONFIRM_MS,STOP_TIMEOUT_MS,READY_HOLD_MS,START_GRACE_MS,MAX_COUNT_PER_S,UI_TIMEOUT_MS,LEASE_MS,JOG_STALE_MS
+  15.009  STAT ppr=UNKNOWN
+  15.009  STAT cal=PPR UNKNOWN angle UNKNOWN
+  15.512  >>> STATUS
+  15.531  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  15.531  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=-1
+  15.531  STAT lock=limits_unset fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  15.531  STAT missing=MAX_DUTY_PERCENT,MAX_RUN_MS,MAX_TRAVEL_COUNTS,POWER_SETTLE_MS,BRAKE_RELEASE_WAIT_MS,BRAKE_APPLY_WAIT_MS,STOP_SPEED_THRESHOLD,STOP_CONFIRM_MS,STOP_TIMEOUT_MS,READY_HOLD_MS,START_GRACE_MS,MAX_COUNT_PER_S,UI_TIMEOUT_MS,LEASE_MS,JOG_STALE_MS
+  15.532  STAT ppr=UNKNOWN
+  15.532  STAT cal=PPR UNKNOWN angle UNKNOWN
+  15.532  >>> CONFIG
+  15.533  CFG MAX_DUTY_PERCENT=-1 percent_of_1023
+  15.533  CFG MAX_RUN_MS=-1 ms
+  15.533  CFG MAX_TRAVEL_COUNTS=-1 count
+  15.533  CFG POWER_SETTLE_MS=-1 ms
+  15.533  CFG BRAKE_RELEASE_WAIT_MS=-1 ms
+  15.533  CFG BRAKE_APPLY_WAIT_MS=-1 ms
+  15.533  CFG STOP_SPEED_THRESHOLD=-1 count_per_s
+  15.533  CFG STOP_CONFIRM_MS=-1 ms
+  15.533  CFG STOP_TIMEOUT_MS=-1 ms
+  15.533  CFG READY_HOLD_MS=-1 ms
+  15.533  CFG START_GRACE_MS=-1 ms
+  15.534  CFG MAX_COUNT_PER_S=-1 count_per_s
+  15.534  CFG UI_TIMEOUT_MS=-1 ms
+  15.534  CFG LEASE_MS=-1 ms
+  15.534  CFG JOG_STALE_MS=-1 ms
+  15.534  CFG JOG_DUTY=-1 percent_of_1023
+  15.534  CFG ENCODER_SIGN=1 sign
+  15.534  CFG GLITCH_NS=0 ns
+  15.534  CFG AUTHORITY=local LOCK=limits_unset
+  15.534  CFG MISSING=MAX_DUTY_PERCENT,MAX_RUN_MS,MAX_TRAVEL_COUNTS,POWER_SETTLE_MS,BRAKE_RELEASE_WAIT_MS,BRAKE_APPLY_WAIT_MS,STOP_SPEED_THRESHOLD,STOP_CONFIRM_MS,STOP_TIMEOUT_MS,READY_HOLD_MS,START_GRACE_MS,MAX_COUNT_PER_S,UI_TIMEOUT_MS,LEASE_MS,JOG_STALE_MS
+  15.534  CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+  15.534  CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+  15.535  CFG -1 means UNCONFIGURED
+  15.535  >>> SET MAX_DUTY_PERCENT 25
+  15.596  OK set
+  15.596  >>> SET MAX_RUN_MS 600
+  15.600  OK set
+  15.600  >>> SET MAX_TRAVEL_COUNTS 3000
+  15.662  OK set
+  15.662  >>> SET POWER_SETTLE_MS 1500
+  15.665  OK set
+  15.665  >>> SET BRAKE_RELEASE_WAIT_MS 300
+  15.728  OK set
+  15.728  >>> SET BRAKE_APPLY_WAIT_MS 300
+  15.735  OK set
+  15.735  >>> SET STOP_SPEED_THRESHOLD 20
+  15.796  OK set
+  15.796  >>> SET STOP_CONFIRM_MS 200
+  15.800  OK set
+  15.800  >>> SET STOP_TIMEOUT_MS 2000
+  15.861  OK set
+  15.861  >>> SET READY_HOLD_MS 3000
+  15.865  OK set
+  15.865  >>> SET START_GRACE_MS 200
+  15.927  OK set
+  15.927  >>> SET MAX_COUNT_PER_S 1000000
+  15.930  OK set
+  15.930  >>> SET UI_TIMEOUT_MS 1000
+  15.993  OK set
+  15.993  >>> SET LEASE_MS 2000
+  16.000  OK set
+  16.000  >>> SET JOG_STALE_MS 150
+  16.061  OK set
+  16.061  >>> SET JOG_DUTY 10
+  16.065  OK set
+  16.065  >>> SET ENCODER_SIGN 1
+  16.126  OK sign
+  16.126  EVT,26912333,sign,1
+  16.126  >>> SET GLITCH_NS 0
+  16.131  OK glitch
+  16.131  >>> CONFIG
+  16.131  EVT,26973333,counter_reinit,glitch_ns,0,ok,1
+  16.133  CFG MAX_DUTY_PERCENT=25 percent_of_1023
+  16.133  CFG MAX_RUN_MS=600 ms
+  16.133  CFG MAX_TRAVEL_COUNTS=3000 count
+  16.133  CFG POWER_SETTLE_MS=1500 ms
+  16.133  CFG BRAKE_RELEASE_WAIT_MS=300 ms
+  16.133  CFG BRAKE_APPLY_WAIT_MS=300 ms
+  16.133  CFG STOP_SPEED_THRESHOLD=20 count_per_s
+  16.133  CFG STOP_CONFIRM_MS=200 ms
+  16.133  CFG STOP_TIMEOUT_MS=2000 ms
+  16.133  CFG READY_HOLD_MS=3000 ms
+  16.133  CFG START_GRACE_MS=200 ms
+  16.134  CFG MAX_COUNT_PER_S=1000000 count_per_s
+  16.134  CFG UI_TIMEOUT_MS=1000 ms
+  16.134  CFG LEASE_MS=2000 ms
+  16.134  CFG JOG_STALE_MS=150 ms
+  16.134  CFG JOG_DUTY=10 percent_of_1023
+  16.134  CFG ENCODER_SIGN=1 sign
+  16.134  CFG GLITCH_NS=0 ns
+  16.134  CFG AUTHORITY=local LOCK=
+  16.134  CFG MISSING=
+  16.134  CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+  16.134  CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+  16.134  CFG -1 means UNCONFIGURED
+  16.134  >>> STATUS
+  16.194  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  16.194  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  16.194  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  16.194  STAT missing=
+  16.194  STAT ppr=UNKNOWN
+  16.194  STAT cal=PPR UNKNOWN angle UNKNOWN
+  16.698  >>> STATUS
+  16.722  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  16.722  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  16.722  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  16.722  STAT missing=
+  16.722  STAT ppr=UNKNOWN
+  16.722  STAT cal=PPR UNKNOWN angle UNKNOWN
+  17.225  >>> STATUS
+  17.250  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  17.250  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  17.250  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  17.250  STAT missing=
+  17.250  STAT ppr=UNKNOWN
+  17.250  STAT cal=PPR UNKNOWN angle UNKNOWN
+  17.754  >>> STATUS
+  17.777  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  17.777  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  17.777  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  17.777  STAT missing=
+  17.777  STAT ppr=UNKNOWN
+  17.777  STAT cal=PPR UNKNOWN angle UNKNOWN
+  18.280  >>> STATUS
+  18.306  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  18.306  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  18.306  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  18.306  STAT missing=
+  18.306  STAT ppr=UNKNOWN
+  18.306  STAT cal=PPR UNKNOWN angle UNKNOWN
+  18.809  >>> STATUS
+  18.834  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  18.834  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  18.834  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  18.834  STAT missing=
+  18.834  STAT ppr=UNKNOWN
+  18.834  STAT cal=PPR UNKNOWN angle UNKNOWN
+  19.336  >>> STATUS
+  19.362  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  19.362  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  19.362  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  19.362  STAT missing=
+  19.362  STAT ppr=UNKNOWN
+  19.362  STAT cal=PPR UNKNOWN angle UNKNOWN
+  19.866  >>> STATUS
+  19.890  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  19.890  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  19.890  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  19.890  STAT missing=
+  19.890  STAT ppr=UNKNOWN
+  19.890  STAT cal=PPR UNKNOWN angle UNKNOWN
+  20.395  >>> STATUS
+  20.417  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  20.417  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  20.417  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  20.417  STAT missing=
+  20.417  STAT ppr=UNKNOWN
+  20.417  STAT cal=PPR UNKNOWN angle UNKNOWN
+  20.922  >>> STATUS
+  20.946  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  20.946  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  20.946  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  20.946  STAT missing=
+  20.946  STAT ppr=UNKNOWN
+  20.946  STAT cal=PPR UNKNOWN angle UNKNOWN
+  21.451  >>> STATUS
+  21.473  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  21.474  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  21.474  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  21.474  STAT missing=
+  21.474  STAT ppr=UNKNOWN
+  21.474  STAT cal=PPR UNKNOWN angle UNKNOWN
+  21.979  >>> STATUS
+  22.002  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  22.002  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  22.002  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  22.002  STAT missing=
+  22.002  STAT ppr=UNKNOWN
+  22.002  STAT cal=PPR UNKNOWN angle UNKNOWN
+  22.507  >>> STATUS
+  22.530  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  22.530  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  22.530  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  22.530  STAT missing=
+  22.530  STAT ppr=UNKNOWN
+  22.530  STAT cal=PPR UNKNOWN angle UNKNOWN
+  23.032  >>> STATUS
+  23.057  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  23.057  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  23.057  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  23.057  STAT missing=
+  23.057  STAT ppr=UNKNOWN
+  23.057  STAT cal=PPR UNKNOWN angle UNKNOWN
+  23.561  >>> STATUS
+  23.586  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  23.586  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  23.586  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  23.586  STAT missing=
+  23.586  STAT ppr=UNKNOWN
+  23.586  STAT cal=PPR UNKNOWN angle UNKNOWN
+  24.089  >>> STATUS
+  24.114  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  24.114  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  24.114  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  24.114  STAT missing=
+  24.114  STAT ppr=UNKNOWN
+  24.114  STAT cal=PPR UNKNOWN angle UNKNOWN
+  24.618  >>> STATUS
+  24.641  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  24.642  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  24.642  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  24.642  STAT missing=
+  24.642  STAT ppr=UNKNOWN
+  24.642  STAT cal=PPR UNKNOWN angle UNKNOWN
+  25.146  >>> STATUS
+  25.170  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  25.170  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  25.170  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  25.170  STAT missing=
+  25.170  STAT ppr=UNKNOWN
+  25.170  STAT cal=PPR UNKNOWN angle UNKNOWN
+  25.674  >>> STATUS
+  25.697  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  25.697  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  25.697  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  25.697  STAT missing=
+  25.697  STAT ppr=UNKNOWN
+  25.697  STAT cal=PPR UNKNOWN angle UNKNOWN
+  26.200  >>> STATUS
+  26.225  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  26.226  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  26.226  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  26.226  STAT missing=
+  26.226  STAT ppr=UNKNOWN
+  26.226  STAT cal=PPR UNKNOWN angle UNKNOWN
+  26.731  >>> STATUS
+  26.753  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  26.754  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  26.754  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  26.754  STAT missing=
+  26.754  STAT ppr=UNKNOWN
+  26.754  STAT cal=PPR UNKNOWN angle UNKNOWN
+  27.257  >>> STATUS
+  27.281  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  27.282  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  27.282  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  27.282  STAT missing=
+  27.282  STAT ppr=UNKNOWN
+  27.282  STAT cal=PPR UNKNOWN angle UNKNOWN
+  27.785  >>> STATUS
+  27.809  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  27.810  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  27.810  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  27.810  STAT missing=
+  27.810  STAT ppr=UNKNOWN
+  27.810  STAT cal=PPR UNKNOWN angle UNKNOWN
+  28.315  >>> STATUS
+  28.336  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  28.337  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  28.337  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  28.337  STAT missing=
+  28.337  STAT ppr=UNKNOWN
+  28.337  STAT cal=PPR UNKNOWN angle UNKNOWN
+  28.839  >>> STATUS
+  28.865  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  28.866  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  28.866  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  28.866  STAT missing=
+  28.866  STAT ppr=UNKNOWN
+  28.866  STAT cal=PPR UNKNOWN angle UNKNOWN
+  29.369  >>> STATUS
+  29.393  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  29.394  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  29.394  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  29.394  STAT missing=
+  29.394  STAT ppr=UNKNOWN
+  29.394  STAT cal=PPR UNKNOWN angle UNKNOWN
+  29.899  >>> STATUS
+  29.921  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  29.922  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  29.922  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  29.922  STAT missing=
+  29.922  STAT ppr=UNKNOWN
+  29.922  STAT cal=PPR UNKNOWN angle UNKNOWN
+  30.426  >>> STATUS
+  30.449  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  30.450  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  30.450  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  30.450  STAT missing=
+  30.450  STAT ppr=UNKNOWN
+  30.450  STAT cal=PPR UNKNOWN angle UNKNOWN
+  30.954  >>> STATUS
+  30.976  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  30.977  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  30.977  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  30.977  STAT missing=
+  30.977  STAT ppr=UNKNOWN
+  30.977  STAT cal=PPR UNKNOWN angle UNKNOWN
+  31.481  >>> STATUS
+  31.505  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  31.506  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  31.506  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  31.506  STAT missing=
+  31.506  STAT ppr=UNKNOWN
+  31.506  STAT cal=PPR UNKNOWN angle UNKNOWN
+  32.011  >>> STATUS
+  32.033  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  32.034  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  32.034  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  32.034  STAT missing=
+  32.034  STAT ppr=UNKNOWN
+  32.034  STAT cal=PPR UNKNOWN angle UNKNOWN
+  32.535  >>> STATUS
+  32.561  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  32.562  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  32.562  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  32.562  STAT missing=
+  32.562  STAT ppr=UNKNOWN
+  32.562  STAT cal=PPR UNKNOWN angle UNKNOWN
+  33.067  >>> STATUS
+  33.089  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  33.090  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  33.090  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  33.090  STAT missing=
+  33.090  STAT ppr=UNKNOWN
+  33.090  STAT cal=PPR UNKNOWN angle UNKNOWN
+  33.593  >>> STATUS
+  33.616  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  33.617  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  33.617  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  33.617  STAT missing=
+  33.617  STAT ppr=UNKNOWN
+  33.617  STAT cal=PPR UNKNOWN angle UNKNOWN
+  34.121  >>> STATUS
+  34.145  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  34.146  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  34.146  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  34.146  STAT missing=
+  34.146  STAT ppr=UNKNOWN
+  34.146  STAT cal=PPR UNKNOWN angle UNKNOWN
+  34.646  >>> STATUS
+  34.673  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  34.674  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  34.674  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  34.674  STAT missing=
+  34.674  STAT ppr=UNKNOWN
+  34.674  STAT cal=PPR UNKNOWN angle UNKNOWN
+  35.175  >>> STATUS
+  35.201  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  35.202  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  35.202  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  35.202  STAT missing=
+  35.202  STAT ppr=UNKNOWN
+  35.202  STAT cal=PPR UNKNOWN angle UNKNOWN
+  35.707  >>> STATUS
+  35.729  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  35.730  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  35.730  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  35.730  STAT missing=
+  35.730  STAT ppr=UNKNOWN
+  35.730  STAT cal=PPR UNKNOWN angle UNKNOWN
+  36.235  # READER read failed: [Errno 9] Bad file descriptor

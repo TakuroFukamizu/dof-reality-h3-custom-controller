@@ -1,0 +1,2211 @@
+   0.001  # opened /dev/cu.usbmodem2101
+  15.006  # no banner; asking STATUS
+  15.006  >>> STATUS
+  15.007  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  15.008  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  15.008  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  15.008  STAT missing=
+  15.008  STAT ppr=UNKNOWN
+  15.008  STAT cal=PPR UNKNOWN angle UNKNOWN
+  15.511  >>> STATUS
+  15.534  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  15.535  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  15.535  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  15.535  STAT missing=
+  15.535  STAT ppr=UNKNOWN
+  15.535  STAT cal=PPR UNKNOWN angle UNKNOWN
+  15.535  >>> CONFIG
+  15.537  CFG MAX_DUTY_PERCENT=25 percent_of_1023
+  15.537  CFG MAX_RUN_MS=600 ms
+  15.537  CFG MAX_TRAVEL_COUNTS=3000 count
+  15.537  CFG POWER_SETTLE_MS=1500 ms
+  15.537  CFG BRAKE_RELEASE_WAIT_MS=300 ms
+  15.537  CFG BRAKE_APPLY_WAIT_MS=300 ms
+  15.537  CFG STOP_SPEED_THRESHOLD=20 count_per_s
+  15.537  CFG STOP_CONFIRM_MS=200 ms
+  15.537  CFG STOP_TIMEOUT_MS=2000 ms
+  15.537  CFG READY_HOLD_MS=3000 ms
+  15.537  CFG START_GRACE_MS=200 ms
+  15.537  CFG MAX_COUNT_PER_S=1000000 count_per_s
+  15.537  CFG UI_TIMEOUT_MS=1000 ms
+  15.538  CFG LEASE_MS=2000 ms
+  15.538  CFG JOG_STALE_MS=150 ms
+  15.538  CFG JOG_DUTY=10 percent_of_1023
+  15.538  CFG ENCODER_SIGN=1 sign
+  15.538  CFG GLITCH_NS=0 ns
+  15.538  CFG AUTHORITY=local LOCK=
+  15.538  CFG MISSING=
+  15.538  CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+  15.538  CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+  15.538  CFG -1 means UNCONFIGURED
+  15.538  >>> SET MAX_DUTY_PERCENT 25
+  15.540  OK set
+  15.540  >>> SET MAX_RUN_MS 600
+  15.601  OK set
+  15.601  >>> SET MAX_TRAVEL_COUNTS 3000
+  15.605  OK set
+  15.605  >>> SET POWER_SETTLE_MS 1500
+  15.667  OK set
+  15.667  >>> SET BRAKE_RELEASE_WAIT_MS 300
+  15.670  OK set
+  15.670  >>> SET BRAKE_APPLY_WAIT_MS 300
+  15.733  OK set
+  15.733  >>> SET STOP_SPEED_THRESHOLD 20
+  15.740  OK set
+  15.740  >>> SET STOP_CONFIRM_MS 200
+  15.800  OK set
+  15.800  >>> SET STOP_TIMEOUT_MS 2000
+  15.805  OK set
+  15.805  >>> SET READY_HOLD_MS 3000
+  15.866  OK set
+  15.866  >>> SET START_GRACE_MS 200
+  15.870  OK set
+  15.870  >>> SET MAX_COUNT_PER_S 1000000
+  15.932  OK set
+  15.932  >>> SET UI_TIMEOUT_MS 1000
+  15.935  OK set
+  15.935  >>> SET LEASE_MS 2000
+  15.998  OK set
+  15.998  >>> SET JOG_STALE_MS 150
+  16.005  OK set
+  16.005  >>> SET JOG_DUTY 10
+  16.065  OK set
+  16.065  >>> SET ENCODER_SIGN 1
+  16.070  OK sign
+  16.070  >>> SET GLITCH_NS 0
+  16.070  EVT,77004333,sign,1
+  16.130  OK glitch
+  16.131  >>> CONFIG
+  16.131  EVT,77063988,counter_reinit,glitch_ns,0,ok,1
+  16.131  CFG MAX_DUTY_PERCENT=25 percent_of_1023
+  16.132  CFG MAX_RUN_MS=600 ms
+  16.132  CFG MAX_TRAVEL_COUNTS=3000 count
+  16.132  CFG POWER_SETTLE_MS=1500 ms
+  16.132  CFG BRAKE_RELEASE_WAIT_MS=300 ms
+  16.132  CFG BRAKE_APPLY_WAIT_MS=300 ms
+  16.132  CFG STOP_SPEED_THRESHOLD=20 count_per_s
+  16.132  CFG STOP_CONFIRM_MS=200 ms
+  16.132  CFG STOP_TIMEOUT_MS=2000 ms
+  16.132  CFG READY_HOLD_MS=3000 ms
+  16.132  CFG START_GRACE_MS=200 ms
+  16.132  CFG MAX_COUNT_PER_S=1000000 count_per_s
+  16.132  CFG UI_TIMEOUT_MS=1000 ms
+  16.132  CFG LEASE_MS=2000 ms
+  16.132  CFG JOG_STALE_MS=150 ms
+  16.132  CFG JOG_DUTY=10 percent_of_1023
+  16.133  CFG ENCODER_SIGN=1 sign
+  16.133  CFG GLITCH_NS=0 ns
+  16.133  CFG AUTHORITY=local LOCK=
+  16.133  CFG MISSING=
+  16.133  CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18
+  16.133  CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only
+  16.133  CFG -1 means UNCONFIGURED
+  16.133  >>> STATUS
+  16.134  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  16.134  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=0 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  16.134  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  16.134  STAT missing=
+  16.134  STAT ppr=UNKNOWN
+  16.135  STAT cal=PPR UNKNOWN angle UNKNOWN
+  16.637  >>> STATUS
+  16.658  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  16.659  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  16.659  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  16.659  STAT missing=
+  16.659  STAT ppr=UNKNOWN
+  16.659  STAT cal=PPR UNKNOWN angle UNKNOWN
+  17.162  >>> STATUS
+  17.186  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  17.187  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  17.187  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  17.187  STAT missing=
+  17.187  STAT ppr=UNKNOWN
+  17.187  STAT cal=PPR UNKNOWN angle UNKNOWN
+  17.690  >>> STATUS
+  17.714  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  17.714  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  17.715  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  17.715  STAT missing=
+  17.715  STAT ppr=UNKNOWN
+  17.715  STAT cal=PPR UNKNOWN angle UNKNOWN
+  18.217  >>> STATUS
+  18.242  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  18.243  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  18.243  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  18.243  STAT missing=
+  18.243  STAT ppr=UNKNOWN
+  18.243  STAT cal=PPR UNKNOWN angle UNKNOWN
+  18.747  >>> STATUS
+  18.769  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  18.769  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  18.770  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  18.770  STAT missing=
+  18.770  STAT ppr=UNKNOWN
+  18.770  STAT cal=PPR UNKNOWN angle UNKNOWN
+  19.274  >>> STATUS
+  19.298  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  19.298  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  19.299  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  19.299  STAT missing=
+  19.299  STAT ppr=UNKNOWN
+  19.299  STAT cal=PPR UNKNOWN angle UNKNOWN
+  19.801  >>> STATUS
+  19.827  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  19.827  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  19.827  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  19.827  STAT missing=
+  19.827  STAT ppr=UNKNOWN
+  19.827  STAT cal=PPR UNKNOWN angle UNKNOWN
+  20.331  >>> STATUS
+  20.354  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  20.354  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  20.355  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  20.355  STAT missing=
+  20.355  STAT ppr=UNKNOWN
+  20.355  STAT cal=PPR UNKNOWN angle UNKNOWN
+  20.858  >>> STATUS
+  20.882  STAT state=DISARMED stop= power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  20.882  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  20.883  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=local stream=0 drops=0
+  20.883  STAT missing=
+  20.883  STAT ppr=UNKNOWN
+  20.883  STAT cal=PPR UNKNOWN angle UNKNOWN
+  21.388  >>> AUTHORITY USB
+  21.410  OK authority=usb
+  21.411  >>> STREAM ON
+  21.411  OK heartbeat
+  21.411  OK stream=on
+  21.412  >>> ARM
+  21.412  seq,t_us,trial_id,axis,state,power_on_cmd,power_gpio_level,brake_release_cmd,brake_gpio_level,requested_command,requested_unit,applied_duty_pct,pwm_raw,pwm_full_scale,pwm_hz,dir_level,count_total_x4,count_trial_x4,velocity_count_s,a_level,b_level,elapsed_ms,stop_reason,log_drop_count
+  21.415  OK state=POWER_WAIT
+  21.415  EVT,82349333,power_on_cmd,1
+  21.415  1,82349333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.475  2,82370336,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.475  3,82395328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.481  4,82415333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.541  5,82435334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.541  6,82460328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.546  7,82480333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.607  8,82501334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.607  9,82526328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.612  10,82546333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.673  OK heartbeat
+  21.673  11,82567334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.673  12,82592328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.678  13,82612333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.739  14,82633334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.739  15,82658328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.744  16,82678333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.805  17,82699334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.805  18,82724328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.810  19,82744333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.871  OK heartbeat
+  21.871  20,82765336,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.871  21,82790328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.876  22,82810333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.937  23,82831334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.937  24,82856328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  21.942  25,82876333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.003  26,82897334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.003  27,82922328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.008  28,82942333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.069  OK heartbeat
+  22.069  29,82963336,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.069  30,82988328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.074  31,83008333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.135  32,83029334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.135  33,83054328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.140  34,83074333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.201  35,83095334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.201  36,83120328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.206  37,83140333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.267  OK heartbeat
+  22.267  38,83161335,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.267  39,83186328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.272  40,83206333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.333  41,83227334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.333  42,83252328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.338  43,83272333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.399  44,83293334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.399  45,83318328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.404  46,83338333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.465  OK heartbeat
+  22.465  47,83359334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.465  48,83384328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.470  49,83404333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.531  50,83425334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.531  51,83450328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.536  52,83470333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.597  53,83491334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.597  54,83516328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.602  55,83536333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.663  OK heartbeat
+  22.663  56,83557334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.663  57,83582328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.668  58,83602333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.729  59,83623334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.729  60,83648328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.734  61,83668333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.795  62,83689334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.795  63,83714328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.800  64,83734333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.861  OK heartbeat
+  22.861  65,83755334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.861  66,83780328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.866  67,83800333,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.927  EVT,83851328,brake_release_cmd,1
+  22.927  68,83821334,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.927  69,83846328,0,1,POWER_WAIT,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.932  70,83866333,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.993  71,83887336,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.993  72,83912328,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  22.998  73,83932333,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.059  OK heartbeat
+  23.059  74,83953337,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.059  75,83978328,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.064  76,83998333,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.125  77,84019335,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.125  78,84044328,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.130  79,84064333,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.191  80,84085334,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.191  81,84110328,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.196  82,84130333,0,1,BRAKE_WAIT,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.257  OK heartbeat
+  23.257  83,84151335,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.257  84,84176328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.262  85,84196333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.323  86,84217334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.323  87,84242328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.328  88,84262333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.389  89,84283334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.389  90,84308328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.394  91,84328333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.455  OK heartbeat
+  23.455  92,84349334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.455  93,84374328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.460  94,84394333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.521  95,84415334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.521  96,84440328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.526  97,84460333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.587  98,84481334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.587  99,84506328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.592  100,84526333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.653  101,84547334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.653  102,84572328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.656  OK heartbeat
+  23.658  103,84592333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.719  104,84613334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.719  105,84638328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.724  106,84658333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.785  107,84679334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.785  108,84704328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.790  109,84724333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.851  110,84745334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.851  111,84770328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.856  112,84790333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.917  OK heartbeat
+  23.917  113,84811334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.917  114,84836328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.922  115,84856333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.983  116,84877334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.983  117,84902328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  23.988  118,84922333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.049  119,84943334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.049  120,84968328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.054  121,84988333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.115  OK heartbeat
+  24.115  122,85009334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.115  123,85034328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.120  124,85054333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.181  125,85075334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.181  126,85100328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.186  127,85120333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.247  128,85141334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.247  129,85166328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.252  130,85186333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.313  OK heartbeat
+  24.313  131,85207334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.313  132,85232328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.318  133,85252333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.379  134,85273334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.379  135,85298328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.384  136,85318333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.445  137,85339334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.445  138,85364328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.450  139,85384333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.511  OK heartbeat
+  24.511  140,85405334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.511  141,85430328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.516  142,85450333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.577  143,85471334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.577  144,85496328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.582  145,85516333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.643  146,85537334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.643  147,85562328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.648  148,85582333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.709  OK heartbeat
+  24.709  149,85603334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.709  150,85628328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.714  151,85648333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.775  152,85669334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.775  153,85694328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.780  154,85714333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.841  155,85735334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.841  156,85760328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.846  157,85780333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.907  OK heartbeat
+  24.907  158,85801334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.907  159,85826328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.912  160,85846333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.973  161,85867334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.973  162,85892328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  24.978  163,85912333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.039  164,85933334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.039  165,85958328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.044  166,85978333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.105  OK heartbeat
+  25.105  167,85999334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.105  168,86024328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.110  169,86044333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.171  170,86065334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.171  171,86090328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.176  172,86110333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.237  173,86131334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.237  174,86156328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.242  175,86176333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.303  OK heartbeat
+  25.303  176,86197334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.303  177,86222328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.308  178,86242333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.369  179,86263334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.369  180,86288328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.374  181,86308333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.435  182,86329334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.435  183,86354328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.440  184,86374333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.501  OK heartbeat
+  25.501  185,86395334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.501  186,86420328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.506  187,86440333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.567  188,86461334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.567  189,86486328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.572  190,86506333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.633  191,86527334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.633  192,86552328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.638  193,86572333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.699  OK heartbeat
+  25.699  194,86593334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.699  195,86618328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.704  196,86638333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.765  197,86659334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.765  198,86684328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.770  199,86704333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.831  200,86725334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.831  201,86750328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.836  202,86770333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.897  203,86791334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.897  204,86816328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.898  OK heartbeat
+  25.902  205,86836333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.963  206,86857334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.963  207,86882328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  25.968  208,86902333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.029  209,86923334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.029  210,86948328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.034  211,86968333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.095  212,86989334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.095  213,87014328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.100  214,87034333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.101  OK heartbeat
+  26.161  215,87055334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.161  216,87080328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.166  217,87100333,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.227  218,87121334,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.227  219,87146328,0,1,READY,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,,0
+  26.232  220,87166333,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.293  221,87187334,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.293  222,87212328,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.298  223,87232333,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.359  OK heartbeat
+  26.359  224,87253334,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.359  225,87278328,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.364  226,87298333,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.425  EVT,87359332,brake_release_cmd,0
+  26.425  227,87319334,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.425  228,87344328,0,1,STOPPING,1,1,1,1,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.430  229,87364333,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.491  230,87385334,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.491  231,87410328,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.496  232,87430333,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.557  OK heartbeat
+  26.557  233,87451334,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.557  234,87476328,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.562  235,87496333,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.623  236,87517334,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.623  237,87542328,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.628  238,87562333,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.689  239,87583334,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.689  240,87608328,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.694  241,87628333,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.755  OK heartbeat
+  26.755  EVT,87659328,power_on_cmd,0
+  26.755  242,87649335,0,1,BRAKE_APPLY,1,1,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.755  243,87674328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.760  244,87694333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.821  245,87715334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.821  246,87740328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.826  247,87760333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.887  248,87781334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.887  249,87806328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.892  250,87826333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.953  OK heartbeat
+  26.953  251,87847334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.953  252,87872328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  26.958  253,87892333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.019  254,87913334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.019  255,87938328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.024  256,87958333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.085  257,87979334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.085  258,88004328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.090  259,88024333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.151  OK heartbeat
+  27.151  260,88045334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.151  261,88070328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.156  262,88090333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.217  263,88111334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.217  264,88136328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.222  265,88156333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.283  266,88177334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.283  267,88202328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.288  268,88222333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.349  OK heartbeat
+  27.349  269,88243334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.349  270,88268328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.354  271,88288333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.415  272,88309334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.415  273,88334328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.420  274,88354333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.481  275,88375334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.481  276,88400328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.486  277,88420333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.547  OK heartbeat
+  27.547  278,88441334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.547  279,88466328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.552  280,88486333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.613  281,88507334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.613  282,88532328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.618  283,88552333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.679  284,88573334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.679  285,88598328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.684  286,88618333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.745  OK heartbeat
+  27.745  287,88639334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.745  288,88664328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.750  289,88684333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.811  290,88705334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.811  291,88730328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.816  292,88750333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.877  293,88771334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.877  294,88796328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.882  295,88816333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.943  OK heartbeat
+  27.943  296,88837334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.943  297,88862328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  27.948  298,88882333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.009  299,88903334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.009  300,88928328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.014  301,88948333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.075  302,88969334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.075  303,88994328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.080  304,89014333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.141  OK heartbeat
+  28.141  305,89035334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.141  306,89060328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.146  307,89080333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.207  308,89101334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.207  309,89126328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.212  310,89146333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.273  311,89167334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.273  312,89192328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.278  313,89212333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.339  314,89233334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.339  315,89258328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.340  OK heartbeat
+  28.344  316,89278333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.405  317,89299334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.405  318,89324328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.410  319,89344333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.471  320,89365334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.471  321,89390328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.476  322,89410333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.537  323,89431334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.537  324,89456328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.542  325,89476333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.543  OK heartbeat
+  28.603  326,89497334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.603  327,89522328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.608  328,89542333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.669  329,89563334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.669  330,89588328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.674  331,89608333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.735  332,89629334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.735  333,89654328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.735  TRACE note a_level and b_level are single digitalRead samples, not a pulse or noise waveform
+  28.735  TRACE t_us,state,power_on_cmd,brake_release_cmd,power_gpio,brake_gpio,pwm_raw,pcnt_raw,count_total,delta,a_level,b_level,mark
+  28.735  TRACE,82349333,POWER_WAIT,1,0,0,0,0,0,0,0,1,1,tick
+  28.736  TRACE,82349333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,post
+  28.736  TRACE,82355335,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.736  TRACE,82360329,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.737  TRACE,82365334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.737  TRACE,82370336,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.737  TRACE,82375334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.737  TRACE,82380328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.737  TRACE,82385328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.738  TRACE,82390328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.739  TRACE,82395328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.739  TRACE,82400328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.739  TRACE,82405328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.739  TRACE,82409963,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.740  TRACE,82415333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.741  TRACE,82420334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.741  TRACE,82425330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.741  TRACE,82430333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.743  TRACE,82435334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.743  TRACE,82440334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.743  TRACE,82445328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.743  TRACE,82450328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.801  OK heartbeat
+  28.801  334,89679333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.801  335,89699334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.801  336,89724328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.801  TRACE,82455328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.801  TRACE,82460328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.801  TRACE,82465328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.801  TRACE,82470328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.802  TRACE,82475332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.802  TRACE,82480333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.802  TRACE,82486333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.803  TRACE,82491330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.803  TRACE,82496334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.803  TRACE,82501334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.804  TRACE,82506334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.804  TRACE,82511328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.805  TRACE,82516328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.805  TRACE,82521328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.805  TRACE,82526328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.805  TRACE,82531328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.806  TRACE,82536328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.806  TRACE,82541332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.807  TRACE,82546333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.807  TRACE,82552333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.807  TRACE,82557330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.807  TRACE,82562333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.807  TRACE,82567334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.808  TRACE,82572334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.809  TRACE,82577328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.809  TRACE,82582328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.809  TRACE,82587328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.809  TRACE,82592328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.867  337,89744333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.867  338,89764335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.867  339,89789328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.867  TRACE,82597328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.867  TRACE,82602328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.867  TRACE,82607332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.867  TRACE,82612333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.868  TRACE,82618333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.868  TRACE,82623329,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.869  TRACE,82628334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.869  TRACE,82633334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.870  TRACE,82638334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.870  TRACE,82643328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.870  TRACE,82648328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.870  TRACE,82653328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.872  TRACE,82658328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.872  TRACE,82663328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.872  TRACE,82668328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.872  TRACE,82673332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.873  TRACE,82678333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.873  TRACE,82684333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.874  TRACE,82689330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.874  TRACE,82694333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.875  340,89809333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.875  TRACE,82699334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.875  TRACE,82704333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.875  TRACE,82709328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.875  TRACE,82714328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.933  341,89829335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.933  342,89854328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.933  TRACE,82719328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.933  TRACE,82724328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.933  TRACE,82729328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.933  TRACE,82734328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.935  TRACE,82739332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.935  TRACE,82744333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.935  TRACE,82750334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.935  TRACE,82755330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.937  TRACE,82760334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.937  TRACE,82765336,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.937  TRACE,82770334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.937  TRACE,82775328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.938  TRACE,82780328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.938  TRACE,82785328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.939  TRACE,82790328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.939  TRACE,82795328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.940  343,89874333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  28.940  TRACE,82800328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.940  TRACE,82805332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.940  TRACE,82810333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.940  TRACE,82816333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.942  TRACE,82821331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.942  TRACE,82826333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.942  TRACE,82831334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  28.942  TRACE,82836334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.000  OK heartbeat
+  29.000  344,89894334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.000  345,89919328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.000  TRACE,82841328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.000  TRACE,82846328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.000  TRACE,82851328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.001  TRACE,82856328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.001  TRACE,82861328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.001  TRACE,82866328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.002  TRACE,82871332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.002  TRACE,82876333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.002  TRACE,82882333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.002  TRACE,82887330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.002  TRACE,82892334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.003  TRACE,82897334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.004  TRACE,82902333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.004  TRACE,82907328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.004  TRACE,82912328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.004  TRACE,82917328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.005  TRACE,82922328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.006  TRACE,82927328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.006  TRACE,82932328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.006  TRACE,82937332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.008  TRACE,82942333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.008  TRACE,82948334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.008  TRACE,82953330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.008  TRACE,82958333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.066  346,89944333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.066  347,89964334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.066  348,89989328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.066  TRACE,82963336,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.066  TRACE,82968334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.066  TRACE,82973328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.066  TRACE,82978328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.067  TRACE,82983328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.067  TRACE,82988328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.068  TRACE,82993328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.068  TRACE,82998328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.068  TRACE,83003332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.068  TRACE,83008333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.068  TRACE,83014333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.069  TRACE,83019330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.070  TRACE,83024333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.070  TRACE,83029334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.070  TRACE,83034334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.070  TRACE,83039328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.071  TRACE,83044328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.071  TRACE,83049328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.071  TRACE,83054328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.072  TRACE,83059328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.072  TRACE,83064328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.072  TRACE,83069332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.072  TRACE,83074333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.073  TRACE,83080334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.074  TRACE,83085330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.074  TRACE,83090334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.074  TRACE,83095334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.074  TRACE,83100333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.132  349,90009333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.132  350,90029335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.132  351,90054328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.132  TRACE,83105328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.132  TRACE,83110328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.132  TRACE,83115328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.132  TRACE,83120328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.133  TRACE,83125328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.133  TRACE,83130328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.134  TRACE,83135332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.134  TRACE,83140333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.135  TRACE,83146334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.135  TRACE,83151331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.135  TRACE,83156333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.135  TRACE,83161335,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.137  TRACE,83166334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.137  TRACE,83171328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.137  TRACE,83176328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.137  TRACE,83181328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.138  TRACE,83186328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.138  TRACE,83191328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.139  TRACE,83196328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.139  TRACE,83201332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.140  352,90074333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.140  TRACE,83206333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.140  TRACE,83212334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.140  TRACE,83217331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.140  TRACE,83222333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.198  OK heartbeat
+  29.198  353,90094334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.198  354,90119328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.198  TRACE,83227334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.198  TRACE,83232334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.198  TRACE,83237328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.198  TRACE,83242328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.200  TRACE,83247328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.200  TRACE,83252328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.200  TRACE,83257328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.200  TRACE,83262328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.202  TRACE,83267332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.202  TRACE,83272333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.202  TRACE,83278334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.202  TRACE,83283331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.203  TRACE,83288334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.203  TRACE,83293334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.204  TRACE,83298333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.204  TRACE,83303328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.205  355,90139333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.205  TRACE,83308328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.205  TRACE,83313328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.205  TRACE,83318328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.205  TRACE,83323328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.207  TRACE,83328328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.207  TRACE,83333332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.207  TRACE,83338333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.207  TRACE,83344333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.265  356,90159336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.265  357,90184328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.265  TRACE,83349330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.265  TRACE,83354333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.266  TRACE,83359334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.266  TRACE,83364333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.266  TRACE,83369328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.266  TRACE,83374328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.266  TRACE,83379328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.267  TRACE,83384328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.267  TRACE,83389328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.267  TRACE,83394328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.268  TRACE,83399332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.268  TRACE,83404333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.269  TRACE,83410334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.269  TRACE,83415330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.269  TRACE,83420333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.269  TRACE,83425334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.270  TRACE,83430334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.271  TRACE,83435328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.271  TRACE,83440328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.271  TRACE,83445328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.273  TRACE,83450328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.273  TRACE,83455328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.273  TRACE,83460328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.273  TRACE,83465332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.331  358,90209333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.331  359,90229334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.331  360,90254328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.331  TRACE,83470333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.331  TRACE,83476333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.331  TRACE,83481331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.332  TRACE,83486334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.332  TRACE,83491334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.332  TRACE,83496333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.333  TRACE,83501328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.333  TRACE,83506328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.333  TRACE,83511328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.333  TRACE,83516328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.333  TRACE,83521328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.334  TRACE,83526328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.335  TRACE,83531332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.335  TRACE,83536333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.335  TRACE,83542333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.335  TRACE,83547330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.336  TRACE,83552333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.337  TRACE,83557334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.337  TRACE,83562333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.337  TRACE,83567328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.337  TRACE,83572328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.337  TRACE,83577328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.338  TRACE,83582328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.338  TRACE,83587328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.339  TRACE,83592328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.339  TRACE,83597332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.339  TRACE,83602333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.339  TRACE,83608333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.397  OK heartbeat
+  29.397  361,90274333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.397  362,90294335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.397  363,90319328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.397  TRACE,83613330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.398  TRACE,83618333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.398  TRACE,83623334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.398  TRACE,83628333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.398  TRACE,83633328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.398  TRACE,83638328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.399  TRACE,83643328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.399  TRACE,83648328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.400  TRACE,83653328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.400  TRACE,83658328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.400  TRACE,83663332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.400  TRACE,83668333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.402  TRACE,83674334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.402  TRACE,83679330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.402  TRACE,83684334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.402  TRACE,83689334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.403  TRACE,83694333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.403  TRACE,83699328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.404  TRACE,83704328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.404  TRACE,83709328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.405  364,90339333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.405  TRACE,83714328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.405  TRACE,83719328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.405  TRACE,83724328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.405  TRACE,83729332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.463  365,90359334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.463  366,90384328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.463  TRACE,83734333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.463  TRACE,83740333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.463  TRACE,83745330,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.463  TRACE,83750333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.465  TRACE,83755334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.465  TRACE,83760333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.465  TRACE,83765328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.465  TRACE,83770328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.467  TRACE,83775328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.467  TRACE,83780328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.467  TRACE,83785328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.467  TRACE,83790328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.468  TRACE,83795332,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.468  TRACE,83800333,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.469  TRACE,83806334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.469  TRACE,83811331,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.470  367,90404333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.470  TRACE,83816334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.470  TRACE,83821334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.470  TRACE,83826334,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.470  TRACE,83831328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.472  TRACE,83836328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.472  TRACE,83841328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.472  TRACE,83846328,POWER_WAIT,1,0,1,0,0,0,0,0,1,1,tick
+  29.472  TRACE,83851328,BRAKE_WAIT,1,1,1,0,0,0,0,0,1,1,tick
+  29.530  368,90424336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.530  369,90449328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.530  TRACE,83851328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,post
+  29.530  TRACE,83856328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.530  TRACE,83861329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.531  TRACE,83866333,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.531  TRACE,83872334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.531  TRACE,83877328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.532  TRACE,83882335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.532  TRACE,83887336,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.532  TRACE,83892334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.532  TRACE,83897328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.532  TRACE,83902328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.533  TRACE,83907328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.534  TRACE,83912328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.534  TRACE,83917329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.534  TRACE,83922328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.534  TRACE,83927329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.535  TRACE,83932333,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.536  TRACE,83938335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.536  TRACE,83943329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.536  TRACE,83948336,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.538  TRACE,83953337,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.538  TRACE,83958334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.538  TRACE,83963328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.538  TRACE,83968328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.596  OK heartbeat
+  29.596  370,90474333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.596  371,90494334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.596  372,90519328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.596  TRACE,83973328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.596  TRACE,83978328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.596  TRACE,83983329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.597  TRACE,83988328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.597  TRACE,83993329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.597  TRACE,83998333,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.598  TRACE,84004335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.598  TRACE,84009329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.598  TRACE,84014335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.598  TRACE,84019335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.599  TRACE,84024334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.599  TRACE,84029328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.600  TRACE,84034328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.600  TRACE,84039328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.600  TRACE,84044328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.600  TRACE,84049329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.601  TRACE,84054328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.601  TRACE,84059329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.602  TRACE,84064333,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.602  TRACE,84070336,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.602  TRACE,84075328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.602  TRACE,84080334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.603  TRACE,84085334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.603  TRACE,84090334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.604  TRACE,84095328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.604  TRACE,84100328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.604  TRACE,84105328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.604  TRACE,84110328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.662  373,90539333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.662  374,90559334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.662  375,90584328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.662  TRACE,84115329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.662  TRACE,84120328,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.662  TRACE,84125329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.663  TRACE,84130333,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.663  TRACE,84136334,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.663  TRACE,84141329,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.664  TRACE,84146335,BRAKE_WAIT,1,1,1,1,0,0,0,0,1,1,tick
+  29.664  TRACE,84151335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.665  TRACE,84156334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.665  TRACE,84161328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.665  TRACE,84166328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.665  TRACE,84171328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.667  TRACE,84176328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.667  TRACE,84181330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.667  TRACE,84186328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.667  TRACE,84191330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.668  TRACE,84196333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.668  TRACE,84202335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.668  TRACE,84207329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.669  TRACE,84212334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.670  376,90604333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.670  TRACE,84217334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.670  TRACE,84222334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.670  TRACE,84227328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.670  TRACE,84232328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.728  377,90624334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.728  378,90649328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.728  TRACE,84237328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.728  TRACE,84242328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.728  TRACE,84247330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.728  TRACE,84252328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.730  TRACE,84257330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.730  TRACE,84262333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.730  TRACE,84268336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.730  TRACE,84273328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.732  TRACE,84278335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.732  TRACE,84283334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.732  TRACE,84288334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.732  TRACE,84293328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.733  TRACE,84298328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.733  TRACE,84303328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.734  TRACE,84308328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.734  TRACE,84313330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.735  379,90669333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.735  TRACE,84318328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.735  TRACE,84323330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.735  TRACE,84328333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.735  TRACE,84334335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.737  TRACE,84339328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.737  TRACE,84344335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.737  TRACE,84349334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.737  TRACE,84354334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.795  OK heartbeat
+  29.795  380,90689335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.795  381,90714328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.796  TRACE,84359328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84364328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84369328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84374328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84379330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84384328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.796  TRACE,84389330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.797  TRACE,84394333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.797  TRACE,84400334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.798  TRACE,84405329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.798  TRACE,84410335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.798  TRACE,84415334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.799  TRACE,84420334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.799  TRACE,84425328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.799  TRACE,84430328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.799  TRACE,84435328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.801  TRACE,84440328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.801  TRACE,84445330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.801  TRACE,84450328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.801  TRACE,84455330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.803  TRACE,84460333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.803  TRACE,84466335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.803  TRACE,84471330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.803  TRACE,84476334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.861  382,90739333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.861  383,90759334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.861  384,90784328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.861  TRACE,84481334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.861  TRACE,84486334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.861  TRACE,84491328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.861  TRACE,84496328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.862  TRACE,84501328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.862  TRACE,84506328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.863  TRACE,84511330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.863  TRACE,84516328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.863  TRACE,84521330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.863  TRACE,84526333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.863  TRACE,84532334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.864  TRACE,84537329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.865  TRACE,84542335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.865  TRACE,84547334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.865  TRACE,84552334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.865  TRACE,84557328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.866  TRACE,84562328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.866  TRACE,84567328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.866  TRACE,84572328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.867  TRACE,84577330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.867  TRACE,84582328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.867  TRACE,84587330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.867  TRACE,84592333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.868  TRACE,84598334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.869  TRACE,84603329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.869  TRACE,84608334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.869  TRACE,84613334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.869  TRACE,84618334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.927  385,90804333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.927  386,90824334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.927  387,90849328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.927  TRACE,84623328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.927  TRACE,84628328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.927  TRACE,84633328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.928  TRACE,84638328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.928  TRACE,84643330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.928  TRACE,84648328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.928  TRACE,84653330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.929  TRACE,84658333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.930  TRACE,84664335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.930  TRACE,84669330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.930  TRACE,84674334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.930  TRACE,84679334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.932  TRACE,84684334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.932  TRACE,84689328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.932  TRACE,84694328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.932  TRACE,84699328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.933  TRACE,84704328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.933  TRACE,84709330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.933  TRACE,84714328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.934  TRACE,84719330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.935  388,90869333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.935  TRACE,84724333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.935  TRACE,84730336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.935  TRACE,84735329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.935  TRACE,84740335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.993  OK heartbeat
+  29.993  389,90889334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.993  390,90914328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  29.993  TRACE,84745334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.993  TRACE,84750334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.993  TRACE,84755328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.993  TRACE,84760328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.995  TRACE,84765328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.995  TRACE,84770328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.995  TRACE,84775330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.995  TRACE,84780328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.997  TRACE,84785330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.997  TRACE,84790333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.997  TRACE,84796334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.997  TRACE,84801330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.998  TRACE,84806335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.998  TRACE,84811334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.999  TRACE,84816334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  29.999  TRACE,84821328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.000  391,90934333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.000  TRACE,84826328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.000  TRACE,84831328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.000  TRACE,84836328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.000  TRACE,84841330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.002  TRACE,84846328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.002  TRACE,84851330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.002  TRACE,84856333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.002  TRACE,84862335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.060  392,90954336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.060  393,90979328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.060  TRACE,84867330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.060  TRACE,84872334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.060  TRACE,84877334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.060  TRACE,84882334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.061  TRACE,84887328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.061  TRACE,84892328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.061  TRACE,84897328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.062  TRACE,84902328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.062  TRACE,84907330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.062  TRACE,84912328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.062  TRACE,84917330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.063  TRACE,84922333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.064  TRACE,84928335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.064  TRACE,84933330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.064  TRACE,84938334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.064  TRACE,84943334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.065  TRACE,84948334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84953328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84958328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84963328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84968328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84973330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.066  TRACE,84978328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.067  TRACE,84983330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.068  TRACE,84988333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.068  TRACE,84994335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.068  TRACE,84999328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.068  TRACE,85004335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.126  394,91004333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.126  395,91024334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.126  396,91049328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.126  TRACE,85009334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.126  TRACE,85014334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.126  TRACE,85019328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.127  TRACE,85024328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.127  TRACE,85029328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.127  TRACE,85034328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.127  TRACE,85039330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.128  TRACE,85044328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.128  TRACE,85049330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.128  TRACE,85054333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.128  TRACE,85060336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.129  TRACE,85065329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.130  TRACE,85070334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.130  TRACE,85075334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.130  TRACE,85080334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.130  TRACE,85085328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.131  TRACE,85090328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.131  TRACE,85095328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.132  TRACE,85100328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.132  TRACE,85105330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.132  TRACE,85110328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.132  TRACE,85115330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.132  TRACE,85120333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.133  TRACE,85126334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.134  TRACE,85131328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.134  TRACE,85136334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.134  TRACE,85141334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.134  TRACE,85146334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.192  OK heartbeat
+  30.192  397,91069333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.192  398,91089336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.192  399,91114328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.192  TRACE,85151328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.193  TRACE,85156328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.193  TRACE,85161328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.193  TRACE,85166328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.193  TRACE,85171330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.193  TRACE,85176328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.194  TRACE,85181330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.194  TRACE,85186333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.195  TRACE,85192334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.195  TRACE,85197328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.195  TRACE,85202335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.195  TRACE,85207334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.197  TRACE,85212334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.197  TRACE,85217328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.197  TRACE,85222328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.197  TRACE,85227328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.198  TRACE,85232328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.198  TRACE,85237330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.198  TRACE,85242328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.199  TRACE,85247330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.200  400,91134333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.200  TRACE,85252333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.200  TRACE,85258334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.200  TRACE,85263328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.200  TRACE,85268334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.258  401,91154335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.258  402,91179328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.258  TRACE,85273334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.258  TRACE,85278334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.258  TRACE,85283328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.258  TRACE,85288328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.260  TRACE,85293328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.260  TRACE,85298328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.260  TRACE,85303330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.260  TRACE,85308328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.262  TRACE,85313330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.262  TRACE,85318333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.262  TRACE,85324335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.262  TRACE,85329329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.263  TRACE,85334334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.263  TRACE,85339334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.264  TRACE,85344334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.264  TRACE,85349328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.265  403,91199333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.265  TRACE,85354328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.265  TRACE,85359328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.265  TRACE,85364328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.265  TRACE,85369330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.267  TRACE,85374328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.267  TRACE,85379330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.267  TRACE,85384333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.267  TRACE,85390334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.325  404,91219334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.325  405,91244328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.325  TRACE,85395330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.325  TRACE,85400335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.325  TRACE,85405334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.325  TRACE,85410334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.326  TRACE,85415328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.326  TRACE,85420328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.326  TRACE,85425328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.327  TRACE,85430328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.327  TRACE,85435330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.327  TRACE,85440328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.327  TRACE,85445330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.328  TRACE,85450333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.329  TRACE,85456335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.329  TRACE,85461328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.329  TRACE,85466334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.329  TRACE,85471334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.330  TRACE,85476334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85481328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85486328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85491328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85496328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85501330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85506328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.331  TRACE,85511330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.333  TRACE,85516333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.333  TRACE,85522336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.333  TRACE,85527329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.333  TRACE,85532334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.391  OK heartbeat
+  30.391  406,91269333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.391  407,91289334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.391  408,91314328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.391  TRACE,85537334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.391  TRACE,85542334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.392  TRACE,85547328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.392  TRACE,85552328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.392  TRACE,85557328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.392  TRACE,85562328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.392  TRACE,85567330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.393  TRACE,85572328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.393  TRACE,85577330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.393  TRACE,85582333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.393  TRACE,85588336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.394  TRACE,85593328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.395  TRACE,85598334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.395  TRACE,85603334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.395  TRACE,85608334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.395  TRACE,85613328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.396  TRACE,85618328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.396  TRACE,85623328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.396  TRACE,85628328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.397  TRACE,85633330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.397  TRACE,85638328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.397  TRACE,85643330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.397  TRACE,85648333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.398  TRACE,85654334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.399  TRACE,85659328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.399  TRACE,85664334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.399  TRACE,85669334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.399  TRACE,85674334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.457  409,91334333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.457  410,91354334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.457  411,91379328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.457  TRACE,85679328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.457  TRACE,85684328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.457  TRACE,85689328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.458  TRACE,85694328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.458  TRACE,85699330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.458  TRACE,85704328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.458  TRACE,85709330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.459  TRACE,85714333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.460  TRACE,85720334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.460  TRACE,85725329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.460  TRACE,85730335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.460  TRACE,85735334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.462  TRACE,85740334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.462  TRACE,85745328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.462  TRACE,85750328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.462  TRACE,85755328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.463  TRACE,85760328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.463  TRACE,85765330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.463  TRACE,85770328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.464  TRACE,85775330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.465  412,91399333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.465  TRACE,85780333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.465  TRACE,85786335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.465  TRACE,85791328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.465  TRACE,85796334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.523  413,91419336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.523  414,91444328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.523  TRACE,85801334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.523  TRACE,85806334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.523  TRACE,85811328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.523  TRACE,85816328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.525  TRACE,85821328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.525  TRACE,85826328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.525  TRACE,85831330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.525  TRACE,85836328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.527  TRACE,85841330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.527  TRACE,85846333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.527  TRACE,85852335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.527  TRACE,85857329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.528  TRACE,85862334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.528  TRACE,85867334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.529  TRACE,85872334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.529  TRACE,85877328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.530  415,91464333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.530  TRACE,85882328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.530  TRACE,85887328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.530  TRACE,85892328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.530  TRACE,85897330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.532  TRACE,85902328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.532  TRACE,85907330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.532  TRACE,85912333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.532  TRACE,85918335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.590  OK heartbeat
+  30.590  416,91484334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.590  417,91509328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.590  TRACE,85923329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.590  TRACE,85928335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.591  TRACE,85933334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.591  TRACE,85938334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.591  TRACE,85943328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.591  TRACE,85948328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.591  TRACE,85953328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.592  TRACE,85958328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.592  TRACE,85963330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.592  TRACE,85968328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.592  TRACE,85973330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.593  TRACE,85978333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.594  TRACE,85984335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.594  TRACE,85989330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.594  TRACE,85994334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.594  TRACE,85999334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.595  TRACE,86004334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.596  TRACE,86009328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.596  TRACE,86014328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.596  TRACE,86019328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.598  TRACE,86024328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.598  TRACE,86029330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.598  TRACE,86034328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.598  TRACE,86039330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.656  418,91534333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.656  419,91554334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.656  420,91579328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.656  TRACE,86044333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.656  TRACE,86050335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.656  TRACE,86055329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.656  TRACE,86060334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.657  TRACE,86065334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.657  TRACE,86070334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.658  TRACE,86075328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.658  TRACE,86080328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.658  TRACE,86085328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.658  TRACE,86090328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.658  TRACE,86095330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.659  TRACE,86100328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.660  TRACE,86105330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.660  TRACE,86110333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.660  TRACE,86116335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.660  TRACE,86121328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.661  TRACE,86126334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86131334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86136334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86141328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86146328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86151328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.662  TRACE,86156328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.663  TRACE,86161330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.664  TRACE,86166328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.664  TRACE,86171330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.664  TRACE,86176333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.664  TRACE,86182335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.722  421,91599333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.722  422,91619334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.722  423,91644328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.722  TRACE,86187328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.722  TRACE,86192334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.722  TRACE,86197334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.722  TRACE,86202334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.723  TRACE,86207328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.723  TRACE,86212328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.723  TRACE,86217328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.724  TRACE,86222328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.725  TRACE,86227330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.725  TRACE,86232328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.725  TRACE,86237330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.725  TRACE,86242333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.727  TRACE,86248335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.727  TRACE,86253330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.727  TRACE,86258334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.727  TRACE,86263334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.728  TRACE,86268334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.728  TRACE,86273328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.728  TRACE,86278328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.729  TRACE,86283328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.730  424,91664333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.730  TRACE,86288328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.730  TRACE,86293330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.730  TRACE,86298328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.730  TRACE,86303330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.788  OK heartbeat
+  30.788  425,91684334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.788  426,91709328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.788  TRACE,86308333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.788  TRACE,86314335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.788  TRACE,86319328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.788  TRACE,86324335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.790  TRACE,86329334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.790  TRACE,86334334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.790  TRACE,86339328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.790  TRACE,86344328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.792  TRACE,86349328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.792  TRACE,86354328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.792  TRACE,86359330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.792  TRACE,86364328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.793  TRACE,86369330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.793  TRACE,86374333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.794  TRACE,86380335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.794  TRACE,86385328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.795  427,91729333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.795  TRACE,86390334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.795  TRACE,86395334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.795  TRACE,86400334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.795  TRACE,86405328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.797  TRACE,86410328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.797  TRACE,86415328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.797  TRACE,86420328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.797  TRACE,86425330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.855  428,91749338,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.855  429,91774328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.855  TRACE,86430328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.855  TRACE,86435330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.855  TRACE,86440333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.855  TRACE,86446335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.856  TRACE,86451328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.856  TRACE,86456335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.856  TRACE,86461334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.857  TRACE,86466334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.857  TRACE,86471328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.857  TRACE,86476328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.857  TRACE,86481328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.858  TRACE,86486328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.859  TRACE,86491330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.859  TRACE,86496328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.859  TRACE,86501330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.859  TRACE,86506333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.860  TRACE,86512334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86517328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86522335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86527334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86532334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86537328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.861  TRACE,86542328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.862  TRACE,86547328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.863  TRACE,86552328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.863  TRACE,86557330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.863  TRACE,86562328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.863  TRACE,86567330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.921  430,91799333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.921  431,91819334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.921  432,91844328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.921  TRACE,86572333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.921  TRACE,86578334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.921  TRACE,86583329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.921  TRACE,86588334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.922  TRACE,86593334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.922  TRACE,86598334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.922  TRACE,86603328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.923  TRACE,86608328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.923  TRACE,86613328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.923  TRACE,86618328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.923  TRACE,86623330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.924  TRACE,86628328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.925  TRACE,86633330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.925  TRACE,86638333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.925  TRACE,86644335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.925  TRACE,86649329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.926  TRACE,86654336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.926  TRACE,86659334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.926  TRACE,86664334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.927  TRACE,86669328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.927  TRACE,86674328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.927  TRACE,86679328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.927  TRACE,86684328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.928  TRACE,86689330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.929  TRACE,86694328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.929  TRACE,86699330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.929  TRACE,86704333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.929  TRACE,86710335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.987  433,91864333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.987  434,91884335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.987  435,91909328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.987  TRACE,86715329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.987  TRACE,86720334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.987  TRACE,86725334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.988  TRACE,86730334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.988  TRACE,86735328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.988  TRACE,86740328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.988  TRACE,86745328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.989  TRACE,86750328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.990  OK heartbeat
+  30.990  TRACE,86755330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.990  TRACE,86760328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.990  TRACE,86765330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.990  TRACE,86770333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.992  TRACE,86776336,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.992  TRACE,86781328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.992  TRACE,86786334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.992  TRACE,86791334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.993  TRACE,86796334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.993  TRACE,86801328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.993  TRACE,86806328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.994  TRACE,86811328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.995  436,91929333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  30.995  TRACE,86816328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.995  TRACE,86821330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.995  TRACE,86826328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  30.995  TRACE,86831330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.053  437,91949336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.053  438,91974328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.053  TRACE,86836333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.053  TRACE,86842334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.053  TRACE,86847328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.053  TRACE,86852334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.055  TRACE,86857334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.055  TRACE,86862334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.055  TRACE,86867328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.055  TRACE,86872328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.057  TRACE,86877328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.057  TRACE,86882328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.057  TRACE,86887330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.057  TRACE,86892328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.058  TRACE,86897330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.058  TRACE,86902333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.059  TRACE,86908334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.059  TRACE,86913328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.060  439,91994333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.060  TRACE,86918335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.060  TRACE,86923334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.060  TRACE,86928334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.060  TRACE,86933328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.062  TRACE,86938328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.062  TRACE,86943328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.062  TRACE,86948328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.062  TRACE,86953330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.120  440,92014334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.120  441,92039328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.120  TRACE,86958328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.120  TRACE,86963330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.120  TRACE,86968333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.120  TRACE,86974334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.121  TRACE,86979329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.121  TRACE,86984335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.121  TRACE,86989334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.122  TRACE,86994334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.122  TRACE,86999328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.122  TRACE,87004328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.122  TRACE,87009328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.123  TRACE,87014328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.124  TRACE,87019330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.124  TRACE,87024328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.124  TRACE,87029330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.124  TRACE,87034333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.125  TRACE,87040334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87045329,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87050334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87055334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87060334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87065328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.126  TRACE,87070328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.127  TRACE,87075328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.128  TRACE,87080328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.128  TRACE,87085330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.128  TRACE,87090328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.128  TRACE,87095330,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.186  442,92064333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.186  443,92084334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.186  444,92109328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.186  TRACE,87100333,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.186  TRACE,87106334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.186  TRACE,87111328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.186  TRACE,87116335,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.187  TRACE,87121334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.187  TRACE,87126334,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.187  TRACE,87131328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.188  TRACE,87136328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.188  TRACE,87141328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.188  TRACE,87146328,READY,1,1,1,1,0,0,0,0,1,1,tick
+  31.188  TRACE,87151330,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.189  TRACE,87156328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.190  TRACE,87161328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.190  TRACE,87166333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.190  TRACE,87172336,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.190  TRACE,87177329,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.191  TRACE,87182334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.191  TRACE,87187334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.191  TRACE,87192334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.192  TRACE,87197328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.192  OK heartbeat
+  31.192  TRACE,87202328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.193  TRACE,87207328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.193  TRACE,87212328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.193  TRACE,87217328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.194  TRACE,87222328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.194  TRACE,87227332,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.194  TRACE,87232333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.194  TRACE,87238333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.252  445,92129333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.252  446,92149335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.252  447,92174328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.252  TRACE,87243331,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.252  TRACE,87248333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.252  TRACE,87253334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.252  TRACE,87258334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.253  TRACE,87263328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.253  TRACE,87268328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.253  TRACE,87273328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.254  TRACE,87278328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.255  TRACE,87283328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.255  TRACE,87288328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.255  TRACE,87293332,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.255  TRACE,87298333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.257  TRACE,87304333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.257  TRACE,87309330,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.257  TRACE,87314333,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.257  TRACE,87319334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.258  TRACE,87324334,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.258  TRACE,87329328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.259  TRACE,87334328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.259  TRACE,87339328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.260  448,92194333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.260  TRACE,87344328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.260  TRACE,87349328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.260  TRACE,87354328,STOPPING,1,1,1,1,0,0,0,0,1,1,tick
+  31.260  TRACE,87359332,BRAKE_APPLY,1,0,1,1,0,0,0,0,1,1,tick
+  31.318  449,92214336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.318  450,92239328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.318  TRACE,87359332,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,post
+  31.318  TRACE,87364333,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.318  TRACE,87370336,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.318  TRACE,87375329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.320  TRACE,87380334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.320  TRACE,87385334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.320  TRACE,87390334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.320  TRACE,87395328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.322  TRACE,87400328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.322  TRACE,87405328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.322  TRACE,87410328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.322  TRACE,87415328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.323  TRACE,87420328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.323  TRACE,87425329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.324  TRACE,87430333,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.324  TRACE,87436335,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.325  451,92259333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.325  TRACE,87441329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.325  TRACE,87446335,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.325  TRACE,87451334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.325  TRACE,87456334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.327  TRACE,87461328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.327  TRACE,87466328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.327  TRACE,87471328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.327  TRACE,87476328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.385  452,92279335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.385  453,92304328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.385  TRACE,87481328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.385  TRACE,87486328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.385  TRACE,87491329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.385  TRACE,87496333,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.386  TRACE,87502334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.386  TRACE,87507330,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.387  TRACE,87512334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.387  TRACE,87517334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.387  TRACE,87522334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.387  TRACE,87527328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.387  TRACE,87532328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.388  TRACE,87537328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.389  TRACE,87542328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.389  TRACE,87547328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.389  TRACE,87552328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.389  TRACE,87557329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.390  TRACE,87562333,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87568334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87573329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87578334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87583334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87588334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.391  TRACE,87593328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.392  TRACE,87598328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.393  TRACE,87603328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.393  TRACE,87608328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.393  TRACE,87613328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.393  TRACE,87618328,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.451  OK heartbeat
+  31.451  454,92329333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.451  455,92349334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.451  456,92374328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.451  TRACE,87623329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.451  TRACE,87628333,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.452  TRACE,87634334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.452  TRACE,87639329,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.452  TRACE,87644335,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.452  TRACE,87649335,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.453  TRACE,87654334,BRAKE_APPLY,1,0,1,0,0,0,0,0,1,1,tick
+  31.453  TRACE,87659328,POWER_OFF,0,0,1,0,0,0,0,0,1,1,tick
+  31.453  TRACE,87659328,POWER_OFF,0,0,0,0,0,0,0,0,1,1,post
+  31.453  TRACE,87664328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.453  TRACE,87669328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.454  TRACE,87674328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.455  TRACE,87679329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.455  TRACE,87684328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.455  TRACE,87689329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.455  TRACE,87694333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.456  TRACE,87700334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.456  TRACE,87705330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.457  TRACE,87710334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.457  TRACE,87715334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.457  TRACE,87720334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.457  TRACE,87725328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.457  TRACE,87730328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.458  TRACE,87735328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.459  TRACE,87740328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.459  TRACE,87745328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.459  TRACE,87750328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.459  TRACE,87755332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.517  457,92394333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.517  458,92414335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.517  459,92439328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.517  TRACE,87760333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.517  TRACE,87766333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.517  TRACE,87771331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.517  TRACE,87776334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.518  TRACE,87781334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.518  TRACE,87786334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.518  TRACE,87791328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.519  TRACE,87796328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.520  TRACE,87801328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.520  TRACE,87806328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.520  TRACE,87811328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.520  TRACE,87816328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.522  TRACE,87821332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.522  TRACE,87826333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.522  TRACE,87832333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.522  TRACE,87837330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.523  TRACE,87842334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.523  TRACE,87847334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.524  TRACE,87852334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.524  TRACE,87857328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.525  460,92459333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.525  TRACE,87862328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.525  TRACE,87867328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.525  TRACE,87872328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.525  TRACE,87877328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.583  461,92479334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.583  462,92504328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.583  TRACE,87882328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.583  TRACE,87887332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.583  TRACE,87892333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.583  TRACE,87898333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.585  TRACE,87903331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.585  TRACE,87908333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.585  TRACE,87913334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.585  TRACE,87918334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.587  TRACE,87923328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.587  TRACE,87928328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.587  TRACE,87933328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.587  TRACE,87938328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.588  TRACE,87943328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.588  TRACE,87948328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.589  TRACE,87953332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.589  TRACE,87958333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.590  463,92524333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.590  TRACE,87964334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.590  TRACE,87969330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.590  TRACE,87974333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.590  TRACE,87979334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.592  TRACE,87984334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.592  TRACE,87989328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.592  TRACE,87994328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.592  TRACE,87999328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.650  OK heartbeat
+  31.650  464,92544336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.651  465,92569328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.651  TRACE,88004328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.651  TRACE,88009328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.651  TRACE,88014328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.651  TRACE,88019332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88024333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88030333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88035331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88040334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88045334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.652  TRACE,88050334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.653  TRACE,88055328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.653  TRACE,88060328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.654  TRACE,88065328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.654  TRACE,88070328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.654  TRACE,88075328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.654  TRACE,88080328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.655  TRACE,88085332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.656  TRACE,88090333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.656  TRACE,88096333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.656  TRACE,88101330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.658  TRACE,88106333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.658  TRACE,88111334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.658  TRACE,88116334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.658  TRACE,88121328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.716  466,92594333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.716  467,92614334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.716  468,92639328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.716  TRACE,88126328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.716  TRACE,88131328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.716  TRACE,88136328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.716  TRACE,88141328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.717  TRACE,88146328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.717  TRACE,88151332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.717  TRACE,88156333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.718  TRACE,88162333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.718  TRACE,88167331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.718  TRACE,88172334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.718  TRACE,88177334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.719  TRACE,88182334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.720  TRACE,88187328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.720  TRACE,88192328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.720  TRACE,88197328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.720  TRACE,88202328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.721  TRACE,88207328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.721  TRACE,88212328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.721  TRACE,88217332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.722  TRACE,88222333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.722  TRACE,88228333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.722  TRACE,88233331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.722  TRACE,88238334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.723  TRACE,88243334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.724  TRACE,88248334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.724  TRACE,88253328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.724  TRACE,88258328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.724  TRACE,88263328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.782  469,92659333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.782  470,92679334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.782  471,92704328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.782  TRACE,88268328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.782  TRACE,88273328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.782  TRACE,88278328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.783  TRACE,88283332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.783  TRACE,88288333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.783  TRACE,88294333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.783  TRACE,88299329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.784  TRACE,88304333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.785  TRACE,88309334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.785  TRACE,88314334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.785  TRACE,88319328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.785  TRACE,88324328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.787  TRACE,88329328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.787  TRACE,88334328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.787  TRACE,88339328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.787  TRACE,88344328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.788  TRACE,88349332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.788  TRACE,88354333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.788  TRACE,88360334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.789  TRACE,88365329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.790  472,92724333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.790  TRACE,88370334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.790  TRACE,88375334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.790  TRACE,88380334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.790  TRACE,88385328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.848  OK heartbeat
+  31.848  473,92744335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.848  474,92769328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.848  TRACE,88390328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.848  TRACE,88395328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.848  TRACE,88400328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.848  TRACE,88405328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.850  TRACE,88410328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.850  TRACE,88415332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.850  TRACE,88420333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.850  TRACE,88426333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.852  TRACE,88431330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.852  TRACE,88436334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.852  TRACE,88441334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.852  TRACE,88446334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.853  TRACE,88451328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.853  TRACE,88456328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.854  TRACE,88461328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.854  TRACE,88466328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.855  475,92789333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.855  TRACE,88471328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.855  TRACE,88476328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.855  TRACE,88481332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.855  TRACE,88486333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.857  TRACE,88492333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.857  TRACE,88497330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.857  TRACE,88502333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.857  TRACE,88507334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.915  476,92809335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.915  477,92834328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.915  TRACE,88512334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.915  TRACE,88517328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.915  TRACE,88522328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.915  TRACE,88527328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.916  TRACE,88532328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.916  TRACE,88537328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.916  TRACE,88542328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.917  TRACE,88547332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.917  TRACE,88552333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.917  TRACE,88558333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.917  TRACE,88563330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.918  TRACE,88568334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.919  TRACE,88573334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.919  TRACE,88578334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.919  TRACE,88583328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.919  TRACE,88588328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.920  TRACE,88593328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88598328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88603328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88608328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88613332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88618333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.921  TRACE,88624333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.922  TRACE,88629330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.923  TRACE,88634334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.923  TRACE,88639334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.923  TRACE,88644334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.923  TRACE,88649328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.981  478,92859333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.981  479,92879334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.981  480,92904328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  31.981  TRACE,88654328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.981  TRACE,88659328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.981  TRACE,88664328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.982  TRACE,88669328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.982  TRACE,88674328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.982  TRACE,88679332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.982  TRACE,88684333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.983  TRACE,88690333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.983  TRACE,88695330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.983  TRACE,88700333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.983  TRACE,88705334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.984  TRACE,88710334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.985  TRACE,88715328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.985  TRACE,88720328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.985  TRACE,88725328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.985  TRACE,88730328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.986  TRACE,88735328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.986  TRACE,88740328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.986  TRACE,88745332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.987  TRACE,88750333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.987  TRACE,88756333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.987  TRACE,88761330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.988  TRACE,88766333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.988  TRACE,88771334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.989  TRACE,88776334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.989  TRACE,88781328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.989  TRACE,88786328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  31.989  TRACE,88791328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.047  OK heartbeat
+  32.047  481,92924333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.047  482,92944335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.047  483,92969328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.047  TRACE,88796328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.047  TRACE,88801328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.048  TRACE,88806328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.048  TRACE,88811332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.048  TRACE,88816333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.048  TRACE,88822333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.048  TRACE,88827329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.049  TRACE,88832334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.050  TRACE,88837334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.050  TRACE,88842334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.050  TRACE,88847328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.050  TRACE,88852328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.052  TRACE,88857328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.052  TRACE,88862328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.052  TRACE,88867328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.052  TRACE,88872328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.053  TRACE,88877332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.053  TRACE,88882333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.053  TRACE,88888333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.054  TRACE,88893330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.055  484,92989333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.055  TRACE,88898333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.055  TRACE,88903334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.055  TRACE,88908334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.055  TRACE,88913328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.113  485,93009335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.113  486,93034328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.113  TRACE,88918328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.113  TRACE,88923328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.113  TRACE,88928328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.113  TRACE,88933328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.115  TRACE,88938328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.115  TRACE,88943332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.115  TRACE,88948333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.115  TRACE,88954333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.117  TRACE,88959331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.117  TRACE,88964334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.117  TRACE,88969334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.117  TRACE,88974334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.118  TRACE,88979328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.118  TRACE,88984328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.119  TRACE,88989328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.119  TRACE,88994328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.120  487,93054333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.120  TRACE,88999328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.120  TRACE,89004328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.120  TRACE,89009332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.120  TRACE,89014333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.122  TRACE,89020333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.122  TRACE,89025330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.122  TRACE,89030334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.122  TRACE,89035334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.180  488,93074337,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.180  489,93099328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.180  TRACE,89040334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.180  TRACE,89045328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.180  TRACE,89050328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.180  TRACE,89055328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.181  TRACE,89060328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.181  TRACE,89065328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.181  TRACE,89070328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.182  TRACE,89075332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.182  TRACE,89080333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.182  TRACE,89086333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.182  TRACE,89091329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.183  TRACE,89096334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.184  TRACE,89101334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.184  TRACE,89106334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.184  TRACE,89111328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.184  TRACE,89116328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.185  TRACE,89121328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89126328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89131328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89136328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89141332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89146333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.186  TRACE,89152334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.187  TRACE,89157330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.188  TRACE,89162333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.188  TRACE,89167334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.188  TRACE,89172334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.188  TRACE,89177328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.246  OK heartbeat
+  32.246  490,93124333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.246  491,93144334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.246  492,93169328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.246  TRACE,89182328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.247  TRACE,89187328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.247  TRACE,89192328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.247  TRACE,89197328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.247  TRACE,89202328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.247  TRACE,89207332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.248  TRACE,89212333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.248  TRACE,89218334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.248  TRACE,89223330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.248  TRACE,89228333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.248  TRACE,89233334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.249  TRACE,89238334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.250  TRACE,89243328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.250  TRACE,89248328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.250  TRACE,89253328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.250  TRACE,89258328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.251  TRACE,89263328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.251  TRACE,89268328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.251  TRACE,89273332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.252  TRACE,89278333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.252  TRACE,89284333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.252  TRACE,89289329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.253  TRACE,89294333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.253  TRACE,89299334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.254  TRACE,89304334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.254  TRACE,89309328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.254  TRACE,89314328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.254  TRACE,89319328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.312  493,93189333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.312  494,93209336,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.312  495,93234328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.312  TRACE,89324328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.313  TRACE,89329328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.313  TRACE,89334328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.313  TRACE,89339332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.313  TRACE,89344333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.313  TRACE,89350333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.314  TRACE,89355330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.314  TRACE,89360334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.315  TRACE,89365334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.315  TRACE,89370334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.315  TRACE,89375328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.315  TRACE,89380328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.317  TRACE,89385328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.317  TRACE,89390328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.317  TRACE,89395328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.317  TRACE,89400328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.318  TRACE,89405332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.318  TRACE,89410333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.318  TRACE,89416333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.319  TRACE,89421329,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.320  496,93254333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.320  TRACE,89426333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.320  TRACE,89431334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.320  TRACE,89436334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.320  TRACE,89441328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.378  497,93274335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.378  498,93299328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.378  TRACE,89446328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.378  TRACE,89451328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.378  TRACE,89456328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.378  TRACE,89461328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.380  TRACE,89466328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.380  TRACE,89471332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.380  TRACE,89476333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.380  TRACE,89482333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.382  TRACE,89487330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.382  TRACE,89492334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.382  TRACE,89497334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.382  TRACE,89502334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.383  TRACE,89507328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.383  TRACE,89512328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.383  TRACE,89517328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.384  TRACE,89522328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.385  499,93319333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.385  TRACE,89527328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.385  TRACE,89532328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.385  TRACE,89537332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.385  TRACE,89542333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.387  TRACE,89548333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.387  TRACE,89553331,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.387  TRACE,89558333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.387  TRACE,89563334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.445  OK heartbeat
+  32.445  500,93339335,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.445  501,93364328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.445  TRACE,89568334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.445  TRACE,89573328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.445  TRACE,89578328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.446  TRACE,89583328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.446  TRACE,89588328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.446  TRACE,89593328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.446  TRACE,89598328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.447  TRACE,89603332,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.447  TRACE,89608333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.447  TRACE,89614333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.447  TRACE,89619330,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.448  TRACE,89624333,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.449  TRACE,89629334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.449  TRACE,89634334,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.449  TRACE,89639328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.449  TRACE,89644328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.450  TRACE,89649328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.451  TRACE,89654328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.451  TRACE,89659328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.451  TRACE,89664328,DISARMED,0,0,0,0,0,0,0,0,1,1,tick
+  32.451  TRACE end n=1446 overflow=0
+  32.512  502,93389333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.512  503,93409334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.512  504,93434328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.520  505,93454333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.578  506,93474334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.578  507,93499328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.585  508,93519333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.645  509,93539334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.645  510,93564328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.650  511,93584333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.711  512,93605334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.711  513,93630328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.716  514,93650333,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.753  >>> STATUS
+  32.777  STAT state=DISARMED stop=ready_timeout power_on_cmd=0 power_gpio=0 brake_release_cmd=0 brake_gpio=0 requested=0 applied_duty_pct=0 pwm_raw=0 pwm_full=1023 pwm_hz=20000 dir_level=0
+  32.778  STAT count_total=0 count_display=0 count_trial=0 count_per_s=0 a=1 b=1 stable=1 trial=0 rem_ms=0 ready_ms=0 travel=0 max_travel=3000
+  32.778  STAT lock= fault= reject= visual=VISUAL_IDLE visual_valid=0 authority=usb stream=1 drops=0
+  32.778  STAT missing=
+  32.778  STAT ppr=UNKNOWN
+  32.778  STAT cal=PPR UNKNOWN angle UNKNOWN
+  32.778  515,93671334,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.779  516,93696328,0,1,DISARMED,0,0,0,0,0,none,0,0,1023,20000,0,0,0,0,1,1,0,ready_timeout,0
+  32.779  # READER read failed: [Errno 9] Bad file descriptor
