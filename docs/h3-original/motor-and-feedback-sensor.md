@@ -22,7 +22,7 @@
 | モーター | 位置と動き（2026-10-25 実機確認） |
 | --- | --- |
 | M1（ケーブル表記 #1） | 正面から見て右手前（着座者から見て左）。positive（DIR Low）でシート右前が沈む、negative で上がる |
-| M2（#2） | 正面から見て左。positive（DIR Low）でシート左前が沈む、negative で上がる |
+| M2（#2） | 正面から見て左手前（着座者から見て右）。positive（DIR Low）でシート左前が沈む、negative で上がる |
 | M3（#3） | 後部ヨー機構（Traction Loss）。positive（DIR Low）でシート後部が正面から見て右へ、negative で左へ動く |
 | M4 | 基板上は実装。H3 では未使用 |
 
