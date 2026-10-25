@@ -501,13 +501,21 @@ void onButton(const Button& button) {
   }
 }
 
+uint32_t last_press_ms = 0;
+
 void pollTouch() {
   const auto touch = M5.Touch.getDetail();
   if (touch.wasPressed()) {
+    // 同じ押下で wasPressed が 2 回成立することがある（実機で確認）。250 ms 以内の再押下は無視する。
+    const uint32_t now = millis();
+    if (now - last_press_ms < 250) {
+      return;
+    }
+    last_press_ms = now;
     if (const Button* button = hitButton(touch.x, touch.y)) {
       onButton(*button);
     }
-    next_repeat_ms = millis() + 400;
+    next_repeat_ms = now + 400;
     return;
   }
   if (touch.isHolding() && static_cast<int32_t>(millis() - next_repeat_ms) >= 0) {
@@ -656,18 +664,18 @@ void render() {
   canvas.setTextColor(kOrange, TFT_BLACK);
   canvas.drawString("DIR", 8, 231);
   canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  canvas.drawString(digitalRead(PIN_MD13S_DIR) ? "H" : "L", 36, 231);
+  canvas.drawString(digitalRead(PIN_MD13S_DIR) ? "H" : "L", 34, 231);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("電源", 56, 231);
+  canvas.drawString("PWR", 50, 231);
   canvas.setTextColor(power_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(power_high ? "H" : "L", 88, 231);
+  canvas.drawString(power_high ? "H" : "L", 80, 231);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("ブレーキ", 108, 231);
+  canvas.drawString("BRK", 96, 231);
   canvas.setTextColor(brake_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(brake_high ? "H" : "L", 164, 231);
+  canvas.drawString(brake_high ? "H" : "L", 124, 231);
   canvas.setTextColor(kOrange, TFT_BLACK);
   char stroke_text[40];
-  snprintf(stroke_text, sizeof(stroke_text), "行程 %ld  中立 %ld  符号 %+d", static_cast<long>(snap.profile.stroke),
+  snprintf(stroke_text, sizeof(stroke_text), "行程 %ld 中立 %ld %+d", static_cast<long>(snap.profile.stroke),
            static_cast<long>(snap.profile.neutral), static_cast<int>(snap.working_sign));
   canvas.setTextDatum(middle_right);
   canvas.drawString(stroke_text, width - 8, 231);
