@@ -16,3 +16,4 @@
 | [session_step_20261025_175356.md](session_step_20261025_175356.md) | negative 主 | 1 回転測定 22 回 | DISARMED | **モーター軸 400 count/rev（4 逓倍）** |
 | [session_idle_20261025_185246.md](session_idle_20261025_185246.md) | idle | 未送信（GND 接続後） | DISARMED | UNKNOWN |
 | [session_idle_20261025_185326.md](session_idle_20261025_185326.md) | idle | 未送信（GND 接続後） | DISARMED | UNKNOWN |
+| [session_step_20261025_191952.md](session_step_20261025_191952.md) | 正逆 | 可動範囲測定 37 回 | DISARMED | 全ストローク 5540 count（上端 +4207、下端 −1333） |
