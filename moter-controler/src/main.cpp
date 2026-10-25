@@ -24,6 +24,15 @@ bool ui_dirty = true;
 bool sprite_ok = false;
 ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
+uint32_t next_enc_ms = 0;
+uint32_t last_request_seq = 0;
+AutoPhase last_phase = AutoPhase::Idle;
+AutoKind last_kind = AutoKind::Idle;
+CalStep last_cal_step = CalStep::None;
+// HomeP 開始時の記録（原点ずれ警告用）
+bool home_had_origin = false;
+int32_t home_start_pos = 0;
+int64_t home_start_raw = 0;
 
 char line_buf[64];
 size_t line_len = 0;
@@ -44,12 +53,53 @@ void driveOutput(gpio_num_t pin, int level) {
 }
 
 void publish(const char* prefix) {
+  const ControlSnapshot now = control_snapshot();
   Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d ENC=%lld A=%d B=%d\n",
                 prefix, relay_on ? 1 : 0, brake_on ? 1 : 0, requested_speed,
-                applied_speed, digitalRead(PIN_MD13S_DIR),
+                now.applied_speed, digitalRead(PIN_MD13S_DIR),
                 digitalRead(PIN_POWER_RELAY), digitalRead(PIN_MOTOR_BRAKE),
-                outputLive() ? 1 : 0, static_cast<long long>(encoder_count()),
-                encoder_a_level(), encoder_b_level());
+                outputLive() ? 1 : 0, static_cast<long long>(now.raw_count),
+                now.a_level, now.b_level);
+}
+
+void publishEnc(const ControlSnapshot& now) {
+  Serial.printf("ENC motor=%u count=%lld pos=%ld cps=%d a=%d b=%d origin=%d cal=%d stroke=%ld neutral=%ld sign=%d auto=%s phase=%s reason=%s\n",
+                static_cast<unsigned>(now.profile.motor), static_cast<long long>(now.raw_count),
+                static_cast<long>(now.position), now.count_per_s, now.a_level, now.b_level,
+                now.origin_valid ? 1 : 0, now.profile.calibrated ? 1 : 0,
+                static_cast<long>(now.profile.stroke), static_cast<long>(now.profile.neutral),
+                static_cast<int>(now.working_sign), auto_kind_name(now.kind), auto_phase_name(now.phase),
+                now.reason);
+}
+
+// 自動移動の要求。制御タスクが可否を判定し、結果は snapshot.request_seq / request_error に出る。
+void requestAuto(AutoKind kind) {
+  control_request(kind);
+}
+
+bool autoBusy() {
+  const ControlSnapshot now = control_snapshot();
+  return now.phase == AutoPhase::Moving || now.phase == AutoPhase::Dwell;
+}
+
+// 系統の切り替え。電源 OFF かつ自動移動中でないときだけ。
+bool selectMotor(uint8_t motor) {
+  if (!profile_motor_ok(motor)) {
+    Serial.println("ERR motor_arg");
+    return false;
+  }
+  if (relay_on || autoBusy()) {
+    Serial.println("ERR busy");
+    return false;
+  }
+  profile_store_select_motor(motor);
+  const MotorProfile p = profile_store_load(motor);
+  control_set_profile(p);
+  Serial.printf("OK motor=%u cal=%d stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(motor),
+                p.calibrated ? 1 : 0, static_cast<long>(p.stroke), static_cast<long>(p.neutral),
+                static_cast<int>(p.sign));
+  ui_dirty = true;
+  return true;
 }
 
 void setRelay(bool on) {
@@ -120,7 +170,12 @@ void printHelp() {
   Serial.println("  S -100..100  or  SPEED n");
   Serial.println("  X or STOP     speed 0, relays stay");
   Serial.println("  E or ESTOP    speed 0, power off, brake off");
-  Serial.println("  ? or STATUS");
+  Serial.println("  ? or STATUS  (STAT line + ENC line)");
+  Serial.println("  M 1|2|3       select motor profile (relay off only)");
+  Serial.println("  HOME          drive to P end (speed +) and set origin 0");
+  Serial.println("  UPPER         drive to N end (speed -), needs origin");
+  Serial.println("  NEUTRAL       move to neutral count, needs origin + calibration");
+  Serial.println("  CAL           HOME -> UPPER -> save -> NEUTRAL");
   Serial.printf("PortB IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
   Serial.printf("PortA Yellow/G2 GPIO%d = power, White/G1 GPIO%d = brake, ON level %d\n",
@@ -155,6 +210,33 @@ void handleLine(char* line) {
   }
   if (strcasecmp(cmd, "?") == 0 || strcasecmp(cmd, "STATUS") == 0) {
     publish("STAT");
+    publishEnc(control_snapshot());
+    return;
+  }
+  if (strcasecmp(cmd, "M") == 0 || strcasecmp(cmd, "MOTOR") == 0) {
+    char* end = nullptr;
+    const long value = strtol(cursor, &end, 10);
+    if (end == cursor || *skipSpace(end) != '\0') {
+      Serial.println("ERR motor_arg");
+      return;
+    }
+    selectMotor(static_cast<uint8_t>(value));
+    return;
+  }
+  if (strcasecmp(cmd, "HOME") == 0) {
+    requestAuto(AutoKind::HomeP);
+    return;
+  }
+  if (strcasecmp(cmd, "UPPER") == 0) {
+    requestAuto(AutoKind::HomeN);
+    return;
+  }
+  if (strcasecmp(cmd, "NEUTRAL") == 0) {
+    requestAuto(AutoKind::Neutral);
+    return;
+  }
+  if (strcasecmp(cmd, "CAL") == 0) {
+    requestAuto(AutoKind::Cal);
     return;
   }
   if (strcasecmp(cmd, "X") == 0 || strcasecmp(cmd, "STOP") == 0) {
@@ -458,6 +540,65 @@ void render() {
   canvas.pushSprite(0, 0);
 }
 
+void reportAuto(const ControlSnapshot& now) {
+  const bool active = now.phase == AutoPhase::Moving || now.phase == AutoPhase::Dwell;
+  if (now.request_seq != last_request_seq) {
+    last_request_seq = now.request_seq;
+    if (now.request_error[0] != '\0') {
+      Serial.printf("ERR auto_%s\n", now.request_error);
+      showNotice(now.request_error);
+    }
+  }
+  const bool leg_changed = now.phase != last_phase || now.kind != last_kind || now.cal_step != last_cal_step;
+  if (leg_changed) {
+    const bool started_home_p = active && ((now.kind == AutoKind::HomeP && last_phase != AutoPhase::Moving) ||
+                                           (now.kind == AutoKind::Cal && now.cal_step == CalStep::ToP &&
+                                            last_cal_step != CalStep::ToP));
+    if (started_home_p) {
+      home_had_origin = now.origin_valid;
+      home_start_pos = now.position;
+      home_start_raw = now.raw_count;
+    }
+    Serial.printf("AUTO %s %s %s pos=%ld\n", auto_kind_name(now.kind), auto_phase_name(now.phase), now.reason,
+                  static_cast<long>(now.position));
+    if (now.phase == AutoPhase::Done) {
+      const bool home_leg = now.kind == AutoKind::HomeP;
+      if (home_leg && home_had_origin && now.profile.calibrated) {
+        const int32_t shift = home_start_pos + static_cast<int32_t>((now.raw_count - home_start_raw) * now.working_sign);
+        const int32_t shift_abs = shift < 0 ? -shift : shift;
+        if (shift_abs > now.profile.stroke / 10) {
+          Serial.printf("AUTO warn origin_shift=%ld\n", static_cast<long>(shift));
+        }
+      }
+      if (now.kind == AutoKind::HomeN && now.profile.calibrated) {
+        const int32_t diff = now.last_measured_stroke - now.profile.stroke;
+        if ((diff < 0 ? -diff : diff) > now.profile.stroke / 20) {
+          Serial.printf("AUTO warn stroke measured=%ld saved=%ld\n", static_cast<long>(now.last_measured_stroke),
+                        static_cast<long>(now.profile.stroke));
+        }
+      }
+    }
+    last_phase = now.phase;
+    last_kind = now.kind;
+    last_cal_step = now.cal_step;
+    ui_dirty = true;
+  }
+  if (active && static_cast<int32_t>(millis() - next_enc_ms) >= 0) {
+    next_enc_ms = millis() + 500;
+    publishEnc(now);
+  }
+  if (now.profile_dirty) {
+    if (profile_store_save(now.profile)) {
+      Serial.printf("AUTO saved motor=%u stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(now.profile.motor),
+                    static_cast<long>(now.profile.stroke), static_cast<long>(now.profile.neutral),
+                    static_cast<int>(now.profile.sign));
+    } else {
+      Serial.println("ERR nvs_save");
+    }
+    control_clear_profile_dirty();
+  }
+}
+
 }  // namespace
 
 void setup() {
@@ -549,6 +690,7 @@ void loop() {
       applied_speed = snap.applied_speed;
       ui_dirty = true;
     }
+    reportAuto(snap);
   }
 
   if (ui_dirty) {
