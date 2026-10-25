@@ -529,6 +529,11 @@ def run_step_mode(sess, args, limits, trials, notes):
             if parts[0] == "quit":
                 print("STEP quit", flush=True)
                 return
+            if parts[0] == "status":
+                st = sess.status()
+                notes.append("STATUS count_total=%s state=%s a=%s b=%s" % (st.get("count_total"), st.get("state"), st.get("a"), st.get("b")))
+                print("STEP status count_total=%s state=%s a=%s b=%s" % (st.get("count_total"), st.get("state"), st.get("a"), st.get("b")), flush=True)
+                continue
             if parts[0] == "ref":
                 sess.drain()
                 sess.send("VISUAL REFERENCE")

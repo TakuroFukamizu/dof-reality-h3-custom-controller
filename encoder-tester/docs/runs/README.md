@@ -17,3 +17,4 @@
 | [session_idle_20261025_185246.md](session_idle_20261025_185246.md) | idle | 未送信（GND 接続後） | DISARMED | UNKNOWN |
 | [session_idle_20261025_185326.md](session_idle_20261025_185326.md) | idle | 未送信（GND 接続後） | DISARMED | UNKNOWN |
 | [session_step_20261025_191952.md](session_step_20261025_191952.md) | 正逆 | 可動範囲測定 37 回 | DISARMED | 全ストローク 5540 count（上端 +4207、下端 −1333） |
+| [session_step_20261025_195644.md](session_step_20261025_195644.md) | 正逆 | 高さ 4 点・ブレーキ保持・20/25 % 往復 39 回 | DISARMED | 0.021〜0.030 mm/count（高さ） |
