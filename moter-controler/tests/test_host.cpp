@@ -100,6 +100,37 @@ void test_home_p_stall_without_travel_fails() {
   CHECK(s.m.duty_signed == 0);
 }
 
+Sim calibrated_sim();
+
+void test_home_p_slow_counts_fails() {
+  // 片相断線などで、カウントが止まらずに遅く進み続ける場合。到達として記録してはいけない。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(30, 20, -1);  // 50 count/s を 600 ms
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "slow");
+  CHECK(!s.m.origin_valid);
+  CHECK(s.m.duty_signed == 0);
+}
+
+void test_home_p_slow_after_real_travel_is_arrival() {
+  // 端で押し込みながらゆっくり止まる場合は、十分動いたあとなので到達でよい。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(50, 20, -12);  // 600 count/s で 1 s
+  s.steps(15, 20, -1);   // 50 count/s に落ちる
+  CHECK(s.m.phase == AutoPhase::Done);
+  CHECK(s.m.origin_valid);
+}
+
+void test_neutral_slow_counts_fails() {
+  Sim s = calibrated_sim();
+  s.request(AutoKind::Neutral);
+  s.steps(30, 20, 1);  // 50 count/s
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "slow");
+}
+
 void test_home_p_near_end_short_travel_is_arrival() {
   Sim s;
   s.home_p();
@@ -248,7 +279,7 @@ void test_travel_and_timeout() {
   }
   {
     Sim s; s.request(AutoKind::HomeP);
-    s.steps(2251, 20, -1);  // 45020 ms、毎 tick 変化あり、移動 2251
+    s.steps(2251, 20, -4);  // 45020 ms、200 count/s で遅すぎず、移動 9004 < 12000
     CHECK(s.m.phase == AutoPhase::Failed); CHECK(std::string(s.m.reason) == "timeout");
   }
 }
@@ -289,6 +320,9 @@ int main() {
   test_home_p_arrives();
   test_home_p_stall_without_travel_fails();
   test_home_p_near_end_short_travel_is_arrival();
+  test_home_p_slow_counts_fails();
+  test_home_p_slow_after_real_travel_is_arrival();
+  test_neutral_slow_counts_fails();
   test_sign_autodetect();
   test_home_n_measures_stroke_and_cal_saves();
   test_home_n_rejected_without_origin();

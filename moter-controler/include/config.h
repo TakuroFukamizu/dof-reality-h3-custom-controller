@@ -58,6 +58,7 @@ constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測
 constexpr int NEUTRAL_KP_PERCENT_PER_100 = 1;   // 誤差 100 カウントあたり 1 %
 constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差
 constexpr uint32_t STALL_MS = 200;              // 無パルス停止
+constexpr int32_t MIN_COUNT_RATE = 150;         // 駆動中にこれ未満の count/s が STALL_MS 続いたら停止判定。10 % の実測 400〜650 の 1/3 以下。片相断線の 65 count/s を弾く
 constexpr uint32_t START_GRACE_MS = 300;        // 開始直後の猶予
 constexpr int32_t MAX_TRAVEL = 12000;           // 1 回の自動移動の移動量上限（#1 ストローク 5556 の 2 倍強）
 constexpr uint32_t MOVE_TIMEOUT_MS = 45000;     // 1 回の自動移動の時間上限

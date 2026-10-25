@@ -22,6 +22,7 @@ struct AutoConfig {
   int kp_percent_per_100 = NEUTRAL_KP_PERCENT_PER_100;
   int32_t neutral_band = NEUTRAL_BAND;
   uint32_t stall_ms = STALL_MS;
+  int32_t min_count_rate = MIN_COUNT_RATE;
   uint32_t start_grace_ms = START_GRACE_MS;
   uint32_t move_timeout_ms = MOVE_TIMEOUT_MS;
   uint32_t dwell_ms = DWELL_MS;
@@ -85,6 +86,9 @@ struct AutoMachine {
   int64_t last_raw = 0;
   uint32_t dwell_since_ms = 0;
   bool near_end_at_start = false;
+  int64_t rate_anchor_raw = 0;
+  uint32_t rate_anchor_ms = 0;
+  bool slow_event = false;  // この tick で「遅すぎる」窓が閉じた
 
   int32_t position(int64_t raw) const {
     return static_cast<int32_t>((raw - origin_raw) * working_sign);
@@ -201,6 +205,7 @@ struct AutoMachine {
       finish(AutoPhase::Failed, "timeout");
       return;
     }
+    update_rate(in);
     if (leg == AutoKind::Neutral) {
       tick_neutral(in);
     } else {
@@ -220,6 +225,9 @@ struct AutoMachine {
     start_ms = in.now_ms;
     last_raw = in.raw_count;
     last_change_ms = in.now_ms;
+    rate_anchor_raw = in.raw_count;
+    rate_anchor_ms = in.now_ms;
+    slow_event = false;
     near_end_at_start = false;
     if (leg != AutoKind::Neutral) {
       int32_t dist = 0;
@@ -270,13 +278,30 @@ struct AutoMachine {
     return in.now_ms - start_ms >= cfg.start_grace_ms && in.now_ms - last_change_ms >= cfg.stall_ms;
   }
 
+  // stall_ms ごとに速度の窓を閉じ、猶予後に min_count_rate 未満なら slow_event を立てる。
+  void update_rate(const AutoInputs& in) {
+    slow_event = false;
+    const uint32_t span = in.now_ms - rate_anchor_ms;
+    if (span < cfg.stall_ms) {
+      return;
+    }
+    const int64_t delta = llabs(in.raw_count - rate_anchor_raw);
+    const int64_t rate = (delta * 1000) / static_cast<int64_t>(span);
+    rate_anchor_raw = in.raw_count;
+    rate_anchor_ms = in.now_ms;
+    if (in.now_ms - start_ms >= cfg.start_grace_ms && rate < cfg.min_count_rate) {
+      slow_event = true;
+    }
+  }
+
   void tick_end(const AutoInputs& in, int64_t travel) {
     compute_duty(in);
-    if (!stalled(in)) {
+    const bool stall = stalled(in);
+    if (!stall && !slow_event) {
       return;
     }
     if (travel < cfg.arrival_min_travel && !near_end_at_start) {
-      finish(AutoPhase::Failed, "stall");
+      finish(AutoPhase::Failed, stall ? "stall" : "slow");
       return;
     }
     if (leg == AutoKind::HomeP) {
@@ -321,6 +346,8 @@ struct AutoMachine {
     compute_duty(in);
     if (stalled(in)) {
       finish(AutoPhase::Failed, "stall");
+    } else if (slow_event) {
+      finish(AutoPhase::Failed, "slow");
     }
   }
 
