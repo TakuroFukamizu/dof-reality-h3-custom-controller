@@ -7,20 +7,23 @@
 #include <driver/gpio.h>
 
 #include "config.h"
+#include "control_task.h"
 #include "encoder_pcnt.h"
+#include "motor_output.h"
+#include "profile_store.h"
 
 namespace {
 
-constexpr uint32_t kDutyMax = (1u << PWM_BITS) - 1;
-
 int requested_speed = 0;
-int applied_speed = 0;
+int applied_speed = 0;  // 制御タスクが実際に書いた値（スナップショットから）
 bool relay_on = false;
 bool brake_on = false;
 uint32_t relay_on_ms = 0;
 bool was_live = false;
 bool ui_dirty = true;
 bool sprite_ok = false;
+ControlSnapshot snap;
+uint32_t next_snap_ms = 0;
 
 char line_buf[64];
 size_t line_len = 0;
@@ -29,8 +32,6 @@ uint32_t next_repeat_ms = 0;
 M5Canvas canvas(&M5.Display);
 
 int relayOffLevel() { return RELAY_ON_LEVEL ? 0 : 1; }
-
-int oppositeLevel(int level) { return level ? 0 : 1; }
 
 bool outputLive() {
   return relay_on && (millis() - relay_on_ms >= RELAY_SETTLE_MS);
@@ -41,59 +42,6 @@ void driveOutput(gpio_num_t pin, int level) {
   gpio_set_direction(pin, GPIO_MODE_OUTPUT);
   gpio_set_level(pin, level);
 }
-
-void writePwm(uint32_t duty) {
-#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-  ledcWrite(PIN_MD13S_PWM, duty);
-#else
-  ledcWrite(PWM_CHANNEL, duty);
-#endif
-}
-
-void setupPwm() {
-#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-  ledcAttach(PIN_MD13S_PWM, PWM_FREQ_HZ, PWM_BITS);
-  const uint32_t actual_hz = PWM_FREQ_HZ;
-#else
-  const uint32_t actual_hz = ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_BITS);
-  ledcAttachPin(PIN_MD13S_PWM, PWM_CHANNEL);
-#endif
-  writePwm(0);
-  Serial.printf("pwm %u Hz requested, timer %u Hz, %u-bit\n", PWM_FREQ_HZ,
-                actual_hz, PWM_BITS);
-}
-
-// 反転するときだけ PWM を落としてから DIR を変える。同じ出力なら戻る。
-void writeMotor(int percent) {
-  if (percent == applied_speed) {
-    return;
-  }
-  percent = constrain(percent, SPEED_MIN, SPEED_MAX);
-
-  const int new_dir =
-      (percent >= 0) ? DIR_POSITIVE_LEVEL : oppositeLevel(DIR_POSITIVE_LEVEL);
-  const int old_dir = (applied_speed >= 0) ? DIR_POSITIVE_LEVEL
-                                           : oppositeLevel(DIR_POSITIVE_LEVEL);
-  const bool reversing =
-      percent != 0 && applied_speed != 0 && new_dir != old_dir;
-
-  if (reversing || percent == 0) {
-    writePwm(0);
-  }
-  if (reversing) {
-    delay(DIR_COAST_MS);
-  }
-  if (percent != 0) {
-    digitalWrite(PIN_MD13S_DIR, new_dir);
-    const int magnitude = percent < 0 ? -percent : percent;
-    writePwm(static_cast<uint32_t>(magnitude) * kDutyMax / 100u);
-  }
-
-  applied_speed = percent;
-  ui_dirty = true;
-}
-
-void applyOutput() { writeMotor(outputLive() ? requested_speed : 0); }
 
 void publish(const char* prefix) {
   Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d ENC=%lld A=%d B=%d\n",
@@ -111,7 +59,7 @@ void setRelay(bool on) {
   }
   if (!on) {
     requested_speed = 0;
-    writeMotor(0);
+    control_set_manual_speed(0);
   }
   digitalWrite(PIN_POWER_RELAY, on ? RELAY_ON_LEVEL : relayOffLevel());
   relay_on = on;
@@ -146,7 +94,7 @@ bool setSpeed(int percent) {
     return true;
   }
   requested_speed = percent;
-  applyOutput();
+  control_set_manual_speed(requested_speed);
   publish("OK");
   ui_dirty = true;
   return true;
@@ -154,7 +102,8 @@ bool setSpeed(int percent) {
 
 void estop() {
   requested_speed = 0;
-  writeMotor(0);
+  control_set_manual_speed(0);
+  control_pulse_estop();
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
   digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
   relay_on = false;
@@ -209,6 +158,7 @@ void handleLine(char* line) {
     return;
   }
   if (strcasecmp(cmd, "X") == 0 || strcasecmp(cmd, "STOP") == 0) {
+    control_pulse_stop();
     setSpeed(0);
     return;
   }
@@ -392,6 +342,7 @@ void onButton(const Button& button) {
       setSpeed(requested_speed + button.speed_delta);
       break;
     case Action::Stop:
+      control_pulse_stop();
       setSpeed(0);
       break;
     case Action::Estop:
@@ -547,10 +498,14 @@ void setup() {
   digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
   pinMode(PIN_MD13S_DIR, OUTPUT);
   digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
-  setupPwm();
+  motor_output_begin();
   if (!encoder_begin()) {
     Serial.println("ERR pcnt");
   }
+  if (!profile_store_begin()) {
+    Serial.println("ERR nvs");
+  }
+  control_begin(profile_store_load(profile_store_selected_motor()));
 
   canvas.setColorDepth(16);
   canvas.setPsram(true);
@@ -580,11 +535,20 @@ void loop() {
   }
 
   const bool live = outputLive();
+  control_set_relay_live(live);
+  control_set_brake_released(brake_on);
   if (live != was_live) {
     was_live = live;
-    applyOutput();
     publish("STAT");
     ui_dirty = true;
+  }
+  if (static_cast<int32_t>(millis() - next_snap_ms) >= 0) {
+    next_snap_ms = millis() + 50;
+    snap = control_snapshot();
+    if (snap.applied_speed != applied_speed) {
+      applied_speed = snap.applied_speed;
+      ui_dirty = true;
+    }
   }
 
   if (ui_dirty) {
