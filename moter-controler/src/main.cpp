@@ -176,6 +176,7 @@ void printHelp() {
   Serial.println("  UPPER         drive to N end (speed -), needs origin");
   Serial.println("  NEUTRAL       move to neutral count, needs origin + calibration");
   Serial.println("  CAL           HOME -> UPPER -> save -> NEUTRAL");
+  Serial.println("  UNCAL         clear calibration of selected motor (relay off only)");
   Serial.printf("PortB IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
   Serial.printf("PortA Yellow/G2 GPIO%d = power, White/G1 GPIO%d = brake, ON level %d\n",
@@ -237,6 +238,25 @@ void handleLine(char* line) {
   }
   if (strcasecmp(cmd, "CAL") == 0) {
     requestAuto(AutoKind::Cal);
+    return;
+  }
+  if (strcasecmp(cmd, "UNCAL") == 0) {
+    // 選択中の系統の校正を消す（間違った系統で校正したときの取り消し）。電源 OFF かつ停止中だけ。
+    if (relay_on || autoBusy()) {
+      Serial.println("ERR busy");
+      return;
+    }
+    MotorProfile p = control_snapshot().profile;
+    p.stroke = 0;
+    p.neutral = 0;
+    p.calibrated = false;
+    if (profile_store_save(p)) {
+      control_set_profile(p);
+      Serial.printf("OK uncal motor=%u\n", static_cast<unsigned>(p.motor));
+      ui_dirty = true;
+    } else {
+      Serial.println("ERR nvs_save");
+    }
     return;
   }
   if (strcasecmp(cmd, "X") == 0 || strcasecmp(cmd, "STOP") == 0) {
