@@ -23,10 +23,10 @@
 | --- | --- |
 | M1（ケーブル表記 #1） | 正面から見て右手前（着座者から見て左）。positive（DIR Low）でシート右前が沈む、negative で上がる |
 | M2（#2） | 正面から見て左。positive（DIR Low）でシート左前が沈む、negative で上がる |
-| M3 | 後部ヨー機構。Traction Loss（未確認） |
+| M3（#3） | 後部ヨー機構（Traction Loss）。positive（DIR Low）でシート後部が正面から見て右へ、negative で左へ動く |
 | M4 | 基板上は実装。H3 では未使用 |
 
-M1・M2 は moter-controler / encoder-tester で駆動して確認した。M3 は未確認。モーターの電力は MD13S の MA/MB から黒 2P コネクタで供給される。
+M1〜M3 とも moter-controler / encoder-tester で駆動して確認した（2026-10-25）。モーターの電力は MD13S の MA/MB から黒 2P コネクタで供給される。
 モーター後端の黒いユニットに Feedback Sensor のケーブルが入る。ユニットに型番の刻印は見えない。
 減速機構があり、**モーターは手では回せない**。エンコーダの検証には電動で動かす必要がある。
 
