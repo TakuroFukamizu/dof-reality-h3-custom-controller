@@ -7,6 +7,7 @@
 #include <driver/gpio.h>
 
 #include "config.h"
+#include "encoder_pcnt.h"
 
 namespace {
 
@@ -95,11 +96,12 @@ void writeMotor(int percent) {
 void applyOutput() { writeMotor(outputLive() ? requested_speed : 0); }
 
 void publish(const char* prefix) {
-  Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d\n",
+  Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d ENC=%lld A=%d B=%d\n",
                 prefix, relay_on ? 1 : 0, brake_on ? 1 : 0, requested_speed,
                 applied_speed, digitalRead(PIN_MD13S_DIR),
                 digitalRead(PIN_POWER_RELAY), digitalRead(PIN_MOTOR_BRAKE),
-                outputLive() ? 1 : 0);
+                outputLive() ? 1 : 0, static_cast<long long>(encoder_count()),
+                encoder_a_level(), encoder_b_level());
 }
 
 void setRelay(bool on) {
@@ -515,7 +517,12 @@ void setup() {
 
   auto cfg = M5.config();
   cfg.clear_display = true;
+#if MC_USB_POWER
+  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。12V は接続しない（Issue #1）。
   cfg.output_power = true;
+#else
+  cfg.output_power = false;  // DIN側からBUSの5Vを受ける設定
+#endif
   cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
   cfg.internal_mic = false;
   cfg.internal_spk = false;
@@ -525,6 +532,9 @@ void setup() {
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
+#if !MC_USB_POWER
+  M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
+#endif
   Serial.begin(115200);
 
   if (M5.Display.width() < M5.Display.height()) {
@@ -538,6 +548,9 @@ void setup() {
   pinMode(PIN_MD13S_DIR, OUTPUT);
   digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
   setupPwm();
+  if (!encoder_begin()) {
+    Serial.println("ERR pcnt");
+  }
 
   canvas.setColorDepth(16);
   canvas.setPsram(true);
