@@ -344,7 +344,7 @@ constexpr uint16_t kGreen = rgb565(0, 255, 100);
 constexpr uint16_t kGray = rgb565(60, 60, 60);
 constexpr uint16_t kRed = rgb565(255, 0, 0);
 
-enum class Action : uint8_t { Power, Brake, Speed, Stop, Estop };
+enum class Action : uint8_t { Power, Brake, Speed, Stop, Estop, Motor, HomeP, HomeN, Neutral, Cal };
 
 struct Button {
   int x;
@@ -358,11 +358,18 @@ struct Button {
   Action action;
 };
 
-Button buttons[8];
+constexpr int kButtonCount = 13;
+Button buttons[kButtonCount];
 char power_label[20];
 char brake_label[24];
+char motor_label[8];
+char home_p_label[16];
+char home_n_label[16];
 char notice[32];
 uint32_t notice_until_ms = 0;
+uint32_t result_until_ms = 0;   // 到達 / 中止 / 失敗 の表示期限
+AutoPhase result_phase = AutoPhase::Idle;
+char result_reason[24] = "";
 
 void showNotice(const char* text) {
   snprintf(notice, sizeof(notice), "%s", text);
@@ -374,23 +381,33 @@ void layoutButtons(int width) {
   const int margin = 6;
   const int gap = 6;
   const int half_w = (width - margin * 2 - gap) / 2;
-  const int speed_w = (width - margin * 2 - gap * 3) / 4;
+  const int quarter_w = (width - margin * 2 - gap * 3) / 4;
+  // 速度行は −10 / −1 / [数値] / +1 / +10 の 5 枠。数値枠はボタンではない。
+  const int fifth_w = (width - margin * 2 - gap * 4) / 5;
 
   snprintf(power_label, sizeof(power_label), "電源 切");
-  snprintf(brake_label, sizeof(brake_label), "ブレーキ 切");
-  buttons[0] = {margin, 32, half_w, 40, power_label, true, false, 0, Action::Power};
-  buttons[1] = {margin + half_w + gap, 32, half_w, 40, brake_label, true, false, 0,
-                Action::Brake};
+  snprintf(brake_label, sizeof(brake_label), "ブレーキ 作動");
+  snprintf(motor_label, sizeof(motor_label), "#1");
+  snprintf(home_p_label, sizeof(home_p_label), "%sへ", p_end_label(1));
+  snprintf(home_n_label, sizeof(home_n_label), "%sへ", n_end_label(1));
+
+  buttons[8] = {margin, 2, 48, 24, motor_label, true, false, 0, Action::Motor};
+  buttons[0] = {margin, 30, half_w, 34, power_label, true, false, 0, Action::Power};
+  buttons[1] = {margin + half_w + gap, 30, half_w, 34, brake_label, true, false, 0, Action::Brake};
 
   const int deltas[4] = {-10, -1, 1, 10};
   const char* labels[4] = {"-10", "-1", "+1", "+10"};
+  const int slots[4] = {0, 1, 3, 4};
   for (int i = 0; i < 4; ++i) {
-    buttons[2 + i] = {margin + i * (speed_w + gap), 112, speed_w, 40, labels[i],
-                      true, false, deltas[i], Action::Speed};
+    buttons[2 + i] = {margin + slots[i] * (fifth_w + gap), 102, fifth_w, 34, labels[i], true, false, deltas[i],
+                      Action::Speed};
   }
-  buttons[6] = {margin, 158, half_w, 42, "停止", true, false, 0, Action::Stop};
-  buttons[7] = {margin + half_w + gap, 158, half_w, 42, "非常停止", true, false, 0,
-                Action::Estop};
+  buttons[9] = {margin, 140, quarter_w, 34, home_p_label, false, false, 0, Action::HomeP};
+  buttons[10] = {margin + (quarter_w + gap), 140, quarter_w, 34, home_n_label, false, false, 0, Action::HomeN};
+  buttons[11] = {margin + 2 * (quarter_w + gap), 140, quarter_w, 34, "中立へ", false, false, 0, Action::Neutral};
+  buttons[12] = {margin + 3 * (quarter_w + gap), 140, quarter_w, 34, "校正", false, false, 0, Action::Cal};
+  buttons[6] = {margin, 178, half_w, 38, "停止", true, false, 0, Action::Stop};
+  buttons[7] = {margin + half_w + gap, 178, half_w, 38, "非常停止", true, false, 0, Action::Estop};
 }
 
 void drawButton(const Button& button) {
@@ -414,19 +431,19 @@ void drawButton(const Button& button) {
   canvas.setFont(&fonts::lgfxJapanGothic_16);
   canvas.setTextColor(text, fill);
   canvas.setTextDatum(middle_center);
-  canvas.drawString(button.label, button.x + button.w / 2,
-                    button.y + button.h / 2);
+  canvas.drawString(button.label, button.x + button.w / 2, button.y + button.h / 2);
 }
 
 const Button* hitButton(int x, int y) {
   for (const Button& button : buttons) {
-    if (x >= button.x && x < button.x + button.w && y >= button.y &&
-        y < button.y + button.h) {
+    if (x >= button.x && x < button.x + button.w && y >= button.y && y < button.y + button.h) {
       return &button;
     }
   }
   return nullptr;
 }
+
+bool snapActive() { return snap.phase == AutoPhase::Moving || snap.phase == AutoPhase::Dwell; }
 
 void onButton(const Button& button) {
   switch (button.action) {
@@ -450,6 +467,37 @@ void onButton(const Button& button) {
     case Action::Estop:
       estop();
       break;
+    case Action::Motor:
+      if (!button.enabled) {
+        showNotice("電源OFFで切替");
+        return;
+      }
+      selectMotor(static_cast<uint8_t>(snap.profile.motor % 3 + 1));
+      break;
+    case Action::HomeP:
+    case Action::HomeN:
+    case Action::Neutral:
+    case Action::Cal:
+      if (!button.enabled) {
+        if (!outputLive()) {
+          showNotice("電源ONが必要");
+        } else if (!brake_on) {
+          showNotice("ブレーキ解除が必要");
+        } else if (requested_speed != 0) {
+          showNotice("速度を0に");
+        } else if (!snap.origin_valid) {
+          showNotice("先に原点を取る");
+        } else if (button.action == Action::Neutral && !snap.profile.calibrated) {
+          showNotice("未校正");
+        } else {
+          showNotice("操作不可");
+        }
+        return;
+      }
+      requestAuto(button.action == Action::HomeP ? AutoKind::HomeP
+                  : button.action == Action::HomeN ? AutoKind::HomeN
+                  : button.action == Action::Neutral ? AutoKind::Neutral : AutoKind::Cal);
+      break;
   }
 }
 
@@ -472,6 +520,25 @@ void pollTouch() {
   }
 }
 
+const char* autoLabel(AutoKind kind, uint8_t motor) {
+  static char text[16];
+  switch (kind) {
+    case AutoKind::HomeP:
+      snprintf(text, sizeof(text), "%sへ", p_end_label(motor));
+      return text;
+    case AutoKind::HomeN:
+      snprintf(text, sizeof(text), "%sへ", n_end_label(motor));
+      return text;
+    case AutoKind::Neutral:
+      return "中立へ";
+    case AutoKind::Cal:
+      return "校正中";
+    case AutoKind::Idle:
+      break;
+  }
+  return "";
+}
+
 void render() {
   if (!sprite_ok) {
     return;
@@ -481,14 +548,25 @@ void render() {
   const int width = canvas.width();
   const bool power_high = digitalRead(PIN_POWER_RELAY) != 0;
   const bool brake_high = digitalRead(PIN_MOTOR_BRAKE) != 0;
+  const bool active = snapActive();
+  const uint8_t motor = snap.profile.motor;
+  const bool auto_ok = live && brake_on && requested_speed == 0 && !active;
 
   snprintf(power_label, sizeof(power_label), "電源 %s", relay_on ? "入" : "切");
-  snprintf(brake_label, sizeof(brake_label), "ブレーキ %s", brake_on ? "入" : "切");
+  snprintf(brake_label, sizeof(brake_label), "ブレーキ %s", brake_on ? "解除" : "作動");
+  snprintf(motor_label, sizeof(motor_label), "#%u", static_cast<unsigned>(motor));
+  snprintf(home_p_label, sizeof(home_p_label), "%sへ", p_end_label(motor));
+  snprintf(home_n_label, sizeof(home_n_label), "%sへ", n_end_label(motor));
   buttons[0].selected = relay_on;
   buttons[1].selected = brake_on;
   for (int i = 2; i <= 5; ++i) {
     buttons[i].enabled = relay_on;
   }
+  buttons[8].enabled = !relay_on && !active;
+  buttons[9].enabled = auto_ok;
+  buttons[10].enabled = auto_ok && snap.origin_valid;
+  buttons[11].enabled = auto_ok && snap.origin_valid && snap.profile.calibrated;
+  buttons[12].enabled = auto_ok;
 
   canvas.fillSprite(TFT_BLACK);
   canvas.fillRect(0, 0, width, 28, kDarkRed);
@@ -496,7 +574,7 @@ void render() {
   canvas.setFont(&fonts::lgfxJapanGothic_16);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(kOrange, kDarkRed);
-  canvas.drawString("MD13S", 8, 14);
+  canvas.drawString("MD13S", 62, 14);
   canvas.setTextDatum(middle_right);
   if (notice[0] != '\0') {
     canvas.setTextColor(kRed, kDarkRed);
@@ -504,7 +582,23 @@ void render() {
   } else {
     const char* state = "停止";
     uint16_t state_color = kGray;
-    if (relay_on && !live) {
+    char result_text[32];
+    if (active) {
+      state = autoLabel(snap.kind, motor);
+      state_color = kGreen;
+    } else if (result_until_ms != 0 && static_cast<int32_t>(millis() - result_until_ms) < 0) {
+      if (result_phase == AutoPhase::Done) {
+        state = "到達";
+        state_color = kGreen;
+      } else if (result_phase == AutoPhase::Cancelled) {
+        state = "中止";
+        state_color = kAmber;
+      } else {
+        snprintf(result_text, sizeof(result_text), "失敗:%s", result_reason);
+        state = result_text;
+        state_color = kRed;
+      }
+    } else if (relay_on && !live) {
       state = "待機";
       state_color = kAmber;
     } else if (live && applied_speed != 0) {
@@ -515,47 +609,68 @@ void render() {
     canvas.drawString(state, width - 8, 14);
   }
 
-  canvas.fillRect(6, 76, width - 12, 32, kDarkOrange);
-  canvas.drawRect(6, 76, width - 12, 32, kOrange);
-  canvas.setTextDatum(middle_left);
-  canvas.setTextColor(kOrange, kDarkOrange);
-  canvas.drawString("速度", 14, 92);
-  uint16_t speed_color = TFT_WHITE;
-  if (requested_speed != 0) {
-    speed_color = (live && applied_speed != 0) ? kGreen : kOrange;
-  }
+  // センサー行
+  canvas.fillRect(6, 68, width - 12, 30, kDarkOrange);
+  canvas.drawRect(6, 68, width - 12, 30, kOrange);
   canvas.setFont(&fonts::Font4);
-  canvas.setTextColor(speed_color, kDarkOrange);
-  canvas.setTextDatum(middle_center);
-  char speed_text[8];
-  snprintf(speed_text, sizeof(speed_text), "%d", requested_speed);
-  canvas.drawString(speed_text, width / 2 + 16, 92);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(snap.origin_valid ? TFT_WHITE : kAmber, kDarkOrange);
+  char pos_text[16];
+  snprintf(pos_text, sizeof(pos_text), "%ld", static_cast<long>(snap.position));
+  canvas.drawString(pos_text, 12, 83);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextDatum(middle_right);
+  char info_text[48];
+  snprintf(info_text, sizeof(info_text), "%d c/s  A%d B%d  %s %s", snap.count_per_s, snap.a_level, snap.b_level,
+           snap.origin_valid ? "原点" : "原点なし", snap.profile.calibrated ? "校正済" : "未校正");
+  canvas.setTextColor(snap.profile.calibrated ? kOrange : kRed, kDarkOrange);
+  canvas.drawString(info_text, width - 12, 83);
 
   for (const Button& button : buttons) {
     drawButton(button);
   }
 
-  canvas.drawLine(6, 206, width - 6, 206, kAmber);
-  canvas.setFont(&fonts::lgfxJapanGothic_16);
+  // 速度の数値（速度行の中央枠）
+  {
+    const int margin = 6;
+    const int gap = 6;
+    const int fifth_w = (width - margin * 2 - gap * 4) / 5;
+    const int x = margin + 2 * (fifth_w + gap);
+    canvas.fillRect(x, 102, fifth_w, 34, kDarkOrange);
+    canvas.drawRect(x, 102, fifth_w, 34, kOrange);
+    uint16_t speed_color = TFT_WHITE;
+    if (requested_speed != 0) {
+      speed_color = (live && applied_speed != 0) ? kGreen : kOrange;
+    }
+    canvas.setFont(&fonts::Font4);
+    canvas.setTextColor(speed_color, kDarkOrange);
+    canvas.setTextDatum(middle_center);
+    char speed_text[8];
+    snprintf(speed_text, sizeof(speed_text), "%d", requested_speed);
+    canvas.drawString(speed_text, x + fifth_w / 2, 119);
+  }
+
+  canvas.drawLine(6, 220, width - 6, 220, kAmber);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("状態", 8, 222);
-  const char* direction = "停止";
-  if (requested_speed > 0) {
-    direction = "正転";
-  } else if (requested_speed < 0) {
-    direction = "逆転";
-  }
+  canvas.drawString("DIR", 8, 231);
   canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  canvas.drawString(direction, 48, 222);
+  canvas.drawString(digitalRead(PIN_MD13S_DIR) ? "H" : "L", 36, 231);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("電源", 96, 222);
+  canvas.drawString("電源", 56, 231);
   canvas.setTextColor(power_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(power_high ? "H" : "L", 136, 222);
+  canvas.drawString(power_high ? "H" : "L", 88, 231);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("ブレーキ", 156, 222);
+  canvas.drawString("ブレーキ", 108, 231);
   canvas.setTextColor(brake_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(brake_high ? "H" : "L", 228, 222);
+  canvas.drawString(brake_high ? "H" : "L", 164, 231);
+  canvas.setTextColor(kOrange, TFT_BLACK);
+  char stroke_text[40];
+  snprintf(stroke_text, sizeof(stroke_text), "行程 %ld  中立 %ld  符号 %+d", static_cast<long>(snap.profile.stroke),
+           static_cast<long>(snap.profile.neutral), static_cast<int>(snap.working_sign));
+  canvas.setTextDatum(middle_right);
+  canvas.drawString(stroke_text, width - 8, 231);
 
   canvas.pushSprite(0, 0);
 }
@@ -581,6 +696,12 @@ void reportAuto(const ControlSnapshot& now) {
     }
     Serial.printf("AUTO %s %s %s pos=%ld\n", auto_kind_name(now.kind), auto_phase_name(now.phase), now.reason,
                   static_cast<long>(now.position));
+    Serial.flush();
+    if (now.phase == AutoPhase::Done || now.phase == AutoPhase::Cancelled || now.phase == AutoPhase::Failed) {
+      result_phase = now.phase;
+      snprintf(result_reason, sizeof(result_reason), "%s", now.reason);
+      result_until_ms = millis() + 1500;
+    }
     if (now.phase == AutoPhase::Done) {
       const bool home_leg = now.kind == AutoKind::HomeP;
       if (home_leg && home_had_origin && now.profile.calibrated) {
@@ -606,6 +727,7 @@ void reportAuto(const ControlSnapshot& now) {
   if (active && static_cast<int32_t>(millis() - next_enc_ms) >= 0) {
     next_enc_ms = millis() + 500;
     publishEnc(now);
+    Serial.flush();
   }
   if (now.profile_dirty) {
     if (profile_store_save(now.profile)) {
@@ -705,9 +827,19 @@ void loop() {
   }
   if (static_cast<int32_t>(millis() - next_snap_ms) >= 0) {
     next_snap_ms = millis() + 50;
+    const ControlSnapshot previous = snap;
     snap = control_snapshot();
     if (snap.applied_speed != applied_speed) {
       applied_speed = snap.applied_speed;
+      ui_dirty = true;
+    }
+    if (snap.position != previous.position || snap.origin_valid != previous.origin_valid ||
+        snap.profile.calibrated != previous.profile.calibrated || snap.a_level != previous.a_level ||
+        snap.b_level != previous.b_level || snap.count_per_s != previous.count_per_s) {
+      ui_dirty = true;
+    }
+    if (result_until_ms != 0 && static_cast<int32_t>(millis() - result_until_ms) >= 0) {
+      result_until_ms = 0;
       ui_dirty = true;
     }
     reportAuto(snap);
