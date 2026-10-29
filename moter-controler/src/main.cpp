@@ -7,6 +7,7 @@
 #include <driver/gpio.h>
 
 #include "config.h"
+#include "pmic_log.h"
 
 namespace {
 
@@ -515,7 +516,12 @@ void setup() {
 
   auto cfg = M5.config();
   cfg.clear_display = true;
+#if MC_PMIC_LOG
+  // Issue #1 の計測は、不具合が出た構成と同じく DIN Base の 5V を受ける（CoreS3 から BUS 5V を出さない）。
+  cfg.output_power = false;
+#else
   cfg.output_power = true;
+#endif
   cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
   cfg.internal_mic = false;
   cfg.internal_spk = false;
@@ -525,6 +531,10 @@ void setup() {
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
+#if MC_PMIC_LOG
+  pmic_log_boot();  // 前回の電源断要因（REG21）を、ほかの処理より先に読む
+  M5.Power.setUsbOutput(false);  // CoreS3 から PC 側への USB 給電を無効化（不具合が出た構成と同じ）
+#endif
   Serial.begin(115200);
 
   if (M5.Display.width() < M5.Display.height()) {
@@ -560,6 +570,9 @@ void loop() {
   M5.update();
   pollSerial();
   pollTouch();
+#if MC_PMIC_LOG
+  pmic_log_tick();
+#endif
 
   if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {
     notice[0] = '\0';
