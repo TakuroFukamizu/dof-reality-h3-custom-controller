@@ -10,6 +10,7 @@
 #include "control_task.h"
 #include "encoder_pcnt.h"
 #include "motor_output.h"
+#include "pmic_log.h"
 #include "profile_store.h"
 
 namespace {
@@ -786,6 +787,9 @@ void setup() {
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
+#if MC_PMIC_LOG
+  pmic_log_boot();  // 前回の電源断要因（REG21）を、ほかの処理より先に読む
+#endif
 #if !MC_USB_POWER
   M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
 #endif
@@ -831,6 +835,9 @@ void loop() {
   M5.update();
   pollSerial();
   pollTouch();
+#if MC_PMIC_LOG
+  pmic_log_tick();
+#endif
 
   if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {
     notice[0] = '\0';
