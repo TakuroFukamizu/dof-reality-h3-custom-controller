@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // M5Stack CoreS3 SE の公式 HY2.0-4P 表。
 //   Black = GND, Red = 5V, Yellow = IO1, White = IO2
 //
@@ -41,3 +43,25 @@ constexpr uint32_t DIR_COAST_MS = 5;       // 反転前に PWM を落として�
 
 constexpr int SPEED_MIN = -100;
 constexpr int SPEED_MAX = 100;
+
+// --- フィードバックセンサー（encoder-tester の実測に合わせる） ---
+// Port C: Yellow G17 = A（センサー白）、White G18 = B（センサー緑）。レベル変換後の 3.3V。
+constexpr int PIN_ENC_A = 17;
+constexpr int PIN_ENC_B = 18;
+constexpr int ENCODER_SIGN_DEFAULT = 1;      // 速度 − でカウント増（#1 実測）。系統ごとに校正で判定して上書き
+constexpr int32_t COUNTS_PER_MOTOR_REV = 400;  // モーター軸 1 回転の 4 逓倍カウント（表示用）
+
+// --- 自動移動（端当て原点復帰・中立への比例制御） ---
+constexpr int HOME_DUTY = 10;                   // 端当ての Duty。10 % 250 ms で異常無く止まった
+constexpr int AUTO_DUTY_MAX = 15;               // 自動移動の上限
+constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測
+constexpr int NEUTRAL_KP_PERCENT_PER_100 = 1;   // 誤差 100 カウントあたり 1 %
+constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差
+constexpr uint32_t STALL_MS = 200;              // 無パルス停止
+constexpr int32_t MIN_COUNT_RATE = 150;         // 駆動中にこれ未満の count/s が STALL_MS 続いたら停止判定。10 % の実測 400〜650 の 1/3 以下。片相断線の 65 count/s を弾く
+constexpr uint32_t START_GRACE_MS = 300;        // 開始直後の猶予
+constexpr int32_t MAX_TRAVEL = 12000;           // 1 回の自動移動の移動量上限（#1 ストローク 5556 の 2 倍強）
+constexpr uint32_t MOVE_TIMEOUT_MS = 45000;     // 1 回の自動移動の時間上限
+constexpr int32_t SLOW_ZONE = 400;              // 端の手前で HOME_DUTY に落とす距離
+constexpr int32_t ARRIVAL_MIN_TRAVEL = 400;     // これ未満の移動で止まったら到達ではなく失敗
+constexpr uint32_t DWELL_MS = 200;              // 中立のバンド内に居続ける時間
