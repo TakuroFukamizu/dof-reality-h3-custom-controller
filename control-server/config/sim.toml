@@ -1,0 +1,107 @@
+# h3-control-server 模擬軸（sim backend）用の設定。実機なしの結合試験・開発用。
+# calibration_valid = true は模擬軸だから許される。実機の設定にコピーしない。
+# 単位は名前に含める: count, count/s, count/s², ms。
+# 校正・符号・リミットの変更は DISARMED のときだけ（サーバー再起動で反映）。
+#
+# !!! 軸 2・3 の値は未測定の仮値。軸 1 の値をコピーしない（architecture.md §6）。
+# !!! calibration_valid = false のあいだは ARM できない。
+
+schema_version = 1
+rig_id = "h3-sim"
+
+# 主電源リレー（DC_STOP1 緑, G2）を操作する唯一の軸
+power_controller_axis = 1
+
+[server]
+bind = "127.0.0.1:8892"
+admin_token_env = "H3CS_ADMIN_TOKEN"
+allowed_origins = ["http://localhost:8891", "http://127.0.0.1:8891"]
+max_body_bytes = 4096
+admin_rate_limit_per_s = 20
+status_period_ms = 100
+
+[timing]
+planner_period_ms = 10
+set_position_valid_for_ms = 50
+mcu_command_timeout_ms = 100
+mcu_stop_timeout_ms = 1500
+axis_status_timeout_ms = 200
+source_freshness_ms = 250
+arm_timeout_ms = 5000
+stop_settle_timeout_ms = 3000
+stop_hold_ms = 1000
+max_frame_skew = 5
+hello_retry_ms = 200
+hello_timeout_ms = 2000
+
+[game]
+max_gain = 0.35                  # 新装置で検証済みの上限ではない。旧 UI の 0.6 を採用しない
+allow_missing_frame_seq = false  # 有人運転では frame_seq 必須
+clamp_out_of_range = true
+virtual_min = 0.0
+virtual_max = 1023.0
+center_speed_fraction = 0.25
+
+[backend]
+kind = "sim"
+start_referenced = true
+plant_max_vel_count_s = 4000.0
+status_period_ms = 20
+link_latency_ms = 1
+
+[[axis]]
+axis_id = 1
+device_id = "5131000000000001"
+name = "右手前リフト (motor #1)"
+calibration_valid = true   # 模擬軸のみ
+# 2026-10-25 無負荷・1 測定点。水平付近を 0 とした値。向き（旧仮想 0→1023 で上がるか下がるか）は未確認
+count_at_virtual_0 = -2000
+count_at_virtual_512 = 0
+count_at_virtual_1023 = 2000
+mechanical_min_count = -2742
+mechanical_max_count = 2814
+soft_min_count = -2300
+soft_max_count = 2300
+decel_zone_count = 300
+max_vel_count_s = 2000
+max_acc_count_s2 = 8000
+following_error_limit_count = 400
+overspeed_count_s = 3500
+
+[[axis]]
+axis_id = 2
+device_id = "5131000000000002"
+name = "左リフト (motor #2)"
+calibration_valid = true   # 模擬軸のみ
+# 未測定の仮値（小さく取る）
+count_at_virtual_0 = -400
+count_at_virtual_512 = 0
+count_at_virtual_1023 = 400
+mechanical_min_count = -1000
+mechanical_max_count = 1000
+soft_min_count = -600
+soft_max_count = 600
+decel_zone_count = 300
+max_vel_count_s = 1000
+max_acc_count_s2 = 4000
+following_error_limit_count = 300
+overspeed_count_s = 2000
+
+[[axis]]
+axis_id = 3
+device_id = "5131000000000003"
+name = "後部ヨー (motor #3)"
+calibration_valid = true   # 模擬軸のみ
+# 未測定の仮値（小さく取る）
+count_at_virtual_0 = -400
+count_at_virtual_512 = 0
+count_at_virtual_1023 = 400
+mechanical_min_count = -1000
+mechanical_max_count = 1000
+soft_min_count = -600
+soft_max_count = 600
+decel_zone_count = 300
+max_vel_count_s = 1000
+max_acc_count_s2 = 4000
+following_error_limit_count = 300
+overspeed_count_s = 2000

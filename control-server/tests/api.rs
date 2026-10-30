@@ -1,0 +1,656 @@
+//! api: guards and handlers (DESIGN.md §7). Router-level tests use
+//! `tower::ServiceExt::oneshot` with a stub control loop; WebSocket tests run
+//! a real server with the sim backend on 127.0.0.1:0.
+
+mod common;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use common::*;
+use futures_util::{SinkExt, StreamExt};
+use h3cs::api::{self, AdminRequest, AppState, TokenBucket};
+use h3cs::config::Config;
+use h3cs::session::{AcceptedPose, PoseIntake};
+use h3cs::supervisor::{AdminCmd, AdminError, AdminOk, Supervisor};
+use h3cs::types::RigState;
+use http_body_util::BodyExt;
+use serde_json::Value;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
+use tower::ServiceExt;
+
+// ------------------------------------------------------------------ stub harness
+
+struct Stub {
+    app: Router,
+    pose_rx: watch::Receiver<Option<AcceptedPose>>,
+    seen: Arc<Mutex<Vec<AdminCmd>>>,
+    _shutdown: watch::Sender<bool>,
+}
+
+/// Router with a stub control loop: `reply` decides each admin answer;
+/// `None` never answers (the request times out).
+type Reply = fn(&AdminCmd) -> Result<AdminOk, AdminError>;
+
+fn stub(cfg: Config, reply: Option<Reply>) -> Stub {
+    let cfg = Arc::new(cfg);
+    let (admin_tx, mut admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
+    let (pose_tx, pose_rx) = watch::channel(None);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    let (_status_tx, status_rx) = watch::channel(Arc::new(snap));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        let _keep = _status_tx;
+        let mut held = Vec::new();
+        while let Some((cmd, tx)) = admin_rx.recv().await {
+            seen2.lock().unwrap().push(cmd.clone());
+            match reply {
+                Some(f) => {
+                    let _ = tx.send(f(&cmd));
+                }
+                None => held.push(tx),
+            }
+        }
+    });
+    let state = AppState::new(
+        cfg,
+        Arc::new(Mutex::new(PoseIntake::new())),
+        Arc::new(pose_tx),
+        admin_tx,
+        status_rx,
+        TOKEN.into(),
+        shutdown_rx,
+    );
+    Stub { app: api::router(state), pose_rx, seen, _shutdown: shutdown_tx }
+}
+
+fn ok_reply(_: &AdminCmd) -> Result<AdminOk, AdminError> {
+    Ok(AdminOk { rig_state: RigState::ReadyToArm, note: None })
+}
+
+fn not_ready(_: &AdminCmd) -> Result<AdminOk, AdminError> {
+    Err(AdminError { error: "not_ready".into(), blockers: vec!["not_connected: axis2".into()] })
+}
+
+fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Request<Body> {
+    let mut b = Request::builder().method(method).uri(path);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    if !body.is_empty() {
+        b = b.header("content-type", "application/json").header("content-length", body.len().to_string());
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn call(app: &Router, r: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.clone().oneshot(r).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
+
+// ------------------------------------------------------------------ guards
+
+#[tokio::test]
+async fn foreign_origin_is_forbidden() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let (st, body) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://evil.example")], "")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "forbidden_origin");
+    // Even /v1/stop and the WS route are behind the Origin check.
+    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("origin", "http://evil.example")], "")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
+
+    let (st, _) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://localhost:8891")], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&s.app, req("GET", "/v1/status", &[], "")).await;
+    assert_eq!(st, StatusCode::OK, "no Origin (non-browser client) is allowed");
+}
+
+#[tokio::test]
+async fn admin_routes_need_the_bearer_token() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/v1/arm", "/v1/start", "/v1/disarm", "/v1/fault/reset", "/v1/center", "/v1/reference", "/v1/fault"] {
+        let (st, body) = call(&s.app, req("POST", path, &[], "")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} without token");
+        assert_eq!(body["error"], "unauthorized");
+        let (st, _) = call(&s.app, req("POST", path, &[("authorization", "Bearer wrong-token")], "")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} wrong token");
+        let (st, _) = call(&s.app, req("POST", path, &[("authorization", TOKEN)], "")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} without Bearer prefix");
+    }
+    assert!(s.seen.lock().unwrap().is_empty());
+    let (st, body) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["rig_state"], "READY_TO_ARM");
+    assert_eq!(s.seen.lock().unwrap().as_slice(), &[AdminCmd::Arm]);
+}
+
+#[tokio::test]
+async fn stop_needs_no_token_and_is_not_rate_limited() {
+    let mut cfg = sim_cfg();
+    cfg.server.admin_rate_limit_per_s = 1;
+    let s = stub(cfg, Some(ok_reply));
+    // Use up the admin budget.
+    let (st, _) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    for _ in 0..5 {
+        let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+    }
+    assert_eq!(s.seen.lock().unwrap().iter().filter(|c| **c == AdminCmd::Stop).count(), 5);
+}
+
+#[tokio::test]
+async fn oversize_body_is_413() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let big = format!("{{\"note\":\"{}\"}}", "x".repeat(5000));
+    let (st, body) = call(&s.app, req("POST", "/v1/fault", &[("authorization", &bearer())], &big)).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["ok"], false);
+    let big = format!("{{\"axis\":1,\"count\":0,\"pad\":\"{}\"}}", "x".repeat(5000));
+    let (st, _) = call(&s.app, req("POST", "/v1/reference", &[("authorization", &bearer())], &big)).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(s.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_rate_limit_is_429_and_refills() {
+    let mut cfg = sim_cfg();
+    cfg.server.admin_rate_limit_per_s = 3;
+    let s = stub(cfg, Some(ok_reply));
+    let arm = || req("POST", "/v1/arm", &[("authorization", &bearer())], "");
+    for _ in 0..3 {
+        assert_eq!(call(&s.app, arm()).await.0, StatusCode::OK);
+    }
+    let (st, body) = call(&s.app, arm()).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"], "rate_limited");
+    tokio::time::advance(Duration::from_millis(400)).await;
+    assert_eq!(call(&s.app, arm()).await.0, StatusCode::OK, "refilled at 3/s");
+    assert_eq!(call(&s.app, arm()).await.0, StatusCode::TOO_MANY_REQUESTS);
+    // Unauthenticated requests do not spend the budget.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..10 {
+        let (st, _) = call(&s.app, req("POST", "/v1/arm", &[], "")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(call(&s.app, arm()).await.0, StatusCode::OK);
+}
+
+#[test]
+fn token_bucket_zero_rate_disables() {
+    let t0 = Instant::now();
+    let mut b = TokenBucket::new(0, t0);
+    assert!((0..1000).all(|_| b.take(t0)));
+    let mut b = TokenBucket::new(2, t0);
+    assert!(b.take(t0) && b.take(t0) && !b.take(t0));
+}
+
+#[test]
+fn constant_time_eq_basics() {
+    assert!(api::constant_time_eq(b"abc", b"abc"));
+    assert!(!api::constant_time_eq(b"abc", b"abd"));
+    assert!(!api::constant_time_eq(b"abc", b"abcd"));
+}
+
+#[tokio::test]
+async fn refused_admin_command_is_409_with_blockers() {
+    let s = stub(sim_cfg(), Some(not_ready));
+    let (st, body) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "not_ready");
+    assert_eq!(body["blockers"][0], "not_connected: axis2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_without_control_loop_answer_is_503_after_1s() {
+    let s = stub(sim_cfg(), None);
+    let t = Instant::now();
+    let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "control_loop_unavailable");
+    assert!(t.elapsed() >= Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn reference_and_fault_bodies() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let h = [("authorization", bearer())];
+    let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (st, _) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":2,"count":-15}"#)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":4,"count":0}"#)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_axis");
+    let (st, _) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":1}"#)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&s.app, req("POST", "/v1/fault", &h, r#"{"note":"operator test"}"#)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&s.app, req("POST", "/v1/fault", &h, "")).await;
+    assert_eq!(st, StatusCode::OK, "empty fault body is still a fault");
+    let seen = s.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            AdminCmd::Reference { axis: h3cs::types::AxisId::new(2).unwrap(), count: -15 },
+            AdminCmd::Fault { note: "operator test".into() },
+            AdminCmd::Fault { note: String::new() },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn session_response_and_pose_watch_cleared() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let (st, body) = call(&s.app, req("POST", "/v1/session", &[], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    let id = body["source_session"].as_str().unwrap();
+    assert_eq!(id.len(), 32);
+    assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(body["protocol"], 1);
+    assert_eq!(body["max_gain"], 0.35);
+    assert_eq!(body["source_freshness_ms"], 250);
+    assert_eq!(body["require_frame_seq"], true);
+    let (_, body2) = call(&s.app, req("POST", "/v1/session", &[], "")).await;
+    assert_ne!(body2["source_session"], body["source_session"]);
+    assert!(s.pose_rx.borrow().is_none());
+}
+
+#[tokio::test]
+async fn unknown_route_is_json_404() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let (st, body) = call(&s.app, req("GET", "/v1/nope", &[], "")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(body["ok"], false);
+}
+
+// ------------------------------------------------------------------ WS (real server)
+
+#[tokio::test]
+async fn new_session_makes_the_old_websocket_stale() {
+    let srv = start_sim(sim_cfg()).await;
+    let a = new_session(srv.local_addr).await;
+    let mut ws_a = ws_connect(srv.local_addr, &a).await;
+    ws_send(&mut ws_a, pose_json(&a, 1, 1, 0.1, 0.0, 0.0, 0.35)).await;
+    let ack = next_ack(&mut ws_a).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["seq"], 1);
+    assert_eq!(ack["fresh"], true);
+
+    let b = new_session(srv.local_addr).await;
+    ws_send(&mut ws_a, pose_json(&a, 2, 2, 0.1, 0.0, 0.0, 0.35)).await;
+    let ack = next_ack(&mut ws_a).await;
+    assert_eq!(ack["accepted"], false);
+    assert_eq!(ack["reason"], "stale_session");
+    assert_eq!(ack["seq"], 2);
+
+    // A WS pinned to session B rejects messages naming another session.
+    let mut ws_b = ws_connect(srv.local_addr, &b).await;
+    ws_send(&mut ws_b, pose_json(&a, 3, 3, 0.1, 0.0, 0.0, 0.35)).await;
+    assert_eq!(next_ack(&mut ws_b).await["reason"], "stale_session");
+    ws_send(&mut ws_b, pose_json(&b, 1, 1, 0.1, 0.0, 0.0, 0.5)).await;
+    let ack = next_ack(&mut ws_b).await;
+    assert_eq!(ack["accepted"], true);
+    assert_eq!(ack["effective_gain"], 0.35);
+    assert_eq!(ack["limits"][0], "gain_limited");
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_ws_messages_get_bad_message_and_the_socket_stays_open() {
+    let srv = start_sim(sim_cfg()).await;
+    let id = new_session(srv.local_addr).await;
+    let mut ws = ws_connect(srv.local_addr, &id).await;
+
+    for bad in ["not json".to_string(), r#"{"type":"teleport"}"#.into(), r#"{"type":"pose","seq":1}"#.into()] {
+        ws_send(&mut ws, bad).await;
+        let ack = next_ack(&mut ws).await;
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["reason"], "bad_message");
+        assert!(ack["seq"].is_null());
+    }
+    // Over max_body_bytes (4096) but under the transport cap.
+    let huge = format!("{{\"type\":\"pose\",\"pad\":\"{}\"}}", "x".repeat(6000));
+    ws_send(&mut ws, huge).await;
+    assert_eq!(next_ack(&mut ws).await["reason"], "bad_message");
+    ws.send(Message::Binary(vec![1u8, 2, 3].into())).await.unwrap();
+    assert_eq!(next_ack(&mut ws).await["reason"], "bad_message");
+
+    // Non-finite and protocol errors are acked with their seq.
+    let nan = pose_json(&id, 1, 1, 0.0, 0.0, 0.0, 0.35).replace("\"pitch\":0.0", "\"pitch\":1e999");
+    ws_send(&mut ws, nan).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], false, "{ack}");
+
+    ws_send(&mut ws, pose_json(&id, 5, 1, 0.2, 0.1, 0.0, 0.35)).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "socket still usable: {ack}");
+    ws_send(&mut ws, pose_json(&id, 5, 2, 0.2, 0.1, 0.0, 0.35)).await;
+    assert_eq!(next_ack(&mut ws).await["reason"], "old_seq");
+    let gain = serde_json::json!({"type":"gain","protocol":1,"source_session":id,"seq":6,"gain":0.2}).to_string();
+    ws_send(&mut ws, gain).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true);
+    assert_eq!(ack["effective_gain"], 0.2);
+    srv.shutdown().await;
+}
+
+fn assert_keys(v: &Value, keys: &[&str], what: &str) {
+    let obj = v.as_object().unwrap_or_else(|| panic!("{what} is not an object: {v}"));
+    for k in keys {
+        assert!(obj.contains_key(*k), "{what} lacks key {k:?}: {v}");
+    }
+}
+
+const STATUS_KEYS: &[&str] = &[
+    "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
+    "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
+    "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "measured_angles",
+    "physical_estop", "telemetry",
+];
+const AXIS_KEYS: &[&str] = &[
+    "axis_id", "name", "connected", "port", "device_id", "boot_id", "mcu_state", "fault_code", "configured",
+    "referenced", "calibration_valid", "actual_count", "target_count", "velocity_count_s",
+    "following_error_count", "pwm_permille", "power_on_cmd", "brake_release_cmd", "power_controller", "current_a",
+    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count",
+];
+const SESSION_KEYS: &[&str] = &["source_session_prefix", "fresh", "freshness_mode", "source_age_ms", "last_seq", "last_frame_seq"];
+const TELEMETRY_KEYS: &[&str] =
+    &["tick_count", "tick_overruns", "tick_dt_ms", "pose_rx_to_tick_ms", "status_age_ms", "frame_skew", "log_dropped"];
+
+fn check_status_shape(v: &Value) {
+    assert_keys(v, STATUS_KEYS, "status");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["physical_estop"], "not_monitored");
+    assert!(v["measured_angles"].is_null());
+    let axes = v["axes"].as_array().expect("axes");
+    assert_eq!(axes.len(), 3);
+    for a in axes {
+        assert_keys(a, AXIS_KEYS, "axis");
+    }
+    assert_keys(&v["session"], SESSION_KEYS, "session");
+    assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
+    for k in ["tick_dt_ms", "pose_rx_to_tick_ms", "status_age_ms", "frame_skew"] {
+        assert_keys(&v["telemetry"][k], &["p50", "p95", "p99", "max"], k);
+    }
+}
+
+#[tokio::test]
+async fn status_json_has_every_documented_key() {
+    let srv = start_sim(sim_cfg()).await;
+    wait_state(&srv, RigState::ReadyToArm, Duration::from_secs(3)).await;
+    let r = http(srv.local_addr, "GET", "/v1/status", &[], None).await;
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    check_status_shape(&v);
+    assert_eq!(v["rig_state"], "READY_TO_ARM");
+    assert_eq!(v["armed"], false);
+    assert!(v["telemetry"]["tick_count"].as_u64().unwrap() > 0);
+    assert!(v["axes"][0]["current_a"].is_null(), "no current sensor: null, not 0");
+
+    // WS pushes the same shape with type = status, without any pose sent.
+    let id = new_session(srv.local_addr).await;
+    let mut ws = ws_connect(srv.local_addr, &id).await;
+    let st = next_status(&mut ws).await;
+    check_status_shape(&st);
+    // The first push may predate the session (published at the last tick).
+    let mut st = st;
+    for _ in 0..5 {
+        if st["session"]["source_session_prefix"] == id[..8] {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    // Only a prefix is public: the full id gates pose input.
+    assert_eq!(st["session"]["source_session_prefix"], &id[..8]);
+    assert!(!st.to_string().contains(id.as_str()), "full session id leaked in status");
+    let st2 = next_status(&mut ws).await;
+    assert_eq!(st2["type"], "status");
+    let _ = ws.next().await;
+    srv.shutdown().await;
+}
+
+// ------------------------------------------------------------------ review fixes (stage B)
+
+/// Router whose admin queue and status sender the test holds directly.
+fn manual(cfg: Config) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>) {
+    let cfg = Arc::new(cfg);
+    let (admin_tx, admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
+    let (pose_tx, _pose_rx) = watch::channel(None);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    let (status_tx, status_rx) = watch::channel(Arc::new(snap));
+    let state = AppState::new(
+        cfg,
+        Arc::new(Mutex::new(PoseIntake::new())),
+        Arc::new(pose_tx),
+        admin_tx,
+        status_rx,
+        TOKEN.into(),
+        shutdown_rx,
+    );
+    (api::router(state), admin_rx, status_tx)
+}
+
+#[tokio::test]
+async fn fault_latches_whatever_the_body() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let h = [("authorization", bearer())];
+    let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for body in [r#"{"note":"x","why":1}"#, "note=x", "{not json", "  "] {
+        let (st, b) = call(&s.app, req("POST", "/v1/fault", &h, body)).await;
+        assert_eq!(st, StatusCode::OK, "{body:?}: {b}");
+    }
+    let seen = s.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            AdminCmd::Fault { note: "x".into() },
+            AdminCmd::Fault { note: "unparsed body: note=x".into() },
+            AdminCmd::Fault { note: "unparsed body: {not json".into() },
+            AdminCmd::Fault { note: String::new() },
+        ]
+    );
+    let long = "y".repeat(1000);
+    assert_eq!(api::fault_note(long.as_bytes()).chars().count(), "unparsed body: ".len() + 200);
+}
+
+#[tokio::test]
+async fn disarm_and_fault_are_not_rate_limited() {
+    let mut cfg = sim_cfg();
+    cfg.server.admin_rate_limit_per_s = 1;
+    let s = stub(cfg, Some(ok_reply));
+    let auth = [("authorization", bearer())];
+    let auth: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0, StatusCode::OK);
+    assert_eq!(call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0, StatusCode::TOO_MANY_REQUESTS);
+    for _ in 0..5 {
+        assert_eq!(call(&s.app, req("POST", "/v1/disarm", &auth, "")).await.0, StatusCode::OK);
+        assert_eq!(call(&s.app, req("POST", "/v1/fault", &auth, "")).await.0, StatusCode::OK);
+    }
+    // Still behind the token.
+    assert_eq!(call(&s.app, req("POST", "/v1/fault", &[], "")).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(call(&s.app, req("POST", "/v1/fault/reset", &auth, "")).await.0, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn wrong_method_is_json_405() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let (st, body) = call(&s.app, req("GET", "/v1/session", &[], "")).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"], "method_not_allowed");
+    assert_eq!(body["ok"], false);
+    let (st, body) = call(&s.app, req("POST", "/v1/status", &[], "")).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"], "method_not_allowed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_command_answered_503_is_never_executed_late() {
+    let (app, mut admin_rx, _status) = manual(sim_cfg());
+    let auth = bearer();
+    let t = Instant::now();
+    let (st, body) = call(&app, req("POST", "/v1/arm", &[("authorization", &auth)], "")).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "control_loop_unavailable");
+    assert!(t.elapsed() >= api::ADMIN_TIMEOUT);
+    // The loop catches up: the request is still queued but cannot be claimed.
+    let (cmd, reply) = admin_rx.try_recv().expect("queued");
+    assert_eq!(cmd, AdminCmd::Arm);
+    assert!(!reply.claim(), "requester gave up: must not run");
+    assert!(!api::runs_when_abandoned(&cmd));
+    // Safety commands still run when abandoned.
+    let (st, _) = call(&app, req("POST", "/v1/stop", &[], "")).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    let (cmd, reply) = admin_rx.try_recv().expect("queued");
+    assert!(!reply.claim() && api::runs_when_abandoned(&cmd));
+    for c in [AdminCmd::Disarm, AdminCmd::Fault { note: String::new() }] {
+        assert!(api::runs_when_abandoned(&c));
+    }
+    for c in [AdminCmd::Start, AdminCmd::Center, AdminCmd::FaultReset] {
+        assert!(!api::runs_when_abandoned(&c));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn claimed_admin_command_is_answered_even_after_the_timeout() {
+    let (app, mut admin_rx, _status) = manual(sim_cfg());
+    let loop_task = tokio::spawn(async move {
+        let (_, reply) = admin_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(reply.claim());
+        // Executing takes past the API timeout.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = reply.send(Ok(AdminOk { rig_state: RigState::Arming, note: None }));
+    });
+    let (st, body) = call(&app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["rig_state"], "ARMING");
+    loop_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn non_loopback_peers_get_only_status_and_stop() {
+    use axum::extract::connect_info::MockConnectInfo;
+    let mut cfg = sim_cfg();
+    cfg.server.allow_non_loopback = true;
+    let lan: std::net::SocketAddr = "192.168.1.20:50000".parse().unwrap();
+    let s = stub(cfg.clone(), Some(ok_reply));
+    let app = s.app.clone().layer(MockConnectInfo(lan));
+    let auth = bearer();
+    for (m, p) in [("POST", "/v1/session"), ("GET", "/v1/motion"), ("POST", "/v1/arm"), ("POST", "/v1/fault")] {
+        let (st, body) = call(&app, req(m, p, &[("authorization", &auth)], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {p}");
+        assert_eq!(body["error"], "loopback_only");
+    }
+    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::OK);
+    assert_eq!(call(&app, req("POST", "/v1/stop", &[], "")).await.0, StatusCode::OK);
+    assert_eq!(s.seen.lock().unwrap().as_slice(), &[AdminCmd::Stop]);
+    // Loopback peers (also IPv4-mapped) keep everything.
+    for local in ["127.0.0.1:50000", "[::ffff:127.0.0.1]:50000", "[::1]:50000"] {
+        let app = s.app.clone().layer(MockConnectInfo(local.parse::<std::net::SocketAddr>().unwrap()));
+        assert_eq!(call(&app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::OK, "{local}");
+    }
+    // Unknown peer: fail closed.
+    assert_eq!(call(&s.app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::FORBIDDEN);
+    // Without the knob the bind is loopback-only and nothing is filtered.
+    let s = stub(sim_cfg(), Some(ok_reply));
+    assert_eq!(call(&s.app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn status_is_503_once_the_control_loop_is_gone() {
+    let (app, _admin_rx, status_tx) = manual(sim_cfg());
+    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::OK);
+    drop(status_tx);
+    let (st, body) = call(&app, req("GET", "/v1/status", &[], "")).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "control_loop_unavailable");
+}
+
+#[tokio::test]
+async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use h3cs::telemetry::{lock_events, shared_event_log};
+    let mut cfg = sim_cfg();
+    cfg.server.allow_non_loopback = true;
+    let cfg = Arc::new(cfg);
+    let (admin_tx, _admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
+    let (pose_tx, _pose_rx) = watch::channel(None);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (status_tx, status_rx) = watch::channel(Arc::new(Supervisor::new(&cfg).snapshot(Instant::now())));
+    let log = shared_event_log(Instant::now());
+    let state = AppState::new(
+        cfg,
+        Arc::new(Mutex::new(PoseIntake::new())),
+        Arc::new(pose_tx),
+        admin_tx,
+        status_rx,
+        TOKEN.into(),
+        shutdown_rx,
+    )
+    .with_event_log(log.clone());
+    let app = api::router(state).layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()));
+    for k in 1..=5 {
+        lock_events(&log).push(Instant::now(), "probe", serde_json::json!({ "k": k }));
+    }
+
+    let (st, body) = call(&app, req("GET", "/v1/events", &[], "")).await;
+    assert_eq!(st, StatusCode::OK, "no token needed: {body}");
+    assert_eq!(body["next_id"], 6);
+    assert_eq!(body["dropped"], 0);
+    let ks = |b: &Value| b["events"].as_array().unwrap().iter().map(|e| e["detail"]["k"].as_i64().unwrap()).collect::<Vec<_>>();
+    assert_eq!(ks(&body), [1, 2, 3, 4, 5], "oldest first");
+    assert_eq!(ks(&call(&app, req("GET", "/v1/events?n=2", &[], "")).await.1), [4, 5]);
+    assert_eq!(ks(&call(&app, req("GET", "/v1/events?after=3", &[], "")).await.1), [4, 5]);
+    assert_eq!(ks(&call(&app, req("GET", "/v1/events?after=1&n=2", &[], "")).await.1), [4, 5]);
+    assert!(ks(&call(&app, req("GET", "/v1/events?after=5", &[], "")).await.1).is_empty());
+    let (st, body) = call(&app, req("GET", "/v1/events?n=lots", &[], "")).await;
+    assert_eq!((st, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")));
+
+    // Post-mortem: the loop is gone (status 503) but its events stay readable.
+    drop(status_tx);
+    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    let (st, body) = call(&app, req("GET", "/v1/events", &[], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ks(&body).len(), 5);
+
+    // Not for the LAN, like the rest of the operator surface.
+    let lan = api::router(AppState::new(
+        Arc::new({
+            let mut c = sim_cfg();
+            c.server.allow_non_loopback = true;
+            c
+        }),
+        Arc::new(Mutex::new(PoseIntake::new())),
+        Arc::new(watch::channel(None).0),
+        mpsc::channel::<AdminRequest>(1).0,
+        watch::channel(Arc::new(Supervisor::new(&sim_cfg()).snapshot(Instant::now()))).1,
+        TOKEN.into(),
+        watch::channel(false).1,
+    ))
+    .layer(MockConnectInfo("192.168.1.20:50000".parse::<std::net::SocketAddr>().unwrap()));
+    let (st, body) = call(&lan, req("GET", "/v1/events", &[], "")).await;
+    assert_eq!((st, body["error"].as_str()), (StatusCode::FORBIDDEN, Some("loopback_only")));
+}

@@ -1,0 +1,37 @@
+[package]
+name = "h3-control-server"
+version = "0.1.0"
+edition = "2021"
+description = "DOF Reality H3 replacement control server: game pose API, h3game-v1 compat, calibration, 3-axis planner, supervisor, CoreS3 axis links"
+publish = false
+
+[lib]
+name = "h3cs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "h3-control-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["limit"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+crc = "3"
+tokio-serial = "5.4"
+rand = "0.8"
+
+[dev-dependencies]
+# Paused-clock tests (#[tokio::test(start_paused = true)]).
+tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.26"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
