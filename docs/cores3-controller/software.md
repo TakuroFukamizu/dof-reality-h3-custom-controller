@@ -6,7 +6,7 @@
 Motion Software / Telemetry
            │
            ▼
-   H3 Motion Controller（PC、Python を想定）
+   h3-control-server（PC、Rust）
            │  Pitch / Roll / Yaw → 各軸の目標位置（Kinematics）
     ┌──────┼──────┐
     ▼      ▼      ▼
@@ -15,9 +15,8 @@ Motion Software / Telemetry
  CoreS3 CoreS3 CoreS3     各軸で位置制御ループを完結
 ```
 
-- 3 台は同一ファームウェアで動作し、起動時の設定で軸 ID と制御パラメータを切り替える。
-- COM ポート番号に依存せず、接続時のハンドシェイクで軸 ID を識別する。
-- 通信断時は各軸が自律的に停止する。PC からの指令にはシーケンス番号と適用時刻を付けて 3 台を揃える。USB だけでは厳密な時刻同期にならないので、同期誤差を測定して許容できるか確認する。
+- 3 台は同一ファームウェア（軸ごとの設定を持たない）。軸の割当は PC が HELLO の `device_id`（eFuse MAC 由来）と PC の設定ファイルの対応で決める（COM ポート番号に依存しない。HELLO の `axis_id_hint` は PC は採用しない）。制御パラメータ（ソフトリミット・速度・加速度・期限など）は毎 boot、PC の CONFIG で受け取る。
+- 通信断時は各軸が自律的に停止する。PC からの指令には seq と group_frame_id を付ける。v1 は適用時刻（`apply_at_us`）を使わず受信時に適用し、3 軸のずれは STATUS の `last_applied_frame` で監視する。USB だけでは厳密な時刻同期にならないので、同期誤差を測定して許容できるか確認する。
 
 ## ESP32-S3 のコア分担（案）
 
@@ -28,6 +27,8 @@ Motion Software / Telemetry
 
 当初は「ブレーキなど安全系だけを別コアに」という案だったが、位置制御と異常検出を同じ高優先度タスクにまとめた方が停止判断の遅延を管理しやすい。
 両コアは電源・メモリ・割り込みを共有するため、ハードウェアのウォッチドッグと独立した駆動遮断手段は別途必要。
+
+USB（Core 0）で受けた管理命令は、制御側（Core 1）の状態遷移を確定させてから ACK を返す。ACK の後に送る STATUS は送信時点の状態から作り、命令前に取ったスナップショットを送らない（[protocol.md](../control-server/protocol.md) §1。PC はこの順序に依存している）。
 
 ### タスク構成（案）
 
@@ -68,11 +69,12 @@ Duty の意味を曖昧にしない。UI・ログは符号付き Duty [%] に正
 
 ## 状態機械
 
-本番制御の基本形:
+本番の状態機械は [protocol.md](../control-server/protocol.md) §3.1・§5 を正とする（以前の案「DISARMED → READY → ARMED → MOVING → STOPPING → READY」は使わない）:
 
 ```text
-DISARMED → READY → ARMED → MOVING → STOPPING → READY
-                 異常はどの状態からでも FAULT へ（PWM 停止、明示的なリセットで解除）
+BOOT → DISARMED → ARMING → HOLDING ⇄ ACTIVE（ACTIVE → STOPPING → HOLDING）
+DISARM: → DISARMING → DISARMED
+異常はどの状態からでも FAULT ラッチ（PWM 0・ブレーキ作動）→ FAULT_RESET で DISARMED（自動再 ARM しない）
 ```
 
 `encoder-tester` で実装している単軸試験用の遷移:
@@ -96,6 +98,8 @@ DISARMED → POWER_WAIT → BRAKE_WAIT → READY → RUNNING → STOPPING → BR
 NVS に ARM / ON / JOG 状態を保存して自動復帰させない。USB 再接続・リセットで自動運転しない。起動時に `while (!Serial)` で無期限に待たない。
 
 ## USB プロトコル
+
+PC（h3-control-server）との本番用プロトコルは [control-server/protocol.md](../control-server/protocol.md)（v1、PC 側実装済み・CoreS3 側未実装）を正とする。下の「本番向け（案）」はそれ以前の案。ファームが実装すべき項目は [control-server/README.md](../control-server/README.md)「CoreS3 側でやること」、参照する挙動は `control-server/src/sim_axis.rs`。
 
 ### 本番向け（案）
 
@@ -168,7 +172,7 @@ count_total_x4,count_trial_x4,velocity_count_s,a_level,b_level,elapsed_ms,stop_r
 ```
 
 - 電源・ブレーキは実状態を読み返す入力がないため「ON 指令」「解除指令中」と表示し、実状態と区別する。
-- 異常時は `ENCODER_LOST` / `FOLLOWING_ERROR` / `USB_TIMEOUT` / `POWER_FAULT` などの原因を明示。
+- 異常時は `ENCODER_FAULT` / `FOLLOWING_ERROR` / `COMMAND_TIMEOUT` / `POWER_FAULT` など、protocol.md §3.2 の異常コード名で原因を明示する（画面上の短い別名を足すのはよい）。
 - 試験ツールでは `NO CURRENT MONITORING / POSITION NOT HOMED` を常時表示。
 
 ## 現状の実装
@@ -185,6 +189,10 @@ CoreS3 SE 1 台で MD13S・主電源リレー・ブレーキリレーを動か�
 ### `encoder-tester/`
 
 Grok Build に指示書（v3）を渡して作成した単軸試験ツール。`moter-controler/` とは独立したフォルダ。`tools/run_once.py` が USB 権限取得 → SET → ARM → READY 確認 → RUN 1 回 → DISARMED まで監視・記録を一続きに行う。実施記録は `encoder-tester/docs/runs/`、生ログは `encoder-tester/logs/`。
+
+### PC 側 `control-server/`
+
+PC 側のコントロールサーバー（Rust）。上の USB プロトコル v1 の PC 側と、MCU 側の参照モデル（模擬軸）を実装済み。CoreS3 ファームウェアのプロトコル部分はまだ無い。詳細は [control-server/README.md](../control-server/README.md)。
 
 ## 開発の進め方
 
