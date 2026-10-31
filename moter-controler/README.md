@@ -8,11 +8,27 @@ PATH の `pio` は使わない。
 
 ```sh
 cd moter-controler
-/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3            # DIN Base 12V から給電する本番設定
-/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower   # USB のみ給電（開発用。12V は接続しない。Issue #1）
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3            # Bottom（Base15）の DC ジャックから給電する本番設定
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower   # USB のみ給電（開発用。Bottom の DC は接続しない。DIN Base 時代の Issue #1 回避用）
 /Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower -t upload --upload-port /dev/cu.usbmodem2101
 tests/run_tests.sh   # ホストテスト（状態機械とプロファイル）
 ```
+
+## 配線（Base15）
+
+Bottom は Base15 産業用プロト基板モジュール V1.1（M5Stack K025-B）。DIN Base は使わない。Base15 に XH 8pin と XH 2pin のソケットを増設し、リレー駆動の MOSFET とエンコーダ用のレベル変換を Base15 内に収める。バッテリーは無い。給電は Base15 の DC ジャック（9〜24V → MP1584 → BUS 5V）。Base15 での電源経路は未検証。詳細は [../encoder-tester/docs/wiring.md](../encoder-tester/docs/wiring.md)。
+
+| 信号 | 定数 | GPIO | 接続 |
+| --- | --- | --- | --- |
+| MD13S PWM | `PIN_MD13S_PWM` | G9 | Grove Port.B 黄（Base15 上。DIN Base と同じ配置） |
+| MD13S DIR | `PIN_MD13S_DIR` | G8 | Grove Port.B 白 |
+| エンコーダ A（センサー白） | `PIN_ENC_A` | G17 | XH 8pin #2 → Base15 内レベル変換 |
+| エンコーダ B（センサー緑） | `PIN_ENC_B` | G18 | XH 8pin #3 → Base15 内レベル変換 |
+| ブレーキ解除リレー IN | `PIN_MOTOR_BRAKE` | G13 | XH 8pin #5 → Base15 内 MOSFET（回路構成は未定）。GPIO は HIGH で解除指令。MOSFET が反転段なら `RELAY_ON_LEVEL` の見直しが要る |
+| Protection Board VIOUT | `PIN_VIOUT` | G10 | XH 8pin #6 → Base15 内で分圧。ADC 読み取りは未実装 |
+| 主電源リレー IN | `PIN_POWER_RELAY` | G2 | XH 2pin #2。GPIO 直結（電源基板側に MOSFET）。HIGH で給電 |
+
+G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298）と共用。`internal_spk = false` と `external_speaker_value = 0` を保つ（`src/main.cpp` の `setup()`）。Base15 の MOSFET ゲートには外付けプルダウンを付ける。
 
 ## 画面
 

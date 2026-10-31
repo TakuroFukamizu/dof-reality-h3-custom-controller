@@ -4,19 +4,24 @@
 
 // 動作確認済み moter-controler と同じ電気設定。
 // 未測定の時間・Duty・移動量はここへ入れない。実行時の SET まで UNCONFIGURED。
+//
+// Bottom は Base15 産業用プロト基板モジュール V1.1。XH 8pin / 2pin のソケットを増設し、
+// リレー駆動の MOSFET とエンコーダ用レベル変換を Base15 内に収める。配線は docs/wiring.md。
+// G13 は CoreS3 SE 内部で I2S_DOUT（AW88298）と共用。main.cpp の internal_spk = false と
+// external_speaker_value = 0 を保つ。
 
-constexpr int POWER_GPIO = 2;             // Port A 黄。主電源リレー
-constexpr int BRAKE_GPIO = 1;             // Port A 白。ブレーキ解除リレー
+constexpr int POWER_GPIO = 2;             // XH 2pin #2。主電源リレー IN（GPIO 直結）
+constexpr int BRAKE_GPIO = 13;            // XH 8pin #5。ブレーキ解除リレー IN（Base15 内 MOSFET 経由）
 constexpr int POWER_ON_LEVEL = 1;         // HIGH で給電指令
 constexpr int BRAKE_RELEASE_LEVEL = 1;    // HIGH でブレーキ解除指令
-constexpr int PWM_GPIO = 9;               // Port B 黄。MD13S PWM
-constexpr int DIR_GPIO = 8;               // Port B 白。MD13S DIR
+constexpr int PWM_GPIO = 9;               // Grove Port.B 黄（Base15 上）。MD13S PWM
+constexpr int DIR_GPIO = 8;               // Grove Port.B 白（Base15 上）。MD13S DIR
 constexpr int DIR_POSITIVE_LEVEL = 0;     // 正方向は DIR Low
 constexpr int PWM_FREQUENCY_HZ = 20000;   // MD13S の上限
 constexpr int PWM_RESOLUTION_BITS = 10;
 constexpr int PWM_FULL_SCALE = (1 << PWM_RESOLUTION_BITS) - 1;  // 1023
-constexpr int ENCODER_A_GPIO = 17;        // Port C 黄。センサー白の既定
-constexpr int ENCODER_B_GPIO = 18;        // Port C 白。センサー緑の既定
+constexpr int ENCODER_A_GPIO = 17;        // XH 8pin #2。センサー白（Base15 内レベル変換後）の既定
+constexpr int ENCODER_B_GPIO = 18;        // XH 8pin #3。センサー緑（Base15 内レベル変換後）の既定
 constexpr int ENCODER_SIGN_DEFAULT = 1;
 
 constexpr int UNCONFIGURED = -1;

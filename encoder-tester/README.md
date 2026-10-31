@@ -11,13 +11,15 @@ M5Stack CoreS3 SE で、DOF Reality H3 の 1 軸を有限時間だけ動かし�
 | 項目 | 状態 |
 | --- | --- |
 | ソースとホストテスト | このフォルダにある。ホストテストは 282 件成功 |
-| ファームウェアのビルド | pioarduino 55.03.312 / Arduino 3.3.12 で成功。`m5stack-cores3`（DIN 12V 給電設定）と `m5stack-cores3-usbpower`（USB のみ）の 2 環境 |
+| ファームウェアのビルド | pioarduino 55.03.312 / Arduino 3.3.12 で成功。`m5stack-cores3`（Bottom の DC から給電する設定）と `m5stack-cores3-usbpower`（USB のみ）の 2 環境 |
 | 実機への書き込み | 2026-10-25 に `m5stack-cores3-usbpower` を書き込み済み |
-| 実機での駆動 | 2026-10-25 に 10 % / 15 % で正逆駆動。再現性 1 % 以内 |
+| 実機での駆動 | 2026-10-25 に 10 % / 15 % で正逆駆動。再現性 1 % 以内（DIN Base + Grove 配線。ブレーキは当時 G1） |
 | カウントの確認 | 直交 A/B の 4 逓倍計数を確認 |
 | 分解能 | **モーター軸 400 count/rev（4 逓倍、100 PPR 相当）**。減速比とシート角度への換算は未測定。詳細は [docs/results_20261025.md](docs/results_20261025.md) |
 
 電流監視は接続していない。画面の ESTOP と USB の `ESTOP` は、出力指令を落とすソフトのラッチであり、物理の非常停止ではない。G2 は 3 軸共通の AC 給電になり得る。CoreS3 は 1 台だけにする。
+
+2026-10-31 に Bottom を DIN Base から Base15 産業用プロト基板モジュール V1.1 に変更し、ブレーキ解除リレーを G1 から G13 に移した（`include/config.h`、[docs/wiring.md](docs/wiring.md)）。Base15 構成での実機確認はまだ。
 
 ## ビルド
 

@@ -190,10 +190,12 @@ void printHelp() {
   Serial.println("  NEUTRAL       move to neutral count, needs origin + calibration");
   Serial.println("  CAL           HOME -> UPPER -> save -> NEUTRAL");
   Serial.println("  UNCAL         clear calibration of selected motor (relay off only)");
-  Serial.printf("PortB IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
+  Serial.printf("PortB(Base15) IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
-  Serial.printf("PortA Yellow/G2 GPIO%d = power, White/G1 GPIO%d = brake, ON level %d\n",
+  Serial.printf("XH2pin#2 GPIO%d = power, XH8pin#5 GPIO%d = brake, ON level %d\n",
                 PIN_POWER_RELAY, PIN_MOTOR_BRAKE, RELAY_ON_LEVEL);
+  Serial.printf("XH8pin#2/#3 GPIO%d/%d = encoder A/B, XH8pin#6 GPIO%d = VIOUT (not read)\n",
+                PIN_ENC_A, PIN_ENC_B, PIN_VIOUT);
 }
 
 const char* skipSpace(const char* s) {
@@ -773,17 +775,22 @@ void setup() {
   auto cfg = M5.config();
   cfg.clear_display = true;
 #if MC_USB_POWER
-  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。12V は接続しない（Issue #1）。
+  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。Bottom の DC 入力は接続しない。
+  // （DIN Base 時代の Issue #1 回避用。Base15 の DC と USB の同時接続は未検証）
   cfg.output_power = true;
 #else
-  cfg.output_power = false;  // DIN側からBUSの5Vを受ける設定
+  cfg.output_power = false;  // Bottom（Base15 の DC ジャック → MP1584 → BUS 5V）から 5V を受ける設定
 #endif
   cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
   cfg.internal_mic = false;
   cfg.internal_spk = false;
   cfg.external_imu = false;
   cfg.external_rtc = false;
-  // Port A を外部機器の探索に使わせない。GPIO1 と GPIO2 がリレーなので、I2C の High で入れたくない。
+  // 外部機器の探索をさせない。理由は 2 つ。
+  //  - Port.A（G1 SCL / G2 SDA）の I2C 探索抑止。G2 は主電源リレー IN なので I2C の High で入れたくない
+  //    （G1 はブレーキを G13 に移して空いたが、I2C は両線が要るので緩めない）。
+  //  - Module Display / RCA の検出が走ると M5Unified が mbus_pin23 = G13 を I2S DOUT に取る。
+  //    G13 はブレーキ解除リレー IN なので external_speaker_value = 0 で止める。internal_spk = false も同じ理由で保つ。
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);

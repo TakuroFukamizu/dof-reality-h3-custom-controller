@@ -35,7 +35,7 @@ struct AutoInputs {
   uint32_t now_ms = 0;
   int64_t raw_count = 0;           // ISR 累積。符号を掛ける前
   bool relay_live = false;         // 主電源リレー ON かつ settle 済み
-  bool brake_released = false;     // brake_on（GPIO1 HIGH ＝ 解除）
+  bool brake_released = false;     // brake_on（PIN_MOTOR_BRAKE = G13 HIGH ＝ 解除）
   bool manual_speed_nonzero = false;
   bool stop = false;               // この tick に STOP が来た
   bool estop = false;              // この tick に非常停止が来た
