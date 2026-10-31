@@ -486,6 +486,9 @@ void onButton(const Button& button) {
       break;
     case Action::Motor:
       if (!button.enabled) {
+        // 系統が切り替わらなかった理由をシリアルにも残す（画面の通知は 1.2 s で消え、校正を別の系統に保存してしまう）
+        Serial.printf("UI motor_disabled motor=%u relay=%d active=%d\n", static_cast<unsigned>(snap.profile.motor),
+                      relay_on ? 1 : 0, snapActive() ? 1 : 0);
         showNotice("電源OFFで切替");
         return;
       }
