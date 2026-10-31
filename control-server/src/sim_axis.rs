@@ -101,10 +101,23 @@
 //! rejected until it is fixed. CONFIG_INVALID / NOT_REFERENCED are reserved
 //! codes, never latched: ARM_PREPARE is rejected with an ACK reason instead.
 //!
+//! # Axis selection (protocol.md §1.1)
+//!
+//! The operator selects the axis on the real unit (power button, NVS). Here it
+//! is `SimParams::selected_axis`, changed at run time with
+//! [`SimMcu::select_axis`]: accepted in DISARMED only; it clears CONFIG
+//! (`CONFIGURED`, `calibration_hash`) and `POSITION_REFERENCED`, sends one
+//! AXIS_SELECT and puts the new value in every later HELLO / STATUS. The
+//! encoder count is untouched. [`SimMcu::select_axis_unchecked`] breaks the
+//! DISARMED rule on purpose (tests of the PC side's reaction); outside DISARMED
+//! the limits and the lease are kept, so the unit stops by COMMAND_TIMEOUT
+//! (the PC never writes to a conflicted axis). `reboot` keeps
+//! the selection (NVS).
+//!
 //! # STATUS
 //!
 //! Sent every `status_period_ms` (from [`SimMcu::tick`]) and immediately whenever
-//! `(mcu_state, fault_code, flags)` changes. `target_count` is the current
+//! `(mcu_state, fault_code, flags, selected_axis)` changes. `target_count` is the current
 //! (profiled) control setpoint; `following_error_count = actual − setpoint`;
 //! `pwm_permille` is a proportional + feed-forward estimate; `current_ma = 0`
 //! with CURRENT_VALID unset. Counters saturate at `u16::MAX`.
@@ -149,8 +162,9 @@ pub struct SimParams {
     pub device_id: DeviceId,
     pub boot_id: u32,
     pub fw_version: [u8; 3],
-    /// HELLO.axis_id_hint (0 = unset; the server never trusts it).
-    pub axis_id_hint: u8,
+    /// Axis selected on the MCU at boot (HELLO / STATUS `selected_axis`;
+    /// 0 = none, the server then falls back to the configured `device_id`).
+    pub selected_axis: u8,
     /// Establish POSITION_REFERENCED at boot (bench convenience; real firmware
     /// boots unreferenced). Re-applied by [`SimMcu::reboot`].
     pub start_referenced: bool,
@@ -173,7 +187,7 @@ impl Default for SimParams {
             device_id: DeviceId(0x5131_0000_0000_0001),
             boot_id: 1,
             fw_version: [0, 1, 0],
-            axis_id_hint: 0,
+            selected_axis: 0,
             start_referenced: true,
             plant_max_vel_count_s: 4000.0,
             status_period_ms: 20,
@@ -187,10 +201,16 @@ impl Default for SimParams {
 
 impl SimParams {
     /// Parameters for one axis of the `[backend] kind = "sim"` configuration.
-    pub fn from_backend(cfg: &SimBackendConfig, device_id: DeviceId, boot_id: u32) -> Self {
+    pub fn from_backend(
+        cfg: &SimBackendConfig,
+        device_id: DeviceId,
+        boot_id: u32,
+        selected_axis: u8,
+    ) -> Self {
         Self {
             device_id,
             boot_id,
+            selected_axis,
             start_referenced: cfg.start_referenced,
             plant_max_vel_count_s: cfg.plant_max_vel_count_s,
             status_period_ms: cfg.status_period_ms,
@@ -217,6 +237,8 @@ enum StopKind {
 pub struct SimMcu {
     params: SimParams,
     boot_id: u32,
+    /// Current selection (NVS on the real unit; survives `reboot`).
+    selected_axis: u8,
     /// `now_us` at boot; `mcu_time_us = now_us − boot_origin_us`.
     boot_origin_us: Option<u64>,
     now_us: Option<u64>,
@@ -265,7 +287,7 @@ pub struct SimMcu {
 
     outbox: Vec<McuMsg>,
     next_status_us: Option<u64>,
-    last_status_key: Option<(McuState, FaultCode, u16)>,
+    last_status_key: Option<(McuState, FaultCode, u16, u8)>,
 }
 
 impl SimMcu {
@@ -273,6 +295,7 @@ impl SimMcu {
         let actual = params.initial_count as f64;
         Self {
             boot_id: params.boot_id,
+            selected_axis: params.selected_axis,
             boot_origin_us: None,
             now_us: None,
             state: McuState::Disarmed,
@@ -389,6 +412,10 @@ impl SimMcu {
     pub fn boot_id(&self) -> u32 {
         self.boot_id
     }
+    /// Axis currently selected on this unit (0 = none).
+    pub fn selected_axis(&self) -> u8 {
+        self.selected_axis
+    }
     pub fn config(&self) -> Option<&Config> {
         self.config.as_ref()
     }
@@ -431,6 +458,7 @@ impl SimMcu {
             boot_id: self.boot_id,
             mcu_time_us: self.mcu_time(now),
             mcu_state: self.state as u8,
+            selected_axis: self.selected_axis,
             fault_code: self.fault_code(),
             flags: self.flags(),
             pwm_permille: self.pwm_permille(),
@@ -488,10 +516,11 @@ impl SimMcu {
     /// request_id cache cleared, reference re-initialized from
     /// `params.start_referenced`. The encoder count restarts at 0 unless the
     /// simulated homing (`start_referenced`) re-establishes the same coordinate.
-    /// Fault-injection switches are kept.
+    /// Fault-injection switches and the axis selection (NVS) are kept.
     pub fn reboot(&mut self, new_boot_id: u32) {
         let mut fresh = SimMcu::new(self.params.clone());
         fresh.boot_id = new_boot_id;
+        fresh.selected_axis = self.selected_axis;
         let pos = if self.params.start_referenced {
             self.actual
         } else {
@@ -507,6 +536,57 @@ impl SimMcu {
         fresh.freeze_tx = self.freeze_tx;
         fresh.fault_cause_present = self.fault_cause_present;
         *self = fresh;
+    }
+
+    /// Operator selects axis `new` (protocol.md §1.1): accepted in DISARMED
+    /// only, otherwise ignored (the real unit shows a message). On a change:
+    /// CONFIG / `CONFIGURED` / `calibration_hash` / `POSITION_REFERENCED`
+    /// cleared, one AXIS_SELECT, and every later HELLO / STATUS carries `new`.
+    /// The encoder count is not touched. Like `handle`, time is advanced first
+    /// and the result may also carry STATUS.
+    pub fn select_axis(&mut self, new: u8, now_us: u64) -> Vec<McuMsg> {
+        let now = self.advance_to(now_us);
+        if self.state == McuState::Disarmed {
+            self.apply_axis_select(new, now);
+        }
+        self.drain()
+    }
+
+    /// Test hook: switch in any state (a unit that violates the DISARMED rule,
+    /// so the PC side's fault handling can be exercised). Outside DISARMED the
+    /// CONFIG limits and the lease stay in force (only `POSITION_REFERENCED`
+    /// is cleared): the unit ends in FAULT(COMMAND_TIMEOUT) once the PC stops
+    /// writing to it.
+    pub fn select_axis_unchecked(&mut self, new: u8, now_us: u64) -> Vec<McuMsg> {
+        let now = self.advance_to(now_us);
+        self.apply_axis_select(new, now);
+        self.drain()
+    }
+
+    /// The switch itself; output stays in the outbox (the async runner sends it).
+    fn apply_axis_select(&mut self, new: u8, _now: u64) {
+        if new == self.selected_axis {
+            return;
+        }
+        let prev = self.selected_axis;
+        self.selected_axis = new;
+        // Axis-specific values must not carry over to the other axis.
+        // Outside DISARMED (rule violation, `select_axis_unchecked`) the limits
+        // and the lease are kept: the PC sends nothing to a unit on a conflicted
+        // axis, so COMMAND_TIMEOUT is the only thing that stops it (protocol.md
+        // §1.1). Dropping `config` here would silence the lease check.
+        if self.state == McuState::Disarmed {
+            self.config = None;
+        }
+        self.referenced = false;
+        self.push(McuMsg::AxisSelect(protocol::AxisSelect {
+            boot_id: self.boot_id,
+            selected_axis: new,
+            prev_selected_axis: prev,
+            mcu_state: self.state as u8,
+        }));
+        // selected_axis is part of the STATUS key: a STATUS follows at once.
+        self.emit_status_if_changed();
     }
 
     // ------------------------------------------------------------------
@@ -621,7 +701,7 @@ impl SimMcu {
         self.push(McuMsg::Hello(Hello {
             request_id,
             protocol_version: PROTOCOL_VERSION,
-            axis_id_hint: self.params.axis_id_hint,
+            selected_axis: self.selected_axis,
             mcu_state: self.state as u8,
             device_id: self.params.device_id,
             boot_id: self.boot_id,
@@ -1134,11 +1214,11 @@ impl SimMcu {
         }
     }
 
-    fn status_key(&self) -> (McuState, FaultCode, u16) {
-        (self.state, self.fault_code(), self.flags())
+    fn status_key(&self) -> (McuState, FaultCode, u16, u8) {
+        (self.state, self.fault_code(), self.flags(), self.selected_axis)
     }
 
-    /// Immediate STATUS when state, fault code or flags changed.
+    /// Immediate STATUS when state, fault code, flags or selected_axis changed.
     fn emit_status_if_changed(&mut self) {
         let key = self.status_key();
         if self.last_status_key != Some(key) {
@@ -1228,6 +1308,7 @@ pub struct SimSnapshot {
     pub actual_count: Counts,
     pub target_count: Counts,
     pub boot_id: u32,
+    pub selected_axis: u8,
     pub session_epoch: Option<u32>,
     pub configured: bool,
     pub referenced: bool,
@@ -1257,6 +1338,7 @@ impl SimHandle {
             actual_count: m.actual_count(),
             target_count: m.target_count(),
             boot_id: m.boot_id(),
+            selected_axis: m.selected_axis(),
             session_epoch: m.session_epoch(),
             configured: m.is_configured(),
             referenced: m.is_referenced(),
@@ -1290,6 +1372,21 @@ impl SimHandle {
     }
     pub fn reboot(&self, new_boot_id: u32) {
         self.shared.lock().reboot(new_boot_id);
+    }
+    /// Operator switches the unit to axis `new` (DISARMED only, protocol.md
+    /// §1.1). AXIS_SELECT and the new STATUS go out with the runner's next tick.
+    pub fn select_axis(&self, new: u8) {
+        let mut m = self.shared.lock();
+        if m.state() == McuState::Disarmed {
+            let now = m.now_us.unwrap_or(0);
+            m.apply_axis_select(new, now);
+        }
+    }
+    /// Switch in any state (rule violation, for tests of the PC side).
+    pub fn select_axis_unchecked(&self, new: u8) {
+        let mut m = self.shared.lock();
+        let now = m.now_us.unwrap_or(0);
+        m.apply_axis_select(new, now);
     }
     /// Corrupt the CRC of the next transmitted frame (the host must discard it).
     pub fn corrupt_next_tx(&self) {

@@ -13,11 +13,32 @@
 //!   `set_position[i]`. START needs an unexpired SET_POSITION received after
 //!   ARM_PREPARE (which resets that window), so reordering can make the MCU
 //!   reject START.
-//! - Route messages for an axis only to [`Supervisor::axis_port`]. A second
-//!   port that identifies as an already-connected axis is a duplicate: it gets
-//!   nothing, and its Status/Ack/FaultEvent must not be forwarded (events
-//!   carry no port). Report its closing with [`LinkEvent::PortClosed`].
+//! - Route messages for an axis only to [`Supervisor::axis_port`] (the
+//!   axis's *primary* port). Any other port claiming the axis gets nothing,
+//!   and its Status/Ack/FaultEvent must not be forwarded (events carry no
+//!   port). Report its closing with [`LinkEvent::PortClosed`].
 //! - `DecodeErrors.count` is a delta (errors since the previous report).
+//!
+//! # Axis assignment and conflicts (DESIGN.md §10.2)
+//!
+//! Each axis keeps its **claimants**: the ports whose MCU selected it (or,
+//! for `selected_axis = 0`, whose device_id is configured for it). The
+//! primary — the one that gets CONFIG / SET_POSITION and whose STATUS counts —
+//! is the sole claimant; two or more claimants while not driving (Idle /
+//! Fault) is an **axis conflict**: no primary, no CONFIG, blocker
+//! `axis_conflict`, rig OFFLINE, `Arm` / `Start` / `Center` refused with
+//! `axis_conflict`, and the API refuses poses. A second claimant while
+//! driving leaves the primary in place and starts a controlled stop; the
+//! conflict takes effect once the rig is idle. When one claimant remains it is
+//! promoted like a fresh `Identified` (CONFIG, or HOST_FAULT while latched).
+//! The primary's own axis changing while driving (`Disconnected` with reason
+//! `axis_changed:`) latches [`RigFault::AxisChanged`].
+//!
+//! The configured `device_id` is a cross-check only: a mismatch (either
+//! direction) is blocker `axis_device_mismatch`, never an unknown device.
+//! `reference_stale`: a unit that is assigned to a different axis under the
+//! same boot_id must be re-referenced by this server (SET_REFERENCE accepted)
+//! before ARM, whatever its `POSITION_REFERENCED` flag says.
 //!
 //! # Decisions not spelled out in DESIGN.md
 //!
@@ -55,7 +76,7 @@
 //!   every axis's STATUS.target_count (MCU setpoint) is within
 //!   [`CENTER_TOLERANCE_COUNT`] of neutral.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -91,6 +112,8 @@ pub const CONFIG_RETRY: Duration = Duration::from_millis(1000);
 pub const FAULT_RESET_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Center move is complete within this many counts of neutral (at zero velocity).
 pub const CENTER_TOLERANCE_COUNT: f64 = 1.0;
+/// Units remembered for re-reference detection (`device_id → last axis`).
+const MAX_TRACKED_DEVICES: usize = 64;
 
 /// CONTROLLED_STOP `reason` byte (informational on the MCU).
 pub mod stop_reason {
@@ -112,6 +135,8 @@ pub mod admin_error {
     pub const AXIS_DISCONNECTED: &str = "axis_disconnected";
     pub const AXIS_NOT_SETTLED: &str = "axis_not_settled";
     pub const NOT_DISARMED: &str = "not_disarmed";
+    /// Two units select the same axis (DESIGN.md §10.2).
+    pub const AXIS_CONFLICT: &str = "axis_conflict";
 }
 
 // ------------------------------------------------------------------ inputs
@@ -119,7 +144,9 @@ pub mod admin_error {
 /// Event from an axis link (one task per USB port).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkEvent {
-    /// HELLO matched the `[[axis]]` with this device_id.
+    /// The port's MCU claims `axis` (HELLO `selected_axis`, or the `[[axis]]`
+    /// configured with its device_id when that is 0). Also sent again on a
+    /// repeated HELLO and after an axis change (preceded by `Disconnected`).
     Identified {
         axis: AxisId,
         hello: Hello,
@@ -156,8 +183,9 @@ pub enum LinkEvent {
         port: String,
         count: u64,
     },
-    /// A port that never became an axis link (unknown or duplicate device)
-    /// closed; clears its blocker. Additive to DESIGN.md §5.
+    /// A port that is not an axis's primary (unknown device, or a second
+    /// unit claiming an axis) closed; clears its blocker / claim. Additive
+    /// to DESIGN.md §5.
     PortClosed {
         port: String,
     },
@@ -234,6 +262,13 @@ pub struct SupervisorEvent {
     pub detail: serde_json::Value,
 }
 
+/// One port claiming an axis (`AxisSnapshot::claimants`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimantSnapshot {
+    pub port: String,
+    pub device_id: DeviceId,
+}
+
 /// One entry of `StatusSnapshot::axes` (DESIGN.md §7.2). STATUS-derived
 /// fields are `None` until the first STATUS of the current connection.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -242,8 +277,18 @@ pub struct AxisSnapshot {
     pub name: String,
     pub connected: bool,
     pub port: Option<String>,
-    /// From configuration.
+    /// The connected unit's device_id; the configured value when none.
     pub device_id: DeviceId,
+    /// Configured cross-check (0 = none).
+    pub expected_device_id: DeviceId,
+    /// How the primary was assigned: `"selected"` (MCU `selected_axis`),
+    /// `"config"` (device_id fallback), null when not connected.
+    pub assignment: Option<&'static str>,
+    /// Ports claiming this axis: the primary alone normally, two or more in
+    /// an axis conflict.
+    pub claimants: Vec<ClaimantSnapshot>,
+    /// The unit must be re-referenced by this server (DESIGN.md §10.2).
+    pub reference_stale: bool,
     pub boot_id: Option<BootId>,
     pub mcu_state: Option<McuState>,
     pub fault_code: Option<FaultCode>,
@@ -290,6 +335,8 @@ pub struct StatusSnapshot {
     pub session_epoch: u32,
     pub group_frame_id: u32,
     pub axes: Vec<AxisSnapshot>,
+    /// Axes claimed by two or more units (empty = no conflict).
+    pub axis_conflict: Vec<AxisId>,
     /// Always null: angles are not calibrated.
     pub measured_angles: Option<serde_json::Value>,
     pub physical_estop: &'static str,
@@ -368,8 +415,17 @@ enum Phase {
     },
 }
 
+/// A port whose MCU claims an axis (DESIGN.md §10.2).
+#[derive(Debug, Clone, PartialEq)]
+struct Claimant {
+    port: String,
+    /// Last HELLO (its `selected_axis` is kept current by the link).
+    hello: Hello,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AxisTrack {
+    /// A primary port is assigned (`port`, `hello`, STATUS are its).
     connected: bool,
     port: Option<String>,
     hello: Option<Hello>,
@@ -390,7 +446,8 @@ struct AxisTrack {
     configured_epoch: Option<u32>,
     config_rejected: Option<AckReason>,
     config_retry_at: Option<Instant>,
-    duplicate_ports: Vec<String>,
+    /// Every port claiming this axis, the primary included.
+    claimants: Vec<Claimant>,
     decode_errors: u64,
     reset_rejected: Option<AckReason>,
     /// ACKed the current group command.
@@ -420,6 +477,9 @@ impl AxisTrack {
     fn frame_lag(&self) -> Option<i64> {
         self.status
             .map(|s| i64::from(self.status_frame.wrapping_sub(s.last_applied_frame) as i32))
+    }
+    fn in_conflict(&self) -> bool {
+        self.claimants.len() >= 2
     }
     fn status_fault(&self) -> Option<FaultCode> {
         let s = self.status?;
@@ -464,6 +524,12 @@ pub struct Supervisor {
     axes: [AxisTrack; AXIS_COUNT],
     unknown_ports: BTreeMap<String, DeviceId>,
     host_decode_errors: u64,
+    /// Last axis each unit was primary for, with its boot_id (re-reference
+    /// detection, DESIGN.md §10.2).
+    last_assignment: BTreeMap<DeviceId, (BootId, AxisId)>,
+    /// Units (device_id, boot_id) that changed axis under one boot and were
+    /// not re-referenced by this server since.
+    stale_refs: BTreeSet<(DeviceId, BootId)>,
 
     phase: Phase,
     planner: Planner,
@@ -531,6 +597,8 @@ impl Supervisor {
             axes: Default::default(),
             unknown_ports: BTreeMap::new(),
             host_decode_errors: 0,
+            last_assignment: BTreeMap::new(),
+            stale_refs: BTreeSet::new(),
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             planner_settled: false,
@@ -610,12 +678,30 @@ impl Supervisor {
         self.fault_history.iter()
     }
 
-    /// The port that carries this axis's link (duplicates excluded).
+    /// The primary port of this axis (none while disconnected or in conflict).
     pub fn axis_port(&self, axis: AxisId) -> Option<&str> {
         self.axes
             .get(axis.index())
             .filter(|t| t.connected)
             .and_then(|t| t.port.as_deref())
+    }
+
+    /// Axes claimed by two or more units (DESIGN.md §10.2).
+    pub fn axis_conflict(&self) -> Vec<AxisId> {
+        (0..AXIS_COUNT)
+            .filter(|&i| self.axes[i].in_conflict())
+            .filter_map(AxisId::from_index)
+            .collect()
+    }
+
+    /// The connected unit on axis `i` changed axis under its current boot and
+    /// has not been re-referenced by this server since.
+    fn reference_stale(&self, i: usize) -> bool {
+        let t = &self.axes[i];
+        match (t.connected, t.hello, t.boot_id) {
+            (true, Some(h), Some(b)) => self.stale_refs.contains(&(h.device_id, b)),
+            _ => false,
+        }
     }
 
     /// Last measured spread of `last_applied_frame` across axes while ACTIVE.
@@ -648,18 +734,38 @@ impl Supervisor {
         let mut b = Vec::new();
         for (i, t) in self.axes.iter().enumerate() {
             let n = i + 1;
-            if self.device_ids[i].is_unassigned() {
-                b.push(format!(
-                    "device_id_unassigned: axis{n} has device_id 0 in config"
-                ));
-            }
             if !t.connected {
                 b.push(format!("not_connected: axis{n}"));
             }
-            if !t.duplicate_ports.is_empty() {
+            if t.in_conflict() {
+                let who: Vec<String> = t
+                    .claimants
+                    .iter()
+                    .map(|c| format!("{}({})", c.port, c.hello.device_id))
+                    .collect();
+                b.push(format!("axis_conflict: axis{n} claimed by {}", who.join(", ")));
+            }
+            // Cross-check against the configured device_id, both directions.
+            let expected = self.device_ids[i];
+            for c in &t.claimants {
+                let d = c.hello.device_id;
+                if !expected.is_unassigned() && d != expected {
+                    b.push(format!(
+                        "axis_device_mismatch: axis{n} device {d}, config expects {expected}"
+                    ));
+                }
+                if let Some(m) = (0..AXIS_COUNT)
+                    .find(|&m| m != i && !d.is_unassigned() && self.device_ids[m] == d)
+                {
+                    b.push(format!(
+                        "axis_device_mismatch: device {d} is configured as axis{} but selected axis{n}",
+                        m + 1
+                    ));
+                }
+            }
+            if self.reference_stale(i) {
                 b.push(format!(
-                    "duplicate_device: axis{n} device {} also identified on {:?}",
-                    self.device_ids[i], t.duplicate_ports
+                    "reference_stale: axis{n} re-reference required after axis change"
                 ));
             }
             if !self.operator_valid[i] {
@@ -750,7 +856,7 @@ impl Supervisor {
                 self.on_identified(axis, hello, port, now)
             }
             LinkEvent::UnknownDevice { port, device_id } => {
-                self.forget_duplicate_port(&port);
+                self.forget_port(&port, now);
                 self.event(
                     now,
                     "unknown_device",
@@ -778,7 +884,7 @@ impl Supervisor {
             },
             LinkEvent::PortClosed { port } => {
                 self.unknown_ports.remove(&port);
-                self.forget_duplicate_port(&port);
+                self.forget_port(&port, now);
             }
         }
         self.advance(now);
@@ -929,7 +1035,27 @@ impl Supervisor {
                     name: self.names[i].clone(),
                     connected: t.connected,
                     port: t.port.clone(),
-                    device_id: self.device_ids[i],
+                    device_id: t
+                        .hello
+                        .filter(|_| t.connected)
+                        .map_or(self.device_ids[i], |h| h.device_id),
+                    expected_device_id: self.device_ids[i],
+                    assignment: t.hello.filter(|_| t.connected).map(|h| {
+                        if h.selected_axis != 0 {
+                            "selected"
+                        } else {
+                            "config"
+                        }
+                    }),
+                    claimants: t
+                        .claimants
+                        .iter()
+                        .map(|c| ClaimantSnapshot {
+                            port: c.port.clone(),
+                            device_id: c.hello.device_id,
+                        })
+                        .collect(),
+                    reference_stale: self.reference_stale(i),
                     boot_id: t.boot_id,
                     mcu_state: t.mcu_state(),
                     fault_code: s.map(|s| s.fault_code),
@@ -976,6 +1102,7 @@ impl Supervisor {
             session_epoch: self.epoch,
             group_frame_id: self.group_frame_id,
             axes,
+            axis_conflict: self.axis_conflict(),
             measured_angles: None,
             physical_estop: "not_monitored",
             telemetry: None,
@@ -986,32 +1113,133 @@ impl Supervisor {
 
     fn on_identified(&mut self, axis: AxisId, hello: Hello, port: String, now: Instant) {
         let i = axis.index();
-        let expected = self.device_ids[i];
-        if expected.is_unassigned() || hello.device_id != expected {
-            // The link should not have matched it; treat as unknown.
-            self.unknown_ports.insert(port, hello.device_id);
+        self.unknown_ports.remove(&port);
+        self.note_claim(axis, &hello, now);
+        // A port claims one axis at a time.
+        for (j, t) in self.axes.iter_mut().enumerate() {
+            if j != i {
+                t.claimants.retain(|c| c.port != port);
+            }
+        }
+        let t = &mut self.axes[i];
+        match t.claimants.iter_mut().find(|c| c.port == port) {
+            Some(c) => c.hello = hello,
+            None => t.claimants.push(Claimant {
+                port: port.clone(),
+                hello,
+            }),
+        }
+        let is_primary = t.connected && t.port.as_deref() == Some(port.as_str());
+        if is_primary {
+            // Repeated HELLO of the primary (reboot detection below).
+            self.promote(i, hello, port, now);
             return;
         }
-        self.unknown_ports.remove(&port);
-        let t = &mut self.axes[i];
-        if t.connected && t.port.as_deref() != Some(port.as_str()) {
-            if !t.duplicate_ports.contains(&port) {
-                t.duplicate_ports.push(port.clone());
-            }
+        if t.connected || t.in_conflict() {
+            // Another unit claims an axis that has a primary, or joins an
+            // existing conflict. The primary is left alone here: while
+            // driving the rig is brought to rest first; when idle / latched
+            // `reconcile_claimants` demotes it (DESIGN.md §10.2).
             self.event(
                 now,
-                "duplicate_device",
-                serde_json::json!({"axis": axis, "port": port}),
+                "axis_conflict",
+                serde_json::json!({"axis": axis, "port": port, "device_id": hello.device_id,
+                    "primary": self.axes[i].port}),
             );
+            if self.is_armed() {
+                match self.phase {
+                    Phase::Arming { .. } => self.begin_disarm(now),
+                    Phase::Holding { .. } | Phase::Active { .. } => {
+                        self.begin_stop(stop_reason::ADMIN, now)
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
-        let rebooted = t.boot_id.is_some_and(|b| b != hello.boot_id);
-        let reconnect = !t.connected;
+        self.promote(i, hello, port, now);
+    }
+
+    /// Re-reference bookkeeping at claim time (DESIGN.md §10.2): the same unit
+    /// under the same boot_id claiming another axis than last time is stale
+    /// until this server's SET_REFERENCE is accepted or it reboots. The MCU
+    /// should drop POSITION_REFERENCED itself; this does not rely on it.
+    fn note_claim(&mut self, axis: AxisId, hello: &Hello, now: Instant) {
+        if let Some(&(b, prev)) = self.last_assignment.get(&hello.device_id) {
+            if b == hello.boot_id && prev != axis {
+                self.stale_refs.insert((hello.device_id, b));
+                self.event(
+                    now,
+                    "reference_stale",
+                    serde_json::json!({"axis": axis, "device_id": hello.device_id, "previous_axis": prev}),
+                );
+            }
+        }
+        // Both maps are bounded, but never at the expense of a unit that is
+        // still here: evicting a present unit would clear its `reference_stale`
+        // blocker or hide its next switch (fail closed; present units are at
+        // most one per port, so the maps stay bounded).
+        let present = self.present_device_ids();
+        if self.last_assignment.len() >= MAX_TRACKED_DEVICES
+            && !self.last_assignment.contains_key(&hello.device_id)
+        {
+            if let Some(k) = self
+                .last_assignment
+                .keys()
+                .find(|d| !present.contains(d))
+                .copied()
+            {
+                self.last_assignment.remove(&k);
+            }
+        }
+        self.last_assignment
+            .insert(hello.device_id, (hello.boot_id, axis));
+        if self.stale_refs.len() > MAX_TRACKED_DEVICES {
+            if let Some(k) = self
+                .stale_refs
+                .iter()
+                .find(|(d, _)| !present.contains(d))
+                .copied()
+            {
+                self.stale_refs.remove(&k);
+            }
+        }
+    }
+
+    /// device_ids of every unit currently identified on some port (primary or
+    /// claimant of any axis).
+    fn present_device_ids(&self) -> BTreeSet<DeviceId> {
+        self.axes
+            .iter()
+            .flat_map(|t| t.claimants.iter().map(|c| c.hello.device_id))
+            .chain(self.axes.iter().filter_map(|t| t.hello.as_ref().map(|h| h.device_id)))
+            .collect()
+    }
+
+    /// Make `port` the primary of axis `i` (a fresh connection, a repeated
+    /// HELLO of the current primary, or the claimant left after a conflict):
+    /// reboot / re-reference bookkeeping, then CONFIG — or HOST_FAULT while
+    /// latched. Never moves, arms or starts anything.
+    fn promote(&mut self, i: usize, hello: Hello, port: String, now: Instant) {
+        let Some(axis) = AxisId::from_index(i) else {
+            return;
+        };
+        let t = &mut self.axes[i];
+        // A reboot is the *same* unit with a new boot_id; another unit taking
+        // over the axis (after an axis change) is a reconnect, not a reboot.
+        let same_unit = t.hello.is_some_and(|h| h.device_id == hello.device_id);
+        let rebooted = same_unit && t.boot_id.is_some_and(|b| b != hello.boot_id);
+        let reconnect = !t.connected || !same_unit;
         t.connected = true;
         t.port = Some(port.clone());
         t.hello = Some(hello);
         t.boot_id = Some(hello.boot_id);
         t.identified_at = Some(now);
+        if rebooted {
+            // A new boot has no reference to be stale about.
+            self.stale_refs.retain(|(d, _)| *d != hello.device_id);
+        }
+        let t = &mut self.axes[i];
         if rebooted || reconnect {
             t.status = None;
             t.status_at = None;
@@ -1029,6 +1257,7 @@ impl Supervisor {
             now,
             "identified",
             serde_json::json!({"axis": axis, "port": port, "boot_id": hello.boot_id,
+                "selected_axis": hello.selected_axis, "device_id": hello.device_id,
                 "hash_match": hello.calibration_hash == self.hashes[i], "rebooted": rebooted}),
         );
         if rebooted && self.is_armed() {
@@ -1063,7 +1292,11 @@ impl Supervisor {
         if rebooted {
             t.configured_epoch = None;
             t.config_rejected = None;
+            if let Some(h) = t.hello {
+                self.stale_refs.retain(|(d, _)| *d != h.device_id);
+            }
         }
+        let t = &mut self.axes[i];
         t.boot_id = Some(status.boot_id);
         if status.flags & status_flags::CONFIGURED == 0 {
             t.configured_epoch = None;
@@ -1115,22 +1348,95 @@ impl Supervisor {
         if !t.connected {
             return;
         }
-        t.connected = false;
-        t.port = None;
-        t.status = None;
-        t.status_at = None;
-        t.configured_epoch = None;
-        t.group_ok = false;
-        self.pending.retain(|_, p| p.axis != i);
+        if let Some(port) = t.port.clone() {
+            t.claimants.retain(|c| c.port != port);
+        }
+        self.drop_primary(i);
         self.event(
             now,
             "disconnected",
             serde_json::json!({"axis": axis, "reason": reason}),
         );
         if self.is_armed() {
-            self.latch(RigFault::AxisDisconnected { axis }, Some(reason), now);
+            let fault = if reason.starts_with(crate::axis_link::reason::AXIS_CHANGED) {
+                RigFault::AxisChanged { axis }
+            } else {
+                RigFault::AxisDisconnected { axis }
+            };
+            self.latch(fault, Some(reason), now);
         } else if let Phase::Fault { reset: Some(_) } = self.phase {
             self.phase = Phase::Fault { reset: None };
+        }
+    }
+
+    /// Forget the primary of axis `i` (link gone or demoted by a conflict):
+    /// its STATUS, CONFIG state and outstanding requests are void.
+    fn drop_primary(&mut self, i: usize) {
+        let t = &mut self.axes[i];
+        t.connected = false;
+        t.port = None;
+        t.status = None;
+        t.status_at = None;
+        t.configured_epoch = None;
+        t.config_rejected = None;
+        t.group_ok = false;
+        self.pending.retain(|_, p| p.axis != i);
+        if let Some(q) = self.outbox.get_mut(i) {
+            q.clear();
+        }
+    }
+
+    /// A port that is not an axis's primary went away (or became unknown):
+    /// remove it from every claimant list. The remaining sole claimant of a
+    /// conflicted axis is promoted by `reconcile_claimants`.
+    fn forget_port(&mut self, port: &str, now: Instant) {
+        for i in 0..AXIS_COUNT {
+            if self.axes[i].connected && self.axes[i].port.as_deref() == Some(port) {
+                // Should have come as Disconnected; treat it as one.
+                self.on_disconnected(i, "port_closed".into(), now);
+            }
+            self.axes[i].claimants.retain(|c| c.port != port);
+        }
+    }
+
+    /// Idle / Fault only (DESIGN.md §10.2): two or more claimants → no
+    /// primary; exactly one and no primary → promote it.
+    ///
+    /// While latched, a primary that was being driven keeps its role until
+    /// the HOST_FAULT of this episode is ACKed (or times out): `drop_primary`
+    /// clears its outbox and the server routes nothing to a conflicted axis,
+    /// so demoting it first would lose the HOST_FAULT (the unit would only
+    /// stop on its own lease).
+    fn reconcile_claimants(&mut self, now: Instant) {
+        for i in 0..AXIS_COUNT {
+            let t = &self.axes[i];
+            if t.in_conflict() && t.connected {
+                let Some(axis) = AxisId::from_index(i) else {
+                    continue;
+                };
+                // Outstanding = sent this episode, not ACKed, not yet timed out
+                // (`expire_pending` does not re-send to a conflicted axis, so
+                // the deferral is bounded by one ACK_TIMEOUT).
+                let host_fault_outstanding = matches!(self.phase, Phase::Fault { .. })
+                    && t.host_fault_ack_ev.is_none()
+                    && t.host_fault_req.is_some_and(|id| self.pending.contains_key(&id));
+                if host_fault_outstanding {
+                    continue;
+                }
+                self.event(
+                    now,
+                    "axis_conflict",
+                    serde_json::json!({"axis": axis, "primary": t.port, "demoted": true}),
+                );
+                self.drop_primary(i);
+                // Like a disconnect: a FAULT_RESET in flight cannot complete.
+                if let Phase::Fault { reset: Some(_) } = self.phase {
+                    self.phase = Phase::Fault { reset: None };
+                }
+            } else if t.claimants.len() == 1 && !t.connected {
+                let c = t.claimants[0].clone();
+                self.promote(i, c.hello, c.port, now);
+            }
         }
     }
 
@@ -1172,6 +1478,13 @@ impl Supervisor {
                         t.config_rejected = None;
                     }
                     Purpose::FaultReset => self.axes[i].reset_rejected = None,
+                    Purpose::Reference => {
+                        // This server re-referenced the unit: no longer stale.
+                        let t = &self.axes[i];
+                        if let (Some(h), Some(b)) = (t.hello, t.boot_id) {
+                            self.stale_refs.remove(&(h.device_id, b));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1252,6 +1565,12 @@ impl Supervisor {
     }
 
     fn cmd_arm(&mut self, now: Instant) -> Result<Option<String>, AdminError> {
+        if !self.axis_conflict().is_empty() {
+            return Err(AdminError::new(
+                admin_error::AXIS_CONFLICT,
+                self.blockers(now),
+            ));
+        }
         match self.phase {
             Phase::Idle(RigState::ReadyToArm | RigState::BrakedDisarmed) => {}
             Phase::Idle(_) => {
@@ -1289,6 +1608,12 @@ impl Supervisor {
         source: ActiveSource,
         now: Instant,
     ) -> Result<Option<String>, AdminError> {
+        if !self.axis_conflict().is_empty() {
+            return Err(AdminError::new(
+                admin_error::AXIS_CONFLICT,
+                self.blockers(now),
+            ));
+        }
         match self.phase {
             Phase::Holding {
                 start: None,
@@ -1639,6 +1964,7 @@ impl Supervisor {
             Phase::Fault { reset: None } => {}
         }
         if matches!(self.phase, Phase::Idle(_) | Phase::Fault { .. }) {
+            self.reconcile_claimants(now);
             self.reconcile_config(now);
         }
         self.classify(now);
@@ -2073,17 +2399,17 @@ impl Supervisor {
             if let Some(p) = self.pending.remove(&id) {
                 let detail = serde_json::json!({"axis": p.axis + 1, "msg": msg_name(p.msg_type), "request_id": id});
                 self.event(now, "ack_timeout", detail);
-                let unconfirmed = self.axes.get(p.axis).is_some_and(|t| t.host_fault_req == Some(id));
+                // Re-send an unanswered HOST_FAULT while latched — except to a
+                // conflicted axis, whose primary is demoted instead (one
+                // attempt; see `reconcile_claimants`).
+                let unconfirmed = self
+                    .axes
+                    .get(p.axis)
+                    .is_some_and(|t| t.host_fault_req == Some(id) && !t.in_conflict());
                 if unconfirmed && matches!(self.phase, Phase::Fault { .. }) {
                     self.send_host_fault(p.axis, now);
                 }
             }
-        }
-    }
-
-    fn forget_duplicate_port(&mut self, port: &str) {
-        for t in &mut self.axes {
-            t.duplicate_ports.retain(|p| p != port);
         }
     }
 

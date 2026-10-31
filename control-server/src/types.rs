@@ -17,8 +17,10 @@ pub const VIRTUAL_MAX: f64 = 1023.0;
 
 /// Physical axis identifier, 1..=3. Index 0 of `[_; AXIS_COUNT]` arrays is axis 1.
 /// Axis 1 = right-front lift (motor #1), axis 2 = left lift (motor #2),
-/// axis 3 = rear yaw (motor #3). The ID comes from configuration that maps a
-/// MCU `device_id` to a physical axis, never from USB enumeration order.
+/// axis 3 = rear yaw (motor #3). The ID comes from the axis the operator
+/// selected on the MCU (HELLO `selected_axis`, protocol §1.1), with the
+/// configured `device_id` as a fallback / cross-check; never from USB
+/// enumeration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub struct AxisId(u8);
@@ -66,9 +68,10 @@ impl fmt::Display for AxisId {
 pub struct DeviceId(pub u64);
 
 impl DeviceId {
-    /// All-zero placeholder ("not yet read from the real MCU's HELLO").
-    /// Config validation accepts it (any number of times), but an axis with an
-    /// unassigned device_id can never be matched or ARMed.
+    /// All-zero placeholder: "no cross-check for this axis". Config validation
+    /// accepts it (any number of times). The axis is then assigned only from
+    /// the MCU's `selected_axis`; a HELLO with `selected_axis = 0` cannot be
+    /// matched to it.
     pub fn is_unassigned(&self) -> bool {
         self.0 == 0
     }
@@ -272,6 +275,9 @@ pub enum RigFault {
     AxisDisconnected { axis: AxisId },
     /// An axis rebooted (boot_id changed) while armed.
     AxisRebooted { axis: AxisId },
+    /// The MCU driving this axis switched to another axis while armed
+    /// (`selected_axis` changed; protocol §1.1, DESIGN §10.2).
+    AxisChanged { axis: AxisId },
     /// An axis left the state the supervisor commanded (e.g. dropped to DISARMED while ACTIVE).
     AxisStateMismatch { axis: AxisId, expected: McuState, actual: McuState },
     /// ARMING did not reach HOLDING on all axes in time.

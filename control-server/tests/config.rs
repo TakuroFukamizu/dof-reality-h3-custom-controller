@@ -312,3 +312,28 @@ fn huge_timing_values_rejected() {
     }
     assert_eq!(h3cs::config::bounded_ms(u64::MAX), std::time::Duration::from_millis(MAX_TIMING_MS));
 }
+
+#[test]
+fn sim_backend_report_selected_axis_defaults_to_true() {
+    let BackendConfig::Sim(b) = sim().backend else { panic!("sim backend") };
+    assert!(b.report_selected_axis);
+    let text = std::fs::read_to_string(SIM).unwrap();
+    assert!(text.contains("report_selected_axis = true"), "sim.toml documents the key");
+    let off = text.replace("report_selected_axis = true", "report_selected_axis = false");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&off).unwrap().backend else { panic!("sim backend") };
+    assert!(!b.report_selected_axis);
+    // Omitted → default true.
+    let omitted = text.replace("report_selected_axis = true", "");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else { panic!("sim backend") };
+    assert!(b.report_selected_axis);
+}
+
+#[test]
+fn all_zero_device_ids_mean_no_cross_check_and_validate() {
+    // Three axes without a device_id: valid (assignment comes from selected_axis).
+    let mut cfg = sim();
+    for a in &mut cfg.axes {
+        a.device_id = DeviceId(0);
+    }
+    cfg.validate().unwrap();
+}

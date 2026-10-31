@@ -5,11 +5,13 @@
 //! 1. **Handshake.** Only HELLO_REQ is written (every `timing.hello_retry_ms`)
 //!    until a HELLO arrives or `timing.hello_timeout_ms` passes. STATUS and
 //!    other frames seen before HELLO are ignored. The HELLO must carry
-//!    `protocol_version == 1`, the POSITION_MODE capability and a `device_id`
-//!    that exactly matches a non-placeholder `[[axis]]`. Otherwise the link
-//!    emits [`LinkEvent::UnknownDevice`], closes the port and stops: nothing
-//!    but HELLO_REQ is ever written to it. A handshake that ends without any
-//!    HELLO (timeout, EOF, write failure) emits [`LinkEvent::PortClosed`].
+//!    `protocol_version == 1` and the POSITION_MODE capability. The axis is
+//!    the MCU's `selected_axis` (1..=3, protocol §1.1); when it is 0 the
+//!    `[[axis]]` whose non-zero `device_id` matches is used instead. If
+//!    neither decides, the link emits [`LinkEvent::UnknownDevice`], closes the
+//!    port and stops: nothing but HELLO_REQ is ever written to it. A handshake
+//!    that ends without any HELLO (timeout, EOF, write failure) emits
+//!    [`LinkEvent::PortClosed`].
 //! 2. **Identified.** [`LinkEvent::Identified`] is emitted, then a reader and
 //!    a writer run concurrently. The reader forwards STATUS / ACK / FAULT_EVENT;
 //!    a HELLO with the same device_id is forwarded as `Identified` again (the
@@ -18,10 +20,19 @@
 //!    The writer sends admin messages first (bounded queue, [`ADMIN_QUEUE_LEN`])
 //!    and then the latest SET_POSITION (watch, never queued). Every write is
 //!    bounded by [`WRITE_TIMEOUT`].
-//! 3. **End.** Exactly one [`LinkEvent::Disconnected`] per identified link:
+//! 3. **Axis change** (DESIGN.md §10.1). The link remembers the axis it
+//!    currently claims. When AXIS_SELECT, a HELLO, or a STATUS with a non-zero
+//!    `selected_axis` resolves (same rule as the handshake) to another axis, it
+//!    emits `Disconnected { axis: old, reason: "axis_changed: <old>-><new>" }`
+//!    and then `Identified { axis: new, hello }` on the same port, where
+//!    `hello` is the last HELLO with the new `selected_axis` written in. A
+//!    value that resolves to no axis (0 without a configured `device_id`)
+//!    emits `Disconnected` (same reason, new = 0) then `UnknownDevice`, and
+//!    the port is closed. A value equal to the current axis is ignored.
+//! 4. **End.** Exactly one [`LinkEvent::Disconnected`] per identified axis:
 //!    EOF, read/write error, write timeout, STATUS silent for
-//!    `timing.axis_status_timeout_ms`, device change, or the handle closing it.
-//!    The port is closed when the task ends.
+//!    `timing.axis_status_timeout_ms`, device or axis change, or the handle
+//!    closing it. The port is closed when the task ends.
 //!
 //! # Decisions not spelled out in DESIGN.md
 //!
@@ -29,9 +40,11 @@
 //!   clears the unknown-device ARM blocker on `PortClosed`, so the server should
 //!   send it only once the port has physically gone (e.g. it disappeared from
 //!   [`list_serial_ports`]).
-//! - The link cannot tell that it is a *duplicate* of an already-connected
-//!   axis; events are tagged with the port so the server can drop events of a
-//!   port other than `Supervisor::axis_port(axis)`.
+//! - The link cannot tell that it *conflicts* with another port claiming the
+//!   same axis; events are tagged with the port so the server can drop events
+//!   of a port other than `Supervisor::axis_port(axis)`.
+//! - A STATUS whose `selected_axis` is 0 never changes the axis (old firmware
+//!   that does not fill the field keeps working through the config fallback).
 //! - Decode errors (COBS / CRC / version / length / unknown type, oversize
 //!   frames) are counted, never fatal, and reported as `DecodeErrors` deltas at
 //!   most every [`DECODE_REPORT_PERIOD`] and once more when the link ends.
@@ -75,6 +88,10 @@ pub mod reason {
     pub const EVENTS_CLOSED: &str = "events_closed";
     /// Prefix; detail is the new device_id.
     pub const DEVICE_CHANGED: &str = "device_changed";
+    /// Prefix; detail is `<old>-><new>` (axis numbers, 0 = none). Followed by
+    /// `Identified` for the new axis on the same port, or by `UnknownDevice`
+    /// when the new value resolves to no axis (DESIGN.md §10.1).
+    pub const AXIS_CHANGED: &str = "axis_changed";
     /// Prefix; detail says what was wrong with a mid-session HELLO.
     pub const BAD_HELLO: &str = "bad_hello";
     /// Prefix; detail is the I/O error.
@@ -265,6 +282,15 @@ enum HandshakeEnd {
     Shutdown,
 }
 
+/// How the reader of an identified link ended.
+enum ReadEnd {
+    /// `Disconnected { axis, reason }` is still to be emitted.
+    Disconnected(String),
+    /// The device left its axis for one the server cannot map: the reader
+    /// already emitted `Disconnected` for the old axis; emit `UnknownDevice`.
+    Unassigned { device_id: DeviceId, why: String },
+}
+
 struct Link {
     port: String,
     cfg: Arc<Config>,
@@ -272,6 +298,19 @@ struct Link {
     phase: Arc<Phase>,
     acc: FrameAccumulator,
     decode: DecodeStats,
+}
+
+/// What an identified link currently claims: the axis and the last HELLO
+/// (its `selected_axis` is kept in step with AXIS_SELECT / STATUS).
+#[derive(Debug, Clone, Copy)]
+struct Claimed {
+    axis: AxisId,
+    hello: Hello,
+}
+
+/// `Disconnected.reason` for an axis change (`axis_changed: 1->2`).
+pub fn axis_changed_reason(old: u8, new: u8) -> String {
+    format!("{}: {old}->{new}", reason::AXIS_CHANGED)
 }
 
 impl Link {
@@ -326,7 +365,8 @@ impl Link {
         };
 
         self.phase.set_axis(axis);
-        tracing::info!(port = %self.port, %axis, device_id = %hello.device_id, boot_id = hello.boot_id, "axis identified");
+        tracing::info!(port = %self.port, %axis, device_id = %hello.device_id, boot_id = hello.boot_id,
+            selected_axis = hello.selected_axis, "axis identified");
         self.report_decode_errors(None).await;
         self.emit(LinkEvent::Identified {
             axis,
@@ -336,31 +376,47 @@ impl Link {
         .await;
 
         let mut by_host = false;
-        let why = {
+        let mut claimed = Claimed { axis, hello };
+        let end = {
             let writer = write_loop(&mut wr, admin_rx, setpos_rx);
-            let reader = self.read_loop(axis, hello.device_id, &mut rd, pending);
+            let reader = self.read_loop(&mut claimed, &mut rd, pending);
             tokio::select! {
                 r = reader => r,
-                w = writer => w,
+                w = writer => ReadEnd::Disconnected(w),
                 _ = &mut shutdown_rx => {
                     by_host = true;
-                    reason::CLOSED_BY_HOST.to_string()
+                    ReadEnd::Disconnected(reason::CLOSED_BY_HOST.to_string())
                 }
             }
         };
+        // The axis may have changed since the handshake.
+        let axis = claimed.axis;
         self.phase.close();
         drop(rd);
         drop(wr);
-        tracing::info!(port = %self.port, %axis, reason = %why, "axis link closed");
-        let ev = LinkEvent::Disconnected { axis, reason: why };
-        if by_host {
-            // The server may be waiting on shutdown() and not draining events.
-            // Disconnected first: it matters more than the decode count.
-            let _ = self.events.try_send((self.port.clone(), ev));
-            self.flush_decode_try(Some(axis));
-        } else {
-            self.report_decode_errors(Some(axis)).await;
-            self.emit(ev).await;
+        match end {
+            ReadEnd::Disconnected(why) => {
+                tracing::info!(port = %self.port, %axis, reason = %why, "axis link closed");
+                let ev = LinkEvent::Disconnected { axis, reason: why };
+                if by_host {
+                    // The server may be waiting on shutdown() and not draining events.
+                    // Disconnected first: it matters more than the decode count.
+                    let _ = self.events.try_send((self.port.clone(), ev));
+                    self.flush_decode_try(Some(axis));
+                } else {
+                    self.report_decode_errors(Some(axis)).await;
+                    self.emit(ev).await;
+                }
+            }
+            ReadEnd::Unassigned { device_id, why } => {
+                tracing::warn!(port = %self.port, %device_id, "{why}; port closed");
+                self.report_decode_errors(None).await;
+                self.emit(LinkEvent::UnknownDevice {
+                    port: self.port.clone(),
+                    device_id,
+                })
+                .await;
+            }
         }
     }
 
@@ -424,7 +480,7 @@ impl Link {
         }
     }
 
-    /// Map a HELLO to a configured axis, or say why it cannot be used.
+    /// Check a HELLO and map it to an axis, or say why it cannot be used.
     fn match_hello(&self, h: &Hello) -> Result<AxisId, String> {
         if h.protocol_version != PROTOCOL_VERSION {
             return Err(format!(
@@ -435,22 +491,36 @@ impl Link {
         if h.capabilities & capabilities::POSITION_MODE == 0 {
             return Err("POSITION_MODE capability missing".into());
         }
+        self.resolve_axis(h.selected_axis, h.device_id)
+    }
+
+    /// The axis a device claims (DESIGN.md §10.1): `selected_axis` when it is
+    /// 1..=3, else the `[[axis]]` configured with this `device_id`.
+    fn resolve_axis(&self, selected_axis: u8, device_id: DeviceId) -> Result<AxisId, String> {
+        if let Some(axis) = AxisId::new(selected_axis) {
+            return Ok(axis);
+        }
+        if selected_axis != 0 {
+            return Err(format!("selected_axis {selected_axis} is not 0..=3"));
+        }
         self.cfg
             .axes
             .iter()
-            .find(|a| !a.device_id.is_unassigned() && a.device_id == h.device_id)
+            .find(|a| !a.device_id.is_unassigned() && a.device_id == device_id)
             .map(|a| a.axis_id)
-            .ok_or_else(|| format!("device_id {} is not in [[axis]]", h.device_id))
+            .ok_or_else(|| {
+                format!("selected_axis 0 and device_id {device_id} is not in [[axis]]")
+            })
     }
 
-    /// Reader + STATUS watchdog of an identified link. Returns the disconnect reason.
+    /// Reader + STATUS watchdog of an identified link. `claimed` is updated on
+    /// every axis change so the caller reports the end for the right axis.
     async fn read_loop<R>(
         &mut self,
-        axis: AxisId,
-        device_id: DeviceId,
+        claimed: &mut Claimed,
         rd: &mut R,
         pending: Vec<Vec<u8>>,
-    ) -> String
+    ) -> ReadEnd
     where
         R: AsyncRead + Unpin,
     {
@@ -464,23 +534,23 @@ impl Link {
         let mut frames = pending;
         loop {
             for f in std::mem::take(&mut frames) {
-                if let Err(why) = self
-                    .on_frame(axis, device_id, &f, watchdog.as_mut(), status_timeout)
+                if let Err(end) = self
+                    .on_frame(claimed, &f, watchdog.as_mut(), status_timeout)
                     .await
                 {
-                    return why;
+                    return end;
                 }
             }
             tokio::select! {
                 r = rd.read(&mut buf) => match r {
-                    Ok(0) => return reason::EOF.into(),
+                    Ok(0) => return ReadEnd::Disconnected(reason::EOF.into()),
                     Ok(n) => frames = self.push_bytes(buf.get(..n).unwrap_or_default()),
-                    Err(e) => return format!("{}: {e}", reason::READ_ERROR),
+                    Err(e) => return ReadEnd::Disconnected(format!("{}: {e}", reason::READ_ERROR)),
                 },
-                _ = &mut watchdog => return reason::STATUS_TIMEOUT.into(),
+                _ = &mut watchdog => return ReadEnd::Disconnected(reason::STATUS_TIMEOUT.into()),
                 _ = report.tick() => {
-                    if !self.report_decode_errors(Some(axis)).await {
-                        return reason::EVENTS_CLOSED.into();
+                    if !self.report_decode_errors(Some(claimed.axis)).await {
+                        return ReadEnd::Disconnected(reason::EVENTS_CLOSED.into());
                     }
                 }
             }
@@ -489,36 +559,68 @@ impl Link {
 
     async fn on_frame(
         &mut self,
-        axis: AxisId,
-        device_id: DeviceId,
+        claimed: &mut Claimed,
         f: &[u8],
         watchdog: std::pin::Pin<&mut tokio::time::Sleep>,
         status_timeout: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReadEnd> {
         let ev = match decode_mcu_frame(f) {
             Ok(McuMsg::Status(status)) => {
                 let received_at = Instant::now();
                 watchdog.reset(received_at + status_timeout);
+                // (c) the MCU switched and AXIS_SELECT was lost: STATUS says so.
+                if status.selected_axis != 0 && status.selected_axis != claimed.hello.selected_axis {
+                    self.switch_axis(claimed, status.selected_axis).await?;
+                }
                 LinkEvent::Status {
-                    axis,
+                    axis: claimed.axis,
                     status,
                     received_at,
                 }
             }
-            Ok(McuMsg::Ack(ack)) => LinkEvent::Ack { axis, ack },
-            Ok(McuMsg::FaultEvent(ev)) => LinkEvent::FaultEvent { axis, ev },
+            Ok(McuMsg::Ack(ack)) => LinkEvent::Ack {
+                axis: claimed.axis,
+                ack,
+            },
+            Ok(McuMsg::FaultEvent(ev)) => LinkEvent::FaultEvent {
+                axis: claimed.axis,
+                ev,
+            },
             Ok(McuMsg::Hello(h)) => {
-                if h.device_id != device_id {
-                    return Err(format!("{}: {}", reason::DEVICE_CHANGED, h.device_id));
+                if h.device_id != claimed.hello.device_id {
+                    return Err(ReadEnd::Disconnected(format!(
+                        "{}: {}",
+                        reason::DEVICE_CHANGED,
+                        h.device_id
+                    )));
                 }
-                if let Err(why) = self.match_hello(&h) {
-                    return Err(format!("{}: {why}", reason::BAD_HELLO));
+                // (b) a HELLO naming another axis switches; the same axis is
+                // forwarded as Identified again (reboot detection).
+                claimed.hello = h;
+                let new = match self.match_hello(&h) {
+                    Ok(axis) => axis,
+                    Err(why) if h.selected_axis == 0 => {
+                        return Err(self.unassign(claimed, why).await);
+                    }
+                    Err(why) => {
+                        return Err(ReadEnd::Disconnected(format!("{}: {why}", reason::BAD_HELLO)));
+                    }
+                };
+                if new != claimed.axis {
+                    self.change_axis(claimed, new).await?;
                 }
                 LinkEvent::Identified {
-                    axis,
+                    axis: claimed.axis,
                     hello: h,
                     port: self.port.clone(),
                 }
+            }
+            Ok(McuMsg::AxisSelect(sel)) => {
+                // (a) same value → ignore; otherwise re-identify on this port.
+                if sel.selected_axis != claimed.hello.selected_axis {
+                    self.switch_axis(claimed, sel.selected_axis).await?;
+                }
+                return Ok(());
             }
             Ok(McuMsg::ClockSyncReply(_)) => return Ok(()),
             Err(_) => {
@@ -529,7 +631,68 @@ impl Link {
         if self.emit(ev).await {
             Ok(())
         } else {
-            Err(reason::EVENTS_CLOSED.into())
+            Err(ReadEnd::Disconnected(reason::EVENTS_CLOSED.into()))
+        }
+    }
+
+    /// Apply a new `selected_axis` seen in AXIS_SELECT or STATUS: resolve it
+    /// and, when the axis differs, emit `Disconnected` + `Identified`.
+    async fn switch_axis(&mut self, claimed: &mut Claimed, selected_axis: u8) -> Result<(), ReadEnd> {
+        claimed.hello.selected_axis = selected_axis;
+        let new = match self.resolve_axis(selected_axis, claimed.hello.device_id) {
+            Ok(axis) => axis,
+            Err(why) => return Err(self.unassign(claimed, why).await),
+        };
+        if new == claimed.axis {
+            return Ok(());
+        }
+        self.change_axis(claimed, new).await?;
+        let ev = LinkEvent::Identified {
+            axis: claimed.axis,
+            hello: claimed.hello,
+            port: self.port.clone(),
+        };
+        if self.emit(ev).await {
+            Ok(())
+        } else {
+            Err(ReadEnd::Disconnected(reason::EVENTS_CLOSED.into()))
+        }
+    }
+
+    /// `Disconnected` for the old axis, then claim `new` (the caller emits
+    /// `Identified`).
+    async fn change_axis(&mut self, claimed: &mut Claimed, new: AxisId) -> Result<(), ReadEnd> {
+        let old = claimed.axis;
+        tracing::info!(port = %self.port, %old, %new, "axis changed");
+        let ok = self
+            .emit(LinkEvent::Disconnected {
+                axis: old,
+                reason: axis_changed_reason(old.get(), new.get()),
+            })
+            .await;
+        if !ok {
+            return Err(ReadEnd::Disconnected(reason::EVENTS_CLOSED.into()));
+        }
+        claimed.axis = new;
+        self.phase.set_axis(new);
+        Ok(())
+    }
+
+    /// The device no longer claims any axis the server can map: `Disconnected`
+    /// for the old axis now; the caller ends the link with `UnknownDevice`.
+    async fn unassign(&mut self, claimed: &mut Claimed, why: String) -> ReadEnd {
+        let old = claimed.axis;
+        // Refuse sends before the supervisor learns of it.
+        self.phase.close();
+        let _ = self
+            .emit(LinkEvent::Disconnected {
+                axis: old,
+                reason: axis_changed_reason(old.get(), 0),
+            })
+            .await;
+        ReadEnd::Unassigned {
+            device_id: claimed.hello.device_id,
+            why,
         }
     }
 

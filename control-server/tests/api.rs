@@ -366,11 +366,12 @@ fn assert_keys(v: &Value, keys: &[&str], what: &str) {
 const STATUS_KEYS: &[&str] = &[
     "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
     "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
-    "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "measured_angles",
+    "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "axis_conflict", "measured_angles",
     "physical_estop", "telemetry",
 ];
 const AXIS_KEYS: &[&str] = &[
-    "axis_id", "name", "connected", "port", "device_id", "boot_id", "mcu_state", "fault_code", "configured",
+    "axis_id", "name", "connected", "port", "device_id", "expected_device_id", "assignment", "claimants",
+    "reference_stale", "boot_id", "mcu_state", "fault_code", "configured",
     "referenced", "calibration_valid", "actual_count", "target_count", "velocity_count_s",
     "following_error_count", "pwm_permille", "power_on_cmd", "brake_release_cmd", "power_controller", "current_a",
     "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count",
@@ -653,4 +654,85 @@ async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
     .layer(MockConnectInfo("192.168.1.20:50000".parse::<std::net::SocketAddr>().unwrap()));
     let (st, body) = call(&lan, req("GET", "/v1/events", &[], "")).await;
     assert_eq!((st, body["error"].as_str()), (StatusCode::FORBIDDEN, Some("loopback_only")));
+}
+
+// ------------------------------------------------------------------ axis conflict (DESIGN §10)
+
+/// Serve a router on a loopback port (WebSocket tests need real TCP).
+async fn serve(app: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn pose_and_gain_are_rejected_axis_conflict_without_reaching_the_intake() {
+    let cfg = Arc::new(sim_cfg());
+    let (admin_tx, _admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
+    let (pose_tx, pose_rx) = watch::channel(None);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    snap.axis_conflict = vec![h3cs::types::AxisId::new(2).unwrap()];
+    let (status_tx, status_rx) = watch::channel(Arc::new(snap.clone()));
+    let session = Arc::new(Mutex::new(PoseIntake::new()));
+    let state = AppState::new(cfg, session.clone(), Arc::new(pose_tx), admin_tx, status_rx, TOKEN.into(), shutdown_rx);
+    let addr = serve(api::router(state)).await;
+
+    let id = new_session(addr).await;
+    let mut ws = ws_connect(addr, &id).await;
+    ws_send(&mut ws, pose_json(&id, 1, 1, 0.1, 0.0, 0.0, 0.3)).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], false);
+    assert_eq!(ack["reason"], "axis_conflict");
+    assert_eq!(ack["seq"], 1);
+    assert_eq!(ack["fresh"], false, "freshness never extended");
+    let gain = serde_json::json!({"type": "gain", "protocol": 1, "source_session": id, "seq": 2, "gain": 0.2}).to_string();
+    ws_send(&mut ws, gain).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
+    assert!(pose_rx.borrow().is_none(), "nothing stored for the supervisor");
+    {
+        let s = session.lock().unwrap();
+        assert!(s.latest().is_none());
+        assert!(!s.is_fresh(Instant::now()));
+    }
+    // The status pushed on the socket shows the conflict.
+    let st = next_status(&mut ws).await;
+    assert_eq!(st["axis_conflict"], serde_json::json!([2]));
+
+    // Conflict resolved: the same client is accepted again (seq continues).
+    snap.axis_conflict.clear();
+    status_tx.send_replace(Arc::new(snap));
+    ws_send(&mut ws, pose_json(&id, 3, 1, 0.1, 0.0, 0.0, 0.3)).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert!(pose_rx.borrow().is_some());
+}
+
+#[tokio::test]
+async fn arm_start_center_pass_the_supervisors_axis_conflict_as_409() {
+    fn conflict(cmd: &AdminCmd) -> Result<AdminOk, AdminError> {
+        match cmd {
+            AdminCmd::Arm | AdminCmd::Start | AdminCmd::Center => Err(AdminError {
+                error: "axis_conflict".into(),
+                blockers: vec!["axis_conflict: axis2 claimed by sim:3(5131000000000002), sim:2(5131000000000001)".into()],
+            }),
+            _ => Ok(AdminOk { rig_state: RigState::Offline, note: Some("not driving".into()) }),
+        }
+    }
+    let s = stub(sim_cfg(), Some(conflict));
+    let b = bearer();
+    for path in ["/v1/arm", "/v1/start", "/v1/center"] {
+        let (st, body) = call(&s.app, req("POST", path, &[("authorization", &b)], "")).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{path}: {body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "axis_conflict");
+        assert!(body["blockers"][0].as_str().unwrap().starts_with("axis_conflict: axis2"), "{body}");
+    }
+    // Stop (no token) is unaffected.
+    let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
+    assert_eq!((st, body["ok"].as_bool()), (StatusCode::OK, Some(true)));
 }

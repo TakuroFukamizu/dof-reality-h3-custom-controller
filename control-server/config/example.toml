@@ -43,12 +43,13 @@ center_speed_fraction = 0.25
 
 [backend]
 kind = "serial"
-# HELLO の device_id で軸を照合する。ポート番号の順番には依存しない。
+# 軸は各 CoreS3 で選択した系統（HELLO / STATUS の selected_axis、protocol.md §1.1）で
+# 決まる。ポート番号の順番には依存しない。下の device_id は照合用。
 ports = ["/dev/cu.usbmodem1101", "/dev/cu.usbmodem1201", "/dev/cu.usbmodem1301"]
 
 [[axis]]
 axis_id = 1
-device_id = "0000000000000000"   # 実機の HELLO で確認して記入
+device_id = "0000000000000000"   # 照合用（0 = 照合しない）。実機の HELLO の値を書くと、別の個体がこの系統を選んだとき ARM しない（axis_device_mismatch）
 name = "右手前リフト (motor #1)"
 calibration_valid = false
 # 2026-10-25 無負荷・1 測定点。水平付近を 0 とした値。向き（旧仮想 0→1023 で上がるか下がるか）は未確認
@@ -67,7 +68,7 @@ overspeed_count_s = 3500
 
 [[axis]]
 axis_id = 2
-device_id = "0000000000000000"   # 未記入（重複・未知の device_id では ARM 不可）
+device_id = "0000000000000000"   # 照合用（0 = 照合しない）。同じ系統を 2 台が選ぶと ARM 不可（axis_conflict）
 name = "左リフト (motor #2)"
 calibration_valid = false
 # 未測定の仮値（小さく取る）
@@ -86,7 +87,7 @@ overspeed_count_s = 2000
 
 [[axis]]
 axis_id = 3
-device_id = "0000000000000000"
+device_id = "0000000000000000"   # 照合用（0 = 照合しない）
 name = "後部ヨー (motor #3)"
 calibration_valid = false
 # 未測定の仮値（小さく取る）

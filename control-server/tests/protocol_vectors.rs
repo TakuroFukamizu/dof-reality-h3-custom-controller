@@ -158,7 +158,7 @@ fn vectors() -> Vec<Vector> {
             msg: Msg::Mcu(McuMsg::Hello(Hello {
                 request_id: 1,
                 protocol_version: PROTOCOL_VERSION,
-                axis_id_hint: 0,
+                selected_axis: 1, // byte 5: the unit selected axis 1
                 mcu_state: 1, // DISARMED
                 device_id: DeviceId(0x5131_0000_0000_0001),
                 boot_id: BOOT_ID,
@@ -166,8 +166,8 @@ fn vectors() -> Vec<Vector> {
                 capabilities: capabilities::POSITION_MODE,
                 calibration_hash: 0,
             })),
-            frame_hex: "01 81 20 00 01 00 00 00 01 00 01 00 01 00 00 00 00 00 31 51 EF CD AB 89 00 01 00 00 01 00 00 00 00 00 00 00 78 8D",
-            wire_hex: "04 01 81 20 02 01 01 01 02 01 02 01 02 01 01 01 01 01 07 31 51 EF CD AB 89 02 01 01 02 01 01 01 01 01 01 01 03 78 8D 00",
+            frame_hex: "01 81 20 00 01 00 00 00 01 01 01 00 01 00 00 00 00 00 31 51 EF CD AB 89 00 01 00 00 01 00 00 00 00 00 00 00 1E 98",
+            wire_hex: "04 01 81 20 02 01 01 01 04 01 01 01 02 01 01 01 01 01 07 31 51 EF CD AB 89 02 01 01 02 01 01 01 01 01 01 01 03 1E 98 00",
         },
         Vector {
             title: "ACK ACCEPTED",
@@ -197,6 +197,7 @@ fn vectors() -> Vec<Vector> {
                 boot_id: BOOT_ID,
                 mcu_time_us: 1_234_567_890,
                 mcu_state: 4, // ACTIVE
+                selected_axis: 1, // byte 13 (was reserved): axis 1 (matches POWER_CONTROLLER in flags)
                 fault_code: FaultCode::None,
                 flags: 0x001F, // POWER_ON_CMD|BRAKE_RELEASE_CMD|POSITION_REFERENCED|CONFIGURED|POWER_CONTROLLER
                 pwm_permille: -250,
@@ -211,8 +212,8 @@ fn vectors() -> Vec<Vector> {
                 rx_error_count: 1,
                 stale_drop_count: 2,
             })),
-            frame_hex: "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 00 00 00 1F 00 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 C3 5C",
-            wire_hex: "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 02 04 01 01 02 1F 10 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 C3 5C 00",
+            frame_hex: "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 1F 00 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 49 36",
+            wire_hex: "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 02 1F 10 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 49 36 00",
         },
         Vector {
             title: "FAULT_EVENT",
@@ -236,6 +237,17 @@ fn vectors() -> Vec<Vector> {
             })),
             frame_hex: "01 85 1C 00 09 00 00 00 40 42 0F 00 00 00 00 00 40 4B 4C 00 00 00 00 00 B8 4B 4C 00 00 00 00 00 A9 A7",
             wire_hex: "04 01 85 1C 02 09 01 01 04 40 42 0F 01 01 01 01 04 40 4B 4C 01 01 01 01 04 B8 4B 4C 01 01 01 01 03 A9 A7 00",
+        },
+        Vector {
+            title: "AXIS_SELECT",
+            msg: Msg::Mcu(McuMsg::AxisSelect(AxisSelect {
+                boot_id: BOOT_ID,
+                selected_axis: 2,
+                prev_selected_axis: 1,
+                mcu_state: 1, // DISARMED
+            })),
+            frame_hex: "01 86 08 00 EF CD AB 89 02 01 01 00 32 C1",
+            wire_hex: "04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00",
         },
     ]
 }

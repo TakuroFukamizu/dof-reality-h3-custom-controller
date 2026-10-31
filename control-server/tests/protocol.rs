@@ -179,11 +179,11 @@ const ALL_REASONS: [AckReason; 8] = [
 ];
 
 fn rand_mcu(r: &mut Rng) -> McuMsg {
-    match r.below(5) {
+    match r.below(6) {
         0 => McuMsg::Hello(Hello {
             request_id: r.edgy_u32(),
             protocol_version: r.u8(),
-            axis_id_hint: r.u8(),
+            selected_axis: r.u8(),
             mcu_state: r.u8(),
             device_id: DeviceId(r.edgy_u64()),
             boot_id: r.edgy_u32(),
@@ -201,6 +201,7 @@ fn rand_mcu(r: &mut Rng) -> McuMsg {
             boot_id: r.edgy_u32(),
             mcu_time_us: r.edgy_u64(),
             mcu_state: r.u8(),
+            selected_axis: r.u8(),
             fault_code: ALL_FAULTS[r.below(ALL_FAULTS.len() as u64) as usize],
             flags: r.u16(),
             pwm_permille: r.u16() as i16,
@@ -222,11 +223,17 @@ fn rand_mcu(r: &mut Rng) -> McuMsg {
             mcu_state_before: r.u8(),
             actual_count: r.edgy_i32(),
         }),
-        _ => McuMsg::ClockSyncReply(ClockSyncReply {
+        4 => McuMsg::ClockSyncReply(ClockSyncReply {
             request_id: r.edgy_u32(),
             pc_time_us: r.edgy_u64(),
             mcu_rx_us: r.edgy_u64(),
             mcu_tx_us: r.edgy_u64(),
+        }),
+        _ => McuMsg::AxisSelect(AxisSelect {
+            boot_id: r.edgy_u32(),
+            selected_axis: r.u8(),
+            prev_selected_axis: r.u8(),
+            mcu_state: r.u8(),
         }),
     }
 }
@@ -488,6 +495,7 @@ fn sample_status() -> McuMsg {
         boot_id: 0xDEADBEEF,
         mcu_time_us: 123_456_789,
         mcu_state: 3,
+        selected_axis: 2,
         fault_code: FaultCode::None,
         flags: 0b1111,
         pwm_permille: -250,
@@ -700,8 +708,8 @@ fn unknown_type_rejected_including_cross_direction() {
         Err(DecodeError::UnknownType(0x00))
     );
     assert_eq!(
-        McuMsg::decode_payload(0x86, &[]),
-        Err(DecodeError::UnknownType(0x86))
+        McuMsg::decode_payload(0x87, &[]),
+        Err(DecodeError::UnknownType(0x87))
     );
 }
 
@@ -727,6 +735,7 @@ fn payload_length_tables_match_spec() {
         (STATUS, 56),
         (FAULT_EVENT, 20),
         (CLOCK_SYNC_REPLY, 28),
+        (AXIS_SELECT, 8),
     ];
     let mut n_host = 0;
     let mut n_mcu = 0;
@@ -857,7 +866,7 @@ fn reserved_fields_written_zero_and_ignored_on_decode() {
     let hello = McuMsg::Hello(Hello {
         request_id: u32::MAX,
         protocol_version: 0xFF,
-        axis_id_hint: 0xFF,
+        selected_axis: 0xFF,
         mcu_state: 0xFF,
         device_id: DeviceId(u64::MAX),
         boot_id: u32::MAX,
@@ -873,7 +882,15 @@ fn reserved_fields_written_zero_and_ignored_on_decode() {
         mcu_state_before: 0xFF,
         actual_count: -1,
     });
-    let mcu_cases: [(McuMsg, &[usize]); 3] = [(hello, &[7, 23]), (st, &[13]), (fe, &[15])];
+    let sel = McuMsg::AxisSelect(AxisSelect {
+        boot_id: u32::MAX,
+        selected_axis: 0xFF,
+        prev_selected_axis: 0xFF,
+        mcu_state: 0xFF,
+    });
+    // STATUS offset 13 is `selected_axis` since protocol §1.1 (no longer reserved).
+    let mcu_cases: [(McuMsg, &[usize]); 3] = [(hello, &[7, 23]), (fe, &[15]), (sel, &[7])];
+    assert_eq!(st.encode_payload()[13], 2, "STATUS byte 13 carries selected_axis");
     for (m, reserved) in mcu_cases {
         let mut p = m.encode_payload();
         for &i in reserved {
@@ -882,6 +899,41 @@ fn reserved_fields_written_zero_and_ignored_on_decode() {
         }
         assert_eq!(McuMsg::decode_payload(m.msg_type(), &p), Ok(m));
     }
+}
+
+#[test]
+fn axis_select_layout_and_length() {
+    // protocol §4: 0x86, 8 bytes: u32 boot_id / u8 selected_axis / u8 prev / u8 mcu_state / u8 reserved.
+    assert_eq!(mcu_payload_len(msg_type::AXIS_SELECT), Some(8));
+    let m = McuMsg::AxisSelect(AxisSelect {
+        boot_id: 0x89AB_CDEF,
+        selected_axis: 2,
+        prev_selected_axis: 1,
+        mcu_state: 1,
+    });
+    assert_eq!(m.msg_type(), 0x86);
+    assert_eq!(m.encode_payload(), [0xEF, 0xCD, 0xAB, 0x89, 2, 1, 1, 0]);
+    mcu_rt(m);
+    // Wrong length is rejected, never panics.
+    assert!(matches!(
+        McuMsg::decode_payload(msg_type::AXIS_SELECT, &[0u8; 7]),
+        Err(DecodeError::BadPayloadLen { msg_type: 0x86, expected: 8, got: 7 })
+    ));
+    assert!(McuMsg::decode_payload(msg_type::AXIS_SELECT, &[]).is_err());
+}
+
+#[test]
+fn status_selected_axis_is_byte_13_and_old_frames_decode_as_zero() {
+    let McuMsg::Status(s) = sample_status() else { unreachable!() };
+    let m = McuMsg::Status(Status { selected_axis: 3, ..s });
+    let mut p = m.encode_payload();
+    assert_eq!(p[13], 3);
+    // A frame from firmware that still writes reserved = 0 decodes with selected_axis 0.
+    p[13] = 0;
+    assert_eq!(
+        McuMsg::decode_payload(msg_type::STATUS, &p),
+        Ok(McuMsg::Status(Status { selected_axis: 0, ..s }))
+    );
 }
 
 // ---------- round trips ----------
@@ -966,7 +1018,7 @@ fn round_trip_every_mcu_message_edge_values() {
         mcu_rt(McuMsg::Hello(Hello {
             request_id: u,
             protocol_version: b,
-            axis_id_hint: b,
+            selected_axis: b,
             mcu_state: b,
             device_id: DeviceId(w),
             boot_id: u,
@@ -990,6 +1042,7 @@ fn round_trip_every_mcu_message_edge_values() {
                     boot_id: u,
                     mcu_time_us: w,
                     mcu_state: b,
+                    selected_axis: b,
                     fault_code: f,
                     flags: h,
                     pwm_permille: pwm,
@@ -1020,6 +1073,12 @@ fn round_trip_every_mcu_message_edge_values() {
             pc_time_us: w,
             mcu_rx_us: w,
             mcu_tx_us: w,
+        }));
+        mcu_rt(McuMsg::AxisSelect(AxisSelect {
+            boot_id: u,
+            selected_axis: b,
+            prev_selected_axis: b.wrapping_sub(1),
+            mcu_state: b,
         }));
     }
 }

@@ -34,6 +34,11 @@
 //! - A WS text message longer than `max_body_bytes`, a binary message or
 //!   malformed JSON gets a `bad_message` ack (seq null); the connection stays
 //!   open. Frames above [`ws_hard_limit`] close the connection.
+//! - While the latest status snapshot lists an `axis_conflict` (two MCUs
+//!   selecting the same axis, DESIGN.md §10), every pose / gain message is
+//!   acked `axis_conflict` before it reaches [`PoseIntake`]: nothing is stored
+//!   and freshness is not extended. `/v1/arm`, `/v1/start`, `/v1/center` get
+//!   the supervisor's 409 `axis_conflict`; stop / disarm / fault are unaffected.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -546,6 +551,10 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
     };
     if pinned.is_some_and(|p| p != msg_session) {
         return AckMsg::rejected(Some(seq), RejectReason::StaleSession, false);
+    }
+    if !st.inner.status_rx.borrow().axis_conflict.is_empty() {
+        // Not handed to the intake: no pose stored, no freshness extension.
+        return AckMsg::rejected(Some(seq), RejectReason::AxisConflict, s.is_fresh(recv_at));
     }
     let result = match &msg {
         ClientMsg::Pose(p) => s

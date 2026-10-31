@@ -38,6 +38,7 @@ pub mod msg_type {
     pub const STATUS: u8 = 0x83;
     pub const FAULT_EVENT: u8 = 0x84;
     pub const CLOCK_SYNC_REPLY: u8 = 0x85;
+    pub const AXIS_SELECT: u8 = 0x86;
 }
 
 /// ACK result (protocol §3.3).
@@ -108,8 +109,10 @@ pub struct SetPosition {
 pub struct Hello {
     pub request_id: u32,
     pub protocol_version: u8,
-    /// MCU-local hint only; the server never trusts it for axis mapping.
-    pub axis_id_hint: u8,
+    /// Axis (1..=3) the operator selected on the MCU, 0 = none yet. The server
+    /// assigns the port from this (protocol §1.1); `device_id` is only a
+    /// configured cross-check.
+    pub selected_axis: u8,
     /// Raw MCU state byte (see [`crate::types::McuState::from_u8`]).
     pub mcu_state: u8,
     pub device_id: DeviceId,
@@ -133,6 +136,8 @@ pub struct Status {
     pub mcu_time_us: u64,
     /// Raw MCU state byte (see [`crate::types::McuState::from_u8`]).
     pub mcu_state: u8,
+    /// Same value as HELLO (offset 13, was reserved; old firmware sends 0).
+    pub selected_axis: u8,
     pub fault_code: FaultCode,
     pub flags: u16,
     pub pwm_permille: i16,
@@ -156,6 +161,19 @@ pub struct FaultEvent {
     pub fault_code: FaultCode,
     pub mcu_state_before: u8,
     pub actual_count: Counts,
+}
+
+/// Sent once when the operator switches the axis on the MCU (protocol §1.1,
+/// §4 `0x86`). No ACK. The PC also notices the switch from the next HELLO /
+/// STATUS `selected_axis`, so a lost AXIS_SELECT is caught up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AxisSelect {
+    pub boot_id: u32,
+    /// New value (1..=3, 0 = none).
+    pub selected_axis: u8,
+    pub prev_selected_axis: u8,
+    /// Raw MCU state byte at the switch (DISARMED under the MCU rules).
+    pub mcu_state: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -217,6 +235,7 @@ pub enum McuMsg {
     Status(Status),
     FaultEvent(FaultEvent),
     ClockSyncReply(ClockSyncReply),
+    AxisSelect(AxisSelect),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -307,6 +326,7 @@ pub const fn mcu_payload_len(msg_type: u8) -> Option<usize> {
         STATUS => 56,
         FAULT_EVENT => 20,
         CLOCK_SYNC_REPLY => 28,
+        AXIS_SELECT => 8,
         _ => return None,
     })
 }
@@ -599,6 +619,7 @@ impl McuMsg {
             McuMsg::Status(_) => t::STATUS,
             McuMsg::FaultEvent(_) => t::FAULT_EVENT,
             McuMsg::ClockSyncReply(_) => t::CLOCK_SYNC_REPLY,
+            McuMsg::AxisSelect(_) => t::AXIS_SELECT,
         }
     }
 
@@ -609,7 +630,7 @@ impl McuMsg {
             McuMsg::Hello(h) => w
                 .u32(h.request_id)
                 .u8(h.protocol_version)
-                .u8(h.axis_id_hint)
+                .u8(h.selected_axis)
                 .u8(h.mcu_state)
                 .u8(0)
                 .u64(h.device_id.0)
@@ -629,7 +650,7 @@ impl McuMsg {
                 .u32(s.boot_id)
                 .u64(s.mcu_time_us)
                 .u8(s.mcu_state)
-                .u8(0)
+                .u8(s.selected_axis)
                 .u16(s.fault_code.to_u16())
                 .u16(s.flags)
                 .i16(s.pwm_permille)
@@ -655,6 +676,12 @@ impl McuMsg {
                 .u64(c.pc_time_us)
                 .u64(c.mcu_rx_us)
                 .u64(c.mcu_tx_us),
+            McuMsg::AxisSelect(a) => w
+                .u32(a.boot_id)
+                .u8(a.selected_axis)
+                .u8(a.prev_selected_axis)
+                .u8(a.mcu_state)
+                .u8(0),
         };
         w.finish()
     }
@@ -670,7 +697,7 @@ impl McuMsg {
             t::HELLO => {
                 let request_id = r.u32()?;
                 let protocol_version = r.u8()?;
-                let axis_id_hint = r.u8()?;
+                let selected_axis = r.u8()?;
                 let mcu_state = r.u8()?;
                 r.skip(1)?;
                 let device_id = DeviceId(r.u64()?);
@@ -680,7 +707,7 @@ impl McuMsg {
                 McuMsg::Hello(Hello {
                     request_id,
                     protocol_version,
-                    axis_id_hint,
+                    selected_axis,
                     mcu_state,
                     device_id,
                     boot_id,
@@ -699,11 +726,12 @@ impl McuMsg {
                 let boot_id = r.u32()?;
                 let mcu_time_us = r.u64()?;
                 let mcu_state = r.u8()?;
-                r.skip(1)?;
+                let selected_axis = r.u8()?;
                 McuMsg::Status(Status {
                     boot_id,
                     mcu_time_us,
                     mcu_state,
+                    selected_axis,
                     fault_code: FaultCode::from_u16(r.u16()?),
                     flags: r.u16()?,
                     pwm_permille: r.i16()?,
@@ -739,6 +767,16 @@ impl McuMsg {
                 mcu_rx_us: r.u64()?,
                 mcu_tx_us: r.u64()?,
             }),
+            t::AXIS_SELECT => {
+                let a = AxisSelect {
+                    boot_id: r.u32()?,
+                    selected_axis: r.u8()?,
+                    prev_selected_axis: r.u8()?,
+                    mcu_state: r.u8()?,
+                };
+                r.skip(1)?;
+                McuMsg::AxisSelect(a)
+            }
             other => return Err(DecodeError::UnknownType(other)),
         })
     }

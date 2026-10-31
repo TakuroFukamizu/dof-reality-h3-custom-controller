@@ -48,10 +48,14 @@ start_referenced = true
 plant_max_vel_count_s = 4000.0
 status_period_ms = 20
 link_latency_ms = 1
+# 模擬軸 N は selected_axis = N を名乗る（軸の割当は MCU 側の選択で決まり、下の
+# device_id は照合にだけ使う、protocol.md §1.1）。false にすると 0 を名乗り、
+# device_id だけで割り当てる旧経路の試験になる。
+report_selected_axis = true
 
 [[axis]]
 axis_id = 1
-device_id = "5131000000000001"
+device_id = "5131000000000001"   # 照合用（0 = 照合しない）。模擬軸 1 の device_id
 name = "右手前リフト (motor #1)"
 calibration_valid = true   # 模擬軸のみ
 # 2026-10-25 無負荷・1 測定点。水平付近を 0 とした値。向き（旧仮想 0→1023 で上がるか下がるか）は未確認

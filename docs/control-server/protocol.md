@@ -7,11 +7,31 @@
 ## 1. 基本方針
 
 - 1 本の USB CDC に 1 軸。PC は軸ごとに独立したタスクで読み書きし、1 軸の書き込み待ちで他軸を待たせない。
-- PC は **HELLO で device_id を確認するまで、その USB ポートに HELLO_REQ 以外を送らない**（同じ PC に別の ESP32-S3 が刺さっていることがある）。
+- PC は **HELLO を受けて軸を決めるまで、その USB ポートに HELLO_REQ 以外を送らない**（同じ PC に別の ESP32-S3 が刺さっていることがある）。軸は HELLO の `selected_axis`（MCU で選択中の系統）で決める（§1.1）。
 - 位置制御・PWM・ブレーキシーケンス・期限切れ停止は MCU 側で完結する。PC は位置目標（count）だけを送る。
 - 古い目標の再送はしない。SET_POSITION は ACK を返さず、定期 STATUS の `last_applied_*` で適用を確認する。管理命令は `request_id` 付きで ACK を返し、受理済み命令の再送（`msg_type`・`request_id`・payload がすべて同じフレーム）は再実行しない。HOST_FAULT だけは例外で、毎回実行する（§4「管理命令の共通規則」）。
 - ACK の `ACCEPTED` は「受理」であって、動作の完了ではない（減速・ARMING の待ち時間などは後で進む。到達は STATUS の `mcu_state` で確認する）。
 - **ただし、命令による状態遷移そのものは ACK を送る前に確定させる**（DISARMED→ARMING、HOLDING→ACTIVE、ACTIVE→STOPPING、→DISARMING、任意→FAULT、FAULT→DISARMED、`CONFIGURED`・`POSITION_REFERENCED` の変化）。ACK より後に送る STATUS はすべて遷移後の状態を示す。ACK より前に取ったスナップショットを ACK の後に送らない（USB 送信と制御が別コアでも、STATUS は送信時点の状態から作る）。PC はこれに依存している: ARM_PREPARE の ACK の後に DISARMED の STATUS が来ると軸の状態不一致として FAULT にし、HOST_FAULT の ACK の後の最初の STATUS を見て FAULT_RESET の送り先を決める。
+
+### 1.1 系統（軸）の選択と割当
+
+3 台の CoreS3 は同一ファームウェアで、**どの系統（軸 1〜3）を担当するかは MCU 側で選択する**（電源ボタン操作、NVS に保存）。PC はその選択を受けて軸を割り当てる。PC の設定ファイル `[[axis]].device_id` は任意の「この軸はこの個体のはず」という照合用で、0 なら照合しない。
+
+MCU 側の規則:
+
+- 選択中の系統を HELLO の `selected_axis` と **毎回の STATUS の `selected_axis`** に出す（1〜3、0 = 未選択）。
+- 系統の切り替えは **DISARMED のときだけ** 受け付ける。それ以外の状態では操作を無視する（画面に表示してよい）。FAULT 中も切り替えない（まず FAULT_RESET）。万一 DISARMED 以外で選択が変わる実装になっていても、制限値と lease（`command_timeout_ms`）は保ち続けること。PC は切り替えた個体へ何も送らなくなるので、その個体を止めるのは COMMAND_TIMEOUT だけになる（CONFIG を消して lease を止めてはいけない）。
+- 切り替えたら、ACK と同じ順序規則（§1）で状態を確定してから、(1) `CONFIGURED` と `POSITION_REFERENCED` を消し、`calibration_hash` を 0 にする（CONFIG の内容も位置基準も軸ごとの値なので、前の系統の値を持ち越さない）、(2) AXIS_SELECT（`0x86`、§4）を 1 回送る、(3) 以後の STATUS は新しい `selected_axis` を載せる。AXIS_SELECT に ACK はない。PC は STATUS の `selected_axis`（1〜3）でも変化を検出するので、1〜3 への切り替えは AXIS_SELECT が壊れて届かなくても追いつく。**0（未選択）への変化は STATUS では検出しない**（旧ファーム互換のため STATUS の 0 は無視する）。N→0 は AXIS_SELECT か次の boot の HELLO でしか PC に伝わらず、AXIS_SELECT が落ちると PC はその個体を軸 N のまま扱う（USB の抜き差しで直る）。したがって、一度系統を選んだ後に「未選択」へ戻す操作はファームの UI に置かないことを推奨する（置くなら、この制約を承知の上で）。
+- 系統の選択で `actual_count` の向き・原点・スケールを変えない。count は常に生のエンコーダ計数を SET_REFERENCE で基準化した値で、系統ごとの符号・ストローク・中立位置は PC 側の校正（`[[axis]]`）で扱う。
+- 受理済み命令の記憶（DUPLICATE 判定）と `last_rx_seq` は切り替えで消さなくてよい。
+
+PC 側の規則（詳細は `control-server/DESIGN.md` §10）:
+
+- `selected_axis` が 1〜3 ならその軸。0 なら設定に `device_id` が書かれている軸、どれにも無ければ未知の装置としてポートを閉じ、**その USB 装置が消えるまで開き直さない**（閉じた後に MCU で系統を選んで AXIS_SELECT を送っても PC には届かない）。系統を選んでから **USB を抜き差しする**（CoreS3 のリセットでも可）。新品（NVS 未設定で、設定の `device_id` にも無い個体）の初回は必ずこの手順になる。
+- 設定の `device_id` が 0 でなく、選択された軸の個体と違えば ARM しない（`axis_device_mismatch`）。
+- 同じ系統を 2 台以上が選択していれば（`axis_conflict`）、その軸にはどちらにも CONFIG を送らず、ARM・START・ゲーム入力を拒否する。解消（片方が別の系統へ・切断）で残った 1 台を割り当てる。
+- ARMING〜STOPPING の間に担当軸の `selected_axis` が変わったら PC はリグを FAULT にし、接続中の他の軸へ HOST_FAULT を送る（切り替え先の系統を担当していた個体にも、競合で外す前に HOST_FAULT を届けて ACK を待つ）。**切り替えた個体自身には届かない**（競合中・未割当のポートには PC は何も送らない）ので、その個体は lease 切れ（COMMAND_TIMEOUT）で止まる。MCU 側の「DISARMED のときだけ切り替える」規則が最後の砦。駆動中に同じ系統を選んだ 2 台目が現れたら、減速停止 → DISARM してから競合扱いにする。
+- 同じ boot のまま系統が変わった個体には、PC 自身が SET_REFERENCE を送り直すまで ARM しない（`reference_stale`。ファームが `POSITION_REFERENCED` を消し忘れても古い基準で動かさない）。
 
 ## 2. フレーミング
 
@@ -144,11 +164,12 @@ SET_POSITION の規則:
 
 | type | 名前 | payload | 長さ |
 | --- | --- | --- | ---: |
-| `0x81` | HELLO | 0: u32 request_id / 4: u8 protocol_version / 5: u8 axis_id_hint（MCU 側 NVS の値、0 = 未設定。PC は採用しない） / 6: u8 mcu_state / 7: u8 reserved=0 / 8: u64 device_id（eFuse MAC から作る固有 ID） / 16: u32 boot_id（起動ごとに乱数） / 20: u8 fw_major / 21: u8 fw_minor / 22: u8 fw_patch / 23: u8 reserved=0 / 24: u32 capabilities（bit0 = POSITION モード、bit1 = apply_at、bit2 = 電流計測） / 28: u32 calibration_hash（受理済み CONFIG の値、未設定 0） | 32 |
+| `0x81` | HELLO | 0: u32 request_id / 4: u8 protocol_version / 5: u8 selected_axis（MCU で選択中の系統 1〜3、0 = 未選択。PC はこれで軸を割り当てる、§1.1） / 6: u8 mcu_state / 7: u8 reserved=0 / 8: u64 device_id（eFuse MAC から作る固有 ID） / 16: u32 boot_id（起動ごとに乱数） / 20: u8 fw_major / 21: u8 fw_minor / 22: u8 fw_patch / 23: u8 reserved=0 / 24: u32 capabilities（bit0 = POSITION モード、bit1 = apply_at、bit2 = 電流計測） / 28: u32 calibration_hash（受理済み CONFIG の値、未設定 0） | 32 |
 | `0x82` | ACK | 0: u32 request_id / 4: u8 acked_type / 5: u8 result / 6: u16 reason | 8 |
-| `0x83` | STATUS | 0: u32 boot_id / 4: u64 mcu_time_us / 12: u8 mcu_state / 13: u8 reserved=0 / 14: u16 fault_code / 16: u16 flags / 18: i16 pwm_permille（符号付き −1000〜1000） / 20: i32 actual_count / 24: i32 target_count（下記） / 28: i32 velocity_count_s / 32: i32 following_error_count（下記） / 36: u32 last_applied_frame / 40: u32 last_applied_seq / 44: u32 last_rx_seq / 48: i32 current_ma / 52: u16 rx_error_count / 54: u16 stale_drop_count | 56 |
+| `0x83` | STATUS | 0: u32 boot_id / 4: u64 mcu_time_us / 12: u8 mcu_state / 13: u8 selected_axis（HELLO と同じ値。0 = 未選択） / 14: u16 fault_code / 16: u16 flags / 18: i16 pwm_permille（符号付き −1000〜1000） / 20: i32 actual_count / 24: i32 target_count（下記） / 28: i32 velocity_count_s / 32: i32 following_error_count（下記） / 36: u32 last_applied_frame / 40: u32 last_applied_seq / 44: u32 last_rx_seq / 48: i32 current_ma / 52: u16 rx_error_count / 54: u16 stale_drop_count | 56 |
 | `0x84` | FAULT_EVENT | 0: u32 boot_id / 4: u64 mcu_time_us / 12: u16 fault_code / 14: u8 mcu_state_before / 15: u8 reserved=0 / 16: i32 actual_count | 20 |
 | `0x85` | CLOCK_SYNC_REPLY | 0: u32 request_id / 4: u64 pc_time_us（エコー） / 12: u64 mcu_rx_us / 20: u64 mcu_tx_us | 28 |
+| `0x86` | AXIS_SELECT | 0: u32 boot_id / 4: u8 selected_axis（新しい値 1〜3、0 = 未選択） / 5: u8 prev_selected_axis / 6: u8 mcu_state / 7: u8 reserved=0 | 8 |
 
 - STATUS は MCU が自発的に 50Hz（20ms）で送る。状態遷移・FAULT 発生時は即時にも送ってよい。ACK との順序は §1（ACK より後の STATUS は遷移後の状態）。
 - STATUS の `target_count` = 位置ループがいま追従している目標（速度・加速度制限を適用済みの軌道上の点）。SET_POSITION で受けた `target_count` そのものではない。HOLDING / STOPPING / DISARMING では保持・減速中の目標。PC は中立への移動（`/v1/center`）の完了を全軸の STATUS `target_count` が中立に達したことで判断し、その後に CONTROLLED_STOP を送る。受けた目標を返すと移動の途中で止められる。
@@ -156,6 +177,7 @@ SET_POSITION の規則:
 - FAULT_EVENT は FAULT へ遷移するたびに 1 回送る（原因を問わない。HOST_FAULT・ARMING 中の SOFT_LIMIT も含む）。既に FAULT のときは送らない。`mcu_state_before` は遷移直前の状態。PC は FAULT_EVENT と STATUS のどちらでも異常をラッチする。
 - `actual_count` / `target_count` は `SET_REFERENCE` 適用後の座標。基準未確立なら起動時 0 からの相対値で、`POSITION_REFERENCED` = 0。
 - `boot_id` が変わったら PC はその軸の校正状態を無効化し、再 ARM を要求する。
+- AXIS_SELECT は系統を切り替えたとき（DISARMED のときだけ、§1.1）に 1 回送る。ACK はない。`prev_selected_axis` は切り替え前の値。PC は AXIS_SELECT、または STATUS / HELLO の `selected_axis` の変化のどれでも割当を変える。ただし STATUS の 0 では割当を変えない（旧ファームの reserved=0 と区別できない。§1.1）。
 
 ## 5. 状態遷移（MCU）
 
@@ -303,11 +325,11 @@ wire  (16 byte): 04 01 0B 08 02 0B 01 01 07 2E F5 FF FF A5 41 00
 
 ### 7.12 HELLO（`0x81`、MCU → PC）
 
-値: `{"request_id":1,"protocol_version":1,"axis_id_hint":0,"mcu_state":1,"device_id":"5131000000000001","boot_id":2309737967,"fw_version":[0,1,0],"capabilities":1,"calibration_hash":0}`
+値: `{"request_id":1,"protocol_version":1,"selected_axis":1,"mcu_state":1,"device_id":"5131000000000001","boot_id":2309737967,"fw_version":[0,1,0],"capabilities":1,"calibration_hash":0}`
 
 ```text
-frame (38 byte): 01 81 20 00 01 00 00 00 01 00 01 00 01 00 00 00 00 00 31 51 EF CD AB 89 00 01 00 00 01 00 00 00 00 00 00 00 78 8D
-wire  (40 byte): 04 01 81 20 02 01 01 01 02 01 02 01 02 01 01 01 01 01 07 31 51 EF CD AB 89 02 01 01 02 01 01 01 01 01 01 01 03 78 8D 00
+frame (38 byte): 01 81 20 00 01 00 00 00 01 01 01 00 01 00 00 00 00 00 31 51 EF CD AB 89 00 01 00 00 01 00 00 00 00 00 00 00 1E 98
+wire  (40 byte): 04 01 81 20 02 01 01 01 04 01 01 01 02 01 01 01 01 01 07 31 51 EF CD AB 89 02 01 01 02 01 01 01 01 01 01 01 03 1E 98 00
 ```
 
 ### 7.13 ACK ACCEPTED（`0x82`、MCU → PC）
@@ -330,11 +352,11 @@ wire  (16 byte): 04 01 82 08 02 04 01 01 04 03 01 02 03 3D 21 00
 
 ### 7.15 STATUS（`0x83`、MCU → PC）
 
-値: `{"boot_id":2309737967,"mcu_time_us":1234567890,"mcu_state":4,"fault_code":"NONE","flags":31,"pwm_permille":-250,"actual_count":-1230,"target_count":-1234,"velocity_count_s":-150,"following_error_count":4,"last_applied_frame":1234,"last_applied_seq":1000,"last_rx_seq":1000,"current_ma":0,"rx_error_count":1,"stale_drop_count":2}`
+値: `{"boot_id":2309737967,"mcu_time_us":1234567890,"mcu_state":4,"selected_axis":1,"fault_code":"NONE","flags":31,"pwm_permille":-250,"actual_count":-1230,"target_count":-1234,"velocity_count_s":-150,"following_error_count":4,"last_applied_frame":1234,"last_applied_seq":1000,"last_rx_seq":1000,"current_ma":0,"rx_error_count":1,"stale_drop_count":2}`
 
 ```text
-frame (62 byte): 01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 00 00 00 1F 00 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 C3 5C
-wire  (64 byte): 04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 02 04 01 01 02 1F 10 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 C3 5C 00
+frame (62 byte): 01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 1F 00 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 49 36
+wire  (64 byte): 04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 02 1F 10 06 FF 32 FB FF FF 2E FB FF FF 6A FF FF FF 04 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 49 36 00
 ```
 
 ### 7.16 FAULT_EVENT（`0x84`、MCU → PC）
@@ -353,5 +375,14 @@ wire  (28 byte): 04 01 84 14 09 EF CD AB 89 40 80 96 49 01 01 01 02 02 02 04 07 
 ```text
 frame (34 byte): 01 85 1C 00 09 00 00 00 40 42 0F 00 00 00 00 00 40 4B 4C 00 00 00 00 00 B8 4B 4C 00 00 00 00 00 A9 A7
 wire  (36 byte): 04 01 85 1C 02 09 01 01 04 40 42 0F 01 01 01 01 04 40 4B 4C 01 01 01 01 04 B8 4B 4C 01 01 01 01 03 A9 A7 00
+```
+
+### 7.18 AXIS_SELECT（`0x86`、MCU → PC）
+
+値: `{"boot_id":2309737967,"selected_axis":2,"prev_selected_axis":1,"mcu_state":1}`
+
+```text
+frame (14 byte): 01 86 08 00 EF CD AB 89 02 01 01 00 32 C1
+wire  (16 byte): 04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00
 ```
 <!-- VECTORS:END -->

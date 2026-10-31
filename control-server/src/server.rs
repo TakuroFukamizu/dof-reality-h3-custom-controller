@@ -11,7 +11,9 @@
 //! # Decisions not spelled out in DESIGN.md
 //!
 //! - Status / Ack / FaultEvent from a port that is not `Supervisor::axis_port`
-//!   (a duplicate device) are dropped; its `Disconnected` becomes `PortClosed`.
+//!   (a second unit claiming the axis, or any port of an axis in conflict) are
+//!   dropped; its `Disconnected` becomes `PortClosed`, which removes it from
+//!   the axis's claimants (DESIGN.md §10.3).
 //! - A failed send to an axis link latches a fault through `AdminCmd::Fault`
 //!   (`RigFault::Operator` with a `link_send_failed:` note; there is no
 //!   dedicated variant): always when the admin queue is full, and for a
@@ -30,7 +32,9 @@
 //!   [`api::runs_when_abandoned`] (Stop / Disarm / Fault).
 //! - Sim backend: axis N's simulator is on a scrambled port (axis 3 on
 //!   "sim:1", axis 1 on "sim:2", axis 2 on "sim:3") so mapping never depends
-//!   on port order.
+//!   on port order. With `report_selected_axis` (default) it reports
+//!   `selected_axis = N` and the assignment comes from that; with it off it
+//!   reports 0 and only the configured `device_id` maps it (DESIGN.md §10.3).
 //! - Serial backend: one task per configured port opens it (retry every
 //!   [`SERIAL_RETRY`], never fatal) and forwards the link's events. After an
 //!   unknown device the port is reopened only once it has disappeared from
@@ -52,7 +56,7 @@ use crate::session::{AcceptedPose, PoseIntake};
 use crate::sim_axis::{sim_pair, SimHandle, SimParams};
 use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput};
 use crate::telemetry::{lock_events, shared_event_log, Telemetry, TelemetrySummary};
-use crate::types::{AxisId, RigState};
+use crate::types::{AxisId, DeviceId, RigState};
 
 /// Longest wait for DISARMED during shutdown.
 pub const SHUTDOWN_DISARM_WAIT: Duration = Duration::from_secs(3);
@@ -190,7 +194,16 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
             for (k, n) in SIM_PORT_AXES.iter().enumerate() {
                 let Some(a) = AxisId::new(*n).and_then(|id| cfg.axis(id)) else { continue };
                 let boot_id = rand::random::<u32>().max(1);
-                let (io, handle) = sim_pair(SimParams::from_backend(sim, a.device_id, boot_id));
+                let selected_axis = if sim.report_selected_axis { a.axis_id.get() } else { 0 };
+                // A unit always has a device_id; without a configured one the
+                // simulator uses the documented placeholder pattern 5131…0N.
+                let device_id = if a.device_id.is_unassigned() {
+                    DeviceId(0x5131_0000_0000_0000 + u64::from(a.axis_id.get()))
+                } else {
+                    a.device_id
+                };
+                let (io, handle) =
+                    sim_pair(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
                 let port = format!("sim:{}", k + 1);
                 links.push(axis_link::spawn_link(io, port, cfg.clone(), events_tx.clone()));
                 sims.push((a.axis_id, handle));

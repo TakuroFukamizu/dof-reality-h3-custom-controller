@@ -419,3 +419,260 @@ async fn events_before_and_after_a_fault_can_be_read_back() {
     streamer.stop().await;
     srv.shutdown().await;
 }
+
+// ------------------------------------------------- axis selection (DESIGN §10)
+
+fn no_cross_check(mut cfg: Config, axes: &[u8]) -> Config {
+    for a in &mut cfg.axes {
+        if axes.contains(&a.axis_id.get()) {
+            a.device_id = h3cs::types::DeviceId(0);
+        }
+    }
+    cfg
+}
+
+fn has(blockers: &[String], needle: &str) -> bool {
+    blockers.iter().any(|b| b.contains(needle))
+}
+
+async fn reference(srv: &h3cs::server::RunningServer, axis: u8) {
+    let auth = format!("Bearer {TOKEN}");
+    let body = format!(r#"{{"axis":{axis},"count":0}}"#);
+    let r = http(srv.local_addr, "POST", "/v1/reference", &[("Authorization", &auth)], Some(&body)).await;
+    assert_eq!(r.status, 200, "reference axis {axis}: {r:?}");
+}
+
+#[tokio::test]
+async fn assignment_comes_from_selected_axis_even_on_scrambled_ports() {
+    // (a) No device_id anywhere: only the units' selection can map them.
+    let cfg = no_cross_check(sim_cfg(), &[1, 2, 3]);
+    let srv = start_sim(cfg).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let ports: Vec<_> = st.axes.iter().map(|a| a.port.clone().unwrap_or_default()).collect();
+    assert_eq!(ports, ["sim:2", "sim:3", "sim:1"], "scrambled ports, mapped by selection");
+    for (i, a) in st.axes.iter().enumerate() {
+        assert_eq!(a.assignment, Some("selected"), "{a:?}");
+        assert_eq!(a.device_id, h3cs::types::DeviceId(0x5131_0000_0000_0001 + i as u64), "connected unit's id");
+        assert!(a.expected_device_id.is_unassigned());
+        assert_eq!(a.claimants.len(), 1);
+        assert!(!a.reference_stale);
+    }
+    assert!(st.axis_conflict.is_empty());
+    assert!(st.blockers.is_empty(), "{:?}", st.blockers);
+    srv.shutdown().await;
+
+    // Cross-check on (sim.toml ids): units of axes 1 and 2 swap. Selection
+    // still decides the assignment; the configured device_id blocks ARM in
+    // both directions and the links stay up.
+    let srv = start_sim(sim_cfg()).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    sim(&srv, 1).select_axis(2);
+    wait_status(&srv, S, "conflict", |s| !s.axis_conflict.is_empty()).await;
+    sim(&srv, 2).select_axis(1);
+    let st = wait_status(&srv, 2 * S, "mismatch blockers", |s| {
+        s.axis_conflict.is_empty() && s.axes.iter().all(|a| a.connected) && has(&s.blockers, "axis_device_mismatch")
+    })
+    .await;
+    assert_eq!(st.rig_state, RigState::CalibrationRequired);
+    assert_eq!(st.axes[0].port.as_deref(), Some("sim:3"), "selection wins");
+    assert_eq!(st.axes[0].device_id, h3cs::types::DeviceId(0x5131_0000_0000_0002));
+    assert_eq!(st.axes[0].expected_device_id, h3cs::types::DeviceId(0x5131_0000_0000_0001));
+    assert_eq!(st.axes[0].assignment, Some("selected"));
+    for needle in [
+        "axis_device_mismatch: axis1 device 5131000000000002, config expects 5131000000000001",
+        "axis_device_mismatch: device 5131000000000002 is configured as axis2 but selected axis1",
+        "axis_device_mismatch: axis2 device 5131000000000001, config expects 5131000000000002",
+        "axis_device_mismatch: device 5131000000000001 is configured as axis1 but selected axis2",
+    ] {
+        assert!(has(&st.blockers, needle), "{needle} not in {:?}", st.blockers);
+    }
+    assert!(!has(&st.blockers, "unknown_device"), "{:?}", st.blockers);
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("not_ready")), "{r:?}");
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_unit_switching_axis_is_reassigned_and_needs_re_reference_before_arm() {
+    // (b) Units of axes 1 and 2 swap. No cross-check on those two axes.
+    let cfg = no_cross_check(sim_cfg(), &[1, 2]);
+    let hashes: Vec<u32> = {
+        let cal = calibration::from_config(&cfg);
+        (0..3).map(|i| calibration::calibration_hash(&cfg.rig_id, &cal[i])).collect()
+    };
+    let srv = start_sim(cfg).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let unit_a = sim(&srv, 1); // started on axis 1
+    let unit_b = sim(&srv, 2); // started on axis 2
+
+    unit_a.select_axis(2);
+    let st = wait_status(&srv, S, "conflict on axis 2", |s| s.axis_conflict.len() == 1).await;
+    assert_eq!(st.axis_conflict[0].get(), 2);
+    assert_eq!(st.rig_state, RigState::Offline);
+    assert!(!st.axes[0].connected && !st.axes[1].connected);
+    assert_eq!(st.axes[1].claimants.len(), 2);
+    assert!(st.fault.is_none());
+
+    unit_b.select_axis(1);
+    let st = wait_status(&srv, S, "resolved", |s| {
+        s.axis_conflict.is_empty() && s.axes.iter().all(|a| a.connected && a.configured)
+    })
+    .await;
+    assert_eq!(st.axes[0].port.as_deref(), Some("sim:3"), "unit b now drives axis 1");
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:2"), "unit a now drives axis 2");
+    assert_eq!(st.axes[0].device_id, h3cs::types::DeviceId(0x5131_0000_0000_0002));
+    assert_eq!(st.axes[1].device_id, h3cs::types::DeviceId(0x5131_0000_0000_0001));
+    // Each unit holds the CONFIG of its new axis.
+    assert_eq!(unit_a.with(|m| m.config().map(|c| c.calibration_hash)), Some(hashes[1]));
+    assert_eq!(unit_b.with(|m| m.config().map(|c| c.calibration_hash)), Some(hashes[0]));
+    // Stale reference blocks ARM (and the sim dropped POSITION_REFERENCED too).
+    assert!(st.axes[0].reference_stale && st.axes[1].reference_stale && !st.axes[2].reference_stale);
+    assert_eq!(st.rig_state, RigState::CalibrationRequired);
+    assert!(has(&st.blockers, "reference_stale: axis1"), "{:?}", st.blockers);
+    assert!(has(&st.blockers, "reference_stale: axis2"), "{:?}", st.blockers);
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.json()["error"], "not_ready");
+    assert!(r.json()["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().starts_with("reference_stale: axis")));
+
+    reference(&srv, 1).await;
+    wait_status(&srv, S, "axis 1 re-referenced", |s| !s.axes[0].reference_stale && s.axes[0].referenced).await;
+    assert!(srv.status().axes[1].reference_stale, "axis 2 still stale");
+    reference(&srv, 2).await;
+    wait_state(&srv, RigState::ReadyToArm, 2 * S).await;
+    assert!(unit_a.snapshot().referenced && unit_b.snapshot().referenced);
+    assert!((1..=3).all(|a| sim(&srv, a).state() == McuState::Disarmed), "re-assignment never armed anything");
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_units_selecting_the_same_axis_conflict_until_one_switches_back() {
+    // (c)
+    let srv = start_sim(no_cross_check(sim_cfg(), &[1, 2, 3])).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let id = new_session(srv.local_addr).await;
+    let mut ws = ws_connect(srv.local_addr, &id).await;
+    ws_send(&mut ws, pose_json(&id, 1, 1, 0.1, 0.0, 0.0, GAIN)).await;
+    assert_eq!(next_ack(&mut ws).await["accepted"], true);
+
+    sim(&srv, 1).select_axis(2);
+    let st = wait_status(&srv, S, "conflict", |s| !s.axis_conflict.is_empty()).await;
+    assert_eq!(st.axis_conflict.iter().map(|a| a.get()).collect::<Vec<_>>(), [2]);
+    assert_eq!(st.rig_state, RigState::Offline);
+    assert!(has(&st.blockers, "axis_conflict: axis2 claimed by"), "{:?}", st.blockers);
+    assert!(has(&st.blockers, "not_connected: axis1"), "{:?}", st.blockers);
+    assert!(has(&st.blockers, "not_connected: axis2"), "{:?}", st.blockers);
+    assert!(st.axes[1].port.is_none() && st.axes[1].claimants.len() == 2);
+    // Admin: arm 409 axis_conflict; stop still accepted.
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.json()["error"], "axis_conflict");
+    assert!(r.json()["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().starts_with("axis_conflict: axis2")));
+    let r = admin(srv.local_addr, "/v1/start").await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("axis_conflict")));
+    let r = http(srv.local_addr, "POST", "/v1/stop", &[], None).await;
+    assert_eq!((r.status, r.json()["ok"].as_bool()), (200, Some(true)));
+    // Game input: pose and gain refused, freshness not extended.
+    ws_send(&mut ws, pose_json(&id, 2, 2, 0.1, 0.0, 0.0, GAIN)).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")), "{ack}");
+    let gain = serde_json::json!({"type": "gain", "protocol": 1, "source_session": id, "seq": 3, "gain": 0.2}).to_string();
+    ws_send(&mut ws, gain).await;
+    assert_eq!(next_ack(&mut ws).await["reason"], "axis_conflict");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let st = srv.status();
+    assert_eq!(st.session.as_ref().unwrap()["fresh"], false);
+    assert_eq!(st.session.as_ref().unwrap()["last_seq"], 1, "rejected messages do not advance seq");
+    // Neither unit of axis 2 received CONFIG during the conflict (both idle, unconfigured
+    // for the switched one; the original keeps its earlier CONFIG).
+    assert!(!sim(&srv, 1).snapshot().configured);
+
+    // Resolve: switch the unit back.
+    sim(&srv, 1).select_axis(1);
+    let st = wait_status(&srv, 2 * S, "conflict cleared", |s| {
+        s.axis_conflict.is_empty() && s.axes.iter().all(|a| a.connected && a.configured)
+    })
+    .await;
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:3"), "the remaining unit is primary again");
+    assert_eq!(st.axes[0].port.as_deref(), Some("sim:2"));
+    assert!(st.axes[0].reference_stale, "1→2→1 under one boot: re-reference");
+    assert!(!st.axes[1].reference_stale);
+    ws_send(&mut ws, pose_json(&id, 4, 3, 0.1, 0.0, 0.0, GAIN)).await;
+    assert_eq!(next_ack(&mut ws).await["accepted"], true);
+    assert!(!st.armed);
+    ws.close(None).await.unwrap();
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn unit_switching_axis_while_active_latches_axis_changed() {
+    // (d) a unit violating the DISARMED rule while the rig is ACTIVE.
+    let (srv, streamer) = active_rig(no_cross_check(fast_cfg(), &[1, 2, 3])).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sim(&srv, 1).select_axis_unchecked(2);
+    let st = wait_state(&srv, RigState::FaultLatched, S).await;
+    assert!(matches!(st.fault, Some(RigFault::AxisChanged { axis }) if axis.get() == 1), "{:?}", st.fault);
+    let st = wait_status(&srv, S, "conflict on axis 2", |s| !s.axis_conflict.is_empty()).await;
+    assert_eq!(st.axis_conflict[0].get(), 2);
+    // HOST_FAULT reaches the untouched axis and the axis-2 unit: the latter is
+    // demoted by the conflict only after it ACKed (not left to its own lease).
+    // The switching unit gets nothing from the PC (claimant of a conflicted
+    // axis): its own lease must stop it (protocol.md §1.1).
+    let deadline = tokio::time::Instant::now() + 2 * S;
+    loop {
+        let s3 = sim(&srv, 3).snapshot();
+        let s2 = sim(&srv, 2).snapshot();
+        let s1 = sim(&srv, 1).snapshot();
+        if s3.state == McuState::Fault
+            && s3.fault_code == FaultCode::HostFault
+            && s2.state == McuState::Fault
+            && s2.fault_code == FaultCode::HostFault
+            && s1.state == McuState::Fault
+            && s1.fault_code == FaultCode::CommandTimeout
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "axes not stopped: {s1:?} {s2:?} {s3:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(srv.status().rig_state, RigState::FaultLatched);
+    let r = admin(srv.local_addr, "/v1/start").await;
+    assert_eq!(r.status, 409);
+    streamer.stop().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn report_selected_axis_false_keeps_the_device_id_path() {
+    // (e)
+    let mut cfg = sim_cfg();
+    if let h3cs::config::BackendConfig::Sim(b) = &mut cfg.backend {
+        b.report_selected_axis = false;
+    }
+    let srv = start_sim(cfg).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let ports: Vec<_> = st.axes.iter().map(|a| a.port.clone().unwrap_or_default()).collect();
+    assert_eq!(ports, ["sim:2", "sim:3", "sim:1"]);
+    for a in &st.axes {
+        assert_eq!(a.assignment, Some("config"), "{a:?}");
+        assert_eq!(a.device_id, a.expected_device_id);
+    }
+    assert!((1..=3).all(|a| sim(&srv, a).snapshot().selected_axis == 0));
+    srv.shutdown().await;
+
+    // Without a selection and without a configured device_id the unit is unknown.
+    let mut cfg = sim_cfg();
+    if let h3cs::config::BackendConfig::Sim(b) = &mut cfg.backend {
+        b.report_selected_axis = false;
+    }
+    let cfg = no_cross_check(cfg, &[3]);
+    let srv = start_sim(cfg).await;
+    let st = wait_status(&srv, 3 * S, "unknown device", |s| has(&s.blockers, "unknown_device")).await;
+    assert_eq!(st.rig_state, RigState::Offline);
+    assert!(!st.axes[2].connected);
+    assert!(has(&st.blockers, "unknown_device: device 5131000000000003 on port sim:1"), "{:?}", st.blockers);
+    srv.shutdown().await;
+}

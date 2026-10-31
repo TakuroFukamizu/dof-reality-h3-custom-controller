@@ -71,18 +71,16 @@ fn check_config(path: &Path) -> ExitCode {
     for a in axes {
         let cal = AxisCalibration::from_config(a);
         println!(
-            "  axis {} {:?}: device_id {} calibration_hash 0x{:08x} calibration_valid {}",
+            "  axis {} {:?}: device_id {}{} calibration_hash 0x{:08x} calibration_valid {}",
             a.axis_id.get(),
             a.name,
             a.device_id,
+            if a.device_id.is_unassigned() { " (no cross-check; assigned by the MCU's selected_axis)" } else { "" },
             calibration_hash(&cfg.rig_id, &cal),
             a.calibration_valid
         );
         if !a.calibration_valid {
             blockers.push(format!("calibration_invalid: axis{} calibration_valid = false", a.axis_id.get()));
-        }
-        if a.device_id.is_unassigned() {
-            blockers.push(format!("device_id_unassigned: axis{} has device_id 0 in config", a.axis_id.get()));
         }
         if let Err(e) = cal.validate() {
             blockers.push(format!("calibration_invalid: axis{} {e}", a.axis_id.get()));

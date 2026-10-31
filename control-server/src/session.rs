@@ -96,6 +96,10 @@ pub enum RejectReason {
     BadProtocol,
     #[error("malformed message")]
     BadMessage,
+    /// Two MCUs select the same axis (DESIGN.md §10): pose and gain are
+    /// refused and freshness is not extended until the operator resolves it.
+    #[error("an axis is claimed by two units")]
+    AxisConflict,
 }
 
 /// Server → client ack (§7.1). Sent for accepted and rejected messages.

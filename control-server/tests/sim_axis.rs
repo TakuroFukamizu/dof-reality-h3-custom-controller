@@ -1810,3 +1810,122 @@ fn status_target_is_the_profiled_setpoint_not_the_commanded_target() {
     assert!(s.target_count > start && s.target_count < start + 100, "{s:?}");
     assert_eq!(s.following_error_count, s.actual_count - s.target_count);
 }
+
+// ---------------------------------------------------------------------------
+// Axis selection (protocol.md §1.1, DESIGN.md §10.3)
+// ---------------------------------------------------------------------------
+
+fn axis_selects(out: &[McuMsg]) -> Vec<h3cs::protocol::AxisSelect> {
+    out.iter()
+        .filter_map(|m| match m {
+            McuMsg::AxisSelect(a) => Some(*a),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn select_axis_in_disarmed_clears_config_and_reference_and_announces_once() {
+    let mut h = Harness::new(SimParams {
+        selected_axis: 1,
+        ..SimParams::default()
+    });
+    accepted(h.config());
+    let hello = h.send(HostMsg::HelloReq { request_id: 5 });
+    assert!(
+        matches!(hello[0], McuMsg::Hello(x) if x.selected_axis == 1 && x.calibration_hash == 0x1234_5678),
+        "{hello:?}"
+    );
+    assert_eq!(h.sim.status().selected_axis, 1);
+
+    let now = h.now;
+    let out = h.sim.select_axis(2, now);
+    // (1) flags cleared, (2) exactly one AXIS_SELECT, (3) STATUS after it
+    // carries the new value (protocol §1.1 order).
+    let sel = axis_selects(&out);
+    assert_eq!(sel.len(), 1, "{out:?}");
+    assert_eq!(
+        (sel[0].selected_axis, sel[0].prev_selected_axis, sel[0].mcu_state, sel[0].boot_id),
+        (2, 1, McuState::Disarmed as u8, h.sim.boot_id())
+    );
+    let pos = out.iter().position(|m| matches!(m, McuMsg::AxisSelect(_))).unwrap();
+    let st = out[pos..]
+        .iter()
+        .find_map(|m| match m {
+            McuMsg::Status(s) => Some(*s),
+            _ => None,
+        })
+        .expect("immediate STATUS after AXIS_SELECT");
+    assert_eq!(st.selected_axis, 2);
+    assert_eq!(st.flags & (status_flags::CONFIGURED | status_flags::POSITION_REFERENCED), 0);
+    assert_eq!(st.mcu_state, McuState::Disarmed as u8);
+    assert!(!h.sim.is_configured() && !h.sim.is_referenced());
+    assert_eq!(h.sim.selected_axis(), 2);
+    let hello = h.send(HostMsg::HelloReq { request_id: 6 });
+    assert!(
+        matches!(hello.iter().find(|m| matches!(m, McuMsg::Hello(_))),
+            Some(McuMsg::Hello(x)) if x.selected_axis == 2 && x.calibration_hash == 0),
+        "{hello:?}"
+    );
+    // ARM needs CONFIG and SET_REFERENCE again.
+    rejected(h.arm(), AckReason::NotConfigured);
+    accepted(h.config());
+    rejected(h.arm(), AckReason::NotReferenced);
+    // Selecting the current value does nothing.
+    let now = h.now;
+    assert!(axis_selects(&h.sim.select_axis(2, now)).is_empty());
+    assert!(h.sim.is_configured());
+}
+
+#[test]
+fn select_axis_is_ignored_outside_disarmed_but_unchecked_switches_anyway() {
+    let mut h = Harness::new(SimParams {
+        selected_axis: 1,
+        ..SimParams::default()
+    });
+    h.reach_holding();
+    let now = h.now;
+    assert!(axis_selects(&h.sim.select_axis(2, now)).is_empty());
+    assert_eq!(h.sim.selected_axis(), 1);
+    assert!(h.sim.is_configured(), "CONFIG kept: no switch happened");
+    // FAULT: not accepted either (FAULT_RESET first).
+    h.sim.force_fault(FaultCode::FollowingError);
+    let now = h.now;
+    assert!(axis_selects(&h.sim.select_axis(2, now)).is_empty());
+    assert_eq!(h.sim.selected_axis(), 1);
+    accepted(h.fault_reset());
+    let now = h.now;
+    let sel = axis_selects(&h.sim.select_axis(3, now));
+    assert_eq!(sel.len(), 1);
+    assert_eq!((sel[0].selected_axis, sel[0].prev_selected_axis), (3, 1));
+
+    // Test hook: a unit that breaks the DISARMED rule while HOLDING.
+    let mut h = Harness::new(SimParams {
+        selected_axis: 1,
+        ..SimParams::default()
+    });
+    h.reach_holding();
+    let now = h.now;
+    let sel = axis_selects(&h.sim.select_axis_unchecked(2, now));
+    assert_eq!(sel.len(), 1);
+    assert_eq!(sel[0].mcu_state, McuState::Holding as u8);
+    assert_eq!(h.sim.selected_axis(), 2);
+    assert_eq!(h.sim.status().selected_axis, 2);
+}
+
+#[test]
+fn selection_never_moves_the_count_and_survives_reboot() {
+    let mut h = Harness::new(SimParams {
+        selected_axis: 1,
+        initial_count: 123,
+        ..SimParams::default()
+    });
+    let now = h.now;
+    h.sim.select_axis(3, now);
+    assert_eq!(h.sim.actual_count(), 123, "count is raw encoder + SET_REFERENCE only");
+    assert_eq!(h.sim.target_count(), 123);
+    h.sim.reboot(99);
+    assert_eq!(h.sim.selected_axis(), 3, "selection is NVS: kept across reboot");
+    assert_eq!(h.sim.status().selected_axis, 3);
+    assert_eq!(h.sim.boot_id(), 99);
+}

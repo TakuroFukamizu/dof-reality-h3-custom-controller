@@ -55,7 +55,7 @@ fn hello(device_id: DeviceId, boot_id: u32) -> Hello {
     Hello {
         request_id: 1,
         protocol_version: 1,
-        axis_id_hint: 0,
+        selected_axis: 0,
         mcu_state: 1,
         device_id,
         boot_id,
@@ -70,6 +70,7 @@ fn status(boot_id: u32) -> Status {
         boot_id,
         mcu_time_us: 0,
         mcu_state: McuState::Disarmed as u8,
+        selected_axis: 0,
         fault_code: FaultCode::None,
         flags: 0,
         pwm_permille: 0,
@@ -1068,4 +1069,277 @@ async fn huge_unvalidated_timings_do_not_panic_the_link() {
         .await;
     }
     assert_eq!(link.axis(), Some(ax(1)));
+}
+
+// ------------------------------------------------- axis selection (DESIGN §10.1)
+
+fn axis_select(boot_id: u32, selected_axis: u8, prev: u8) -> Vec<u8> {
+    McuMsg::AxisSelect(h3cs::protocol::AxisSelect {
+        boot_id,
+        selected_axis,
+        prev_selected_axis: prev,
+        mcu_state: McuState::Disarmed as u8,
+    })
+    .to_wire()
+}
+
+/// Collect events of `port` (STATUS dropped) until an `Identified` or
+/// `UnknownDevice` arrives.
+async fn collect_until_reidentified(rx: &mut Events, port: &str) -> Vec<LinkEvent> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut out = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (p, ev) = next(rx, left).await;
+        if p != port || matches!(ev, LinkEvent::Status { .. } | LinkEvent::DecodeErrors { .. }) {
+            continue;
+        }
+        let done = matches!(ev, LinkEvent::Identified { .. } | LinkEvent::UnknownDevice { .. });
+        out.push(ev);
+        if done {
+            return out;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn handshake_assigns_from_selected_axis_not_from_device_id() {
+    // Axis 1's configured device selecting axis 2 → axis 2; an unknown device
+    // selecting axis 3 → axis 3. device_id is a cross-check for the supervisor.
+    for (device, selected, want) in [(dev(1), 2u8, 2u8), (UNKNOWN, 3, 3), (dev(3), 0, 3)] {
+        let (tx, mut rx) = events();
+        let (peer, link) = peer_link(
+            PeerOpts {
+                hello: Some(Hello {
+                    selected_axis: selected,
+                    ..hello(device, 5)
+                }),
+                ..PeerOpts::default()
+            },
+            "p",
+            tx,
+        );
+        let (axis, h) = wait_identified(&mut rx, "p").await;
+        assert_eq!(axis, ax(want), "device {device} selected {selected}");
+        assert_eq!((h.device_id, h.selected_axis), (device, selected));
+        assert_eq!(link.axis(), Some(ax(want)));
+        assert!(!peer.saw_eof());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn selected_axis_out_of_range_is_unknown_device() {
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(Hello {
+                selected_axis: 4,
+                ..hello(dev(1), 5)
+            }),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    let (_, ev) = next(&mut rx, Duration::from_secs(1)).await;
+    assert!(matches!(ev, LinkEvent::UnknownDevice { device_id, .. } if device_id == dev(1)), "{ev:?}");
+    sleep(Duration::from_millis(300)).await;
+    assert!(only_hello_reqs(&peer.log()));
+    assert!(link.is_finished());
+}
+
+#[tokio::test(start_paused = true)]
+async fn axis_select_reidentifies_on_the_same_port() {
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(Hello {
+                selected_axis: 1,
+                ..hello(dev(1), 5)
+            }),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    assert_eq!(wait_identified(&mut rx, "p").await.0, ax(1));
+    sleep(Duration::from_millis(50)).await;
+
+    peer.send_raw(axis_select(5, 2, 1)).await;
+    let evs = collect_until_reidentified(&mut rx, "p").await;
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert_eq!(
+        evs[0],
+        LinkEvent::Disconnected {
+            axis: ax(1),
+            reason: "axis_changed: 1->2".into()
+        }
+    );
+    match &evs[1] {
+        LinkEvent::Identified { axis, hello: h, port } => {
+            assert_eq!((*axis, port.as_str()), (ax(2), "p"));
+            assert_eq!((h.device_id, h.boot_id, h.selected_axis), (dev(1), 5, 2));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(link.axis(), Some(ax(2)));
+    assert!(!link.is_finished());
+    assert!(!peer.saw_eof());
+    // Later frames are tagged with the new axis; the link still writes.
+    let (_, ev) = wait_for(&mut rx, Duration::from_millis(100), |p, e| {
+        p == "p" && matches!(e, LinkEvent::Status { .. })
+    })
+    .await;
+    assert!(matches!(ev, LinkEvent::Status { axis, .. } if axis == ax(2)));
+    link.send_admin(HostMsg::Disarm { request_id: 9 }).unwrap();
+    sleep(Duration::from_millis(20)).await;
+    assert!(peer.log().iter().any(|m| matches!(m, HostMsg::Disarm { request_id: 9 })));
+
+    // The same value again: ignored (no Disconnected / Identified).
+    peer.send_raw(axis_select(5, 2, 2)).await;
+    sleep(Duration::from_millis(100)).await;
+    while let Ok((_, ev)) = rx.try_recv() {
+        assert!(matches!(ev, LinkEvent::Status { .. }), "{ev:?}");
+    }
+    assert_eq!(link.axis(), Some(ax(2)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_or_hello_with_another_selected_axis_switches_too() {
+    // (c) STATUS: AXIS_SELECT lost → the next STATUS carries the new value.
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(Hello {
+                selected_axis: 1,
+                ..hello(dev(1), 5)
+            }),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    assert_eq!(wait_identified(&mut rx, "p").await.0, ax(1));
+    sleep(Duration::from_millis(50)).await;
+    // The peer's periodic STATUS says 0 (old firmware): never a switch.
+    while let Ok((_, ev)) = rx.try_recv() {
+        assert!(matches!(ev, LinkEvent::Status { axis, .. } if axis == ax(1)), "{ev:?}");
+    }
+    peer.send_raw(
+        McuMsg::Status(Status {
+            selected_axis: 3,
+            ..status(5)
+        })
+        .to_wire(),
+    )
+    .await;
+    let evs = collect_until_reidentified(&mut rx, "p").await;
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"));
+    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3));
+    // That STATUS itself is forwarded for the new axis.
+    let (_, ev) = next(&mut rx, Duration::from_millis(50)).await;
+    assert!(matches!(ev, LinkEvent::Status { axis, status, .. } if axis == ax(3) && status.selected_axis == 3), "{ev:?}");
+    assert_eq!(link.axis(), Some(ax(3)));
+
+    // (b) HELLO naming another axis.
+    peer.send_raw(
+        McuMsg::Hello(Hello {
+            selected_axis: 2,
+            ..hello(dev(1), 5)
+        })
+        .to_wire(),
+    )
+    .await;
+    let evs = collect_until_reidentified(&mut rx, "p").await;
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(3) && reason == "axis_changed: 3->2"));
+    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(2) && h.selected_axis == 2 && h.boot_id == 5));
+    assert_eq!(link.axis(), Some(ax(2)));
+    assert!(!link.is_finished());
+}
+
+#[tokio::test(start_paused = true)]
+async fn axis_select_to_zero_without_config_fallback_ends_as_unknown_device() {
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(Hello {
+                selected_axis: 2,
+                ..hello(UNKNOWN, 5)
+            }),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    assert_eq!(wait_identified(&mut rx, "p").await.0, ax(2));
+    sleep(Duration::from_millis(50)).await;
+    peer.send_raw(axis_select(5, 0, 2)).await;
+    let evs = collect_until_reidentified(&mut rx, "p").await;
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert_eq!(
+        evs[0],
+        LinkEvent::Disconnected {
+            axis: ax(2),
+            reason: "axis_changed: 2->0".into()
+        }
+    );
+    assert_eq!(
+        evs[1],
+        LinkEvent::UnknownDevice {
+            port: "p".into(),
+            device_id: UNKNOWN
+        }
+    );
+    sleep(Duration::from_millis(50)).await;
+    assert!(link.is_finished());
+    assert!(peer.saw_eof(), "port closed");
+    assert_eq!(link.axis(), None);
+    assert_eq!(link.send_admin(HostMsg::Disarm { request_id: 1 }), Err(LinkSendError::Closed));
+    // Exactly one Disconnected, no PortClosed, nothing after UnknownDevice.
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn axis_select_to_zero_falls_back_to_the_configured_device_id() {
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(Hello {
+                selected_axis: 1,
+                ..hello(dev(3), 5)
+            }),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    assert_eq!(wait_identified(&mut rx, "p").await.0, ax(1));
+    sleep(Duration::from_millis(50)).await;
+    peer.send_raw(axis_select(5, 0, 1)).await;
+    let evs = collect_until_reidentified(&mut rx, "p").await;
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"));
+    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 0));
+    assert_eq!(link.axis(), Some(ax(3)));
+    assert!(!peer.saw_eof());
+}
+
+#[tokio::test(start_paused = true)]
+async fn sim_select_axis_switches_the_link() {
+    let (tx, mut rx) = events();
+    let (io, sim) = sim_pair(SimParams {
+        selected_axis: 1,
+        ..sim_params(dev(1))
+    });
+    let link = spawn_link(io, "sim:p".into(), cfg(), tx);
+    assert_eq!(wait_identified(&mut rx, "sim:p").await.0, ax(1));
+    sleep(Duration::from_millis(30)).await;
+    sim.select_axis(3);
+    let evs = collect_until_reidentified(&mut rx, "sim:p").await;
+    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"), "{evs:?}");
+    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3), "{evs:?}");
+    assert_eq!(link.axis(), Some(ax(3)));
+    assert_eq!(sim.snapshot().selected_axis, 3);
 }

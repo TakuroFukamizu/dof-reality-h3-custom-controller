@@ -4,7 +4,10 @@
 //! Rules (architecture §6, §11):
 //! - Calibration, signs and limits may only change while DISARMED (the server
 //!   loads config at start; there is no hot reload in v1).
-//! - Every axis is mapped by MCU `device_id`, never by USB port order.
+//! - Every axis is assigned from the axis the operator selected on the MCU
+//!   (HELLO `selected_axis`, protocol §1.1); the configured `device_id` is an
+//!   optional cross-check (0 = none) and the fallback for a MCU that reports
+//!   no selection. Never by USB port order.
 //! - Axis 2/3 values must be measured on their own; do not copy axis 1.
 
 use crate::calibration::AxisCalibration;
@@ -172,20 +175,31 @@ pub struct SimBackendConfig {
     pub status_period_ms: u64,
     /// Simulated one-way link latency.
     pub link_latency_ms: u64,
+    /// Simulated axis N reports `selected_axis = N` (the assignment comes from
+    /// the selection; `device_id` is only cross-checked). `false`: it reports
+    /// 0 and the axis is found through the configured `device_id` alone (the
+    /// fallback path for firmware without axis selection).
+    pub report_selected_axis: bool,
 }
 
 impl Default for SimBackendConfig {
     fn default() -> Self {
-        Self { start_referenced: true, plant_max_vel_count_s: 4000.0, status_period_ms: 20, link_latency_ms: 1 }
+        Self {
+            start_referenced: true,
+            plant_max_vel_count_s: 4000.0,
+            status_period_ms: 20,
+            link_latency_ms: 1,
+            report_selected_axis: true,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SerialBackendConfig {
-    /// Ports to probe. Each is identified by HELLO.device_id before use; a port
-    /// whose device_id is not in `[[axis]]` is closed without sending anything
-    /// except HELLO_REQ.
+    /// Ports to probe. Each is assigned from its HELLO (`selected_axis`, else
+    /// the `[[axis]]` with its `device_id`) before use; a port that resolves
+    /// to no axis is closed without sending anything except HELLO_REQ.
     pub ports: Vec<String>,
     #[serde(default = "default_baud")]
     pub baud: u32,
@@ -199,6 +213,10 @@ fn default_baud() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct AxisConfig {
     pub axis_id: AxisId,
+    /// Optional cross-check: the MCU expected on this axis (0 = none). An
+    /// MCU that selects this axis with another device_id blocks ARM
+    /// (`axis_device_mismatch`); an MCU reporting `selected_axis = 0` is
+    /// assigned to the axis whose device_id matches (fallback).
     pub device_id: DeviceId,
     pub name: String,
     /// Operator assertion that the calibration below was measured on THIS axis.
@@ -253,9 +271,10 @@ impl Config {
     /// 0..=1023 or min >= max; timing values of 0; per-axis calibration
     /// invariants (see `crate::calibration::AxisCalibration::validate`).
     ///
-    /// Placeholder all-zero device_ids (`DeviceId::is_unassigned`) are allowed,
-    /// even on several axes, so a template config loads; the supervisor refuses
-    /// ARM for them. Duplicate non-zero device_ids are rejected.
+    /// All-zero device_ids (`DeviceId::is_unassigned`) mean "no cross-check"
+    /// and are allowed on any number of axes (the axis is then assigned from
+    /// the MCU's `selected_axis` alone). Duplicate non-zero device_ids are
+    /// rejected.
     ///
     /// All problems are collected and reported together, each naming its field.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -268,7 +287,7 @@ impl Config {
             errs.push("rig_id must not be empty".into());
         }
 
-        // Axes: exactly one per AxisId, mapped by device_id.
+        // Axes: exactly one per AxisId; non-zero device_ids unique.
         if self.axes.len() != AXIS_COUNT {
             errs.push(format!("expected exactly {AXIS_COUNT} [[axis]] entries, got {}", self.axes.len()));
         }
