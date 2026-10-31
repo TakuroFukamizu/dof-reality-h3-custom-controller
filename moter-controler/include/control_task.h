@@ -25,6 +25,8 @@ struct ControlSnapshot {
   int32_t last_measured_stroke = 0;
   int8_t working_sign = 1;
   uint32_t request_seq = 0;    // 要求を処理するたびに +1
+  uint32_t manual_fault_seq = 0;  // 手動速度の無パルス／遅すぎ停止が起きるたびに +1
+  char manual_fault_reason[8] = "";  // stall / slow
   char request_error[16] = ""; // 直近の要求が拒否された理由。受理なら空
   uint32_t tick_count = 0;
 };

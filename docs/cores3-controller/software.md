@@ -85,8 +85,8 @@ DISARMED → POWER_WAIT → BRAKE_WAIT → READY → RUNNING → STOPPING → BR
 | 段階 | 内容 |
 | --- | --- |
 | ARM | 操作者が無人・機構支持・可動余裕・他軸切離し・物理停止手段を確認して送る |
-| POWER_WAIT | PWM = 0 のまま G2 で主電源 ON 指令。`POWER_SETTLE_MS` 待つ。電圧の実測入力はないので「電源確認済み」とは表示しない |
-| BRAKE_WAIT | G1 でブレーキ解除給電指令。`BRAKE_RELEASE_WAIT_MS` 待つ |
+| POWER_WAIT | PWM = 0 のまま主電源リレーの GPIO で ON 指令。`POWER_SETTLE_MS` 待つ。電圧の実測入力はないので「電源確認済み」とは表示しない |
+| BRAKE_WAIT | ブレーキ解除リレーの GPIO で解除給電指令。`BRAKE_RELEASE_WAIT_MS` 待つ。ピン番号は [hardware.md](hardware.md) の割当表 |
 | READY | `READY_HOLD_MS` 内に RUN / JOG がなければ停止シーケンスへ。ブレーキ解除状態で無期限に待たない |
 | RUNNING | 時間制限付き（`MAX_RUN_MS`）、Duty 上限（`MAX_DUTY_PERCENT`）、相対移動上限（`MAX_TRAVEL_COUNTS`）、無変化タイムアウト。自動反復・自動 Duty 増加・自動延長はしない |
 | STOPPING | PWM を 0 にし、`count/s` が `STOP_SPEED_THRESHOLD` 以下で `STOP_CONFIRM_MS` 継続したら停止候補。`STOP_TIMEOUT_MS` で異常停止 |
@@ -179,7 +179,8 @@ CoreS3 SE 1 台で MD13S・主電源リレー・ブレーキリレーを動か�
 
 - タッチ UI: 電源 入/切、ブレーキ 入/切、速度 −10 / −1 / +1 / +10、停止、非常停止。速度ボタンは電源 ON 時のみ有効。
 - シリアルコマンド: `R 0|1`（RELAY）、`B 0|1`（BRAKE）、`S -100..100`（SPEED）、`X`（STOP、リレーは維持）、`E`（ESTOP、速度 0・電源 OFF・ブレーキ OFF）、`?`（STATUS）、`HELP`。
-- 起動時: 全出力ピンを安全側（リレー OFF、DIR 正、PWM 0）で駆動してから `M5.begin()`。Port A の I²C 探索を無効化。
+- 起動時: 全出力ピンを安全側（リレー OFF、DIR 正、PWM 0）で駆動してから `M5.begin()`。外部 I²C（G1 / G2）の機器探索と内蔵スピーカー・マイク（G13 / G14 を I²S に使う）を無効化。G2 は主電源リレー、G13 はブレーキ解除リレー。
+- ピン割当は `include/config.h`。2026-10-31 に Base15 向けへ変更（ブレーキ G1 → G13、`PIN_VIOUT = 10` を追加。VIOUT の ADC 読み取りは未実装）。ブレーキ解除の論理は `BRAKE_ON_LEVEL`、主電源は `RELAY_ON_LEVEL` と別定数にし、Base15 内の MOSFET が反転段でもブレーキ側だけを変えられるようにした。
 - 速度は要求値と適用値を分け、リレー ON 後 100ms は PWM を出さない。
 
 ### `encoder-tester/`

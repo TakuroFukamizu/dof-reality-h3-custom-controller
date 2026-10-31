@@ -27,6 +27,7 @@ ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
 uint32_t next_enc_ms = 0;
 uint32_t last_request_seq = 0;
+uint32_t last_manual_fault_seq = 0;
 AutoPhase last_phase = AutoPhase::Idle;
 AutoKind last_kind = AutoKind::Idle;
 CalStep last_cal_step = CalStep::None;
@@ -42,6 +43,7 @@ uint32_t next_repeat_ms = 0;
 M5Canvas canvas(&M5.Display);
 
 int relayOffLevel() { return RELAY_ON_LEVEL ? 0 : 1; }
+int brakeOffLevel() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 bool outputLive() {
   return relay_on && (millis() - relay_on_ms >= RELAY_SETTLE_MS);
@@ -125,7 +127,7 @@ void setBrake(bool on) {
     publish("OK");
     return;
   }
-  digitalWrite(PIN_MOTOR_BRAKE, on ? RELAY_ON_LEVEL : relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, on ? BRAKE_ON_LEVEL : brakeOffLevel());
   brake_on = on;
   ui_dirty = true;
   publish("OK");
@@ -168,7 +170,7 @@ void estop() {
   control_set_manual_speed(0);
   control_pulse_estop();
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
-  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
   relay_on = false;
   brake_on = false;
   was_live = false;
@@ -190,10 +192,12 @@ void printHelp() {
   Serial.println("  NEUTRAL       move to neutral count, needs origin + calibration");
   Serial.println("  CAL           HOME -> UPPER -> save -> NEUTRAL");
   Serial.println("  UNCAL         clear calibration of selected motor (relay off only)");
-  Serial.printf("PortB IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
+  Serial.printf("PortB(Base15) IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
-  Serial.printf("PortA Yellow/G2 GPIO%d = power, White/G1 GPIO%d = brake, ON level %d\n",
-                PIN_POWER_RELAY, PIN_MOTOR_BRAKE, RELAY_ON_LEVEL);
+  Serial.printf("XH2pin#2 GPIO%d = power (ON level %d), XH8pin#5 GPIO%d = brake (ON level %d)\n",
+                PIN_POWER_RELAY, RELAY_ON_LEVEL, PIN_MOTOR_BRAKE, BRAKE_ON_LEVEL);
+  Serial.printf("XH8pin#2/#3 GPIO%d/%d = encoder A/B, XH8pin#6 GPIO%d = VIOUT (not read)\n",
+                PIN_ENC_A, PIN_ENC_B, PIN_VIOUT);
 }
 
 const char* skipSpace(const char* s) {
@@ -492,6 +496,11 @@ void onButton(const Button& button) {
     case Action::Neutral:
     case Action::Cal:
       if (!button.enabled) {
+        // 無効なボタンが押された理由をシリアルにも残す（画面の通知は 1.5 s で消える）
+        Serial.printf("UI auto_disabled live=%d brake=%d speed=%d origin=%d cal=%d active=%d\n", outputLive() ? 1 : 0,
+                      brake_on ? 1 : 0, requested_speed, snap.origin_valid ? 1 : 0, snap.profile.calibrated ? 1 : 0,
+                      snapActive() ? 1 : 0);
+        Serial.flush();
         if (!outputLive()) {
           showNotice("電源ONが必要");
         } else if (!brake_on) {
@@ -705,6 +714,16 @@ void reportAuto(const ControlSnapshot& now) {
       showNotice(now.request_error);
     }
   }
+  if (now.manual_fault_seq != last_manual_fault_seq) {
+    // 手動速度中にセンサーの計数が止まった。制御タスクは既に出力 0。速度指令も 0 に戻して通知する。
+    last_manual_fault_seq = now.manual_fault_seq;
+    requested_speed = 0;
+    control_set_manual_speed(0);
+    Serial.printf("WARN manual_%s speed->0\n", now.manual_fault_reason);
+    Serial.flush();
+    showNotice(strcmp(now.manual_fault_reason, "slow") == 0 ? "遅すぎ停止 速度0" : "無パルス停止 速度0");
+    ui_dirty = true;
+  }
   const bool leg_changed = now.phase != last_phase || now.kind != last_kind || now.cal_step != last_cal_step;
   if (leg_changed) {
     const bool started_home_p = active && ((now.kind == AutoKind::HomeP && last_phase != AutoPhase::Moving) ||
@@ -721,7 +740,7 @@ void reportAuto(const ControlSnapshot& now) {
     if (now.phase == AutoPhase::Done || now.phase == AutoPhase::Cancelled || now.phase == AutoPhase::Failed) {
       result_phase = now.phase;
       snprintf(result_reason, sizeof(result_reason), "%s", now.reason);
-      result_until_ms = millis() + 1500;
+      result_until_ms = millis() + 4000;  // 失敗理由（stall / slow）を読める長さ
     }
     if (now.phase == AutoPhase::Done) {
       const bool home_leg = now.kind == AutoKind::HomeP;
@@ -766,24 +785,29 @@ void reportAuto(const ControlSnapshot& now) {
 
 void setup() {
   driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
-  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), relayOffLevel());
+  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), brakeOffLevel());
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
   auto cfg = M5.config();
   cfg.clear_display = true;
 #if MC_USB_POWER
-  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。12V は接続しない（Issue #1）。
+  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。Bottom の DC 入力は接続しない。
+  // （DIN Base 時代の Issue #1 回避用。Base15 の DC と USB の同時接続は未検証）
   cfg.output_power = true;
 #else
-  cfg.output_power = false;  // DIN側からBUSの5Vを受ける設定
+  cfg.output_power = false;  // Bottom（Base15 の DC ジャック → MP1584 → BUS 5V）から 5V を受ける設定
 #endif
   cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
   cfg.internal_mic = false;
   cfg.internal_spk = false;
   cfg.external_imu = false;
   cfg.external_rtc = false;
-  // Port A を外部機器の探索に使わせない。GPIO1 と GPIO2 がリレーなので、I2C の High で入れたくない。
+  // 外部機器の探索をさせない。理由は 2 つ。
+  //  - Port.A（G1 SCL / G2 SDA）の I2C 探索抑止。G2 は主電源リレー IN なので I2C の High で入れたくない
+  //    （G1 はブレーキを G13 に移して空いたが、I2C は両線が要るので緩めない）。
+  //  - Module Display / RCA の検出が走ると M5Unified が mbus_pin23 = G13 を I2S DOUT に取る。
+  //    G13 はブレーキ解除リレー IN なので external_speaker_value = 0 で止める。internal_spk = false も同じ理由で保つ。
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
@@ -794,6 +818,9 @@ void setup() {
   M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
 #endif
   Serial.begin(115200);
+  // USB CDC をホストが読んでいないと write / flush は既定 100 ms ずつ待つ。自動移動中は AUTO 行と ENC 行の
+  // flush が続くので、UI ループが 200 ms 止まると制御タスクの入力鮮度の守りが働いてしまう。20 ms に短縮する。
+  Serial.setTxTimeoutMs(20);
 
   if (M5.Display.width() < M5.Display.height()) {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
@@ -802,7 +829,7 @@ void setup() {
   pinMode(PIN_POWER_RELAY, OUTPUT);
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
   pinMode(PIN_MOTOR_BRAKE, OUTPUT);
-  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
   pinMode(PIN_MD13S_DIR, OUTPUT);
   digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
   motor_output_begin();
