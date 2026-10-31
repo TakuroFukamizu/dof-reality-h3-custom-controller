@@ -496,6 +496,11 @@ void onButton(const Button& button) {
     case Action::Neutral:
     case Action::Cal:
       if (!button.enabled) {
+        // 無効なボタンが押された理由をシリアルにも残す（画面の通知は 1.5 s で消える）
+        Serial.printf("UI auto_disabled live=%d brake=%d speed=%d origin=%d cal=%d active=%d\n", outputLive() ? 1 : 0,
+                      brake_on ? 1 : 0, requested_speed, snap.origin_valid ? 1 : 0, snap.profile.calibrated ? 1 : 0,
+                      snapActive() ? 1 : 0);
+        Serial.flush();
         if (!outputLive()) {
           showNotice("電源ONが必要");
         } else if (!brake_on) {
