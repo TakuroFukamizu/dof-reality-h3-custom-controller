@@ -29,6 +29,7 @@ struct AutoConfig {
   int32_t max_travel = MAX_TRAVEL;
   int32_t slow_zone = SLOW_ZONE;
   int32_t arrival_min_travel = ARRIVAL_MIN_TRAVEL;
+  int manual_min_duty = MANUAL_GUARD_MIN_DUTY;
 };
 
 struct AutoInputs {

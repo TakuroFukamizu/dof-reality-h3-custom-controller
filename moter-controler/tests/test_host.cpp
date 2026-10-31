@@ -390,17 +390,45 @@ void test_manual_guard_latches_on_slow_counts_at_home_duty() {
   CHECK(std::string(g.reason) == "slow");
 }
 
-void test_manual_guard_low_duty_ignores_slow_but_not_stall() {
+void test_manual_guard_below_min_duty_is_not_monitored() {
+  // 7 % 未満は機構が動かないことが実測で分かっているので、無パルスでも遅すぎでも止めない。
+  ManualGuard g;
+  bool ever_latched = false;
+  bool all_pass = true;
+  for (uint32_t t = 0; t <= 3000; t += 50) {
+    if (g.tick(t, 42, 5, true) != 5) all_pass = false;
+    if (g.latched) ever_latched = true;
+  }
+  CHECK(!ever_latched);
+  CHECK(all_pass);
+}
+
+void test_manual_guard_ramp_from_1_restarts_window_at_min_duty() {
+  // +1 を押しながら 1 → 7 に上げる。7 に達してから 300 ms は猶予、その後 200 ms 無パルスで停止。
+  ManualGuard g;
+  uint32_t t = 0;
+  for (int speed = 1; speed <= 6; ++speed) {
+    for (int i = 0; i < 10; ++i, t += 50) CHECK(g.tick(t, 42, speed, true) == speed);  // 各 500 ms
+  }
+  const uint32_t reached = t;  // 3000 ms で 7 に到達
+  CHECK(g.tick(reached, 42, 7, true) == 7);
+  CHECK(g.tick(reached + 299, 42, 7, true) == 7);
+  CHECK(g.tick(reached + 300, 42, 7, true) == 0);
+  CHECK(g.latched);
+  CHECK(std::string(g.reason) == "stall");
+}
+
+void test_manual_guard_min_duty_stall_but_no_slow() {
+  // 7〜9 % は無パルスでは止めるが、遅すぎ（150 count/s 未満）では止めない。
   ManualGuard g;
   bool ever_latched = false;
   for (uint32_t t = 0; t <= 2000; t += 50) {
-    const int64_t raw = (t / 50) % 2;
-    g.tick(t, raw, 5, true);  // HOME_DUTY 未満。動いていない可能性があるので遅すぎでは止めない
+    g.tick(t, (t / 50) % 2, 7, true);
     if (g.latched) ever_latched = true;
   }
   CHECK(!ever_latched);
   ManualGuard h;
-  for (uint32_t t = 0; t <= 600; t += 50) h.tick(t, 42, 5, true);  // 完全に無パルスなら止める
+  for (uint32_t t = 0; t <= 300; t += 50) h.tick(t, 42, 7, true);
   CHECK(h.latched);
   CHECK(std::string(h.reason) == "stall");
 }
@@ -450,7 +478,9 @@ int main() {
   test_manual_guard_passes_speed_while_counting();
   test_manual_guard_latches_on_no_pulses();
   test_manual_guard_latches_on_slow_counts_at_home_duty();
-  test_manual_guard_low_duty_ignores_slow_but_not_stall();
+  test_manual_guard_below_min_duty_is_not_monitored();
+  test_manual_guard_ramp_from_1_restarts_window_at_min_duty();
+  test_manual_guard_min_duty_stall_but_no_slow();
   test_manual_guard_relay_off_or_zero_speed_outputs_zero_and_resets();
   test_manual_guard_speed_change_does_not_restart_window();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);

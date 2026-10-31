@@ -6,9 +6,10 @@
 // GPIO・時計を持たない。制御タスクが tick ごとに呼び、戻り値を PWM に出す。
 //
 // - 速度 0 または主電源リレーが live でないときは計測を止め、ラッチも解除する。
-// - 無パルス: START_GRACE_MS 経過後、カウントが STALL_MS 変わらなければ "stall"。
+// - |速度| が MANUAL_GUARD_MIN_DUTY（7 %）未満は監視しない（機構が動かないことがあり、+1 で徐々に上げる操作を
+//   無パルスで止めてしまうため）。7 % に達した時点から計測を始める。
+// - 無パルス: 計測開始から START_GRACE_MS 経過後、カウントが STALL_MS 変わらなければ "stall"。
 // - 遅すぎ: |速度| が HOME_DUTY 以上のときだけ、STALL_MS ごとの窓で MIN_COUNT_RATE 未満なら "slow"。
-//   HOME_DUTY 未満は機構が動かないこともあるので、遅すぎでは止めない（無パルスでは止める）。
 // - ラッチ中は速度指令が残っていても 0 を返す。指令が 0 に戻ったら解除し、次の指令で最初から計測する。
 
 #include <stdint.h>
@@ -31,6 +32,11 @@ struct ManualGuard {
     }
     if (latched) {
       return 0;
+    }
+    const int mag = manual_speed < 0 ? -manual_speed : manual_speed;
+    if (mag < cfg.manual_min_duty) {
+      running_ = false;  // 監視範囲に戻ったら最初から計測する
+      return manual_speed;
     }
     if (!running_) {
       running_ = true;
@@ -55,7 +61,6 @@ struct ManualGuard {
       const int64_t rate = (delta * 1000) / static_cast<int64_t>(now_ms - anchor_ms_);
       anchor_raw_ = raw;
       anchor_ms_ = now_ms;
-      const int mag = manual_speed < 0 ? -manual_speed : manual_speed;
       if (past_grace && mag >= cfg.home_duty && rate < cfg.min_count_rate) {
         latch("slow");
         return 0;
