@@ -3,6 +3,7 @@
 #include <string>
 
 #include "auto_move.h"
+#include "manual_guard.h"
 #include "motor_profile.h"
 
 namespace {
@@ -341,6 +342,89 @@ void test_set_profile_invalidates_origin() {
   CHECK(s.m.working_sign == p.sign);
 }
 
+// --- 手動速度の無パルス／遅すぎ停止 ---
+void test_manual_guard_passes_speed_while_counting() {
+  ManualGuard g;
+  int64_t raw = 0;
+  bool all_pass = true;
+  for (uint32_t t = 0; t <= 2000; t += 50) {
+    const int out = g.tick(t, raw, 10, true);
+    if (out != 10) all_pass = false;
+    raw += 30;  // 600 count/s
+  }
+  CHECK(all_pass);
+  CHECK(!g.latched);
+  CHECK(g.fault_seq == 0);
+}
+
+void test_manual_guard_latches_on_no_pulses() {
+  ManualGuard g;
+  CHECK(g.tick(0, 100, 10, true) == 10);
+  CHECK(g.tick(250, 100, 10, true) == 10);  // 猶予内
+  CHECK(g.tick(299, 100, 10, true) == 10);  // 猶予 300 の直前（無パルスは猶予明けに即判定）
+  CHECK(g.tick(300, 100, 10, true) == 0);
+  CHECK(g.latched);
+  CHECK(std::string(g.reason) == "stall");
+  CHECK(g.fault_seq == 1);
+  CHECK(g.tick(600, 100, 10, true) == 0);   // 速度指令が残っていても 0 のまま
+  CHECK(g.tick(700, 100, 0, true) == 0);    // 0 に戻すとラッチ解除
+  CHECK(!g.latched);
+  CHECK(g.tick(800, 100, 10, true) == 10);  // 再開は最初からやり直し
+  CHECK(g.tick(1000, 100, 10, true) == 10);
+  CHECK(g.tick(1300, 100, 10, true) == 0);
+  CHECK(g.fault_seq == 2);
+}
+
+void test_manual_guard_latches_on_slow_counts_at_home_duty() {
+  ManualGuard g;
+  int64_t raw = 0;
+  bool latched_at = false;
+  uint32_t when = 0;
+  for (uint32_t t = 0; t <= 2000 && !latched_at; t += 50) {
+    raw = (t / 50) % 2;  // 毎 tick 変わるが往復するだけ（片相断線の揺れ）
+    g.tick(t, raw, 10, true);
+    if (g.latched) { latched_at = true; when = t; }
+  }
+  CHECK(latched_at);
+  CHECK(when >= 300 && when <= 700);
+  CHECK(std::string(g.reason) == "slow");
+}
+
+void test_manual_guard_low_duty_ignores_slow_but_not_stall() {
+  ManualGuard g;
+  bool ever_latched = false;
+  for (uint32_t t = 0; t <= 2000; t += 50) {
+    const int64_t raw = (t / 50) % 2;
+    g.tick(t, raw, 5, true);  // HOME_DUTY 未満。動いていない可能性があるので遅すぎでは止めない
+    if (g.latched) ever_latched = true;
+  }
+  CHECK(!ever_latched);
+  ManualGuard h;
+  for (uint32_t t = 0; t <= 600; t += 50) h.tick(t, 42, 5, true);  // 完全に無パルスなら止める
+  CHECK(h.latched);
+  CHECK(std::string(h.reason) == "stall");
+}
+
+void test_manual_guard_relay_off_or_zero_speed_outputs_zero_and_resets() {
+  ManualGuard g;
+  CHECK(g.tick(0, 0, 10, false) == 0);
+  CHECK(g.tick(1000, 0, 10, false) == 0);
+  CHECK(!g.latched);
+  CHECK(g.tick(1100, 0, 10, true) == 10);  // relay が入ってから計測開始
+  CHECK(g.tick(1399, 0, 10, true) == 10);  // 1100 起点なので猶予は 1400 まで
+  CHECK(g.tick(1400, 0, 10, true) == 0);
+  CHECK(g.tick(1700, 0, 0, true) == 0);
+  CHECK(!g.latched);
+}
+
+void test_manual_guard_speed_change_does_not_restart_window() {
+  ManualGuard g;
+  g.tick(0, 0, 10, true);
+  g.tick(300, 0, 20, true);  // 速度を変えても計測は継続
+  CHECK(g.tick(500, 0, 20, true) == 0);
+  CHECK(g.latched);
+}
+
 }  // namespace
 
 int main() {
@@ -363,6 +447,12 @@ int main() {
   test_travel_and_timeout();
   test_can_start_conditions();
   test_set_profile_invalidates_origin();
+  test_manual_guard_passes_speed_while_counting();
+  test_manual_guard_latches_on_no_pulses();
+  test_manual_guard_latches_on_slow_counts_at_home_duty();
+  test_manual_guard_low_duty_ignores_slow_but_not_stall();
+  test_manual_guard_relay_off_or_zero_speed_outputs_zero_and_resets();
+  test_manual_guard_speed_change_does_not_restart_window();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

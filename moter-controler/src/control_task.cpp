@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "encoder_pcnt.h"
+#include "manual_guard.h"
 #include "motor_output.h"
 
 namespace {
@@ -44,6 +45,7 @@ void copy_text(char* dest, size_t size, const char* text) {
 void task_main(void*) {
   AutoMachine machine;
   machine.set_profile(g_initial);
+  ManualGuard manual_guard;  // 手動速度中にセンサーの計数が止まったら出力 0
   int64_t vel_anchor_count = 0;
   uint32_t vel_anchor_ms = millis();
   int count_per_s = 0;
@@ -100,7 +102,9 @@ void task_main(void*) {
     }
     machine.tick(ai);
 
-    const int out = machine.active() ? machine.duty_signed : (in.relay_live ? in.manual_speed : 0);
+    // 手動速度は、自動移動中でなくても無パルス／遅すぎで 0 にラッチする（センサー断線のまま動かさない）。
+    const int manual_out = manual_guard.tick(now, raw, machine.active() ? 0 : in.manual_speed, in.relay_live);
+    const int out = machine.active() ? machine.duty_signed : manual_out;
     motor_output_write(out);
 
     if (now - vel_anchor_ms >= kVelocityWindowMs) {
@@ -128,6 +132,8 @@ void task_main(void*) {
     snap.working_sign = machine.working_sign;
     snap.request_seq = request_seq;
     copy_text(snap.request_error, sizeof(snap.request_error), request_error);
+    snap.manual_fault_seq = manual_guard.fault_seq;
+    copy_text(snap.manual_fault_reason, sizeof(snap.manual_fault_reason), manual_guard.reason);
     ticks += 1;
     snap.tick_count = ticks;
 

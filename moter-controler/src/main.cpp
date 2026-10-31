@@ -27,6 +27,7 @@ ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
 uint32_t next_enc_ms = 0;
 uint32_t last_request_seq = 0;
+uint32_t last_manual_fault_seq = 0;
 AutoPhase last_phase = AutoPhase::Idle;
 AutoKind last_kind = AutoKind::Idle;
 CalStep last_cal_step = CalStep::None;
@@ -708,6 +709,16 @@ void reportAuto(const ControlSnapshot& now) {
       showNotice(now.request_error);
     }
   }
+  if (now.manual_fault_seq != last_manual_fault_seq) {
+    // 手動速度中にセンサーの計数が止まった。制御タスクは既に出力 0。速度指令も 0 に戻して通知する。
+    last_manual_fault_seq = now.manual_fault_seq;
+    requested_speed = 0;
+    control_set_manual_speed(0);
+    Serial.printf("WARN manual_%s speed->0\n", now.manual_fault_reason);
+    Serial.flush();
+    showNotice(strcmp(now.manual_fault_reason, "slow") == 0 ? "遅すぎ停止 速度0" : "無パルス停止 速度0");
+    ui_dirty = true;
+  }
   const bool leg_changed = now.phase != last_phase || now.kind != last_kind || now.cal_step != last_cal_step;
   if (leg_changed) {
     const bool started_home_p = active && ((now.kind == AutoKind::HomeP && last_phase != AutoPhase::Moving) ||
@@ -724,7 +735,7 @@ void reportAuto(const ControlSnapshot& now) {
     if (now.phase == AutoPhase::Done || now.phase == AutoPhase::Cancelled || now.phase == AutoPhase::Failed) {
       result_phase = now.phase;
       snprintf(result_reason, sizeof(result_reason), "%s", now.reason);
-      result_until_ms = millis() + 1500;
+      result_until_ms = millis() + 4000;  // 失敗理由（stall / slow）を読める長さ
     }
     if (now.phase == AutoPhase::Done) {
       const bool home_leg = now.kind == AutoKind::HomeP;
