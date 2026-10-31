@@ -54,10 +54,10 @@ constexpr int DIR_POSITIVE_LEVEL = 0;
 // DIN Base 構成で HIGH オンを実測。Base15 でも駆動段は Base15 の外なので変えない。
 constexpr int RELAY_ON_LEVEL = 1;
 // ブレーキ解除リレーの論理（G13 → Base15 内 MOSFET → XH 8pin #5）。1 なら GPIO HIGH で解除指令。
-// Base15 内の MOSFET が反転段（ローサイド 1 段）ならここだけを 0 にする。RELAY_ON_LEVEL は触らない。
+// Base15 内の MOSFET は非反転（2026-10-31 に G13 HIGH で解除を実機確認）。回路を反転段に変えるならここだけを 0 にする。RELAY_ON_LEVEL は触らない。
 constexpr int BRAKE_ON_LEVEL = 1;
 // GPIO はコイルを直接駆動しない。リセット中に浮いてオンしないよう、リレー IN がオフ側に保たれる
-// プル抵抗を外付けする（非反転なら GPIO にプルダウン。反転段なら向きが逆になるので回路構成で決める）。
+// プル抵抗を外付けする（現構成はどちらも HIGH オンなので GPIO 側にプルダウン）。
 
 constexpr uint32_t PWM_FREQ_HZ = 20000;  // MD13S の上限
 constexpr uint8_t PWM_BITS = 10;

@@ -24,11 +24,11 @@ Bottom は Base15 産業用プロト基板モジュール V1.1（M5Stack K025-B�
 | MD13S DIR | `PIN_MD13S_DIR` | G8 | Grove Port.B 白 |
 | エンコーダ A（センサー白） | `PIN_ENC_A` | G17 | XH 8pin #2 → Base15 内レベル変換 |
 | エンコーダ B（センサー緑） | `PIN_ENC_B` | G18 | XH 8pin #3 → Base15 内レベル変換 |
-| ブレーキ解除リレー IN | `PIN_MOTOR_BRAKE` | G13 | XH 8pin #5 → Base15 内 MOSFET（回路構成は未定）。GPIO は HIGH で解除指令（`BRAKE_ON_LEVEL = 1`）。MOSFET が反転段なら `BRAKE_ON_LEVEL` だけを 0 にする。主電源の `RELAY_ON_LEVEL` は触らない |
+| ブレーキ解除リレー IN | `PIN_MOTOR_BRAKE` | G13 | XH 8pin #5 → Base15 内 MOSFET（非反転。2026-10-31 に G13 HIGH で解除を実機確認）。GPIO は HIGH で解除指令（`BRAKE_ON_LEVEL = 1`）。回路を反転段に変えるときは `BRAKE_ON_LEVEL` だけを 0 にする。主電源の `RELAY_ON_LEVEL` は触らない |
 | Protection Board VIOUT | `PIN_VIOUT` | G10 | XH 8pin #6 → Base15 内で分圧。ADC 読み取りは未実装 |
 | 主電源リレー IN | `PIN_POWER_RELAY` | G2 | XH 2pin #2。GPIO 直結（駆動素子 Q1 は電源基板側。種別は未確認）。HIGH で給電（`RELAY_ON_LEVEL = 1`） |
 
-G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298）と共用。`internal_spk = false` と `external_speaker_value = 0` を保つ（`src/main.cpp` の `setup()`）。リセット中の浮きでブレーキ解除リレーが入らないよう、リレー IN がオフ側に保たれるプル抵抗を外付けする（非反転段なら G13 側にプルダウン。向きは MOSFET の回路構成が決まってから確定）。
+G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298）と共用。`internal_spk = false` と `external_speaker_value = 0` を保つ（`src/main.cpp` の `setup()`）。リセット中の浮きでブレーキ解除リレーが入らないよう、G13 側（MOSFET ゲート）にプルダウンを外付けする（非反転段で確認済み）。
 
 ## 端当ての退避
 

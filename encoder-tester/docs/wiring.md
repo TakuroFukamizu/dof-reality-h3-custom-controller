@@ -50,16 +50,16 @@ Feedback Sensor エンコーダー、ブレーキ解除リレー、Protection Bo
 | 2 | エンコーダ A（センサー白） | レベル変換 HV → LV | G17 | 3.3V 直交信号 |
 | 3 | エンコーダ B（センサー緑） | レベル変換 HV → LV | G18 | 3.3V 直交信号 |
 | 4 | Feedback Sensor 電源 5V | レベル変換の HV 側電源 | N/A | センサーの 5V。CoreS3 の GPIO には入れない |
-| 5 | ブレーキ解除リレー IN | リレー駆動 MOSFET（回路構成は未定） | G13 | GPIO は HIGH で解除指令（`BRAKE_RELEASE_LEVEL = 1`）。MOSFET の構成次第で IN の論理が反転する |
+| 5 | ブレーキ解除リレー IN | リレー駆動 MOSFET（非反転。2026-10-31 に実機確認） | G13 | GPIO は HIGH で解除指令（`BRAKE_RELEASE_LEVEL = 1`） |
 | 6 | Protection Board VIOUT | 分圧抵抗 | G10 | ADC 入力。読み取りは未実装 |
 | 7 | CoreS3 5V 出力 | | 5V | 予備 |
 | 8 | CoreS3 3.3V 出力 | | 3.3V | 予備 |
 
 ユーザー指定の表では #3 も G17 と書かれていたが、A と同じピンにはできないので G18 とし、2026-10-31 に G18 で確定した。主電源リレー制御の G2 も同日に確定。
 
-Base15 内の MOSFET の回路構成（ローサイド / ハイサイド、反転の有無）は未定。DIN Base 時代は G1 をリレーモジュールの IN に直結し、IN HIGH で解除だった。ローサイド 1 段なら G13 HIGH で IN が LOW になり論理が反転するので、実機で極性を確認してから `BRAKE_RELEASE_LEVEL`（encoder-tester）と `BRAKE_ON_LEVEL`（moter-controler）を合わせる。主電源用の `POWER_ON_LEVEL` / `RELAY_ON_LEVEL` は G2 直結なので触らない。[test_checklist.md](test_checklist.md) の最初の項目で見る。
+Base15 内の MOSFET は非反転で、G13 HIGH でブレーキ解除リレーが入ることを 2026-10-31 に実機確認した（moter-controler、#1）。DIN Base 時代の G1 直結と同じ論理なので `BRAKE_RELEASE_LEVEL`（encoder-tester）と `BRAKE_ON_LEVEL`（moter-controler）は 1 のまま。回路を反転段に変えるときは、この 2 つだけを 0 にする。主電源用の `POWER_ON_LEVEL` / `RELAY_ON_LEVEL` は G2 直結なので触らない。
 
-G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298 の DATAI）と共用。M-Bus pos 23 に出ている。ファームウェアは `internal_spk = false` と `external_speaker_value = 0` を保つ（後者は Module Display/RCA 検出で M5Unified が G13 を I2S DOUT に取るのを防ぐ）。AW88298 は電源投入既定のスタンバイのままで、DATAI は 3.3V CMOS 入力なので、G13 を GPIO 出力にして問題ない。ESP32-S3 の GPIO13 はストラップピンではなく、リセット中は浮く（G1 と同じ）。リセット中の浮きでリレーが入らないよう、リレー IN がオフ側に保たれるプル抵抗を外付けする（非反転段なら G13 側のゲートにプルダウン。ローサイド反転段ではゲートプルダウンが IN を HIGH に倒すので向きが逆になる。回路構成が決まってから確定する）。M5GFX の表示検出に失敗して board_unknown になったときだけ、M5Unified が G13 を Low→High にマイクロ秒パルスする経路がある。正常に CoreS3 SE と検出されれば通らない。
+G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298 の DATAI）と共用。M-Bus pos 23 に出ている。ファームウェアは `internal_spk = false` と `external_speaker_value = 0` を保つ（後者は Module Display/RCA 検出で M5Unified が G13 を I2S DOUT に取るのを防ぐ）。AW88298 は電源投入既定のスタンバイのままで、DATAI は 3.3V CMOS 入力なので、G13 を GPIO 出力にして問題ない。ESP32-S3 の GPIO13 はストラップピンではなく、リセット中は浮く（G1 と同じ）。リセット中の浮きでリレーが入らないよう、G13 側（MOSFET ゲート）にプルダウンを外付けする（非反転段で確認済み）。M5GFX の表示検出に失敗して board_unknown になったときだけ、M5Unified が G13 を Low→High にマイクロ秒パルスする経路がある。正常に CoreS3 SE と検出されれば通らない。
 
 ## XH 2pin ソケット
 
