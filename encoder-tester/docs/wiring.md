@@ -55,7 +55,7 @@ Feedback Sensor エンコーダー、ブレーキ解除リレー、Protection Bo
 | 7 | CoreS3 5V 出力 | | 5V | 予備 |
 | 8 | CoreS3 3.3V 出力 | | 3.3V | 予備 |
 
-ユーザー指定の表では #3 も G17 と書かれていたが、A と同じピンにはできないので誤記と判断し、現行の G18 のままにしている。
+ユーザー指定の表では #3 も G17 と書かれていたが、A と同じピンにはできないので G18 とし、2026-10-31 に G18 で確定した。主電源リレー制御の G2 も同日に確定。
 
 Base15 内の MOSFET の回路構成（ローサイド / ハイサイド、反転の有無）は未定。DIN Base 時代は G1 をリレーモジュールの IN に直結し、IN HIGH で解除だった。ローサイド 1 段なら G13 HIGH で IN が LOW になり論理が反転するので、実機で極性を確認してから `BRAKE_RELEASE_LEVEL`（encoder-tester）と `BRAKE_ON_LEVEL`（moter-controler）を合わせる。主電源用の `POWER_ON_LEVEL` / `RELAY_ON_LEVEL` は G2 直結なので触らない。[test_checklist.md](test_checklist.md) の最初の項目で見る。
 

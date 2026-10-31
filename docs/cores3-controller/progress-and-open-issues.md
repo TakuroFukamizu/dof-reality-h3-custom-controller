@@ -51,7 +51,7 @@
 ## 2026-10-31: Bottom を DIN Base から Base15 に変更する方針
 
 - 理由と Base15 の調査結果は [hardware.md](hardware.md)。Grove 直結できるのが MD13S だけで、リレー用 MOSFET とレベル変換を Bottom 内に収める必要があり、バッテリーと追加 Grove 端子が不要になったため。
-- ピン変更: ブレーキ解除リレーを G1（Port.A 白）から **G13**（XH 8pin #5、Base15 内 MOSFET 経由）へ。VIOUT は G10（XH 8pin #6、Base15 内分圧）として `PIN_VIOUT = 10` を追加（ADC 読み取りは未実装）。主電源 G2、MD13S G9/G8、エンコーダ G17/G18 は番号変更なし。
+- ピン変更: ブレーキ解除リレーを G1（Port.A 白）から **G13**（XH 8pin #5、Base15 内 MOSFET 経由）へ。VIOUT は G10（XH 8pin #6、Base15 内分圧）として `PIN_VIOUT = 10` を追加（ADC 読み取りは未実装）。主電源 G2、MD13S G9/G8、エンコーダ G17/G18 は番号変更なし（原案で空欄だった主電源の G2 と、G17 と重複記載だったエンコーダ B の G18 は、同日に G2 / G18 で確定）。
 - `moter-controler` のコードと `docs/cores3-controller/` を更新済み。**Base15 は未製作で実機未確認**。10-22 / 10-25 の試験結果は DIN Base 構成のもの。
 - Issue #1（DIN Base の 12V と USB 同時接続で電源断）の前提（バッテリー無しの DIN Base）は Base15 では無くなるが、Base15 の電源経路（MP1584 → M-Bus 5V、逆流防止ダイオード無し）で USB と DC を同時接続したときの挙動は未検証。PR #2 の pmiclog env は DIN Base 向けの調査記録として残す。
 - G13 は CoreS3 SE 内部で I²S DOUT（AW88298）と共用。`internal_spk = false`・`external_speaker_value = 0` の維持が前提。ブート時は G1 同様に浮くので、リレー IN がオフ側に保たれるプル抵抗が必要（向きは MOSFET の回路構成で決まる）。moter-controler ではブレーキ用に `BRAKE_ON_LEVEL` を分け、主電源の `RELAY_ON_LEVEL` と独立に反転できるようにした。
@@ -82,9 +82,7 @@
 
 ### Base15 化に伴う未確定事項（2026-10-31）
 
-- 主電源リレー制御（XH 2pin #2）の CoreS3 側 GPIO が原案に書かれていない。現行の G2 を維持したが、要確認。
 - XH 2pin #2 の先が「リレーモジュールの IN」か「電源基板の DC_STOP1 緑（Q1）直結」か。原案は両方を書いており、現行試験構成はリレーモジュール経由。
-- 原案の XH 8pin #3（エンコーダ B）が #2 と同じ G17 と記載されている。A と同一ピンにはできないため誤記と判断し G18 のままにしたが、要確認。
 - Base15 V1.1 と CoreS3 SE の互換性の明示的な公式記載が見つからない（CoreS3 との組合せは Stack Screw Length 表に掲載。バス配列は同一）。
 - Base15 のプロト領域の穴数と、本体 15 mm 内の部品高さクリアランス。MOSFET・レベル変換・XH コネクタが収まるか。
 - リレー駆動用 MOSFET の型番、プル抵抗の位置・向き・値、XH 8pin #5 に出す信号の形（ドレイン出力かリレーモジュール IN 向けの論理か）。
