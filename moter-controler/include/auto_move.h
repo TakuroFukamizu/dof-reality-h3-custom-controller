@@ -30,6 +30,7 @@ struct AutoConfig {
   int32_t slow_zone = SLOW_ZONE;
   int32_t arrival_min_travel = ARRIVAL_MIN_TRAVEL;
   int manual_min_duty = MANUAL_GUARD_MIN_DUTY;
+  int32_t retreat_counts = RETREAT_COUNTS;
 };
 
 struct AutoInputs {
@@ -90,6 +91,9 @@ struct AutoMachine {
   int64_t rate_anchor_raw = 0;
   uint32_t rate_anchor_ms = 0;
   bool slow_event = false;  // この tick で「遅すぎる」窓が閉じた
+  bool retreating = false;   // 端当てで開始直後に止まり、反対へ退避中
+  bool retreat_done = false; // この行程で退避を済ませた（2 回目は失敗にする）
+  int64_t retreat_start_raw = 0;
 
   int32_t position(int64_t raw) const {
     return static_cast<int32_t>((raw - origin_raw) * working_sign);
@@ -229,6 +233,8 @@ struct AutoMachine {
     rate_anchor_raw = in.raw_count;
     rate_anchor_ms = in.now_ms;
     slow_event = false;
+    retreating = false;
+    retreat_done = false;
     near_end_at_start = false;
     if (leg != AutoKind::Neutral) {
       int32_t dist = 0;
@@ -268,12 +274,29 @@ struct AutoMachine {
       duty_signed = err > 0 ? -duty : duty;
       return;
     }
+    if (retreating) {
+      duty_signed = leg == AutoKind::HomeP ? -cfg.home_duty : cfg.home_duty;
+      return;
+    }
     int duty = cfg.home_duty;
     int32_t dist = 0;
     if (end_distance(in.raw_count, &dist) && dist > cfg.slow_zone) {
       duty = cfg.auto_duty_max;
     }
     duty_signed = leg == AutoKind::HomeP ? duty : -duty;
+  }
+
+  // 端当てで開始直後に止まったとき、端に居るのか動けないのかを区別するために反対へ退避する。
+  void begin_retreat(const AutoInputs& in) {
+    retreating = true;
+    retreat_start_raw = in.raw_count;
+    start_ms = in.now_ms;  // 退避にも猶予を与える
+    last_change_ms = in.now_ms;
+    rate_anchor_raw = in.raw_count;
+    rate_anchor_ms = in.now_ms;
+    slow_event = false;
+    set_reason("retreat");
+    compute_duty(in);
   }
 
   bool stalled(const AutoInputs& in) const {
@@ -297,12 +320,32 @@ struct AutoMachine {
   }
 
   void tick_end(const AutoInputs& in, int64_t travel) {
+    if (retreating) {
+      if (llabs(in.raw_count - retreat_start_raw) >= cfg.retreat_counts) {
+        // 退避できた＝動ける。改めて端へ向かう。行程の起点を取り直す（移動量・時間・速度窓）。
+        begin_leg(in);
+        retreat_done = true;
+        reason[0] = '\0';
+        return;
+      }
+      compute_duty(in);
+      if (stalled(in)) {
+        finish(AutoPhase::Failed, "stall");
+      } else if (slow_event) {
+        finish(AutoPhase::Failed, "slow");
+      }
+      return;
+    }
     compute_duty(in);
     const bool stall = stalled(in);
     if (!stall && !slow_event) {
       return;
     }
     if (travel < cfg.arrival_min_travel && !near_end_at_start) {
+      if (!retreat_done) {
+        begin_retreat(in);
+        return;
+      }
       finish(AutoPhase::Failed, stall ? "stall" : "slow");
       return;
     }

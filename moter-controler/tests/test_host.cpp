@@ -91,14 +91,49 @@ void test_home_p_arrives() {
   CHECK(std::string(s.m.reason) == "ok");
 }
 
-void test_home_p_stall_without_travel_fails() {
+void test_home_p_stall_without_travel_retreats_then_fails_if_stuck() {
+  // 開始直後に止まった（端に居る、またはブレーキ・センサーの異常）。まず反対へ退避し、退避も止まれば失敗。
   Sim s;
   s.request(AutoKind::HomeP);
-  s.steps(12, 50, 0);
+  s.steps(8, 50, 0);  // 猶予 300 ms 後に無パルス → 1300 ms で退避開始
+  CHECK(s.m.phase == AutoPhase::Moving);
+  CHECK(s.m.duty_signed == -HOME_DUTY);  // P 端行程の退避は N 端向き
+  CHECK(std::string(s.m.reason) == "retreat");
+  s.steps(8, 50, 0);  // 退避でも動かない（退避にも猶予 300 ms）
   CHECK(s.m.phase == AutoPhase::Failed);
   CHECK(std::string(s.m.reason) == "stall");
   CHECK(!s.m.origin_valid);
   CHECK(s.m.duty_signed == 0);
+}
+
+void test_home_p_already_at_end_retreats_then_arrives() {
+  // 端に居る状態で「下限へ」。退避して RETREAT_COUNTS 離れ、改めて端に当てて到達する。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(8, 50, 0);                // 端で止まっている → 退避開始
+  CHECK(s.m.duty_signed == -HOME_DUTY);
+  s.steps(60, 20, 12);              // 退避で +720 動く（HOME は raw 負方向）
+  CHECK(s.m.phase == AutoPhase::Moving);
+  CHECK(s.m.duty_signed == HOME_DUTY);  // 退避を終えて端へ向き直した
+  CHECK(std::string(s.m.reason) == "");
+  s.steps(60, 20, -12);             // 端へ戻る
+  s.steps(6, 50, 0);                // 当たって止まる
+  CHECK(s.m.phase == AutoPhase::Done);
+  CHECK(s.m.origin_valid);
+  CHECK(s.m.position(s.raw) == 0);
+  CHECK(std::string(s.m.reason) == "ok");
+}
+
+void test_home_p_retreat_happens_once_per_leg() {
+  // 退避して戻ったあとに、再び移動量不足で止まったら、もう退避せず失敗にする。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(8, 50, 0);
+  s.steps(60, 20, 12);
+  CHECK(s.m.duty_signed == HOME_DUTY);
+  s.steps(12, 50, 0);               // 戻り始めで止まる（移動量 < 400）
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "stall");
 }
 
 Sim calibrated_sim();
@@ -107,7 +142,10 @@ void test_home_p_slow_counts_fails() {
   // 片相断線などで、カウントが止まらずに遅く進み続ける場合。到達として記録してはいけない。
   Sim s;
   s.request(AutoKind::HomeP);
-  s.steps(30, 20, -1);  // 50 count/s を 600 ms
+  s.steps(30, 20, -1);  // 50 count/s を 600 ms → 移動量不足なので退避
+  CHECK(s.m.phase == AutoPhase::Moving);
+  CHECK(std::string(s.m.reason) == "retreat");
+  s.steps(30, 20, 1);   // 退避でも 50 count/s しか出ない
   CHECK(s.m.phase == AutoPhase::Failed);
   CHECK(std::string(s.m.reason) == "slow");
   CHECK(!s.m.origin_valid);
@@ -458,7 +496,9 @@ void test_manual_guard_speed_change_does_not_restart_window() {
 int main() {
   test_motor_profile();
   test_home_p_arrives();
-  test_home_p_stall_without_travel_fails();
+  test_home_p_stall_without_travel_retreats_then_fails_if_stuck();
+  test_home_p_already_at_end_retreats_then_arrives();
+  test_home_p_retreat_happens_once_per_leg();
   test_home_p_near_end_short_travel_is_arrival();
   test_home_p_slow_counts_fails();
   test_home_p_slow_after_real_travel_is_arrival();

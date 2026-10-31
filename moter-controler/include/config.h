@@ -90,6 +90,7 @@ constexpr uint32_t MOVE_TIMEOUT_MS = 45000;     // 1 回の自動移動の時間
 constexpr int32_t SLOW_ZONE = 400;              // 端の手前で HOME_DUTY に落とす距離
 constexpr int32_t ARRIVAL_MIN_TRAVEL = 400;     // これ未満の移動で止まったら到達ではなく失敗
 constexpr uint32_t DWELL_MS = 200;              // 中立のバンド内に居続ける時間
+constexpr int32_t RETREAT_COUNTS = 600;         // 端当てで開始直後に止まったとき、反対へ退避する距離（約 1.5 回転）。退避後に改めて端へ当てる
 
 // --- 手動速度の守り（無パルス／遅すぎで出力 0） ---
 constexpr int MANUAL_GUARD_MIN_DUTY = NEUTRAL_DUTY_MIN;  // これ未満は機構が動かないことがある（7 % で動くことを実測）ので監視しない
