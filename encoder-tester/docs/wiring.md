@@ -57,9 +57,9 @@ Feedback Sensor エンコーダー、ブレーキ解除リレー、Protection Bo
 
 ユーザー指定の表では #3 も G17 と書かれていたが、A と同じピンにはできないので誤記と判断し、現行の G18 のままにしている。
 
-Base15 内の MOSFET の回路構成（ローサイド / ハイサイド、反転の有無）は未定。DIN Base 時代は G1 をリレーモジュールの IN に直結し、IN HIGH で解除だった。ローサイド 1 段なら G13 HIGH で IN が LOW になり論理が反転するので、実機で極性を確認してから `BRAKE_RELEASE_LEVEL`（encoder-tester）と `RELAY_ON_LEVEL`（moter-controler）を合わせる。[test_checklist.md](test_checklist.md) の最初の項目で見る。
+Base15 内の MOSFET の回路構成（ローサイド / ハイサイド、反転の有無）は未定。DIN Base 時代は G1 をリレーモジュールの IN に直結し、IN HIGH で解除だった。ローサイド 1 段なら G13 HIGH で IN が LOW になり論理が反転するので、実機で極性を確認してから `BRAKE_RELEASE_LEVEL`（encoder-tester）と `BRAKE_ON_LEVEL`（moter-controler）を合わせる。主電源用の `POWER_ON_LEVEL` / `RELAY_ON_LEVEL` は G2 直結なので触らない。[test_checklist.md](test_checklist.md) の最初の項目で見る。
 
-G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298 の DATAI）と共用。M-Bus pos 23 に出ている。ファームウェアは `internal_spk = false` と `external_speaker_value = 0` を保つ（後者は Module Display/RCA 検出で M5Unified が G13 を I2S DOUT に取るのを防ぐ）。AW88298 は電源投入既定のスタンバイのままで、DATAI は 3.3V CMOS 入力なので、G13 を GPIO 出力にして問題ない。ESP32-S3 の GPIO13 はストラップピンではなく、リセット中は浮く（G1 と同じ）。HIGH で入る MOSFET ゲートには、リセット中の浮きで入らないように外付けプルダウンを付ける。M5GFX の表示検出に失敗して board_unknown になったときだけ、M5Unified が G13 を Low→High にマイクロ秒パルスする経路がある。正常に CoreS3 SE と検出されれば通らない。
+G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298 の DATAI）と共用。M-Bus pos 23 に出ている。ファームウェアは `internal_spk = false` と `external_speaker_value = 0` を保つ（後者は Module Display/RCA 検出で M5Unified が G13 を I2S DOUT に取るのを防ぐ）。AW88298 は電源投入既定のスタンバイのままで、DATAI は 3.3V CMOS 入力なので、G13 を GPIO 出力にして問題ない。ESP32-S3 の GPIO13 はストラップピンではなく、リセット中は浮く（G1 と同じ）。リセット中の浮きでリレーが入らないよう、リレー IN がオフ側に保たれるプル抵抗を外付けする（非反転段なら G13 側のゲートにプルダウン。ローサイド反転段ではゲートプルダウンが IN を HIGH に倒すので向きが逆になる。回路構成が決まってから確定する）。M5GFX の表示検出に失敗して board_unknown になったときだけ、M5Unified が G13 を Low→High にマイクロ秒パルスする経路がある。正常に CoreS3 SE と検出されれば通らない。
 
 ## XH 2pin ソケット
 
@@ -68,7 +68,7 @@ G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298 の DATA
 | # | 接続先 | Base15 内 | CoreS3 SE | レベル |
 | --- | --- | --- | --- | --- |
 | 1 | GND | | GND | |
-| 2 | 主電源リレー IN | GPIO 直結（リレー駆動の MOSFET は電源基板側にある） | G2 | HIGH で給電指令 |
+| 2 | 主電源リレー IN | GPIO 直結（駆動素子 Q1 は電源基板側。種別は未確認） | G2 | HIGH で給電指令 |
 
 ユーザー指定の表には CoreS3 側のピンが無い。最小変更として、現行の G2 のままにしている。G2 は Core 本体側面の Port.A（SDA）にも出ているので、Port.A には何も挿さない。
 
@@ -86,11 +86,11 @@ Port.B の 5V は MD13S に繋がない。
 
 ## 駆動
 
-GPIO はリレーのコイルではなく、リレーモジュールの IN（ブレーキは Base15 内の MOSFET 経由、主電源は電源基板側の MOSFET 経由）を駆動する。HIGH で入る回路には、リセット中の浮きで入らないように外部プルダウンを付ける。
+GPIO はリレーのコイルではなく、リレーモジュールの IN（ブレーキは Base15 内の MOSFET 経由、主電源は現行試験構成ではリレーモジュールの IN に直結）を駆動する。リセット中の浮きで入らないよう、リレー IN がオフ側に保たれるプル抵抗を外付けする（向きは回路構成で決まる）。
 
 ブレーキは、24V を供給すると解除、無通電で作動する。これは実測。ソフトの名前は `brake_release` で、`brake_on` とは呼ばない。
 
-電力の経路は `24V 電源 → Protection Board → MD13S → モーター` のまま。G2 の先は `XH 2pin #2 → DC_STOP1 緑 → R1 15kΩ → 電源基板 Q1 → HRS4H`。この主リレーは、別体の 24V モーター電源への AC を入切する。AC を切っても 24V がすぐ消えるとは限らない。
+電力の経路は `24V 電源 → Protection Board → MD13S → モーター` のまま。G2 の先は、現行試験構成では `XH 2pin #2 → 1ch リレーモジュールの IN`。最終的に電源基板の `DC_STOP1 緑 → R1 15kΩ → Q1 → HRS4H` へ直結するかは要確認（docs/cores3-controller/hardware.md の注 3）。この主リレーは、別体の 24V モーター電源への AC を入切する。AC を切っても 24V がすぐ消えるとは限らない。
 
 G2 は 3 軸共通の AC 給電になり得る。このツールは 1 台の CoreS3 だけで使う。G2 に CoreS3 を並列に繋がない。試験しない軸は、物理的に動かない状態にしておく。
 
@@ -100,7 +100,7 @@ VIOUT は XH 8pin #6 から Base15 内で分圧して G10 へ入れる。Protect
 
 センサーは 6 ピン。赤が +5V、黒が 2 本とも GND、白と緑が直交信号、残りの 1 本は開放。
 
-レベル変換は Base15 内に置く。2026-10-25 までの実測は秋月 AE-LCNV4-MOSFET（BSS138、113837。各側 10kΩ プルアップ）を外付けして行った。Base15 内の部品は未定だが、同じ双方向 MOSFET 型を前提にする。TXS0104E ではない。Core の内部プルアップとプルダウンは使わない。
+レベル変換は Base15 内に置く。2026-10-25 までの実測は秋月 AE-LCNV4-MOSFET（BSS138、113837。各側 10kΩ プルアップ）を外付けして行った。Base15 内でも同じ AE-LCNV4-MOSFET を使う前提（docs/cores3-controller/hardware.md のレベルシフタ節）。TXS0104E ではない。Core の内部プルアップとプルダウンは使わない。
 
 | センサー | XH 8pin | 変換基板 | Core |
 | --- | --- | --- | --- |

@@ -89,7 +89,7 @@ class Sim:
         self.say("CFG GLITCH_NS=%d ns" % self.cfg["GLITCH_NS"])
         self.say("CFG AUTHORITY=%s LOCK=%s" % ("usb" if self.usb else "local", "" if self.limits_ok() else "limits_unset"))
         self.say("CFG MISSING=")
-        self.say("CFG PINS power=2 brake=1 pwm=9 dir=8 enc_a=17 enc_b=18")
+        self.say("CFG PINS power=2 brake=13 pwm=9 dir=8 enc_a=17 enc_b=18")
         self.say("CFG WARN not_physical_estop current_monitor_absent g2_may_feed_all_axes one_cores3_only")
         self.say("CFG -1 means UNCONFIGURED")
 

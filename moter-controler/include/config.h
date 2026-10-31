@@ -23,7 +23,7 @@
 //   #8 CoreS3 3.3V 出力（予備）
 // XH 2pin（主電源リレー）
 //   #1 GND
-//   #2 主電源リレー IN → G2（GPIO 直結。電源基板側に MOSFET がある）
+//   #2 主電源リレー IN → G2（GPIO 直結。駆動素子 Q1 は電源基板側。種別は未確認）
 //
 // M-Bus 位置と Base15 のシルク（Base15 のシルクは初代 Core の番号なので位置で読む）:
 //   G10 = pos 2（シルク 35）, G8 = pos 4（36）, G9 = pos 10（26）, G18 = pos 15（16）,
@@ -50,11 +50,14 @@ constexpr int PIN_VIOUT = 10;       // XH 8pin #6  Protection Board VIOUT（Base
 // 速度 > 0 のときの DIR。真理値表では Low が MA=High。
 constexpr int DIR_POSITIVE_LEVEL = 0;
 
-// リレーモジュールの論理入力。1 なら HIGH でオン、0 なら LOW でオン。
-// GPIO はコイルを直接駆動しない。モジュールの IN に入れる。
-// リセット中に浮いてオンしないよう、オンレベルと逆の抵抗を外付けする
-// （HIGH オンならプルダウン、LOW オンならプルアップ）。
+// 主電源リレーの論理（G2 → XH 2pin #2、GPIO 直結）。1 なら HIGH でオン、0 なら LOW でオン。
+// DIN Base 構成で HIGH オンを実測。Base15 でも駆動段は Base15 の外なので変えない。
 constexpr int RELAY_ON_LEVEL = 1;
+// ブレーキ解除リレーの論理（G13 → Base15 内 MOSFET → XH 8pin #5）。1 なら GPIO HIGH で解除指令。
+// Base15 内の MOSFET が反転段（ローサイド 1 段）ならここだけを 0 にする。RELAY_ON_LEVEL は触らない。
+constexpr int BRAKE_ON_LEVEL = 1;
+// GPIO はコイルを直接駆動しない。リセット中に浮いてオンしないよう、リレー IN がオフ側に保たれる
+// プル抵抗を外付けする（非反転なら GPIO にプルダウン。反転段なら向きが逆になるので回路構成で決める）。
 
 constexpr uint32_t PWM_FREQ_HZ = 20000;  // MD13S の上限
 constexpr uint8_t PWM_BITS = 10;

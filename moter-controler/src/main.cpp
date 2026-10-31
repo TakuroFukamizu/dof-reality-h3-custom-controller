@@ -42,6 +42,7 @@ uint32_t next_repeat_ms = 0;
 M5Canvas canvas(&M5.Display);
 
 int relayOffLevel() { return RELAY_ON_LEVEL ? 0 : 1; }
+int brakeOffLevel() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 bool outputLive() {
   return relay_on && (millis() - relay_on_ms >= RELAY_SETTLE_MS);
@@ -125,7 +126,7 @@ void setBrake(bool on) {
     publish("OK");
     return;
   }
-  digitalWrite(PIN_MOTOR_BRAKE, on ? RELAY_ON_LEVEL : relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, on ? BRAKE_ON_LEVEL : brakeOffLevel());
   brake_on = on;
   ui_dirty = true;
   publish("OK");
@@ -168,7 +169,7 @@ void estop() {
   control_set_manual_speed(0);
   control_pulse_estop();
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
-  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
   relay_on = false;
   brake_on = false;
   was_live = false;
@@ -192,8 +193,8 @@ void printHelp() {
   Serial.println("  UNCAL         clear calibration of selected motor (relay off only)");
   Serial.printf("PortB(Base15) IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
-  Serial.printf("XH2pin#2 GPIO%d = power, XH8pin#5 GPIO%d = brake, ON level %d\n",
-                PIN_POWER_RELAY, PIN_MOTOR_BRAKE, RELAY_ON_LEVEL);
+  Serial.printf("XH2pin#2 GPIO%d = power (ON level %d), XH8pin#5 GPIO%d = brake (ON level %d)\n",
+                PIN_POWER_RELAY, RELAY_ON_LEVEL, PIN_MOTOR_BRAKE, BRAKE_ON_LEVEL);
   Serial.printf("XH8pin#2/#3 GPIO%d/%d = encoder A/B, XH8pin#6 GPIO%d = VIOUT (not read)\n",
                 PIN_ENC_A, PIN_ENC_B, PIN_VIOUT);
 }
@@ -768,7 +769,7 @@ void reportAuto(const ControlSnapshot& now) {
 
 void setup() {
   driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
-  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), relayOffLevel());
+  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), brakeOffLevel());
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
@@ -809,7 +810,7 @@ void setup() {
   pinMode(PIN_POWER_RELAY, OUTPUT);
   digitalWrite(PIN_POWER_RELAY, relayOffLevel());
   pinMode(PIN_MOTOR_BRAKE, OUTPUT);
-  digitalWrite(PIN_MOTOR_BRAKE, relayOffLevel());
+  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
   pinMode(PIN_MD13S_DIR, OUTPUT);
   digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
   motor_output_begin();
