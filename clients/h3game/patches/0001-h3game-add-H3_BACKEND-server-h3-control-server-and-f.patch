@@ -1,4 +1,4 @@
-From 2b5f17d75f0963b30ae5e5052f6e994b0367c7cb Mon Sep 17 00:00:00 2001
+From d21e7e13856f53240a57882b75910c0931eaa41f Mon Sep 17 00:00:00 2001
 From: Takuro Fukamizu <takuro.f.1987@gmail.com>
 Date: Fri, 30 Oct 2026 09:57:21 +0900
 Subject: [PATCH] h3game: add H3_BACKEND=server (h3-control-server) and
@@ -19,7 +19,7 @@ bridge.py
   waiting on the network; an exception from the backend is logged and
   counted (backend_errors) and the POST still gets its answer. /state
   keeps its keys and adds backend, rig_state, armed, calibration_valid,
-  fault, server_url, effective_gain and more.
+  fault, server_url, effective_gain, axis_conflict, hud_note and more.
   /reconnect re-opens the transport only. The /state poll never counts as
   game liveness.
 - All modes: bind the HTTP port before connect(). A second launch on a busy
@@ -39,23 +39,27 @@ web/index.html
   ahead of the 30 Hz POST, so sending the current frameSeq would pair zeros
   with a frame the server has not seen and drive the seat toward center.
 - Server mode only (st.backend === "server"): the play HUD and the setup
-  card add rig_state, a lost session, FAULT and a capped gain to the
-  connection text. /state "connected" is false once another client took
-  the session, so the page no longer says "接続中" / "席 OK" while this
-  bridge's poses go nowhere. Legacy pages look the same.
+  card add rig_state, a lost session, FAULT, the server's axis-assignment
+  note (/state hud_note: 系統の競合 / 個体の不一致 / 再基準化が必要) and a
+  capped gain to the connection text. /state "connected" is false once
+  another client took the session, so the page no longer says "接続中" /
+  "席 OK" while this bridge's poses go nowhere. Legacy pages look the same.
 
 New files: h3_server_backend.py (adapter), h3_motion_client.py (copy of
 the client from dof-reality-h3-custom-controller). Server mode needs
-`pip install websockets` (>= 13).
+`pip install websockets` (>= 13). The backend does nothing about an
+axis_conflict reject besides reporting it (poses keep flowing; the server
+accepts them again once the operator fixes the CoreS3 selection).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Ku3d95v3E4cEBdkTwSXWsv
 ---
  h3game/bridge.py            |  43 ++-
- h3game/h3_motion_client.py  | 592 ++++++++++++++++++++++++++++++++++++
- h3game/h3_server_backend.py | 212 +++++++++++++
+ h3game/h3_motion_client.py  | 658 ++++++++++++++++++++++++++++++++++++
+ h3game/h3_server_backend.py | 274 +++++++++++++++
  h3game/web/index.html       |  14 +-
- 4 files changed, 851 insertions(+), 10 deletions(-)
+ 4 files changed, 979 insertions(+), 10 deletions(-)
  create mode 100644 h3game/h3_motion_client.py
  create mode 100644 h3game/h3_server_backend.py
 
@@ -169,10 +173,10 @@ index 807b4d9..8f51d92 100644
 +        if backend: backend.close()   # 席は止めない(指令が途切れればサーバーが止める)
 diff --git a/h3game/h3_motion_client.py b/h3game/h3_motion_client.py
 new file mode 100644
-index 0000000..cd8cc85
+index 0000000..5f23a87
 --- /dev/null
 +++ b/h3game/h3_motion_client.py
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,658 @@
 +# Copy of clients/python/h3_motion_client.py in dof-reality-h3-custom-controller
 +# (canonical source). Edit there and copy here; do not change this copy alone.
 +"""Game-side client for h3-control-server (DESIGN.md §7, §8).
@@ -201,6 +205,11 @@ index 0000000..cd8cc85
 +- ``frame_seq`` is passed through as given. The server's default config
 +  requires it (``require_frame_seq``); it is never invented here.
 +- No admin token handling: arm / start / disarm belong to the operator CLI.
++- An ``axis_conflict`` reject (two CoreS3 units selected the same 系統,
++  DESIGN.md §10) is an operator problem, not a transport problem: the client
++  keeps sending (the server accepts again as soon as the selection is fixed),
++  never reconnects because of it, and logs it once per episode. It is exposed
++  as ``axis_conflict`` / ``last_reject``.
 +
 +Dependencies: Python >= 3.9, stdlib + ``websockets>=13`` (sync client).
 +
@@ -393,6 +402,8 @@ index 0000000..cd8cc85
 +        self._session_lost = False
 +        self._seq = 0
 +        self._last_ack: Optional[dict] = None
++        self._last_reject: Optional[dict] = None  # last ack with accepted=False
++        self._axis_conflict = False  # last ack was rejected with axis_conflict
 +        self._status: Optional[dict] = None
 +        self._status_at = 0.0
 +        self._warned_no_frame_seq = False
@@ -519,6 +530,23 @@ index 0000000..cd8cc85
 +        with self._cond:
 +            return self._last_ack
 +
++    @property
++    def last_reject(self) -> Optional[dict]:
++        """Last ack with ``accepted: false`` (its ``reason`` is the code, e.g.
++        ``axis_conflict``), or None if nothing was rejected yet. Not cleared by
++        a later accepted ack: compare with ``last_ack`` to see which is newer."""
++        with self._cond:
++            return self._last_reject
++
++    @property
++    def axis_conflict(self) -> bool:
++        """True while the server rejects our input with ``axis_conflict``
++        (two units selected the same 系統; DESIGN.md §10). Cleared by the next
++        ack that is accepted or rejected for another reason. Poses are still
++        sent meanwhile; the operator fixes the selection on the CoreS3."""
++        with self._cond:
++            return self._axis_conflict
++
 +    def reconnect(self) -> None:
 +        """Drop the connection and reconnect now with a new session.
 +        Transport only: never arms or starts. If the rig is ACTIVE, the new
@@ -596,6 +624,7 @@ index 0000000..cd8cc85
 +            self._session_lost = False
 +            self._conn_failed = False
 +            self._connected = True
++            self._axis_conflict = False  # a still-present conflict is logged again on this connection
 +            # A pose that waited through the outage and is already stale is
 +            # useless to the new session: drop it instead of sending.
 +            if self._pose is not None:
@@ -695,17 +724,29 @@ index 0000000..cd8cc85
 +            return
 +        kind = msg.get("type")
 +        if kind == "ack":
++            reason = msg.get("reason")
++            rejected = msg.get("accepted") is False
 +            with self._cond:
 +                self._last_ack = msg
-+                if msg.get("reason") == "stale_session" and not self._session_lost:
++                if rejected:
++                    self._last_reject = msg
++                lost = rejected and reason == "stale_session" and not self._session_lost
++                if lost:
 +                    self._session_lost = True
-+                    lost = True
-+                else:
-+                    lost = False
++                # Edge-triggered: one warning per conflict episode, not per rejected pose.
++                conflict = rejected and reason == "axis_conflict"
++                conflict_began = conflict and not self._axis_conflict
++                conflict_ended = self._axis_conflict and not conflict
++                self._axis_conflict = conflict
 +            if lost:
 +                self.log.warning("session taken over by another client; not sending poses (reconnect() to retake)")
-+            elif msg.get("accepted") is False:
-+                self.log.debug("pose rejected: %s", msg.get("reason"))
++            elif conflict_began:
++                self.log.warning("axis_conflict: two CoreS3 units selected the same axis; server rejects our input "
++                                 "until the operator fixes the selection (still sending, not reconnecting)")
++            elif conflict_ended:
++                self.log.info("axis_conflict cleared")
++            elif rejected:
++                self.log.debug("pose rejected: %s", reason)
 +        elif kind == "status":
 +            msg.pop("type", None)
 +            with self._cond:
@@ -722,8 +763,25 @@ index 0000000..cd8cc85
 +# ---------------------------------------------------------------- CLI
 +
 +
++def _claimants(a: dict) -> str:
++    """``port(device_id), port(device_id)`` from axes[].claimants (DESIGN.md §10.2); ``-`` if none."""
++    items = a.get("claimants")
++    if not isinstance(items, list) or not items:
++        return "-"
++    out = []
++    for c in items:
++        if isinstance(c, dict):
++            out.append("%s(%s)" % (c.get("port"), c.get("device_id")))
++        else:
++            out.append(str(c))
++    return ", ".join(out)
++
++
 +def _summary(st: dict) -> str:
 +    sess = st.get("session") or {}
++    conflict = st.get("axis_conflict")
++    if not isinstance(conflict, list):
++        conflict = []
 +    lines = [
 +        "rig_state:         %s" % st.get("rig_state"),
 +        "armed:             %s" % st.get("armed"),
@@ -731,15 +789,27 @@ index 0000000..cd8cc85
 +        "calibration_valid: %s" % st.get("calibration_valid"),
 +        "fault:             %s" % json.dumps(st.get("fault"), ensure_ascii=False),
 +        "blockers:          %s" % json.dumps(st.get("blockers"), ensure_ascii=False),
++        # Axes claimed by two or more CoreS3 units (same 系統 selected on both):
++        # the server refuses ARM / START / poses until the operator fixes it.
++        "axis_conflict:     %s" % (json.dumps(conflict) if conflict else "none"),
 +        "session:           %s fresh=%s age_ms=%s last_seq=%s last_frame_seq=%s" % (
 +            sess.get("source_session_prefix"), sess.get("fresh"), sess.get("source_age_ms"),
 +            sess.get("last_seq"), sess.get("last_frame_seq")),
 +        "effective_gain:    %s limits=%s" % (st.get("effective_gain"), st.get("limits")),
 +    ]
 +    for a in st.get("axes") or []:
++        if not isinstance(a, dict):
++            continue
 +        lines.append("axis %s: connected=%s mcu_state=%s fault_code=%s actual_count=%s target_count=%s" % (
 +            a.get("axis_id"), a.get("connected"), a.get("mcu_state"), a.get("fault_code"),
 +            a.get("actual_count"), a.get("target_count")))
++        # Assignment (DESIGN.md §10): which unit drives this axis and why.
++        # assignment: "selected" (MCU's 系統 selection) / "config" (device_id only) / None.
++        lines.append("        device_id=%s expected=%s assignment=%s%s claimants=%s" % (
++            a.get("device_id"), a.get("expected_device_id"), a.get("assignment"),
++            " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
++        if a.get("reference_stale"):
++            lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
 +    return "\n".join(lines)
 +
 +
@@ -767,10 +837,10 @@ index 0000000..cd8cc85
 +    sys.exit(main())
 diff --git a/h3game/h3_server_backend.py b/h3game/h3_server_backend.py
 new file mode 100644
-index 0000000..6b8801e
+index 0000000..6cefd6c
 --- /dev/null
 +++ b/h3game/h3_server_backend.py
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,274 @@
 +"""h3-control-server backend for h3game bridge.py (H3_BACKEND=server).
 +
 +Canonical source: clients/h3game/h3_server_backend.py in
@@ -797,6 +867,12 @@ index 0000000..6b8801e
 +- /state ``connected`` is False once another client took the session
 +  (``session_lost``): this bridge's poses are dropped until /reconnect, so the
 +  page must not say the seat is connected.
++- 系統 (axis) assignment problems (DESIGN.md §10) are shown to the player in
++  Japanese through ``hud_note`` (built from the status ``blockers`` codes and
++  the WS reject reason): 系統の競合 (``axis_conflict``), 個体の不一致
++  (``axis_device_mismatch``), 再基準化が必要 (``reference_stale``). The bridge
++  does nothing about them (operator fixes the selection on the CoreS3); the
++  server already refuses ARM / START / poses meanwhile.
 +
 +Python >= 3.9, stdlib + websockets>=13 (through h3_motion_client).
 +"""
@@ -807,10 +883,59 @@ index 0000000..6b8801e
 +import math
 +import numbers
 +import threading
-+from typing import Any, Callable, Dict, Optional
++from typing import Any, Callable, Dict, List, Optional
 +
 +DEFAULT_URL = "http://127.0.0.1:8892"
 +AXES = ("pitch", "roll", "yaw")
++
++# Blocker codes (the text before ':' in StatusSnapshot.blockers[], DESIGN.md
++# §7.2 / §10.2) and WS ack reject reasons that the player should see in
++# Japanese. Other codes stay operator-facing (status / check-config).
++HUD_TEXT = {
++    "axis_conflict": "系統の競合",          # 2 台の CoreS3 が同じ系統を選択している
++    "axis_device_mismatch": "個体の不一致",  # 設定の device_id と選択された個体が違う
++    "reference_stale": "再基準化が必要",     # 同じ boot のまま系統が変わった個体
++}
++REJECT_SUFFIX = "入力拒否"  # the WS ack said axis_conflict: our poses are being refused right now
++
++
++def blocker_code(b: Any) -> Optional[str]:
++    """``"<code>: <detail>"`` → ``"<code>"``; None for anything that is not a string."""
++    if not isinstance(b, str):
++        return None
++    return b.split(":", 1)[0].strip() or None
++
++
++def hud_note(blockers: Any, axis_conflict: Any = None, reject_reason: Any = None) -> Optional[str]:
++    """Japanese one-liner for the game HUD, or None when there is nothing to say.
++
++    ``blockers`` / ``axis_conflict`` are the StatusSnapshot fields (any shape
++    tolerated), ``reject_reason`` the reason of the last rejected WS ack. Each
++    phrase appears once, e.g. ``系統の競合(軸1、入力拒否) / 再基準化が必要``.
++    """
++    parts: List[str] = []
++    seen = set()
++    codes = [blocker_code(b) for b in blockers] if isinstance(blockers, list) else []
++    rejected = reject_reason == "axis_conflict"
++    if rejected and "axis_conflict" not in codes:
++        codes.append("axis_conflict")  # the reject can arrive before (or without) the blocker
++    axes = [a for a in axis_conflict if isinstance(a, int) and not isinstance(a, bool)] \
++        if isinstance(axis_conflict, list) else []
++    for code in codes:
++        if code is None or code not in HUD_TEXT or code in seen:
++            continue
++        seen.add(code)
++        text = HUD_TEXT[code]
++        if code == "axis_conflict":
++            detail = []
++            if axes:
++                detail.append("軸%s" % ",".join(str(a) for a in sorted(set(axes))))
++            if rejected:
++                detail.append(REJECT_SUFFIX)
++            if detail:
++                text += "(%s)" % "、".join(detail)
++        parts.append(text)
++    return " / ".join(parts) if parts else None
 +
 +# Return values of submit() (also the keys of ServerBackend.stats).
 +SENT = "sent"            # pose put in the client slot
@@ -963,6 +1088,8 @@ index 0000000..6b8801e
 +            frame_seq = self._frame_seq
 +            stats = dict(self.stats)
 +        lost = bool(c.session_lost)
++        reject = ack.get("reason") if ack.get("accepted") is False else None
++        conflict = st.get("axis_conflict") if st else None
 +        return {
 +            "backend": "server",
 +            "server_url": self.url,
@@ -980,11 +1107,16 @@ index 0000000..6b8801e
 +            "session_fresh": sess.get("fresh") if mine else None,
 +            "session_lost": lost,
 +            "reject_reason": ack.get("reason"),
++            # Axes claimed by 2+ CoreS3 units (same 系統 selected), DESIGN.md §10.
++            "axis_conflict": conflict if isinstance(conflict, list) else None,
++            # Japanese text for the page (系統の競合 / 個体の不一致 / 再基準化が必要);
++            # None when the server is unreachable or there is nothing to show.
++            "hud_note": hud_note(st.get("blockers"), conflict, reject) if st else None,
 +            "frame_seq": frame_seq,
 +            "pose_stats": stats,
 +        }
 diff --git a/h3game/web/index.html b/h3game/web/index.html
-index 5582760..b09030e 100644
+index 5582760..e03df5c 100644
 --- a/h3game/web/index.html
 +++ b/h3game/web/index.html
 @@ -106,9 +106,14 @@ function readInput(){const v=H3Input.values();const b1=H3Input.buttons('stick1')
@@ -992,7 +1124,7 @@ index 5582760..b09030e 100644
  // ---- 席: target に -1..1 を入れると、なめらかに追いかけて 30回/秒 で bridge に送る ----
  let target={pitch:0,roll:0,yaw:0},cur={pitch:0,roll:0,yaw:0},st={};
 +function srvNote(){if(st.backend!=='server')return'';const g=st.effective_gain;   // server: 接続中でも席が動くとは限らない(ARM・START は人が行う)
-+ return ' '+(st.rig_state||'?')+(st.session_lost?' 別の画面か bridge に取られた(つなぎ直す)':'')+(st.fault?' FAULT':'')+(g!=null&&Math.abs(g-cfg.gain)>0.001?' 揺れは '+(+g).toFixed(2)+' に制限':'')}
++ return ' '+(st.rig_state||'?')+(st.session_lost?' 別の画面か bridge に取られた(つなぎ直す)':'')+(st.fault?' FAULT':'')+(st.hud_note?' '+st.hud_note:'')+(g!=null&&Math.abs(g-cfg.gain)>0.001?' 揺れは '+(+g).toFixed(2)+' に制限':'')}
 +let frameSeq=0,frameAt=performance.now();   // 描画フレームの通し番号と、その時刻(制御サーバーが「ゲームが止まっていないか」を見る)
 +let sentSeq=0,sentAt=frameAt;   // 表示中に最後に送ったフレーム。隠れている間はこれを繰り返す(0 は新しいフレームとして送らない)
  function sendSeat(){if(STANDALONE)return;

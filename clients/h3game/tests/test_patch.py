@@ -151,6 +151,8 @@ class PatchTests(unittest.TestCase):
         self.assertIn("function srvNote(){if(st.backend!=='server')return'';", html)
         self.assertIn("st.session_lost?", html)
         self.assertIn("st.effective_gain", html)
+        # The server's axis-assignment note (/state hud_note: 系統の競合 etc.).
+        self.assertIn("(st.hud_note?' '+st.hud_note:'')", html)
         self.assertIn("'● H3 未接続')+srvNote()+", html)
 
     # ------------------------------------------------------------ second launch / LAN

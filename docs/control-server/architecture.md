@@ -254,7 +254,7 @@ GCを持たないこと、状態/単位/所有権を型で分けやすいこと�
 - CONTROLLED_STOP / DISARM / FAULT / FAULT_RESET
 - CLOCK_SYNC（時刻指定適用を実装する場合）
 
-HELLO: device_id、axis_id、boot_id、fw_version、protocol_version、capabilities、calibration_id/hash、状態。
+HELLO: device_id、axis_id（v1 では `selected_axis` = MCU で選択中の系統。[protocol.md](protocol.md) §1.1）、boot_id、fw_version、protocol_version、capabilities、calibration_id/hash、状態。
 
 SET_POSITION: session_epoch、seq、group_frame_id、target_count、速度/加速度の上限、期限、必要なら同期されたMCU時計上のapply_at。
 

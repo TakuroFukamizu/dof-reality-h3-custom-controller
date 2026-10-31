@@ -13,6 +13,7 @@ import contextlib
 import http.server
 import io
 import json
+import logging
 import os
 import socket
 import sys
@@ -463,7 +464,119 @@ class FakeServerTests(unittest.TestCase):
         self.client = MotionClient("http://127.0.0.1:%d" % free_port())
         self.assertIsNone(self.client.status())
         self.assertIsNone(self.client.last_ack)
+        self.assertIsNone(self.client.last_reject)
+        self.assertFalse(self.client.axis_conflict)
         self.assertFalse(self.client.connected)
+
+    # ------------------------------------------------------------ axis_conflict (DESIGN.md §10)
+
+    def test_axis_conflict_reject_keeps_sending_and_logs_once(self):
+        # Two CoreS3 units selected the same 系統: the server rejects poses with
+        # axis_conflict. Unlike stale_session this is not our problem to fix by
+        # reconnecting: keep the session, keep sending, warn once per episode.
+        log = logging.getLogger("test.axis_conflict.%d" % free_port())
+        fake = self.fake = FakeServer()
+        client = self.client = client_for(fake, connect_timeout=1.0, logger=log)
+        client.start()
+        self.connected()
+        fake.ack_reason = "axis_conflict"
+        with self.assertLogs(log, level="DEBUG") as cm:
+            for i in range(1, 31):
+                client.submit_pose(0.1, 0.0, 0.0, 0.3, frame_seq=i)
+                time.sleep(0.01)
+            wait_until(lambda: fake.poses() and fake.poses()[-1][2]["frame_seq"] == 30, msg="poses despite conflict")
+            wait_until(lambda: client.axis_conflict, msg="axis_conflict flag")
+            time.sleep(0.1)
+        warnings = [r for r in cm.records if r.levelno >= logging.WARNING]
+        self.assertEqual(len(warnings), 1, [r.getMessage() for r in warnings])
+        self.assertIn("axis_conflict", warnings[0].getMessage())
+        self.assertGreaterEqual(len(fake.poses()), 2, "poses must keep flowing during a conflict")
+        self.assertFalse(client.session_lost)
+        self.assertTrue(client.connected)
+        self.assertEqual(len(fake.sessions), 1, "a conflict must not trigger a reconnect")
+        self.assertEqual(client.last_reject["reason"], "axis_conflict")
+        self.assertIs(client.last_reject["accepted"], False)
+        self.assertEqual(client.last_ack, client.last_reject)
+        # Operator fixes the selection: the next accepted ack clears the flag,
+        # last_reject still remembers the reason, and a second episode logs again.
+        fake.ack_reason = None
+        client.submit_pose(0.2, 0.0, 0.0, 0.3, frame_seq=31)
+        wait_until(lambda: not client.axis_conflict, msg="conflict cleared")
+        self.assertTrue(client.last_ack["accepted"])
+        self.assertEqual(client.last_reject["reason"], "axis_conflict")
+        fake.ack_reason = "axis_conflict"
+        with self.assertLogs(log, level="WARNING") as cm:
+            client.submit_pose(0.3, 0.0, 0.0, 0.3, frame_seq=32)
+            wait_until(lambda: client.axis_conflict, msg="second episode")
+        self.assertEqual(len(cm.records), 1)
+        self.assertEqual(len(fake.sessions), 1)
+
+    def test_other_rejects_do_not_set_axis_conflict(self):
+        fake, client = self.start()
+        self.connected()
+        fake.ack_reason = "old_frame"
+        client.submit_pose(0.1, 0.0, 0.0, 0.3, frame_seq=1)
+        rej = wait_until(lambda: client.last_reject, msg="reject")
+        self.assertEqual(rej["reason"], "old_frame")
+        self.assertFalse(client.axis_conflict)
+        self.assertFalse(client.session_lost)
+
+    def test_summary_shows_assignment_and_conflict(self):
+        # StatusSnapshot per DESIGN.md §7.2 / §10.2: top-level axis_conflict,
+        # per-axis device_id / expected_device_id / assignment / claimants / reference_stale.
+        st = {
+            "rig_state": "OFFLINE", "armed": False, "active_source": None, "calibration_valid": True,
+            "fault": None,
+            "blockers": ["axis_conflict: axis1 claimed by /dev/a(5131000000000001), /dev/b(5131000000000002)",
+                         "axis_device_mismatch: axis2 device 5131000000000003, config expects 5131000000000009",
+                         "reference_stale: axis3 re-reference required after axis change"],
+            "axis_conflict": [1],
+            "session": {"source_session_prefix": None, "fresh": False},
+            "effective_gain": None, "limits": [],
+            "axes": [
+                {"axis_id": 1, "connected": False, "mcu_state": None, "fault_code": None,
+                 "actual_count": None, "target_count": None,
+                 "device_id": "5131000000000001", "expected_device_id": "0", "assignment": None,
+                 "claimants": [{"port": "/dev/a", "device_id": "5131000000000001"},
+                               {"port": "/dev/b", "device_id": "5131000000000002"}],
+                 "reference_stale": False},
+                {"axis_id": 2, "connected": True, "mcu_state": "DISARMED", "fault_code": "NONE",
+                 "actual_count": 0, "target_count": 0,
+                 "device_id": "5131000000000003", "expected_device_id": "5131000000000009",
+                 "assignment": "selected",
+                 "claimants": [{"port": "/dev/c", "device_id": "5131000000000003"}],
+                 "reference_stale": False},
+                {"axis_id": 3, "connected": True, "mcu_state": "DISARMED", "fault_code": "NONE",
+                 "actual_count": 0, "target_count": 0,
+                 "device_id": "5131000000000004", "expected_device_id": "5131000000000004",
+                 "assignment": "config",
+                 "claimants": [{"port": "/dev/d", "device_id": "5131000000000004"}],
+                 "reference_stale": True},
+            ],
+        }
+        text = hmc._summary(st)
+        self.assertIn("axis_conflict:     [1]", text)
+        self.assertIn("axis 1:", text)
+        self.assertIn("device_id=5131000000000001 expected=0 assignment=None CONFLICT "
+                      "claimants=/dev/a(5131000000000001), /dev/b(5131000000000002)", text)
+        self.assertIn("device_id=5131000000000003 expected=5131000000000009 assignment=selected "
+                      "claimants=/dev/c(5131000000000003)", text)
+        self.assertIn("assignment=config claimants=/dev/d(5131000000000004)", text)
+        self.assertEqual(text.count("reference_stale: re-reference required"), 1)  # only axis 3
+        self.assertEqual(text.count("CONFLICT"), 1)
+        self.assertIn("axis_device_mismatch", text)  # blockers line is still printed verbatim
+
+    def test_summary_tolerates_old_or_odd_snapshots(self):
+        # A server without §10 (no new keys) and odd values must not raise.
+        old = {"rig_state": "READY_TO_ARM", "axes": [{"axis_id": 1, "connected": True}]}
+        text = hmc._summary(old)
+        self.assertIn("axis_conflict:     none", text)
+        self.assertIn("device_id=None expected=None assignment=None claimants=-", text)
+        odd = {"axis_conflict": 7, "axes": [{"axis_id": 1, "claimants": "x"}, "junk", {"claimants": [1, {"port": "p"}]}]}
+        text = hmc._summary(odd)
+        self.assertIn("claimants=-", text)
+        self.assertIn("claimants=1, p(None)", text)
+        self.assertNotIn("CONFLICT", text)
 
     # ------------------------------------------------------------ stop / CLI
 

@@ -60,7 +60,9 @@ h3game リポジトリへは push していない。パッチはこのディレ�
 | `rig_state`, `armed`, `calibration_valid`, `fault`, `blockers`, `effective_gain` | サーバーの status の値。届いていなければ `null`（0 や false で埋めない） |
 | `session_fresh` | 自分の session の Pose が新鮮か（自分の session でなければ `null`） |
 | `session_lost` | 別のクライアントに session を取られた。この bridge の Pose はサーバーへ送られない。`/reconnect`（「H3 をつなぎ直す」）か画面の再読み込みで取り返す |
-| `reject_reason` | 最新の ack の拒否理由（例 `missing_frame_seq`） |
+| `reject_reason` | 最新の ack の拒否理由（例 `missing_frame_seq`、`axis_conflict`） |
+| `axis_conflict` | 2 台以上の CoreS3 が同じ系統を選んでいる軸の一覧（status の最上位 `axis_conflict`。空なら競合なし、届いていなければ `null`）。競合中はサーバーが ARM・START・Pose を拒否する（DESIGN.md §10） |
+| `hud_note` | 系統の割当に関する画面向けの日本語（status の `blockers` の code と ack の拒否理由から作る）: `axis_conflict` →「系統の競合(軸1)」、ack が `axis_conflict` なら「(軸1、入力拒否)」、`axis_device_mismatch` →「個体の不一致」、`reference_stale` →「再基準化が必要」。複数は ` / ` でつなぐ。何もなければ `null`。パッチ後の index.html は `srvNote()` でこれを接続表示に足す |
 | `frame_seq` | 最後にサーバーへ渡した frame_seq |
 | `pose_stats` | `sent` / `gain_only` / `repeat` / `old_frame` / `invalid` / `new_page` の件数 |
 | `auto_ignored` | 受け付けなかった auto 要求の数 |
@@ -72,6 +74,7 @@ h3game リポジトリへは push していない。パッチはこのディレ�
 - `sendSeat()` の JSON に `frame_seq` と `frame_age_ms`（POST 時点の now − 最後のフレーム時刻）を足す。
 - 画面が隠れている（`document.hidden`）あいだは、従来どおり 0 を送る（legacy の動作は変わらない）。ただし `frame_seq` は**表示中に最後に送った値**を繰り返し、`frame_age_ms` もそのフレームからの経過時間にする。rAF（約 60 Hz）は POST（約 30 Hz）より先に進むので、隠れる直前の「描いたがまだ送っていないフレーム」の番号を 0 と組み合わせて送ると、サーバーには新しいフレームの 0（中央へ）に見える。そうならないよう、隠れている間の POST が新しい frame_seq を持つことはない。server では repeat（gain が変わったときだけ gain_only）になり、座席は動かない。
 - server モードのときだけ（`/state` の `backend` が `"server"`）、プレイ中の HUD と確認画面の接続表示に `rig_state`、session を取られたこと、FAULT、gain がサーバーで制限されていること（`effective_gain` が画面の値と違うとき「揺れは 0.35 に制限」）を足す。`connected` が false のときは「● 制御サーバーで運転できない」と `port` を出す（USB の案内は出さない）。legacy の画面の表示は変わらない。
+- 同じく server モードのときだけ、`/state` の `hud_note`（系統の競合 / 個体の不一致 / 再基準化が必要）を `srvNote()` で接続表示に足す（`+(st.hud_note?' '+st.hud_note:'')`）。競合中はサーバーが入力を拒否するので、プレイヤーには「系統の競合(軸1、入力拒否)」と見える。詳細は `curl -s http://localhost:8891/state` か制御サーバーの status。
 - `scene*.js`・`game.js` は変更しない。
 
 旧 bridge は未知のキーを無視するので、パッチ後の画面は旧 bridge（legacy）でもそのまま動く。
@@ -81,6 +84,7 @@ h3game リポジトリへは push していない。パッチはこのディレ�
 - 同じ `frame_seq` の POST（ゲームループが止まって setInterval だけ動いている、画面が隠れて 0 を送っている）は Pose としてサーバーへ渡さない。gain が変わったときだけ gain のみのメッセージ（鮮度を延長しない）を送る。値を変えずに生存を延長するものは何も送らない。
 - 同じ owner で `frame_seq` が戻ったら捨てる。
 - **owner が変わったら**（画面の再読み込み・別タブ。`frame_seq` が 0 からやり直しになる）新しい session で張り直す。
+- 系統の割当の問題（DESIGN.md §10）は bridge では何もしない: `axis_conflict` の ack が来ても再接続せず、Pose は送り続ける（オペレーターが CoreS3 の選択を直せばサーバーがまた受理する）。画面向けには `/state` の `hud_note` と `axis_conflict` に出すだけ。
 - 範囲外・gain 上限の判定はサーバーに任せる（bridge 側でクリップした値ではなく、受けた値を渡す）。非有限値（float にできない巨大な整数を含む）・数値でない値・不正な frame_seq（整数でない、負、2⁶⁴−1 を超える。サーバーは u64 として読むので、超えた値を覚えると以後のフレームがすべて old_frame になる）・不正な frame_age_ms はサーバーへ渡さず `invalid` に数える。
 
 ## 適用方法
@@ -173,7 +177,7 @@ clients/python/.venv/bin/python -m unittest discover -s clients/h3game/tests -v
 
 | ファイル | 内容 | 必要なもの |
 | --- | --- | --- |
-| `test_server_backend.py` | バックエンド層の単体試験（偽クライアント）。frame_seq の扱い、owner 変更、無効値、/state のキー（session を取られたら `connected` false）、並行 POST | なし |
+| `test_server_backend.py` | バックエンド層の単体試験（偽クライアント）。frame_seq の扱い、owner 変更、無効値、/state のキー（session を取られたら `connected` false、`axis_conflict`・`hud_note` の生成と壊れた入力の耐性）、並行 POST | なし |
 | `test_patch.py` | 元リポジトリの一時クローンに `git am`。blob SHA、変更ファイル、正本との一致。legacy は h3_direct を遅延 import し元の bridge と同じ応答・`websockets` 不要。server・dry は `serial`・`h3_direct` を import しない（import すると印を書いて失敗する偽 `serial` で確認）。サーバー不在でも POST が待たされない、壊れた数値（巨大な整数、2⁶⁴ 以上の frame_seq）の POST にも応答して `invalid` に数える。ポート使用中の 2 つ目の bridge はサーバーへ 1 回も要求を出さずに終わる（要求を数える偽サーバーで確認）。LAN のアドレスからの `/reconnect`・`/claim` は無視される（LAN の IPv4 アドレスが無ければその 1 件は skip）。HUD の server 表示 | h3game のクローン（下記） |
 | `test_integration.py` | 実サーバー（sim）＋パッチ後の bridge。ブラウザーの代わりに 30Hz で POST。ARM/START 後に実カウントが期待値（混合式＋校正）に追従、`/state` の新旧キー、POST 停止で STOPPING → BRAKED_DISARMED かつ中立へ戻らない、frame_seq が止まると POST が続いても停止、ACTIVE 中に画面を隠しても中央へ動かない（ページの規則を模擬したもの）、再読み込みで新 session・自動再開なし、bridge の二重起動で走行が止まらない・session を取られたら `/state` が `connected: false`・`session_lost: true`、frame_seq なしは START 不可、dry はサーバーに何も届かない | 上記＋サーバーのバイナリ、websockets |
 | `test_browser.py` ＋ `browser_check.mjs` | ヘッドレス Chromium でパッチ後の画面を開き、POST の `frame_seq` が増え続け `frame_age_ms` が小さいこと、`document.hidden` を偽装すると、隠した直後の最初の POST から `frame_seq` が表示中に最後に送った値のまま 0 が送られること（隠す瞬間に未送信のフレームがある状況を作って確認）、サーバー接続時は ACTIVE 中に隠しても目標・実カウントが中央へ動かず STOPPING → BRAKED_DISARMED でその位置に止まること、サーバーが `freshness_mode=frame_seq` で受理したことを確認 | node、Playwright（`PLAYWRIGHT_MODULE`）、Chromium（`CHROMIUM_PATH`）。なければ skip |

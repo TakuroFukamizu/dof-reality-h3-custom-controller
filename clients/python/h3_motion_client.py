@@ -24,6 +24,11 @@ Contract (what this client does and never does):
 - ``frame_seq`` is passed through as given. The server's default config
   requires it (``require_frame_seq``); it is never invented here.
 - No admin token handling: arm / start / disarm belong to the operator CLI.
+- An ``axis_conflict`` reject (two CoreS3 units selected the same 系統,
+  DESIGN.md §10) is an operator problem, not a transport problem: the client
+  keeps sending (the server accepts again as soon as the selection is fixed),
+  never reconnects because of it, and logs it once per episode. It is exposed
+  as ``axis_conflict`` / ``last_reject``.
 
 Dependencies: Python >= 3.9, stdlib + ``websockets>=13`` (sync client).
 
@@ -216,6 +221,8 @@ class MotionClient:
         self._session_lost = False
         self._seq = 0
         self._last_ack: Optional[dict] = None
+        self._last_reject: Optional[dict] = None  # last ack with accepted=False
+        self._axis_conflict = False  # last ack was rejected with axis_conflict
         self._status: Optional[dict] = None
         self._status_at = 0.0
         self._warned_no_frame_seq = False
@@ -342,6 +349,23 @@ class MotionClient:
         with self._cond:
             return self._last_ack
 
+    @property
+    def last_reject(self) -> Optional[dict]:
+        """Last ack with ``accepted: false`` (its ``reason`` is the code, e.g.
+        ``axis_conflict``), or None if nothing was rejected yet. Not cleared by
+        a later accepted ack: compare with ``last_ack`` to see which is newer."""
+        with self._cond:
+            return self._last_reject
+
+    @property
+    def axis_conflict(self) -> bool:
+        """True while the server rejects our input with ``axis_conflict``
+        (two units selected the same 系統; DESIGN.md §10). Cleared by the next
+        ack that is accepted or rejected for another reason. Poses are still
+        sent meanwhile; the operator fixes the selection on the CoreS3."""
+        with self._cond:
+            return self._axis_conflict
+
     def reconnect(self) -> None:
         """Drop the connection and reconnect now with a new session.
         Transport only: never arms or starts. If the rig is ACTIVE, the new
@@ -419,6 +443,7 @@ class MotionClient:
             self._session_lost = False
             self._conn_failed = False
             self._connected = True
+            self._axis_conflict = False  # a still-present conflict is logged again on this connection
             # A pose that waited through the outage and is already stale is
             # useless to the new session: drop it instead of sending.
             if self._pose is not None:
@@ -518,17 +543,29 @@ class MotionClient:
             return
         kind = msg.get("type")
         if kind == "ack":
+            reason = msg.get("reason")
+            rejected = msg.get("accepted") is False
             with self._cond:
                 self._last_ack = msg
-                if msg.get("reason") == "stale_session" and not self._session_lost:
+                if rejected:
+                    self._last_reject = msg
+                lost = rejected and reason == "stale_session" and not self._session_lost
+                if lost:
                     self._session_lost = True
-                    lost = True
-                else:
-                    lost = False
+                # Edge-triggered: one warning per conflict episode, not per rejected pose.
+                conflict = rejected and reason == "axis_conflict"
+                conflict_began = conflict and not self._axis_conflict
+                conflict_ended = self._axis_conflict and not conflict
+                self._axis_conflict = conflict
             if lost:
                 self.log.warning("session taken over by another client; not sending poses (reconnect() to retake)")
-            elif msg.get("accepted") is False:
-                self.log.debug("pose rejected: %s", msg.get("reason"))
+            elif conflict_began:
+                self.log.warning("axis_conflict: two CoreS3 units selected the same axis; server rejects our input "
+                                 "until the operator fixes the selection (still sending, not reconnecting)")
+            elif conflict_ended:
+                self.log.info("axis_conflict cleared")
+            elif rejected:
+                self.log.debug("pose rejected: %s", reason)
         elif kind == "status":
             msg.pop("type", None)
             with self._cond:
@@ -545,8 +582,25 @@ class MotionClient:
 # ---------------------------------------------------------------- CLI
 
 
+def _claimants(a: dict) -> str:
+    """``port(device_id), port(device_id)`` from axes[].claimants (DESIGN.md §10.2); ``-`` if none."""
+    items = a.get("claimants")
+    if not isinstance(items, list) or not items:
+        return "-"
+    out = []
+    for c in items:
+        if isinstance(c, dict):
+            out.append("%s(%s)" % (c.get("port"), c.get("device_id")))
+        else:
+            out.append(str(c))
+    return ", ".join(out)
+
+
 def _summary(st: dict) -> str:
     sess = st.get("session") or {}
+    conflict = st.get("axis_conflict")
+    if not isinstance(conflict, list):
+        conflict = []
     lines = [
         "rig_state:         %s" % st.get("rig_state"),
         "armed:             %s" % st.get("armed"),
@@ -554,15 +608,27 @@ def _summary(st: dict) -> str:
         "calibration_valid: %s" % st.get("calibration_valid"),
         "fault:             %s" % json.dumps(st.get("fault"), ensure_ascii=False),
         "blockers:          %s" % json.dumps(st.get("blockers"), ensure_ascii=False),
+        # Axes claimed by two or more CoreS3 units (same 系統 selected on both):
+        # the server refuses ARM / START / poses until the operator fixes it.
+        "axis_conflict:     %s" % (json.dumps(conflict) if conflict else "none"),
         "session:           %s fresh=%s age_ms=%s last_seq=%s last_frame_seq=%s" % (
             sess.get("source_session_prefix"), sess.get("fresh"), sess.get("source_age_ms"),
             sess.get("last_seq"), sess.get("last_frame_seq")),
         "effective_gain:    %s limits=%s" % (st.get("effective_gain"), st.get("limits")),
     ]
     for a in st.get("axes") or []:
+        if not isinstance(a, dict):
+            continue
         lines.append("axis %s: connected=%s mcu_state=%s fault_code=%s actual_count=%s target_count=%s" % (
             a.get("axis_id"), a.get("connected"), a.get("mcu_state"), a.get("fault_code"),
             a.get("actual_count"), a.get("target_count")))
+        # Assignment (DESIGN.md §10): which unit drives this axis and why.
+        # assignment: "selected" (MCU's 系統 selection) / "config" (device_id only) / None.
+        lines.append("        device_id=%s expected=%s assignment=%s%s claimants=%s" % (
+            a.get("device_id"), a.get("expected_device_id"), a.get("assignment"),
+            " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
+        if a.get("reference_stale"):
+            lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
     return "\n".join(lines)
 
 

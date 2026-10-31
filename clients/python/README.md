@@ -26,6 +26,8 @@ client.close()                      # 座席は止めない（Pose が途絶え�
 | `submit_gain(gain)` | gain だけの更新（`{"type":"gain"}`）。未送信の Pose があればその gain を書き換える。鮮度は延長しない |
 | `status()` | WS で受けた最新 status（`GET /v1/status` と同じ形、`type` キーは除く） |
 | `last_ack` | 最新の ack（dict） |
+| `last_reject` | 最後に拒否された ack（`reason` が拒否理由。拒否が無ければ `None`。受理されても消えない） |
+| `axis_conflict` | 直近の ack が `axis_conflict`（2 台の CoreS3 が同じ系統を選んでいる。DESIGN.md §10）で拒否された。受理された・別の理由の ack で戻る。**送信は止めず、再接続もしない**（オペレーターが CoreS3 側の選択を直せばそのまま受理される）。警告ログは競合 1 回につき 1 行 |
 | `connected` | session 取得済みかつ WS 接続中（通信だけ。ARM 状態ではない） |
 | `session_id` / `session_info` | 現行 session の完全な id / `POST /v1/session` の応答（`max_gain`, `source_freshness_ms`, `require_frame_seq`） |
 | `session_lost` | `stale_session` の ack を受けた（別クライアントが session を取った）。以後 Pose を送らない |
@@ -43,6 +45,7 @@ client.close()                      # 座席は止めない（Pose が途絶え�
 - 通信エラー時は接続を閉じ、0.2 秒から倍々で最大 2 秒のバックオフで、**新しい session** で再接続する。1 秒以上続いた接続のあとだけバックオフを 0.2 秒に戻す。
 - 10 秒間何も受信しなければ（status は既定 100 ms ごと）切断して再接続する。
 - `stale_session` の ack を受けたら自動で session を取り返さない（2 つのクライアントが奪い合わないため）。`reconnect()` で取り返す。
+- `axis_conflict` の ack は通信の問題ではないので、session も接続も変えず送り続ける（`axis_conflict` プロパティで分かる。警告は競合 1 回につき 1 行）。
 
 ## bridge 側が知っておくこと
 
@@ -59,6 +62,8 @@ client.close()                      # 座席は止めない（Pose が途絶え�
 python3 h3_motion_client.py status [--url http://127.0.0.1:8892] [--json]
 python3 h3_motion_client.py stop   [--url http://127.0.0.1:8892]   # 確認できなければ終了コード 1
 ```
+
+`status` は rig_state・blockers・`axis_conflict`（競合している軸）に加え、軸ごとに `device_id`（接続中の個体）・`expected`（設定の `device_id`、0 = 照合なし）・`assignment`（`selected`＝MCU の系統選択 / `config` / None）・`claimants`（`port(device_id)` の一覧。競合中は 2 つ以上、`CONFLICT` 印）・`reference_stale` を出す（DESIGN.md §10）。
 
 ## テスト
 

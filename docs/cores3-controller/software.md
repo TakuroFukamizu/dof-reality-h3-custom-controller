@@ -15,7 +15,7 @@ Motion Software / Telemetry
  CoreS3 CoreS3 CoreS3     各軸で位置制御ループを完結
 ```
 
-- 3 台は同一ファームウェア（軸ごとの設定を持たない）。軸の割当は PC が HELLO の `device_id`（eFuse MAC 由来）と PC の設定ファイルの対応で決める（COM ポート番号に依存しない。HELLO の `axis_id_hint` は PC は採用しない）。制御パラメータ（ソフトリミット・速度・加速度・期限など）は毎 boot、PC の CONFIG で受け取る。
+- 3 台は同一ファームウェア（軸ごとの設定を持たない）。担当する系統（軸 1〜3）は **MCU 側で選択** し（電源ボタン操作、NVS に保存。切り替えは DISARMED のときだけ）、HELLO と毎回の STATUS の `selected_axis` で PC に知らせる。PC はこの値で軸を割り当てる（COM ポート番号に依存しない）。PC の設定ファイルの `device_id`（eFuse MAC 由来）は「この軸はこの個体のはず」という照合用で、違えば ARM しない。同じ系統を 2 台が選ぶと PC はその軸を競合として止める（[control-server/protocol.md](../control-server/protocol.md) §1.1）。制御パラメータ（ソフトリミット・速度・加速度・期限など）は毎 boot、PC の CONFIG で受け取る。
 - 通信断時は各軸が自律的に停止する。PC からの指令には seq と group_frame_id を付ける。v1 は適用時刻（`apply_at_us`）を使わず受信時に適用し、3 軸のずれは STATUS の `last_applied_frame` で監視する。USB だけでは厳密な時刻同期にならないので、同期誤差を測定して許容できるか確認する。
 
 ## ESP32-S3 のコア分担（案）
@@ -105,7 +105,7 @@ PC（h3-control-server）との本番用プロトコルは [control-server/proto
 
 | メッセージ | 内容 |
 | --- | --- |
-| HELLO | 軸 ID、FW バージョン、状態 |
+| HELLO | device_id、選択中の系統（`selected_axis`）、FW バージョン、状態 |
 | ARM / DISARM | 駆動準備要求 / 駆動停止 |
 | SET_TARGET | 目標位置、速度・加速度制限 |
 | STATUS | 実位置、目標位置、PWM、ブレーキ状態 |

@@ -306,6 +306,65 @@ class StateTests(unittest.TestCase):
         self.b.submit(1, body(4), STATE)
         self.assertEqual(self.b.state()["frame_seq"], 4)
 
+    # ------------------------------------------------------------ 系統の割当 (DESIGN.md §10)
+
+    BLOCKERS = ["axis_conflict: axis1 claimed by /dev/a(5131000000000001), /dev/b(5131000000000002)",
+                "axis_device_mismatch: axis2 device 5131000000000003, config expects 5131000000000009",
+                "reference_stale: axis3 re-reference required after axis change"]
+
+    def test_axis_conflict_and_hud_note_from_status(self):
+        self.c.connected = True
+        self.c._status = snapshot("OFFLINE", blockers=list(self.BLOCKERS), axis_conflict=[1])
+        s = self.b.state()
+        self.assertEqual(s["axis_conflict"], [1])
+        self.assertEqual(s["hud_note"], "系統の競合(軸1) / 個体の不一致 / 再基準化が必要")
+        self.assertFalse(s["connected"])  # conflicted axis has no primary → OFFLINE
+        self.assertEqual(s["blockers"], self.BLOCKERS)  # raw codes still available to the page
+
+    def test_hud_note_adds_reject_and_axes(self):
+        self.c.connected = True
+        self.c._status = snapshot("OFFLINE", blockers=[self.BLOCKERS[0]], axis_conflict=[1, 3])
+        self.c.last_ack = {"type": "ack", "seq": 5, "accepted": False, "reason": "axis_conflict"}
+        s = self.b.state()
+        self.assertEqual(s["reject_reason"], "axis_conflict")
+        self.assertEqual(s["hud_note"], "系統の競合(軸1,3、入力拒否)")
+        # Blocker gone but the reject still says conflict (status lags the ack): still shown once.
+        self.c._status = snapshot("READY_TO_ARM", blockers=[], axis_conflict=[])
+        self.assertEqual(self.b.state()["hud_note"], "系統の競合(入力拒否)")
+        # Accepted again: nothing to say.
+        self.c.last_ack = {"type": "ack", "seq": 6, "accepted": True, "reason": None}
+        self.assertIsNone(self.b.state()["hud_note"])
+        self.assertEqual(self.b.state()["axis_conflict"], [])
+
+    def test_hud_note_ignores_other_blockers_and_is_none_when_unreachable(self):
+        self.c.connected = True
+        self.c._status = snapshot("READY_TO_ARM", blockers=["calibration_invalid: axis2", "not_connected: axis3"],
+                                  axis_conflict=[])
+        s = self.b.state()
+        self.assertIsNone(s["hud_note"])
+        self.assertEqual(s["axis_conflict"], [])
+        self.c.connected = False
+        s = self.b.state()
+        self.assertIsNone(s["hud_note"])
+        self.assertIsNone(s["axis_conflict"])
+        # Old server without §10 fields.
+        self.c.connected = True
+        self.c._status = snapshot("READY_TO_ARM")
+        s = self.b.state()
+        self.assertIsNone(s["hud_note"])
+        self.assertIsNone(s["axis_conflict"])
+
+    def test_hud_note_tolerates_malformed_input(self):
+        self.assertIsNone(hsb.hud_note(None))
+        self.assertIsNone(hsb.hud_note("axis_conflict: x"))  # not a list
+        self.assertIsNone(hsb.hud_note([None, 3, "", ":", "unknown_code: y"]))
+        self.assertEqual(hsb.hud_note(["axis_conflict"], axis_conflict="1"), "系統の競合")  # no colon, bad axes
+        self.assertEqual(hsb.hud_note(["axis_conflict:axis1", "axis_conflict: again"], [True, 2, "x", 2]),
+                         "系統の競合(軸2)")
+        self.assertEqual(hsb.hud_note([], reject_reason="old_frame"), None)
+        self.assertEqual(hsb.blocker_code("reference_stale: axis3 ..."), "reference_stale")
+        self.assertIsNone(hsb.blocker_code(5))
+
 
 class DefaultFactoryTests(unittest.TestCase):
     def test_default_factory_is_motion_client(self):

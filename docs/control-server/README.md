@@ -40,7 +40,7 @@ sim backend では 3 台の CoreS3 の代わりに `control-server/src/sim_axis.
 | 区分 | 項目 |
 | --- | --- |
 | 確定（実装・試験済み） | Game API と管理 API（DESIGN.md §7）。混合式は h3_direct.py と同じ（段階 1 の表と一致）。接続・再接続・サーバー終了で中央復帰・ARM・START をしない。ゲーム入力の鮮度は `frame_seq` が進んだときだけ延長。走行中に session が変わると必ず停止。停止・FAULT を後から来た Pose で上書きしない。いずれも **模擬軸での確認** |
-| 確定（実装済み・実機未確認） | USB プロトコル v1 の PC 側（エンコード・デコード・テストベクタ）。serial backend（HELLO の device_id で軸を照合） |
+| 確定（実装済み・実機未確認） | USB プロトコル v1 の PC 側（エンコード・デコード・テストベクタ）。serial backend（HELLO / STATUS の `selected_axis`＝MCU で選択した系統で軸を割り当て、設定の `device_id` は照合用。protocol.md §1.1、DESIGN.md §10） |
 | 推定 | 模擬軸での遅延（[runs/](runs/) の値: Pose 受信→tick 取り込み p99 約 10 ms、tick 周期 p99 約 11 ms）は macOS・無負荷での値。実機・高負荷・Windows で同じとは限らない |
 | 未確定 | 軸 2・3 の校正値（`config/*.toml` の値は仮値）。軸 1 の向き。`max_gain` 0.35、`source_freshness_ms` 250、`mcu_command_timeout_ms` 100 などの期限（ベンチ用の候補値。実機の停止距離・揺れで決める） |
 | 未実装 | CoreS3 ファームウェア（下の「CoreS3 側でやること」）。CLOCK_SYNC と `apply_at_us`（v1 は 0 固定）。実測角度（`measured_angles` は常に null）。物理非常停止の監視（`physical_estop: "not_monitored"`）。サーバー側の JSONL 記録（`telemetry.rs` に記録器はあるが設定・配線していない。`recorder_dropped` は常に 0。障害前後の経過はメモリ上のリング `GET /v1/events` と標準エラーのログで見る。サーバーを再起動すると消える）。telemetry の一部（計画 §8・§11）: SET_POSITION 送信→MCU 適用の遅延、source age の分布、キュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質は測っていない（サーバー受信→MCU 適用 p99 20 ms の目標は評価できない） |
@@ -83,11 +83,12 @@ control-server/scripts/e2e_sim.sh --out /tmp/e2e  # 記録先を変える
 
 | ファイル | 用途 |
 | --- | --- |
-| `control-server/config/example.toml` | 実機用の雛形。`backend.kind = "serial"`、`device_id` は 0（未記入）、全軸 `calibration_valid = false`。**このままでは ARM できない**（`check-config` が阻害要因を列挙する） |
+| `control-server/config/example.toml` | 実機用の雛形。`backend.kind = "serial"`、`device_id` は 0（照合しない。軸は各 CoreS3 で選択した系統で決まる）、全軸 `calibration_valid = false`。**このままでは ARM できない**（`check-config` が阻害要因を列挙する） |
 | `control-server/config/sim.toml` | 模擬軸用。`calibration_valid = true` は模擬軸だから許される。実機の設定にコピーしない |
 
 - 校正・符号・リミットの変更は DISARMED のときだけ（サーバー再起動で反映）。軸 2・3 の値は未測定の仮値。軸 1 の値をコピーしない（architecture.md §6）。
-- 実機で使う前に: HELLO で各軸の `device_id` を確認して記入 → 校正値を実測 → `calibration_valid = true` は人が確認してから。
+- 実機で使う前に: 各 CoreS3 で担当する系統（軸 1〜3）を選択する（電源ボタン操作、NVS に保存。protocol.md §1.1）。未選択のまま PC に挿した個体（設定の `device_id` にも無いもの）は `unknown_device` でポートを閉じられるので、選択してから **USB を抜き差しする**（PC は装置が消えるまでそのポートを開き直さない）→ 必要なら status の `axes[].device_id` を見て `[[axis]].device_id` に記入する（「この軸はこの個体のはず」という照合。0 なら照合しない。違う個体が選ばれていれば `axis_device_mismatch` で ARM しない）→ 校正値を実測 → `calibration_valid = true` は人が確認してから。
+- 軸の割当は MCU 側の選択で決まる。同じ系統を 2 台が選んでいると `axis_conflict`（その軸は OFFLINE、ARM・START・ゲーム入力を拒否）。片方を別の系統にするか抜けば解消する。同じ boot のまま系統を変えた個体は `reference_stale`（`/v1/reference` をやり直すまで ARM しない）。
 - bind は既定で loopback だけ。`server.allow_non_loopback = true` でも LAN の相手に開くのは `GET /v1/status` と `POST /v1/stop` だけ。
 - `power_controller_axis` の軸だけが主電源（G2）を操作する。各軸の STATUS の `POWER_CONTROLLER` がこの設定と違えば ARM しない（`power_role_mismatch`）。
 
@@ -112,6 +113,7 @@ curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 
 ```
 
 - 成功は 200 `{"ok":true,"rig_state":...}`、拒否は 409 `{"ok":false,"error":"<code>","blockers":[...]}`。`blockers` は `"<code>: <detail>"`。
+- 系統の割当（DESIGN.md §10）は status で見る: 最上位 `axis_conflict`（2 台以上が選んでいる軸の一覧。空なら競合なし）、各軸の `device_id`（接続中の個体）・`expected_device_id`（設定値、0 = 照合なし）・`assignment`（`"selected"`＝MCU の選択 / `"config"`＝`device_id` だけで決まった / null）・`claimants`（この軸を名乗るポートと個体。競合中は 2 つ以上）・`reference_stale`。blockers の code は `axis_conflict` / `axis_device_mismatch` / `reference_stale`。競合中は arm / start / center が 409 `axis_conflict`、WS の pose / gain も ack `reason: "axis_conflict"` で拒否（鮮度は延びない）。
 - 503 `control_loop_unavailable`: 制御ループが 1 秒以内に答えなかった。arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は**実行されたかもしれない**（ループが追いつけば実行する）。いずれも status で確かめる。`GET /v1/status` は制御ループが終わっている（落ちた）とき 503。終了処理（SIGTERM など）が始まると新しい接続は受け付けず、503 ではなく接続拒否になる（確定: sim で ARM 中に SIGTERM、5 ms ごとの status は全て接続拒否）。終了処理の直前に受け付けた要求に 503 が返ることはありうる（推定、未観測）。
 - 管理 API は rate limit（既定 20 回/秒）。stop / disarm / fault は対象外。
 - FAULT になったら `fault`・`fault_history`（status）に加えて `GET /v1/events` で直前の経過（ARM・START・軸の接続・ACK の拒否や期限切れ・状態遷移）と、その後の状態遷移を見る。リングは 512 件（古いものから上書き、`dropped` に数える）。制御ループが落ちた後も読める。同じイベントは標準エラーにも info で出る。
@@ -131,8 +133,8 @@ curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 
 参照する挙動は `control-server/src/sim_axis.rs`（`SimMcu`。ENCODER_FAULT・CONTROL_OVERRUN の検出は模擬しておらず、異常注入 `force_fault` で与えるだけ）。同じ入力に同じ応答を返すことを目標にする。フレームのバイト列は protocol.md §7 のテストベクタと一致させる。
 
 1. **フレーミング**（§2）: COBS（区切り 0x00）、header 4 byte＋payload＋CRC-16/CCITT-FALSE（LE）。復号後 256 byte 超・CRC 不一致・版違い・未知種別・長さ違いは破棄して `rx_error_count` を数え、応答しない。
-2. **HELLO**（§4）: HELLO_REQ に `device_id`（eFuse MAC 由来）・起動ごとの乱数 `boot_id`・FW 版・capabilities・受理済み `calibration_hash` を返す。
-3. **STATUS を 50 Hz で自発送信**（§4）: 状態・異常コード・flags・PWM・実位置・制御目標・速度・追従誤差・`last_applied_frame/seq`・`last_rx_seq`・電流（未校正なら CURRENT_VALID を立てない）・エラー数。
+2. **HELLO**（§4）: HELLO_REQ に `selected_axis`（選択中の系統 1〜3、0 = 未選択）・`device_id`（eFuse MAC 由来）・起動ごとの乱数 `boot_id`・FW 版・capabilities・受理済み `calibration_hash` を返す。
+3. **STATUS を 50 Hz で自発送信**（§4）: 状態・`selected_axis`・異常コード・flags・PWM・実位置・制御目標・速度・追従誤差・`last_applied_frame/seq`・`last_rx_seq`・電流（未校正なら CURRENT_VALID を立てない）・エラー数。
 4. **状態機械**（§3.1、§5）: BOOT → DISARMED → ARMING → HOLDING → ACTIVE → STOPPING → HOLDING、DISARM で（動いていれば減速して）DISARMING → DISARMED、異常で FAULT。図にない組み合わせ（HOLDING での CONTROLLED_STOP、DISARMED・ARMING での DISARM など）は拒否せず ACCEPTED（§4 の表。PC はこれらを送り、拒否されると停止失敗として FAULT にする）。USB 再接続・CDC 再オープンで自動 ARM / START しない。NVS に ARM 状態を保存しない。
    - **ACK と STATUS の順序**（§1）: 命令による状態遷移は ACK を送る前に確定させ、ACK の後の STATUS はすべて遷移後の状態にする。USB を Core 0、制御を Core 1 に分けたときに、命令前に取った STATUS を ACK の後に送らない（PC は ARM を状態不一致で中断し、FAULT_RESET の判断を誤る）。
 5. **ARM の前提**（§4 ARM_PREPARE）: DISARMED・CONFIG 受理済み・SET_REFERENCE 済み・epoch 一致・実位置がソフトリミット内。拒否理由の順序も表のとおり。ARMING の順序は §5（主電源は電源担当軸だけ → 範囲外ならブレーキを解除せず FAULT → 現在位置で位置制御開始 → ブレーキ解除）。
@@ -142,6 +144,7 @@ curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 
 9. **SET_REFERENCE / CONFIG** は DISARMED のときだけ。CONFIG は §4 の表にある検査（DISARMED、`soft_min < soft_max`、6 項目 > 0）以外で拒否しない。`role_flags` bit0 を STATUS の `POWER_CONTROLLER` に出す。CONFIG の epoch が変わったら `last_rx_seq` を 0 に戻す（同じ epoch なら保持）。boot ごとに REFERENCED / CONFIGURED は消える。
    - STATUS の `target_count` は軌道上の目標（受けた SET_POSITION の目標ではない）、`following_error_count` は `actual_count − target_count`（§4）。FAULT_EVENT は FAULT へ遷移するたびに 1 回（§4）。
    - PC 側の期限（ACK 1 s、HELLO_REQ 200 ms / 2 s、ARM 5 s、停止 3 s）に収まるようにする（§6）。
-10. PC 側にない責務: 位置制御周期（案 200 Hz 以上）を USB・画面描画に依存させない。PC が止まっても自律的に停止へ進む（期限切れ → 減速 → FAULT・ブレーキ）。
+10. **系統選択**（§1.1）: 担当する系統（軸 1〜3）は MCU 側で選ぶ（電源ボタン操作、NVS に保存）。選択中の値を HELLO と毎回の STATUS の `selected_axis` に出す（0 = 未選択。PC はこれで軸を割り当て、設定の `device_id` は照合にだけ使う）。切り替えは **DISARMED のときだけ** 受け付け、それ以外（FAULT 中も）は操作を無視する。切り替えたら ACK と同じ順序規則で状態を確定してから、`CONFIGURED`・`POSITION_REFERENCED` を消し `calibration_hash` を 0 にし、AXIS_SELECT（`0x86`。`boot_id`、新旧の `selected_axis`、`mcu_state`。ACK なし）を 1 回送り、以後の STATUS に新しい値を載せる。選択で `actual_count` の向き・原点・スケールは変えない（符号・ストローク・中立は PC の校正で扱う）。受理済み命令の記憶と `last_rx_seq` は消さなくてよい。
+11. PC 側にない責務: 位置制御周期（案 200 Hz 以上）を USB・画面描画に依存させない。PC が止まっても自律的に停止へ進む（期限切れ → 減速 → FAULT・ブレーキ）。
 
 v1 で扱わないもの: CLOCK_SYNC による時刻同期と `apply_at_us`（CLOCK_SYNC_REPLY は PC 側で捨てる）。

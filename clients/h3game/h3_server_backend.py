@@ -24,6 +24,12 @@ each accepted POST to ``ServerBackend.submit`` and merges ``state()`` into
 - /state ``connected`` is False once another client took the session
   (``session_lost``): this bridge's poses are dropped until /reconnect, so the
   page must not say the seat is connected.
+- 系統 (axis) assignment problems (DESIGN.md §10) are shown to the player in
+  Japanese through ``hud_note`` (built from the status ``blockers`` codes and
+  the WS reject reason): 系統の競合 (``axis_conflict``), 個体の不一致
+  (``axis_device_mismatch``), 再基準化が必要 (``reference_stale``). The bridge
+  does nothing about them (operator fixes the selection on the CoreS3); the
+  server already refuses ARM / START / poses meanwhile.
 
 Python >= 3.9, stdlib + websockets>=13 (through h3_motion_client).
 """
@@ -34,10 +40,59 @@ import logging
 import math
 import numbers
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 DEFAULT_URL = "http://127.0.0.1:8892"
 AXES = ("pitch", "roll", "yaw")
+
+# Blocker codes (the text before ':' in StatusSnapshot.blockers[], DESIGN.md
+# §7.2 / §10.2) and WS ack reject reasons that the player should see in
+# Japanese. Other codes stay operator-facing (status / check-config).
+HUD_TEXT = {
+    "axis_conflict": "系統の競合",          # 2 台の CoreS3 が同じ系統を選択している
+    "axis_device_mismatch": "個体の不一致",  # 設定の device_id と選択された個体が違う
+    "reference_stale": "再基準化が必要",     # 同じ boot のまま系統が変わった個体
+}
+REJECT_SUFFIX = "入力拒否"  # the WS ack said axis_conflict: our poses are being refused right now
+
+
+def blocker_code(b: Any) -> Optional[str]:
+    """``"<code>: <detail>"`` → ``"<code>"``; None for anything that is not a string."""
+    if not isinstance(b, str):
+        return None
+    return b.split(":", 1)[0].strip() or None
+
+
+def hud_note(blockers: Any, axis_conflict: Any = None, reject_reason: Any = None) -> Optional[str]:
+    """Japanese one-liner for the game HUD, or None when there is nothing to say.
+
+    ``blockers`` / ``axis_conflict`` are the StatusSnapshot fields (any shape
+    tolerated), ``reject_reason`` the reason of the last rejected WS ack. Each
+    phrase appears once, e.g. ``系統の競合(軸1、入力拒否) / 再基準化が必要``.
+    """
+    parts: List[str] = []
+    seen = set()
+    codes = [blocker_code(b) for b in blockers] if isinstance(blockers, list) else []
+    rejected = reject_reason == "axis_conflict"
+    if rejected and "axis_conflict" not in codes:
+        codes.append("axis_conflict")  # the reject can arrive before (or without) the blocker
+    axes = [a for a in axis_conflict if isinstance(a, int) and not isinstance(a, bool)] \
+        if isinstance(axis_conflict, list) else []
+    for code in codes:
+        if code is None or code not in HUD_TEXT or code in seen:
+            continue
+        seen.add(code)
+        text = HUD_TEXT[code]
+        if code == "axis_conflict":
+            detail = []
+            if axes:
+                detail.append("軸%s" % ",".join(str(a) for a in sorted(set(axes))))
+            if rejected:
+                detail.append(REJECT_SUFFIX)
+            if detail:
+                text += "(%s)" % "、".join(detail)
+        parts.append(text)
+    return " / ".join(parts) if parts else None
 
 # Return values of submit() (also the keys of ServerBackend.stats).
 SENT = "sent"            # pose put in the client slot
@@ -190,6 +245,8 @@ class ServerBackend:
             frame_seq = self._frame_seq
             stats = dict(self.stats)
         lost = bool(c.session_lost)
+        reject = ack.get("reason") if ack.get("accepted") is False else None
+        conflict = st.get("axis_conflict") if st else None
         return {
             "backend": "server",
             "server_url": self.url,
@@ -207,6 +264,11 @@ class ServerBackend:
             "session_fresh": sess.get("fresh") if mine else None,
             "session_lost": lost,
             "reject_reason": ack.get("reason"),
+            # Axes claimed by 2+ CoreS3 units (same 系統 selected), DESIGN.md §10.
+            "axis_conflict": conflict if isinstance(conflict, list) else None,
+            # Japanese text for the page (系統の競合 / 個体の不一致 / 再基準化が必要);
+            # None when the server is unreachable or there is nothing to show.
+            "hud_note": hud_note(st.get("blockers"), conflict, reject) if st else None,
             "frame_seq": frame_seq,
             "pose_stats": stats,
         }
