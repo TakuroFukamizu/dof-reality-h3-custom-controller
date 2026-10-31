@@ -818,6 +818,9 @@ void setup() {
   M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
 #endif
   Serial.begin(115200);
+  // USB CDC をホストが読んでいないと write / flush は既定 100 ms ずつ待つ。自動移動中は AUTO 行と ENC 行の
+  // flush が続くので、UI ループが 200 ms 止まると制御タスクの入力鮮度の守りが働いてしまう。20 ms に短縮する。
+  Serial.setTxTimeoutMs(20);
 
   if (M5.Display.width() < M5.Display.height()) {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
