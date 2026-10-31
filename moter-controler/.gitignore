@@ -2,3 +2,4 @@
 .vscode
 .cache
 *.log
+tools/__pycache__/

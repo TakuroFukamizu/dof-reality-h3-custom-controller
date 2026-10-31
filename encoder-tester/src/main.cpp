@@ -21,7 +21,8 @@ bool stall_latched = false;
 }  // namespace
 
 void setup() {
-  // M5.begin は Port A を触ることがある。先にリレーと PWM をオフにしてから始める。
+  // M5.begin は Port.A（G2 = 主電源リレー）の I2C 探索や、Module 検出で G13（= ブレーキ解除リレー）を
+  // I2S DOUT に取ることがある。先にリレーと PWM をオフにし、cfg で探索を切ってから始める。
   power_force_off();
   brake_force_off();
   motor_force_safe();
@@ -30,16 +31,18 @@ void setup() {
   cfg.clear_display = true;
 #if ENCODER_TESTER_USB_POWER
   // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する（10/22 と同じ構成）。
-  // DIN Base 12V と USB の同時接続で約 85 秒後に電源断する問題（Issue #1）の回避用。12V は接続しない。
+  // DIN Base 12V と USB の同時接続で約 85 秒後に電源断する問題（Issue #1）の回避用。Bottom の DC は接続しない。
+  // Bottom は Base15 に変更した。Base15 の DC と USB の同時接続は未検証。
   cfg.output_power = true;
 #else
-  cfg.output_power = false;  // DIN側からBUSの5Vを受ける設定
+  cfg.output_power = false;  // Bottom（Base15 の DC ジャック → MP1584 → BUS 5V）から 5V を受ける設定
 #endif
   cfg.internal_imu = false;
   cfg.internal_mic = false;
   cfg.internal_spk = false;
   cfg.external_imu = false;
   cfg.external_rtc = false;
+  // G2（主電源）は Port.A の I2C 線、G13（ブレーキ）は Module Display/RCA 検出時の I2S DOUT。どちらも探索させない。
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
