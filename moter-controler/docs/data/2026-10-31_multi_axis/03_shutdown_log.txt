@@ -1,0 +1,21 @@
+17:42:49.844 [#1] > B 0
+17:42:49.844 [#3] > B 0
+17:42:49.844 [#2] > B 0
+17:42:50.664 [#1] OK R=1 B=0 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=0 LIVE=1 ENC=1529 A=0 B=1
+17:42:50.664 [#3] OK R=1 B=0 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=0 LIVE=1 ENC=49 A=0 B=1
+17:42:50.664 [#2] OK R=1 B=0 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=0 LIVE=1 ENC=-2 A=1 B=0
+17:42:50.664 [#1] > R 0
+17:42:50.664 [#3] > R 0
+17:42:50.664 [#2] > R 0
+17:42:51.469 [#3] OK R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=87 A=0 B=1
+17:42:51.469 [#2] OK R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=6 A=1 B=0
+17:42:51.469 [#1] > ?
+17:42:51.469 [#3] > ?
+17:42:51.469 [#2] > ?
+17:42:52.689 [#1] OK R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=1529 A=0 B=1
+17:42:52.690 [#1] STAT R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=1529 A=0 B=1
+17:42:52.690 [#1] ENC motor=1 count=1529 pos=2774 cps=0 a=0 b=1 origin=1 cal=1 stroke=5551 neutral=2775 sign=1 auto=neutral phase=done reason=ok
+17:42:52.690 [#3] STAT R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=87 A=0 B=1
+17:42:52.690 [#3] ENC motor=3 count=87 pos=3123 cps=0 a=0 b=1 origin=1 cal=1 stroke=6159 neutral=3079 sign=1 auto=neutral phase=done reason=ok
+17:42:52.690 [#2] STAT R=0 B=0 S=0 OUT=0 DIR=0 PWR_PIN=0 BRK_PIN=0 LIVE=0 ENC=6 A=1 B=0
+17:42:52.690 [#2] ENC motor=2 count=6 pos=2749 cps=0 a=1 b=0 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=done reason=ok
