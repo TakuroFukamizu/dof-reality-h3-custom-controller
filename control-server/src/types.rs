@@ -152,6 +152,11 @@ pub enum LimitReason {
     /// deadline: `max_acc` was raised (or `max_vel` lowered) to the bound
     /// (Issue #15 H2, `limits::clamp`).
     StopTimeLimited,
+    /// A motion limit requested over the game channel (WS `limits`) exceeded
+    /// the operator's `[limits]` value and was reduced to it: the game may
+    /// only lower the operator's limits; `POST /v1/limits` (admin) raises
+    /// them (Issue #15, `limits::OperatorCap`).
+    OperatorLimited,
 }
 
 /// Whole-rig state (server side), architecture §10.

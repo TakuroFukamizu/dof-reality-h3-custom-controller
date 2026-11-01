@@ -138,7 +138,8 @@ use crate::calibration::{self, AxisCalibration};
 use crate::compat;
 use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
 use crate::limits::{
-    self as motion_limits, Ceilings, FwAbsolute, FwTuning, LimitedField, MotionLimits, MotionLimitsSnapshot,
+    self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest, MotionLimits,
+    MotionLimitsSnapshot, OperatorCap,
 };
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
@@ -676,6 +677,9 @@ pub struct Supervisor {
     limits_cfg: LimitsConfig,
     /// What the API asked for (shared set, before the ceilings).
     requested_limits: MotionLimits,
+    /// Fields of `requested_limits` the game channel wrote last: held to the
+    /// operator's `[limits]` values by the clamp (Issue #15).
+    game_fields: FieldSet,
     /// `requested_limits` clamped (ceilings + stop-time rule): what we want
     /// in force and what SET_LIMITS carries.
     target_limits: MotionLimits,
@@ -777,6 +781,7 @@ impl Supervisor {
         let clamped = motion_limits::clamp(
             &requested_limits,
             &Ceilings::fallback(cfg.limits.overspeed_count_s),
+            &OperatorCap::none(requested_limits),
             motion_limits::stop_deadline(&cfg.timing),
         );
         Self {
@@ -784,6 +789,7 @@ impl Supervisor {
             game: cfg.game.clone(),
             limits_cfg: cfg.limits.clone(),
             requested_limits,
+            game_fields: FieldSet::NONE,
             target_limits: clamped.effective,
             effective_limits: clamped.effective,
             limited: clamped.limited,
@@ -1394,10 +1400,24 @@ impl Supervisor {
 
     // ------------------------------------------------------------ motion limits
 
-    /// Replace the requested shared set (the control loop forwards the
-    /// API's value every tick). Takes effect at the next `tick`.
+    /// Replace the requested shared set as the operator / config would
+    /// (no field under the game-channel cap). Takes effect at the next `tick`.
     pub fn set_requested_limits(&mut self, requested: MotionLimits) {
-        self.requested_limits = requested;
+        self.set_limits_request(LimitsRequest::new(requested));
+    }
+
+    /// Replace the requested shared set with its provenance (the control loop
+    /// forwards the API's value every tick): the game-written fields are held
+    /// to the operator's `[limits]` values (Issue #15). Takes effect at the
+    /// next `tick`.
+    pub fn set_limits_request(&mut self, req: LimitsRequest) {
+        self.requested_limits = req.requested;
+        self.game_fields = req.game_fields;
+    }
+
+    /// The cap the clamp applies to the game-written fields.
+    fn operator_cap(&self) -> OperatorCap {
+        OperatorCap { max: MotionLimits::from_config(&self.limits_cfg), fields: self.game_fields }
     }
 
     /// The set in effect: what the planner and SET_POSITION use (the clamped
@@ -1446,6 +1466,8 @@ impl Supervisor {
             requested: self.requested_limits,
             ceiling: self.ceilings(),
             defaults: MotionLimits::from_config(&self.limits_cfg),
+            operator_max: MotionLimits::from_config(&self.limits_cfg),
+            game_fields: self.game_fields,
             limited: self.limited.clone(),
             reasons: self.limit_reasons.clone(),
             pending: self.limits_pending,
@@ -1464,7 +1486,8 @@ impl Supervisor {
     ///   describes). The stop-time rule survives the component-wise minimum:
     ///   both sets satisfy `acc ≥ vel / deadline`, so their minima do too.
     fn recompute_limits(&mut self) {
-        let c = motion_limits::clamp(&self.requested_limits, &self.ceilings(), self.stop_deadline());
+        let c =
+            motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
         self.target_limits = c.effective;
         self.limited = c.limited;
         self.limit_reasons = c.reasons;

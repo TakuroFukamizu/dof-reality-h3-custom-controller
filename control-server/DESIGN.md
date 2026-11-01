@@ -116,7 +116,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 「後に受けた」は時刻ではなくイベント順（supervisor 内の受信通番）で判定する。同一ポートの受信は順序が保たれるので、ACK の後に来た STATUS は HOST_FAULT 処理後の状態を表す。
 - frame skew: 各軸の STATUS を取り込んだ時点の `group_frame_id` と、その STATUS の `last_applied_frame` の差（遅れ量 lag）を軸ごとに記録し、3 軸の lag の最大−最小を skew とする。STATUS が遅れた・途絶えた軸は lag が古いままで skew にはならない（途絶は `axis_status_timeout_ms` で `AxisDisconnected`）。同時に適用されていないフレーム（SET_POSITION を取りこぼす軸）は lag が増えて検出される。
 - 管理命令の拒否理由 `blockers` は `"<code>: <detail>"` 形式（例 `not_connected: axis2`、`rig_state: HOLDING`、`no_fresh_pose: …`）。状態名は JSON と同じ表記（`HOLDING` など）。クライアントは `:` より前の code だけで判定する。
-- 動きの制限値（limits.md）は 3 段で持つ: `requested`（API が書いた値）→ `target`（上限と停止時間の規則で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と SET_POSITION が使う値）。target の SET_LIMITS 内容（Duty 上限）が effective のものと同じなら target を即 effective にする（速度・加速度・gain だけの変更は待たない）。違えば、接続中で SET_LIMITS を知る全軸がその内容を ACK するまで effective は確定済みの組を保ち、target のうち**下がった**成分だけを先に取り込む（status `motion_limits.pending = true`）。速度と Duty を同時に上げても、旧 Duty 上限のままの軸に速い目標を送らない（Issue #15 M3）。成分ごとの最小は停止時間の規則を保つ（両組が `acc ≥ vel / 期限` を満たせば最小同士も満たす）。
+- 動きの制限値（limits.md）は 3 段で持つ: `requested`（API が書いた値。項目ごとに「ゲームが書いた」印つき: その項目は操作者の `[limits]` の値を超えない、Issue #15）→ `target`（上限と停止時間の規則で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と SET_POSITION が使う値）。target の SET_LIMITS 内容（Duty 上限）が effective のものと同じなら target を即 effective にする（速度・加速度・gain だけの変更は待たない）。違えば、接続中で SET_LIMITS を知る全軸がその内容を ACK するまで effective は確定済みの組を保ち、target のうち**下がった**成分だけを先に取り込む（status `motion_limits.pending = true`）。速度と Duty を同時に上げても、旧 Duty 上限のままの軸に速い目標を送らない（Issue #15 M3）。成分ごとの最小は停止時間の規則を保つ（両組が `acc ≥ vel / 期限` を満たせば最小同士も満たす）。
 - 状態のスナップショット（`StatusSnapshot`、§7）を毎 tick 作る。
 
 ## 6. sim_axis（MCU 参照モデル）
@@ -138,8 +138,8 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | --- | --- | --- |
 | `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
 | `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.5, "source_freshness_ms": 250, "require_frame_seq": true}`。動きの制限値を `[limits]` の初期値に戻す（`max_gain` はその値） |
-| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...],"reasons":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。`effective` は clamp した要求値で、制御ループが適用済みかは status の `motion_limits.pending`。limits.md §3.2） |
-| `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
+| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"operator_max":{...},"game_fields":[...],"limited":[...],"reasons":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。`effective` は clamp した要求値で、制御ループが適用済みかは status の `motion_limits.pending`。`operator_max` はゲーム経路の上限（`[limits]` の値）、`game_fields` はいまゲームが書いた項目。limits.md §3.2） |
+| `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える（ゲームと違い、操作者の `[limits]` の値を超えてファームの上限まで上げられる。書いた項目は `game_fields` から外れる）。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
 | `GET /v1/motion[?session=<id>]`（WS） | なし | §7.1。`session` は省略可（各メッセージの `source_session` で判定）。指定した場合は別セッション名のメッセージも `stale_session` |
 | `GET /v1/status` | なし | StatusSnapshot（§7.2） |
 | `GET /v1/events[?n=&after=]` | なし（loopback だけ） | 制御ループのイベントリング（障害前後の経過）。§7.3 |
@@ -184,13 +184,13 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 ```json
 {"type":"ack","seq":1250,"accepted":true,"reason":null,"effective_gain":0.35,"limits":["pose_clamped"],"fresh":true}
-{"type":"ack","seq":1252,"accepted":true,"reason":null,"effective_gain":0.8,"limits":["ceiling_clamped"],"fresh":true,
- "effective_limits":{"max_gain":0.8,"max_vel_count_s":6000,"max_acc_count_s2":15000,"duty_max_percent":40}}
+{"type":"ack","seq":1252,"accepted":true,"reason":null,"effective_gain":0.5,"limits":["operator_limited"],"fresh":false,
+ "effective_limits":{"max_gain":0.5,"max_vel_count_s":3000,"max_acc_count_s2":15000,"duty_max_percent":40}}
 {"type":"status", ...StatusSnapshot}
 ```
 
 - ack は受理・拒否どちらも返す。拒否理由: `stale_session` / `old_seq` / `old_frame` / `non_finite` / `out_of_range` / `invalid_age` / `missing_frame_seq` / `bad_protocol` / `bad_message` / `axis_conflict`（§10。pose・gain とも拒否し、鮮度も更新しない）。
-- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目。制御ループが適用済みかは status の `motion_limits.pending`）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`、停止時間の規則（limits.md §1.1: `max_acc ≥ max_vel / 停止期限`）で `max_acc` を上げた（または `max_vel` を下げた）ら `stop_time_limited`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
+- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目。制御ループが適用済みかは status の `motion_limits.pending`）が付き、`effective_gain` は新しい gain の上限。**ゲーム経路は操作者の `[limits]` の値を下げるだけ**（Issue #15）: 書いた項目がそれを超えたら操作者の値で切って `limits` に `operator_limited`（項目ごとに「最後に書いたのがゲームか」を覚える。`POST /v1/limits` が書いた項目はファームの上限まで上がる）、ファームの上限で切られたら `ceiling_clamped`、停止時間の規則（limits.md §1.1: `max_acc ≥ max_vel / 停止期限`）で `max_acc` を上げた（または `max_vel` を下げた）ら `stop_time_limited`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
 - status は `status_period_ms` ごと。WS 自体は駆動権限を与えない。
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 
@@ -212,7 +212,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
   "requested_pose": null, "requested_gain": null, "effective_gain": null, "limits": [],
   "motion_limits": {"effective": {"max_gain": 0.5, "max_vel_count_s": 3000, "max_acc_count_s2": 15000, "duty_max_percent": 40},
                     "requested": {...}, "ceiling": {"max_gain": 1.0, "max_vel_count_s": 6000, "max_acc_count_s2": 40000, "duty_max_percent": 60},
-                    "defaults": {...}, "limited": [], "reasons": [], "pending": false},
+                    "defaults": {...}, "operator_max": {...}, "game_fields": [], "limited": [], "reasons": [], "pending": false},
   "virtual_targets": [512.0, 512.0, 512.0],
   "target_counts": [0, 0, 0],
   "session_epoch": 3,

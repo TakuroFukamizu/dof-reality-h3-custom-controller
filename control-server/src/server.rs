@@ -446,7 +446,7 @@ impl ControlLoop {
         }
 
         let dt_s = dt.map_or(self.period, |d| d.min(2 * self.period)).as_secs_f64();
-        self.sup.set_requested_limits(motion_limits::read(&self.limits));
+        self.sup.set_limits_request(motion_limits::read(&self.limits));
         let out = self.sup.tick(now, dt_s, pose.as_ref());
         self.dispatch(out, now);
         self.record_telemetry(now, dt);
