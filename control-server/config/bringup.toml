@@ -63,6 +63,7 @@ swap_pitch_roll = true
 invert_pitch = false             # 前に倒して前が下がらなければ true
 invert_roll = false              # 右に倒して右が下がらなければ true
 invert_yaw = false
+start_max_offset_count = 300     # START 時の姿勢が保持位置からこの count を超えて離れる軸があれば 409 pose_not_near_hold（忘れたタブの極端な姿勢で START 直後に飛ばないため）。ゲームを中立にしてから START
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
 # !!! bring-up 用に低い値（旧 PR と同じ動き: gain 0.15、600 count/s、2000 count/s²、Duty 7〜20 %）。

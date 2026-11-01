@@ -148,6 +148,10 @@ pub enum LimitReason {
     /// A requested motion limit (WS `limits` / `POST /v1/limits`) exceeded a
     /// ceiling and was reduced (design 2026-11-01 §5.3).
     CeilingClamped,
+    /// The requested `max_vel` / `max_acc` could not stop within the stop
+    /// deadline: `max_acc` was raised (or `max_vel` lowered) to the bound
+    /// (Issue #15 H2, `limits::clamp`).
+    StopTimeLimited,
 }
 
 /// Whole-rig state (server side), architecture §10.

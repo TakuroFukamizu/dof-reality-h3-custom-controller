@@ -162,6 +162,16 @@ fn limits_rules() {
         // rest dwell must fit inside the settle window.
         (|c| c.timing.rest_error_count = 19, "timing.rest_error_count (19) must be >= limits.deadband_out_count (20)"),
         (|c| c.timing.rest_dwell_ms = 3000, "timing.rest_dwell_ms (3000) must be < timing.stop_settle_timeout_ms (3000)"),
+        // START's pose interlock needs a positive window.
+        (|c| c.game.start_max_offset_count = 0, "game.start_max_offset_count"),
+        // Stop-time rule (Issue #15 H2): 600 count/s at 1 count/s² takes 600 s to stop.
+        (
+            |c| {
+                c.limits.max_vel_count_s = 600;
+                c.limits.max_acc_count_s2 = 1;
+            },
+            "worst-case stop time",
+        ),
     ];
     for (mutate, needle) in cases {
         let mut cfg = sim();
@@ -185,6 +195,7 @@ fn limits_rules() {
     cfg.validate().unwrap();
     assert_eq!(cfg.game.center_tolerance_count, 50);
     assert_eq!(cfg.timing.center_reach_timeout_ms, 5000);
+    assert_eq!(h3cs::config::GameConfig::default().start_max_offset_count, 300);
     assert_eq!(
         (cfg.timing.rest_velocity_count_s, cfg.timing.rest_error_count, cfg.timing.rest_dwell_ms),
         (50, 50, 200)
@@ -199,6 +210,38 @@ fn limits_rules() {
     assert_eq!((d.duty_min_percent, d.kp_percent_per_100, d.ff_count_s_per_percent), (3, 2, 100));
     assert_eq!((d.deadband_count, d.deadband_out_count), (10, 20));
     assert_eq!((d.following_error_limit_count, d.overspeed_count_s), (800, 9000));
+}
+
+/// Issue #15 H2: `max_vel / max_acc` must fit in 0.8 x the shorter stop
+/// timeout, for the initial set and for the firmware ceilings.
+#[test]
+fn stop_time_rule_names_the_numbers() {
+    let mut cfg = sim(); // mcu_stop 1500, stop_settle 3000 → 1.2 s
+    cfg.limits.max_vel_count_s = 600;
+    cfg.limits.max_acc_count_s2 = 1;
+    let m = invalid(&cfg);
+    assert!(m.contains("limits.max_vel_count_s (600) / limits.max_acc_count_s2 (1) = 600.000 s"), "{m}");
+    assert!(m.contains("<= 1.200 s (0.8 x min(timing.mcu_stop_timeout_ms 1500, timing.stop_settle_timeout_ms 3000))"), "{m}");
+    assert!(m.contains("max_acc_count_s2 must be >= 500"), "{m}");
+    // Exactly at the bound passes; one below fails.
+    cfg.limits.max_acc_count_s2 = 500;
+    cfg.validate().unwrap();
+    cfg.limits.max_acc_count_s2 = 499;
+    assert_invalid(&cfg, "worst-case stop time");
+    // The shorter of the two timeouts rules: stop_settle 1000 ms → 0.8 s → needs 750.
+    cfg.limits.max_acc_count_s2 = 500;
+    cfg.timing.stop_settle_timeout_ms = 1000;
+    assert_invalid(&cfg, "max_acc_count_s2 must be >= 750");
+    // The firmware ceilings (6000 / 40000 = 0.15 s) must pass too, or a runtime
+    // request at the velocity ceiling could not be stopped by any allowed acc.
+    let mut cfg = sim();
+    cfg.timing.stop_settle_timeout_ms = 100; // 0.08 s
+    let m = invalid(&cfg);
+    assert!(m.contains("firmware ceilings: max_vel 6000 / max_acc 40000 = 0.150 s"), "{m}");
+    // The shipped sets pass: sim 3000 / 15000 = 0.2 s, bring-up 600 / 2000 = 0.3 s.
+    sim().validate().unwrap();
+    let bringup = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml");
+    Config::load(std::path::Path::new(bringup)).unwrap();
 }
 
 #[test]

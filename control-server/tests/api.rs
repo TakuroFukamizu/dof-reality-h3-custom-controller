@@ -514,7 +514,12 @@ fn check_status_shape(v: &Value) {
     }
     assert_keys(&v["session"], SESSION_KEYS, "session");
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
-    assert_keys(&v["motion_limits"], &["effective", "requested", "ceiling", "defaults", "limited"], "motion_limits");
+    assert_keys(
+        &v["motion_limits"],
+        &["effective", "requested", "ceiling", "defaults", "limited", "reasons", "pending"],
+        "motion_limits",
+    );
+    assert!(v["motion_limits"]["pending"].is_boolean());
     for k in ["effective", "requested", "ceiling", "defaults"] {
         assert_keys(
             &v["motion_limits"][k],
@@ -1208,7 +1213,12 @@ async fn limits_over_ws_and_rest() {
     let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
-    assert_eq!(v["effective"]["max_acc_count_s2"], 1000);
+    // 6000 count/s at 1000 count/s² would take 6 s to stop (deadline 0.8 x 1500 ms):
+    // raised to 5000 and reported (Issue #15 H2).
+    assert_eq!(v["requested"]["max_acc_count_s2"], 1000);
+    assert_eq!(v["effective"]["max_acc_count_s2"], 5000);
+    assert_eq!(v["limited"], serde_json::json!(["max_vel_count_s", "max_acc_count_s2"]));
+    assert_eq!(v["reasons"], serde_json::json!(["ceiling_clamped", "stop_time_limited"]));
     assert_eq!(v["effective"]["max_gain"], 0.8, "other fields kept");
 
     // A new session resets everything to the configured defaults.
@@ -1216,6 +1226,62 @@ async fn limits_over_ws_and_rest() {
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["effective"], v["defaults"]);
     assert_eq!(v["requested"]["max_vel_count_s"], 3000);
+    let _ = ws.close(None).await;
+    srv.shutdown().await;
+}
+
+/// Issue #15 H2: a game cannot lower `max_acc` below what stops `max_vel`
+/// inside the stop deadline (0.8 x min(mcu_stop_timeout 1500, stop_settle 3000)
+/// = 1.2 s); velocity and acceleration in one message are judged jointly.
+#[tokio::test]
+async fn limits_stop_time_rule_over_ws() {
+    let srv = start_sim(sim_cfg()).await;
+    let addr = srv.local_addr;
+    wait_state(&srv, RigState::ReadyToArm, Duration::from_secs(3)).await;
+    let id = new_session(addr).await;
+    let mut ws = ws_connect(addr, &id).await;
+
+    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_vel_count_s": 600}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["limits"], serde_json::json!([]));
+    // acc 1 at 600 count/s: 600 s to stop. Raised to ceil(600 / 1.2) = 500.
+    ws_send(&mut ws, limits_json(&id, 2, serde_json::json!({"max_acc_count_s2": 1}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 600);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 500);
+    assert_eq!(ack["limits"], serde_json::json!(["stop_time_limited"]));
+    // A consistent pair in one message is taken as is …
+    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_vel_count_s": 300, "max_acc_count_s2": 250}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 300);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 250);
+    assert_eq!(ack["limits"], serde_json::json!([]));
+    // … and an inconsistent one is judged on the NEW velocity (1200 needs 1000).
+    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_vel_count_s": 1200, "max_acc_count_s2": 900}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 1200);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 1000);
+    assert_eq!(ack["limits"], serde_json::json!(["stop_time_limited"]));
+    // Status shows the clamp and its reason; nothing is pending (duty unchanged).
+    let mut st = next_status(&mut ws).await;
+    for _ in 0..30 {
+        if st["motion_limits"]["effective"]["max_acc_count_s2"] == 1000 {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    assert_eq!(st["motion_limits"]["effective"]["max_vel_count_s"], 1200, "{st}");
+    assert_eq!(st["motion_limits"]["requested"]["max_acc_count_s2"], 900);
+    assert_eq!(st["motion_limits"]["limited"], serde_json::json!(["max_acc_count_s2"]));
+    assert_eq!(st["motion_limits"]["reasons"], serde_json::json!(["stop_time_limited"]));
+    assert_eq!(st["motion_limits"]["pending"], false);
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["effective"]["max_acc_count_s2"], 1000);
+    assert_eq!(v["reasons"], serde_json::json!(["stop_time_limited"]));
     let _ = ws.close(None).await;
     srv.shutdown().await;
 }
