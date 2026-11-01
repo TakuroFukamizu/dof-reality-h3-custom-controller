@@ -13,7 +13,18 @@
       （h3game: target.pitch = inp.y, target.roll = inp.x。前後は「奥へ倒す = マイナス」）。
       center / min / max による正規化（norm）、不感帯の再スケール、isStick の判定も同じ式。
     不感帯の既定だけ h3game の 0.12 ではなく 0.05（細かい動きを見るため）。ならし（smooth）はしない。
-  - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当は localStorage。
+  - 入力モード（localStorage、既定は「速度」）。サーバーとの約束（pose + gain）は変えず、ページの側で倒し量を姿勢に写す:
+      「位置」: 倒し量（不感帯の後、−1..1）をそのまま pose にする（従来どおり）。
+      「速度」: 倒し量を姿勢の変化の速さにする。刻みごとに pose += 倒し量 × rate × dt（rate = 全ストローク/秒、
+        既定 1.0、0.2〜3.0）、−1..1 で切る。倒したままなら進み続け、離せば（不感帯の内側）その姿勢で止まる。
+        大きく倒せば速く（サーバーの max_vel で頭打ち）、少し倒せばゆっくり動く。「中央へ」で指令姿勢を 0 に戻す。
+        「離すと中央へ戻る」を入れると、離したあと戻る速さ（/秒）で 0 へ戻る（既定は切）。
+        「勢い」（実験的、既定は切）: 倒し量の変化の速さ（d|倒し量|/dt を平滑）で rate を 1〜4 倍にする。
+        弾くように倒すと速く、ゆっくり押すと普通の rate。
+      dt は刻みの実測（最大 0.1 s）。スティックを読めなかった刻みは積分しない（指令姿勢はそのまま、frame_seq も止まる）。
+      「姿勢を 0 に固定」のあいだは速度モードの指令姿勢も 0 に戻す（切ったとき中央から始まる）。
+      速度モードから位置モードへ切り替えると姿勢はその場の倒し量へ跳ぶ（位置モードは倒し量 = 姿勢なので）。
+  - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当・入力モードは localStorage。
   - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
   - 姿勢は 50 Hz で送る。50 Hz の刻みは Web Worker で回す: 主スレッドの setInterval や requestAnimationFrame は、
     タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に間引かれ、frame_seq が進まずサーバーの鮮度切れ
@@ -75,7 +86,13 @@
   .xy::before { left: 50%; top: 0; bottom: 0; width: 1px; }
   .xy::after { top: 50%; left: 0; right: 0; height: 1px; }
   .xy b { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--blue); left: 50%; top: 50%; }
+  /* 輪 = 倒し量（スティック）、塗り = 指令姿勢（送る値）。位置モードでは重なる */
+  .xy u { position: absolute; width: 12px; height: 12px; margin: -7px 0 0 -7px; border: 2px solid var(--amber); border-radius: 50%; left: 50%; top: 50%; text-decoration: none; box-sizing: content-box; }
   label.sl { display: grid; grid-template-columns: 4em 1fr 4.5em; gap: 8px; align-items: center; margin: 4px 0; }
+  label.sl.w { grid-template-columns: 6em 1fr 4.5em; }
+  .flag { display: inline-block; padding: 1px 6px; border: 1px solid #ccc; border-radius: 3px; margin-right: 4px; color: #999; font-size: 12px; }
+  .flag.on { background: #fdebd0; color: var(--amber); border-color: var(--amber); font-weight: bold; }
+  .off { opacity: 0.5; }
   .btns span { display: inline-block; min-width: 1.4em; text-align: center; border: 1px solid #ccc; border-radius: 3px; margin: 1px; font-size: 11px; }
   .btns span.on { background: var(--amber); color: #fff; border-color: var(--amber); }
 </style>
@@ -176,11 +193,17 @@
     <button id="bResetMap" title="axes 0 / 1、反転なし、center 0、不感帯 0.05 に戻す">割当を初期化</button>
   </div>
   <div class="row" style="margin-top:8px; align-items:flex-start">
-    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）"><b></b></div>
+    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）。輪 = 倒し量、塗り = 指令姿勢（送る値）"><u></u><b></b></div>
     <div>
-      <div>roll <span id="rollBig" class="big mono">0.00</span></div>
-      <div>pitch <span id="pitchBig" class="big mono">0.00</span></div>
-      <div class="dim small">不感帯の後の値（−1..1）。これをそのまま pose の roll / pitch として送る（yaw は 0）</div>
+      <div class="row" style="gap:16px">
+        <div><div class="dim small">倒し量（不感帯の後、−1..1）</div>
+          <div>roll <span id="rollBig" class="big mono" style="color:var(--amber)">0.00</span></div>
+          <div>pitch <span id="pitchBig" class="big mono" style="color:var(--amber)">0.00</span></div></div>
+        <div><div class="dim small">指令姿勢（pose として送る値）</div>
+          <div>roll <span id="rollCmd" class="big mono" style="color:var(--blue)">—</span></div>
+          <div>pitch <span id="pitchCmd" class="big mono" style="color:var(--blue)">—</span></div></div>
+      </div>
+      <div class="dim small" id="cmdNote">速度モード: 倒し量 × rate × dt を積分したものが指令姿勢。位置モード: 倒し量 = 指令姿勢（yaw は 0）</div>
     </div>
   </div>
 </section>
@@ -188,8 +211,26 @@
 
 <section>
   <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
+  <!-- 入力モード（localStorage）。既定は「速度」: 倒し量 = 姿勢の変化の速さ。サーバーに送るものは pose + gain のまま -->
+  <div class="row">
+    <label>入力モード <select id="inMode">
+      <option value="rate">速度（倒し量 = 姿勢の変化の速さ）</option>
+      <option value="pos">位置（倒し量 = 姿勢）</option>
+    </select></label>
+    <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
+    <span class="dim small" id="modeNote"></span>
+  </div>
+  <div id="rateCtl">
+    <label class="sl w" title="倒し切ったときの姿勢の変化の速さ。1.0 = 中央から端まで 1 秒。サーバーの max_vel がそれより遅ければサーバーの制限で頭打ちになる（velocity_limited が点く）">rate <input type="range" id="rate" min="0.2" max="3" step="0.1" value="1.0"><span id="rateV">1.0 /s</span></label>
+    <div class="row small">
+      <label title="倒し量が 0（不感帯の内側）のあいだ、指令姿勢を中央へ戻す。切なら離した姿勢で止まる"><input type="checkbox" id="rtc"> 離すと中央へ戻る</label>
+      <label class="sl w" style="display:inline-grid; margin:0" title="中央へ戻る速さ（全ストローク/秒）">戻る速さ <input type="range" id="rtcSpeed" min="0.1" max="3" step="0.1" value="0.5"><span id="rtcSpeedV">0.5 /s</span></label>
+      <label title="実験的。倒し量の変化の速さ（d|倒し量|/dt を約 0.15 s で平滑）で rate を 1〜4 倍にする。弾くように倒すと速く、ゆっくり押すと普通の rate。離す動きでは増やさない"><input type="checkbox" id="momentum"> 勢い（実験的）</label>
+      <span id="momentumV" class="mono dim">×1.00</span>
+    </div>
+  </div>
   <!-- 既定 1.0 = スティック全開でソフトリミット内の端まで。安全側の上限はサーバーの max_gain（setMaxGain でスライダーの最大に反映） -->
-  <label class="sl">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
+  <label class="sl w">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
   <div class="row">
     <button id="bStream">送信開始</button>
     <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
@@ -201,9 +242,14 @@
   </div>
   <div style="margin-top:4px">送っている pose: <span id="sentPose" class="mono dim">—</span></div>
   <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
+  <!-- velocity_limited / acceleration_limited は planner が出す札なので WS の ack には乗らず（ack の limits は受け付け時の
+       pose_clamped / gain_limited だけ）、GET /v1/status の limits（200 ms）に出る。ここはそれを札で見せる -->
+  <div style="margin-top:6px">サーバーの制限 <span class="dim small">status の limits</span>: <span class="flag" id="flagVel">velocity_limited</span><span class="flag" id="flagAcc">acceleration_limited</span><span id="flagOther" class="dim small"></span></div>
+  <div class="dim small">点いているあいだは、速さを決めているのはページでなくサーバー（planner の max_vel / max_acc）。速くしたいならオペレーター用試験ページの「動きの制限」（max_vel / max_acc）を上げる。このページの rate や gain を上げても速くならない。</div>
   <div class="dim small" style="margin-top:4px">
     「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
-    スティックを離せば（不感帯の内側なら）0 を送る。スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（サーバーが鮮度切れで減速停止する）。
+    位置モード: スティックを離せば（不感帯の内側なら）0 を送る。速度モード: 離せばその姿勢で止まる（「離すと中央へ戻る」なら戻る速さで 0 へ）。「中央へ」で指令姿勢を 0 に。
+    スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（速度モードの積分も止まる。サーバーが鮮度切れで減速停止する）。
     ack が stale_session（別のクライアントが session を発行した・サーバー再起動）なら送信を止める。再開は「送信開始」。
   </div>
 </section>
@@ -283,6 +329,39 @@ window.H3Joy = (function () {
     seen.forEach((s, a) => { const sc = s.max - s.min; if (sc > span) { span = sc; best = a; } });
     return best < 0 ? null : { axis: best, span };
   }
+  // 速度モードの 1 刻み（純粋関数）。cmd = 指令姿勢 {pitch, roll}、stick = 倒し量（不感帯の後、−1..1）、dt = 秒。
+  // opts: rate（全ストローク/秒）、mult（勢いの倍率、1 以上）、rtc（離すと中央へ戻る）、rtcSpeed（/秒）。
+  // 倒していれば cmd += stick × rate × mult × dt、倒していなければそのまま（rtc なら rtcSpeed で 0 へ寄せ、行き過ぎない）。
+  // dt は 0..0.1 s で切る（刻みが遅れても跳ばない）。結果は −1..1 で切る。
+  function rateStep(cmd, stick, dt, opts) {
+    const o = opts || {};
+    const r = Math.max(0, Number(o.rate) || 0) * Math.max(1, Number(o.mult) || 1);
+    const d = Math.max(0, Math.min(0.1, Number(dt) || 0));
+    const out = {};
+    for (const k of ['pitch', 'roll']) {
+      const s = stick ? (Number(stick[k]) || 0) : 0;
+      let v = cmd ? (Number(cmd[k]) || 0) : 0;
+      if (s !== 0) v += s * r * d;
+      else if (o.rtc) { const step = Math.max(0, Number(o.rtcSpeed) || 0) * d; v = Math.abs(v) <= step ? 0 : v - Math.sign(v) * step; }
+      out[k] = Math.max(-1, Math.min(1, v));
+    }
+    return out;
+  }
+  // 勢い（実験的）: 倒し量の変化の速さ |Δstick| / dt を時定数 tau で平滑し、倍率 1 + k × speed（1..max）にする。
+  // 1 を下回らない（普通に倒したときより遅くはしない）。離す動き（|stick| が減る）は数えない。
+  function momentum(prev, stick, lastStick, dt, opts) {
+    const o = opts || {};
+    const tau = o.tau == null ? 0.15 : o.tau, k = o.k == null ? 0.2 : o.k, max = o.max == null ? 4 : o.max;
+    const d = Number(dt) || 0;
+    let speed = prev ? (Number(prev.speed) || 0) : 0;
+    if (d > 0 && stick && lastStick) {
+      const mag = Math.hypot(stick.roll, stick.pitch), lastMag = Math.hypot(lastStick.roll, lastStick.pitch);
+      const inst = mag > lastMag ? Math.hypot(stick.roll - lastStick.roll, stick.pitch - lastStick.pitch) / d : 0;
+      const a = d / (tau + d);
+      speed += a * (inst - speed);
+    }
+    return { speed, mult: Math.max(1, Math.min(max, 1 + k * speed)) };
+  }
   // ブラウザの Gamepad API を素の配列に写す（試験では navigator.getGamepads を差し替える）
   function readPads() {
     let gp = [];
@@ -292,7 +371,7 @@ window.H3Joy = (function () {
       buttons: Array.from(g.buttons, (b) => !!(b && b.pressed)),
     }));
   }
-  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, readPads };
+  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, rateStep, momentum, readPads };
 })();
 </script>
 <script>
@@ -302,12 +381,17 @@ window.H3Joy = (function () {
   const J = window.H3Joy;
   const TOKEN_KEY = 'h3cs_admin_token';
   const MAP_KEY = 'h3cs_joystick';
+  const INPUT_KEY = 'h3cs_joystick_input';
   const DEFAULT_MAP = () => ({ roll: { axis: 0, invert: false, center: 0, min: null, max: null }, pitch: { axis: 1, invert: false, center: 0, min: null, max: null } });
+  const DEFAULT_INPUT = () => ({ mode: 'rate', rate: 1.0, rtc: false, rtcSpeed: 0.5, momentum: false });
   const state = {
     session: null, maxGain: null, lastStatus: null, ws: null, streaming: false, seq: 0, frameSeq: 0,
     pollBusy: false, lastPollError: null,
     pads: [], sel: null, pad: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null,
     padLost: false, lostWhy: '', noAutoPick: false,
+    // 入力モード。pose = 倒し量（不感帯の後）、cmd = 指令姿勢（pose として送る値）。位置モードでは cmd = pose、
+    // 速度モードでは cmd を倒し量で積分する。lastTick = 前回スティックを読めた刻みの時刻（dt の実測）。
+    input: DEFAULT_INPUT(), cmd: { pitch: 0, roll: 0 }, lastTick: null, mom: { speed: 0, mult: 1 },
   };
 
   $('hostLabel').textContent = location.host;
@@ -422,6 +506,7 @@ window.H3Joy = (function () {
     fresh.className = s.session && s.session.fresh ? 'ok' : '';
     $('effGain').textContent = fmt(s.effective_gain);
     $('limits').textContent = (s.limits && s.limits.length) ? s.limits.join(', ') : 'なし';
+    renderLimitFlags(s.limits);
     const p = s.requested_pose;
     $('reqPose').textContent = p ? ('pitch ' + Number(p.pitch).toFixed(2) + ' roll ' + Number(p.roll).toFixed(2) + ' yaw ' + Number(p.yaw).toFixed(2)) : '—';
     $('targets').textContent = Array.isArray(s.target_counts) ? s.target_counts.join(', ') : '—';
@@ -579,6 +664,64 @@ window.H3Joy = (function () {
     log('割当を初期化した（axes 0 / 1、反転なし、center 0、不感帯 0.05）');
   });
 
+  // ---------------------------------------------------------------- 入力モード（localStorage）。既定は「速度」
+  const clampNum = (v, lo, hi, dflt) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt);
+  function loadInput() {
+    try {
+      const s = JSON.parse(localStorage.getItem(INPUT_KEY));
+      if (s && typeof s === 'object') {
+        const d = DEFAULT_INPUT();
+        state.input = {
+          mode: s.mode === 'pos' ? 'pos' : 'rate',
+          rate: clampNum(Number(s.rate), 0.2, 3, d.rate),
+          rtc: !!s.rtc,
+          rtcSpeed: clampNum(Number(s.rtcSpeed), 0.1, 3, d.rtcSpeed),
+          momentum: !!s.momentum,
+        };
+      }
+    } catch (e) { /* 壊れた保存値は無視 */ }
+  }
+  function saveInput() {
+    try { localStorage.setItem(INPUT_KEY, JSON.stringify(state.input)); } catch (e) { /* 無視 */ }
+  }
+  function renderInputControls() {
+    const inp = state.input;
+    const rate = inp.mode === 'rate';
+    $('inMode').value = inp.mode;
+    $('rate').value = String(inp.rate);
+    $('rateV').textContent = inp.rate.toFixed(1) + ' /s';
+    $('rtc').checked = inp.rtc;
+    $('rtcSpeed').value = String(inp.rtcSpeed);
+    $('rtcSpeedV').textContent = inp.rtcSpeed.toFixed(1) + ' /s';
+    $('momentum').checked = inp.momentum;
+    $('rateCtl').className = rate ? '' : 'off';
+    for (const id of ['rate', 'rtc', 'rtcSpeed', 'momentum', 'bCmdCenter']) $(id).disabled = !rate;
+    $('rtcSpeed').disabled = !rate || !inp.rtc;
+    $('modeNote').textContent = rate
+      ? '倒し量が姿勢の変化の速さになる。倒したままなら進み続け、離せばその姿勢で止まる（大きく倒す = 速い、少し倒す = ゆっくり）'
+      : '倒し量がそのまま姿勢になる（従来どおり）。離せば 0（中央）へ';
+  }
+  loadInput();
+  renderInputControls();
+  $('inMode').addEventListener('change', () => {
+    const m = $('inMode').value === 'pos' ? 'pos' : 'rate';
+    if (m === state.input.mode) return;
+    // 位置 → 速度: cmd は位置モードのあいだ倒し量を追っているのでそのまま続く（跳ばない）。
+    // 速度 → 位置: 次の刻みで cmd = 倒し量になる（その場の倒し量へ跳ぶ。送信中なら注意）。
+    state.input.mode = m; saveInput(); renderInputControls();
+    state.mom = { speed: 0, mult: 1 };
+    log('入力モード: ' + (m === 'rate' ? '速度（倒し量 = 姿勢の変化の速さ）' : '位置（倒し量 = 姿勢）') + (m === 'pos' && state.streaming ? ' — 姿勢はいまの倒し量へ跳ぶ' : ''), m === 'pos' && state.streaming);
+  });
+  $('rate').addEventListener('input', () => { state.input.rate = clampNum(parseFloat($('rate').value), 0.2, 3, 1.0); saveInput(); renderInputControls(); });
+  $('rtc').addEventListener('change', () => { state.input.rtc = $('rtc').checked; saveInput(); renderInputControls(); });
+  $('rtcSpeed').addEventListener('input', () => { state.input.rtcSpeed = clampNum(parseFloat($('rtcSpeed').value), 0.1, 3, 0.5); saveInput(); renderInputControls(); });
+  $('momentum').addEventListener('change', () => { state.input.momentum = $('momentum').checked; state.mom = { speed: 0, mult: 1 }; saveInput(); renderInputControls(); });
+  // 中央へ: 指令姿勢を 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす（跳ぶのは指令値だけ）。
+  $('bCmdCenter').addEventListener('click', () => {
+    state.cmd = { pitch: 0, roll: 0 };
+    log('指令姿勢を中央（pitch 0 / roll 0）にした');
+  });
+
   // 割当: 4 秒のあいだ、選択中のスティックでいちばん大きく動いた軸を役割に結びつける（input.js の assign と同じ規則）
   function assign(key) {
     if (state.assigning) return;
@@ -688,11 +831,24 @@ window.H3Joy = (function () {
     // どちらも「喪失」: 最後の姿勢のまま frame_seq を止める（0 を作って送らない。Issue #15 M4）。
     const pose = pad ? J.poseFrom(pad, state.map, state.dead) : null;
     if (pose) {
+      // 指令姿勢を進める。dt は刻みの実測（読めなかった刻みのあとは 0 から: 跳ばない。rateStep が 0.1 s で切る）。
+      const now = performance.now();
+      const dt = state.lastTick == null ? 0 : (now - state.lastTick) / 1000;
+      state.lastTick = now;
+      if (state.input.mode !== 'rate') {
+        state.cmd = { pitch: pose.pitch, roll: pose.roll };          // 位置: 倒し量 = 姿勢
+      } else if (state.zero) {
+        state.cmd = { pitch: 0, roll: 0 };                           // 0 固定のあいだは積分しない（切ると中央から）
+      } else {
+        state.mom = state.input.momentum ? J.momentum(state.mom, pose, state.pose, dt) : { speed: 0, mult: 1 };
+        state.cmd = J.rateStep(state.cmd, pose, dt, { rate: state.input.rate, mult: state.mom.mult, rtc: state.input.rtc, rtcSpeed: state.input.rtcSpeed });
+      }
       state.pose = pose;
       state.frameSeq += 1;
       state.padLost = false;
       state.lostWhy = '';
     } else {
+      state.lastTick = null; // 喪失中は積分しない（cmd はそのまま）
       state.padLost = !!(state.sel && state.streaming);
       state.lostWhy = pad ? ('割り当てた軸が機器に無い（roll axis ' + state.map.roll.axis + ' / pitch axis ' + state.map.pitch.axis + '、機器の軸は ' + pad.axes.length + ' 本）') : 'スティックが見えない';
     }
@@ -726,7 +882,7 @@ window.H3Joy = (function () {
     i.style.left = (v < 0 ? 50 - w : 50) + '%';
     i.style.width = w + '%';
   }
-  function renderStick(pad, pose) {
+  function renderStick(pad, pose, cmd) {
     if (pad) {
       $('padAxes').textContent = pad.axes.map((v) => (v >= 0 ? '+' : '') + v.toFixed(3)).join('  ');
       const bb = $('padButtons');
@@ -748,9 +904,17 @@ window.H3Joy = (function () {
       setBar(k + 'RawBar', raw == null ? 0 : raw);
       setBar(k + 'Bar', vals[k]);
     }
-    const dot = $('xy').firstElementChild;
-    dot.style.left = (50 + vals.roll * 45) + '%';
-    dot.style.top = (50 + vals.pitch * 45) + '%';
+    // 輪 = 倒し量、塗り = 指令姿勢（送る値）。位置モードでは重なる。指令姿勢がまだ無ければ塗りは中央に置く
+    const ring = $('xy').firstElementChild;
+    ring.style.left = (50 + vals.roll * 45) + '%';
+    ring.style.top = (50 + vals.pitch * 45) + '%';
+    const c = cmd || { pitch: 0, roll: 0 };
+    const dot = ring.nextElementSibling;
+    dot.style.left = (50 + c.roll * 45) + '%';
+    dot.style.top = (50 + c.pitch * 45) + '%';
+    $('rollCmd').textContent = cmd ? c.roll.toFixed(2) : '—';
+    $('pitchCmd').textContent = cmd ? c.pitch.toFixed(2) : '—';
+    $('momentumV').textContent = '×' + state.mom.mult.toFixed(2);
   }
 
   function frame() {
@@ -780,7 +944,7 @@ window.H3Joy = (function () {
       banner.className = 'banner warn';
     }
     // 読めているあいだはいまの値、喪失中は棒を 0 に戻す（送っている最後の姿勢は sentPose に出る）
-    renderStick(pad, readable ? state.pose : null);
+    renderStick(pad, readable ? state.pose : null, state.pose ? state.cmd : null);
     $('frameSeq').textContent = String(state.frameSeq);
     requestAnimationFrame(frame);
   }
@@ -811,12 +975,21 @@ window.H3Joy = (function () {
     setWsState('closed' + (reason ? ' (' + reason + ')' : ''), !!bad);
   }
 
-  // 送る姿勢: 0 固定なら 0、そうでなければ最後に読んだスティックの値（yaw は常に 0）。
-  // まだ一度も読めていなければ null（0 をでっち上げて送らない。Issue #15 M4）。
+  // 送る姿勢: 0 固定なら 0、そうでなければ指令姿勢 cmd（位置モードでは最後に読んだ倒し量、速度モードでは積分値。yaw は常に 0）。
+  // まだ一度もスティックを読めていなければ null（0 をでっち上げて送らない。Issue #15 M4）。
   function currentPose() {
     if (state.zero) return { pitch: 0, roll: 0 };
-    const p = state.pose;
-    return p ? { pitch: p.pitch, roll: p.roll } : null;
+    return state.pose ? { pitch: state.cmd.pitch, roll: state.cmd.roll } : null;
+  }
+
+  // status の limits を札で出す（velocity_limited / acceleration_limited が点いているあいだは速さを決めているのはサーバー。
+  // planner の札なので WS の ack には乗らない: ack の limits は受け付け時の pose_clamped / gain_limited だけ）
+  function renderLimitFlags(limits) {
+    const l = Array.isArray(limits) ? limits : [];
+    $('flagVel').className = 'flag' + (l.indexOf('velocity_limited') >= 0 ? ' on' : '');
+    $('flagAcc').className = 'flag' + (l.indexOf('acceleration_limited') >= 0 ? ' on' : '');
+    const other = l.filter((x) => x !== 'velocity_limited' && x !== 'acceleration_limited');
+    $('flagOther').textContent = other.length ? other.join(', ') : '';
   }
 
   function sendPose() {

@@ -150,6 +150,18 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 | `e2e_sim.sh` | PASS、チェック 120 / 120（`--out` を作業用ディレクトリにしたので runs/ には置いていない） |
 | 試験ページ（ヘッドレス Chromium、sim） | 手で書いた Playwright スクリプトで確認（リポジトリには入れていない）: 読み込みだけでは POST も session 発行も無し → ARM が 401 の本文ごとログに出る → トークン（sessionStorage）→ session（`max_gain` 0.35 がスライダー上限）→ pitch=+1 で送信開始（50 Hz、ack accepted、`effective_gain=0.35`）→ ARM → HOLDING → START → ACTIVE で目標 [700, −140, 0] → `document.hidden` を偽装すると送信が止まり WS が閉じ（seq 138 のまま）、サーバーは鮮度切れで STOPPING → BRAKED_DISARMED、その間も目標は [700, −140, 0] のまま（中央へ動かない）→ 表示に戻しても自動再開しない → トークン無しの STOP 200 → FAULT → FAULT_LATCHED 表示 → FAULT RESET → READY_TO_ARM → REFERENCE の count 欄に 250 ms 間隔で `2731` を打っても status の再描画（200 ms）で消えない → REFERENCE（確認ダイアログ）200 → DISARM 200。ページエラー・console エラー 0。ブラウザーが同一 origin の POST に付けた `Origin: http://127.0.0.1:<port>` をサーバーが通した |
 
+## 2026-11-02 の結果（ジョイスティックページの入力モード: 速度モードを追加、既定に）
+
+環境: 前節と同じ（rustc / cargo 1.96.0、node 26.3、Playwright 1.65 alpha（npx のキャッシュ）＋ chromium_headless_shell 1243 を `executablePath` で指定）。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test --test api` | 37 passed（ページの配信・埋め込み HTML・外部資源なしの検査は変更なし） |
+| ページの JS | 2 つの `<script>` を `vm.Script` で構文検査、`$()` の id は全部存在、重複なし。`H3Joy.rateStep` を node で評価: 全開 0.02 s × rate 1.0 で +0.02、100 刻みで 1.0 に張りつく（±1 で切る）、dt 5 s でも 0.1 s 分しか進まない、倒し量 0 なら保持、`rtc` は rtcSpeed で 0 へ寄せ行き過ぎず **ちょうど 0** で止まる、`mult` は 1 未満を 1 に、null / NaN の入力で {0, 0}。`H3Joy.momentum`: 5 刻みで 0 → 1 の弾き → 倍率 1.93、保持で約 1 秒後に 1.0x 近くへ減衰、1 秒かけてゆっくり押す → 1.3 未満、離す動き（|stick| が減る）は数えない |
+| ジョイスティック試験ページ（ヘッドレス Chromium、sim、空きポート） | 手で書いた Playwright スクリプト（リポジトリには入れていない。`navigator.getGamepads` を差し替え。**ページは `include_str!` でバイナリに入るので `cargo build` してから**）。41 項目すべて通過、ページエラー・console エラー 0: 読み込みだけでは session なし、既定は速度モード・rate 1.0・戻る切・勢い切、指令姿勢は「—」→ スティック中央で指令 0.00 → **roll 全開 0.5 s で指令 0.50**、1.3 s で 1.00 に張りつく → 離すと 1.00 のまま保持、frame_seq は進む → 倒し量 0.2 で 0.5 s → 0.10（ゆっくり）→ 「中央へ」で 0.00 → 戻る入（2.0 /s）: −1 で −0.40 → 離して 0.6 s で 0.00 → 送信開始で ack accepted、サーバーの `requested_pose.roll` が指令姿勢（0.300）と一致 → **機器を消す**と frame_seq 停止・seq 継続・指令保持・バナー → 戻すと frame_seq 再開、指令は跳ばない（dt を 0 から取り直す）→ 「姿勢を 0 に固定」で 0 を送り指令も 0 → 勢い入: 弾きで ×1.80、保持で ×1.02 へ → **位置モード**に切り替えると rate 系の操作が無効になり、`axes [0.5, −0.3]` が指令 0.47 / −0.26 でサーバーの `requested_pose` も 0.4737 → 別クライアントの `POST /v1/session` で `stale_session` 停止 → 再読み込みでモード（位置）と rate 2.5 が残る → 壊れた保存値（mode "x"、rate 99、rtcSpeed −1）は 速度 / 3.0 / 0.1 に丸める → token → 送信開始 → ARM → HOLDING → START → ACTIVE、`POST /v1/limits` で max_vel 60 / max_acc 200 に下げて全開 → status の `limits` に `velocity_limited, acceleration_limited` が出て札が点く（WS の ack の `limits` は「なし」のまま: planner の札は ack に乗らない） |
+
+変えたこと: `static/joystick_page.html` だけ（入力モード「位置」/「速度」、rate / 中央へ / 離すと中央へ戻る / 勢い、倒し量と指令姿勢の併記、status の `limits` の札とヒント）。サーバーも WS の約束（pose + gain）も変えていない。実機ではまだ使っていない。
+
 ## 2026-11-02 の結果（Issue #15 M5 / M4（ページ）/ L2: Python の session 使い回し、ジョイスティックページの入力衛生、stale_session で送信停止）
 
 環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、node 26.3、Python 3.14 ＋ websockets 17（`clients/python/.venv`）、Playwright（npx のキャッシュ）＋ chromium_headless_shell 1243。
