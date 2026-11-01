@@ -73,6 +73,34 @@ pub fn check_pose(pose: Pose, requested_gain: f64, max_gain: f64, clamp_out_of_r
     Ok(CheckedPose { pose, effective_gain, limits })
 }
 
+/// Rig orientation: how the game's pitch / roll / yaw map onto the mixer's
+/// inputs. The mixer itself is the h3game contract and is never changed; the
+/// physical arrangement of THIS rig (which pair of lifts is left/right, which
+/// way is forward) is an operator setting (`[game]`), not something the game
+/// has to know. 2026-11-02: on the rebuilt rig the mixer's common mode
+/// (`roll` slot) tilts the seat forward/back and its differential (`pitch`
+/// slot) tilts it sideways, so `swap_pitch_roll = true` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Orientation {
+    pub swap_pitch_roll: bool,
+    pub invert_pitch: bool,
+    pub invert_roll: bool,
+    pub invert_yaw: bool,
+}
+
+/// Apply the rig orientation to a game pose (inversion first, then the swap,
+/// so `invert_pitch` always refers to the game's pitch).
+pub fn orient(pose: Pose, o: Orientation) -> Pose {
+    let pitch = if o.invert_pitch { -pose.pitch } else { pose.pitch };
+    let roll = if o.invert_roll { -pose.roll } else { pose.roll };
+    let yaw = if o.invert_yaw { -pose.yaw } else { pose.yaw };
+    if o.swap_pitch_roll {
+        Pose { pitch: roll, roll: pitch, yaw }
+    } else {
+        Pose { pitch, roll, yaw }
+    }
+}
+
 /// The h3game-v1 mixer, unclamped float output (may exceed 0..=1023 when gain
 /// is large; saturation is a separate, reported step).
 pub fn mix(pose: Pose, gain: f64) -> [VirtualPos; AXIS_COUNT] {
