@@ -117,7 +117,7 @@ use crate::compat;
 use crate::config::{Config, GameConfig, TimingConfig};
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
-    self, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
+    self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
     CalResultCode, FaultEvent, Hello, HostMsg, SetPosition, Status,
 };
 use crate::session::AcceptedPose;
@@ -614,6 +614,9 @@ pub struct Supervisor {
     /// Units (device_id, boot_id) that changed axis under one boot and were
     /// not re-referenced by this server since.
     stale_refs: BTreeSet<(DeviceId, BootId)>,
+    /// A multi-axis calibration is running with KEEP_POWER on the power axis: its
+    /// main power is released (CALIBRATE(0)) once every target has reported.
+    cal_keep_power: bool,
 
     phase: Phase,
     planner: Planner,
@@ -683,6 +686,7 @@ impl Supervisor {
             host_decode_errors: 0,
             last_assignment: BTreeMap::new(),
             stale_refs: BTreeSet::new(),
+            cal_keep_power: false,
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             planner_settled: false,
@@ -1021,6 +1025,7 @@ impl Supervisor {
     /// tick (sanitized and capped at 2 × planner period here as well).
     pub fn tick(&mut self, now: Instant, dt_s: f64, pose: Option<&AcceptedPose>) -> TickOutput {
         self.touch(now);
+        self.release_power_hold(now);
         let period = self.timing.planner_period_ms as f64 / 1000.0;
         let dt = if dt_s.is_finite() && dt_s > 0.0 {
             dt_s.min(2.0 * period)
@@ -1828,14 +1833,23 @@ impl Supervisor {
         if !not_disarmed.is_empty() {
             return Err(AdminError::new(admin_error::MCU_NOT_DISARMED, not_disarmed));
         }
+        // Other axes need 24V for the whole run: the power axis must not cut it when it
+        // finishes first (protocol.md §1.2 KEEP_POWER).
+        self.cal_keep_power = targets.len() > 1;
         for a in &targets {
             let i = a.index();
             let id = self.take_request_id();
+            let flags = if self.cal_keep_power && *a == self.power_axis {
+                calibrate_flags::KEEP_POWER
+            } else {
+                0
+            };
             self.push_msg(
                 i,
                 HostMsg::Calibrate {
                     request_id: id,
                     mode: calibrate_mode::START,
+                    flags,
                 },
                 Purpose::Calibrate,
                 now,
@@ -1864,7 +1878,33 @@ impl Supervisor {
 
     /// CALIBRATE(0) to every axis that is CALIBRATING or has a CALIBRATE(1)
     /// outstanding; returns those axes.
+    /// KEEP_POWER: once no axis has a calibration pending, tell the power axis (still in
+    /// POWER_HOLD) to release main power. A cancel there ends the hold; it sends no CAL_RESULT.
+    fn release_power_hold(&mut self, now: Instant) {
+        if !self.cal_keep_power || self.axes.iter().any(|t| t.cal_pending) {
+            return;
+        }
+        self.cal_keep_power = false;
+        let i = self.power_axis.index();
+        if !self.axes[i].connected {
+            return;
+        }
+        let id = self.take_request_id();
+        self.push_msg(
+            i,
+            HostMsg::Calibrate {
+                request_id: id,
+                mode: calibrate_mode::CANCEL,
+                flags: 0,
+            },
+            Purpose::CalibrateCancel,
+            now,
+        );
+        self.event(now, "calibrate_power_release", serde_json::json!({"axis": self.power_axis}));
+    }
+
     fn send_calibrate_cancel(&mut self, now: Instant) -> Vec<AxisId> {
+        self.cal_keep_power = false;
         let mut out = Vec::new();
         for i in 0..AXIS_COUNT {
             let Some(axis) = AxisId::from_index(i) else {
@@ -1879,6 +1919,7 @@ impl Supervisor {
                 HostMsg::Calibrate {
                     request_id: id,
                     mode: calibrate_mode::CANCEL,
+                    flags: 0,
                 },
                 Purpose::CalibrateCancel,
                 now,

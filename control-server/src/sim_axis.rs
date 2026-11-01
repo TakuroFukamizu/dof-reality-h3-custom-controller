@@ -736,7 +736,7 @@ impl SimMcu {
             } => self.command(msg, request_id, msg_type::SET_REFERENCE, now, |s, _| {
                 s.on_set_reference(reference_count)
             }),
-            HostMsg::Calibrate { request_id, mode } => {
+            HostMsg::Calibrate { request_id, mode, .. } => {
                 self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
                     s.on_calibrate(mode, now)
                 })

@@ -128,7 +128,8 @@ inline bool eq_set_reference(const v1::HostMsg& a, const v1::HostMsg& b) {
          a.set_reference.reference_count == b.set_reference.reference_count;
 }
 inline bool eq_calibrate(const v1::HostMsg& a, const v1::HostMsg& b) {
-  return a.calibrate.request_id == b.calibrate.request_id && a.calibrate.mode == b.calibrate.mode;
+  return a.calibrate.request_id == b.calibrate.request_id && a.calibrate.mode == b.calibrate.mode &&
+         a.calibrate.flags == b.calibrate.flags;
 }
 
 inline bool eq_hello(const v1::McuMsg& a, const v1::McuMsg& b) {
@@ -269,16 +270,22 @@ inline void test_vectors_host() {
   {  // 7.19 CALIBRATE（request_id 7、mode 1 = 開始）。CRC は独立した実装（Python）でも確認した値
     v1::HostMsg m{};
     m.type = v1::msg::CALIBRATE;
-    m.calibrate = {7, 1};
+    m.calibrate = {7, 1, 0};
     check_host_vector("01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F",
                       "04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00", m, eq_calibrate);
     CHECK(v1::host_payload_len(v1::msg::CALIBRATE) == 8);
     // mode 0（中止）も同じ長さ
-    m.calibrate = {12, 0};
+    m.calibrate = {12, 0, 0};
     uint8_t f[v1::MAX_FRAME_LEN];
     CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 4 + 8 + 2);
     v1::HostMsg d{};
-    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 12 && d.calibrate.mode == 0);
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 12 && d.calibrate.mode == 0 && d.calibrate.flags == 0);
+    // flags（byte 5、bit0 = KEEP_POWER）は符号化・復号で保たれ、予約の 2 バイトは 0
+    m.calibrate = {13, 1, v1::cal_flags::KEEP_POWER};
+    CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 4 + 8 + 2);
+    CHECK(f[4 + 4] == 1 && f[4 + 5] == 0x01 && f[4 + 6] == 0 && f[4 + 7] == 0);
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 13 && d.calibrate.mode == 1 &&
+          d.calibrate.flags == v1::cal_flags::KEEP_POWER);
   }
 }
 

@@ -404,7 +404,7 @@ wire  (16 byte): 04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00
 
 ### 7.19 CALIBRATE（`0x0C`、PC → MCU）
 
-値: `{"request_id":7,"mode":1}`
+値: `{"request_id":7,"mode":1,"flags":0}`
 
 ```text
 frame (14 byte): 01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F

@@ -163,6 +163,7 @@ fn rand_host(r: &mut Rng) -> HostMsg {
         _ => HostMsg::Calibrate {
             request_id: r.edgy_u32(),
             mode: r.u8(),
+            flags: r.u8(),
         },
     }
 }
@@ -951,15 +952,16 @@ fn axis_select_layout_and_length() {
 fn calibrate_layout_and_length() {
     // protocol §4: 0x0C, 8 bytes: u32 request_id / u8 mode / u8 reserved / u16 reserved.
     assert_eq!(host_payload_len(msg_type::CALIBRATE), Some(8));
-    let m = HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START };
+    let m = HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START, flags: 0 };
     assert_eq!(m.msg_type(), 0x0C);
     assert_eq!(m.encode_payload(), [7, 0, 0, 0, 1, 0, 0, 0]);
     host_rt(m);
-    host_rt(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::CANCEL });
-    // Reserved bytes are ignored on decode; wrong length is rejected.
+    host_rt(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::CANCEL, flags: 0 });
+    // flags (KEEP_POWER) is byte 5; the two reserved bytes are ignored on decode; wrong length is rejected.
+    assert_eq!(HostMsg::Calibrate { request_id: 7, mode: 1, flags: 1 }.encode_payload(), [7, 0, 0, 0, 1, 1, 0, 0]);
     assert_eq!(
         HostMsg::decode_payload(msg_type::CALIBRATE, &[7, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC]),
-        Ok(HostMsg::Calibrate { request_id: 7, mode: 0 })
+        Ok(HostMsg::Calibrate { request_id: 7, mode: 0, flags: 0xAA })
     );
     assert!(matches!(
         HostMsg::decode_payload(msg_type::CALIBRATE, &[0u8; 4]),
@@ -1089,6 +1091,7 @@ fn round_trip_every_host_message_edge_values() {
             HostMsg::Calibrate {
                 request_id: u,
                 mode: h as u8,
+                flags: 0,
             },
         ];
         for m in msgs {
