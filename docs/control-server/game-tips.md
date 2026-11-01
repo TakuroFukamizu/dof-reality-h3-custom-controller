@@ -99,7 +99,7 @@ val = a + (b - a) * s
 - 向く: 「このシーンは全体にゆっくり」「コックピット演出では全体の速度を半分に」のように、シーン単位で一律に抑えたい。姿勢の計算を変えずに済む。
 - 向かない: 動きごとに違う速さを出したい（制限は 3 軸共通・全体に効く）。速度と加速度の上限は下げても、加速の立ち上がり方は台形のまま。
 - 注意:
-  - 値はサーバーが **ファームの絶対上限と `overspeed / 1.5`、gain 1.0** で切る（`ceiling_clamped`）。**操作者の `[limits]` の値は「セッション開始時の初期値」であって上限ではない**（`motion_limits.defaults`）。コードは初期値より上げる要求も受け付ける。だからゲームは `limits` を **初期値より下げる用途にだけ使う**。上げたいときは操作者に `POST /v1/limits` か設定変更を頼む（§6）。
+  - 値はサーバーが **操作者の `[limits]` の値**（status の `motion_limits.operator_max`。理由 `operator_limited`）と **ファームの絶対上限・`overspeed / 1.5`・gain 1.0**（`ceiling_clamped`）で切る。**ゲーム経路（WS `limits`）は操作者の値より上には上げられない**（2026-11-02 Issue #15 で強制に変更）。だからゲームは `limits` を **下げる用途にだけ使う**。上げたいときは操作者に `POST /v1/limits`（Bearer、ファームの上限まで）か設定変更を頼む（§6）。
   - **停止時間の規則**: 加速度を下げ過ぎると STOP で止まり切れなくなるので、サーバーが `max_acc ≥ max_vel / 1.2 s` になるまで `max_acc` を上げる（または `max_vel` を下げる）。ack の `limits` に `stop_time_limited`、`effective_limits` に実際の値が返る。例: `max_vel 600` に `max_acc 1` を要求 → 500 になる。
   - `duty_max_percent` は触らない（§6）。Duty を変える要求は全軸のファームが受理するまで `motion_limits.pending = true` のまま効かない。速度・加速度・gain は即時。
   - `limits` は鮮度を延ばさない（pose を送り続けること）。`POST /v1/session` のたびに初期値へ戻るので、再接続後は送り直す（Python クライアントは `submit_limits(...)` を pose より先に送る）。
@@ -112,7 +112,7 @@ val = a + (b - a) * s
 | --- | --- | --- |
 | pose の ack `limits` | `pose_clamped` / `gain_limited` / `gain_negative` | 受け付け時の検査。姿勢が −1..1 外、gain が `max_gain` 超 |
 | **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない** |
-| `limits` メッセージの ack `limits` | `ceiling_clamped` / `stop_time_limited` | 要求した制限値がサーバーで変えられた。`effective_limits` に結果 |
+| `limits` メッセージの ack `limits` | `operator_limited` / `ceiling_clamped` / `stop_time_limited` | 要求した制限値がサーバーで変えられた（操作者の値で / ファームの上限で / 停止時間の規則で）。`effective_limits` に結果 |
 
 status は `server.status_period_ms`（bring-up 100 ms）ごとに WS に届く。演出を作るときは `limits` に **`velocity_limited` が出ない**ことを確かめる（出ていれば、その瞬間は意図した速さではなくサーバーの上限 600 count/s で動いている。信頼できる印）。`acceleration_limited` は読み方に注意: 30〜50 Hz で送る姿勢は 100 Hz の tick から見ると階段で、段の縁ごとに目標速度が `max_acc × 送信間隔`（20〜60 count/s）跳ぶのに対し 1 tick の加速度の余地は `max_acc × 0.01` = 20 count/s なので、**制限の内側でもフレームごとに点滅する**。点滅は正常、**連続して立ち続ける**ならランプが急すぎる。`virtual_saturated` / `soft_limited` が出たら姿勢が端に当たっている。
 
@@ -204,7 +204,7 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 | **`frame_seq` を偽装する**（タイマーで進める、隠れたタブで進め続ける、固定値を送る） | 鮮度は「ゲームが生きている証明」。描画ループが進んだときだけ +1。`allow_missing_frame_seq = true` に頼らない（有人では使わない） |
 | **向きの補正をゲームに置く**（この機体は pitch と roll が逆だから入れ替えて送る、符号を反転して送る） | 向きは `[game].swap_pitch_roll` / `invert_*` で操作者が機体ごとに設定する。ゲームが補正すると、別の機体や設定変更で二重に反転する。ゲームは pitch = 前後、roll = 左右の意味のまま送る |
 | **混合式を自分で計算して m1 / m2 / m3 を送る** | API は姿勢と gain だけ。混合はサーバー |
-| **`limits` で初期値より上げる**（`max_vel` 600 → 1333、`duty_max` 20 → 60 など） | サーバーはファームの絶対上限までは受け付けてしまうが、`[limits]` の初期値は操作者が機体の状態を見て決めた値。上げるのは操作者が `POST /v1/limits` か設定で。ゲームは **下げる用途だけ** |
+| **`limits` で操作者の値より上げようとする**（`max_vel` 600 → 1333、`duty_max` 20 → 60 など） | サーバーが操作者の値で切って `operator_limited` を返す（上がらない）。`[limits]` の値は操作者が機体の状態を見て決めた上限。上げるのは操作者が `POST /v1/limits` か設定で。ゲームは **下げる用途だけ** |
 | **`duty_max_percent` を触る** | ファームの出力上限。モーターと機構の保護側の値で、操作者が実機を見ながら上げるもの |
 | **ソフトリミット・校正値・中立位置を知っている前提で姿勢を計算する** | count はゲームに見えない単位。姿勢 −1..1 と gain だけで書き、端は `virtual_saturated` / `soft_limited` で知る |
 | **gain で範囲を表現する**（「このシーンは小さく動かしたいから gain 0.3」） | 範囲は姿勢の振幅で表現する（gain 1.0 固定で pitch ±0.3）。gain は h3game 互換の「全体の効き」。pose の中で毎フレーム変えてよい（`{"type":"gain"}` 単独では鮮度が延びない）が、範囲表現に混ぜると飽和の条件（§2）が読みにくくなる |
@@ -221,7 +221,7 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 4. 一番速い演出で status の `limits` に `velocity_limited` が出ないこと、`acceleration_limited` が立ち続けないこと（出るなら意図した速さになっていない。フレームごとの点滅は正常、§3.3）。
 5. タブを裏に回す・ゲームを一時停止する → 250 ms 以内に `STOPPING` → `BRAKED_DISARMED`。中立へ戻らない。
 6. 画面を再読み込み → 旧 session が `stale_session`、座席は止まる、再開には操作者の ARM + START が要ることを画面に出せる。
-7. `limits` を送っているなら、ack の `effective_limits` を表示し、`ceiling_clamped` / `stop_time_limited` が出たら要求値と違うことが分かる。再接続後に送り直している。
+7. `limits` を送っているなら、ack の `effective_limits` を表示し、`operator_limited` / `ceiling_clamped` / `stop_time_limited` が出たら要求値と違うことが分かる。再接続後に送り直している。
 8. `rig_state` / `fault` / `blockers` を画面に出し、FAULT のとき「操作者を呼ぶ」導線がある。
 9. 2 つ目の画面・bridge を同時に開いたとき、先の方が `stale_session` になることを知っている。
 10. 実機では最初は操作者に `max_gain` を 0.3 程度に下げてもらい（`POST /v1/limits`）、向きと速さを目で確認してから 1.0 に戻す。
