@@ -37,6 +37,7 @@ constexpr uint8_t CLOCK_SYNC = 0x09;
 constexpr uint8_t HOST_FAULT = 0x0A;
 constexpr uint8_t SET_REFERENCE = 0x0B;
 constexpr uint8_t CALIBRATE = 0x0C;
+constexpr uint8_t SET_LIMITS = 0x0D;  // Duty 上下限・Kp・FF・不感帯の置き換え（motion-limits 設計 §4.2）
 
 constexpr uint8_t HELLO = 0x81;
 constexpr uint8_t ACK = 0x82;
@@ -45,6 +46,7 @@ constexpr uint8_t FAULT_EVENT = 0x84;
 constexpr uint8_t CLOCK_SYNC_REPLY = 0x85;
 constexpr uint8_t AXIS_SELECT = 0x86;
 constexpr uint8_t CAL_RESULT = 0x87;
+constexpr uint8_t LIMITS = 0x88;  // SET_LIMITS 受理直後の有効値と絶対上限（motion-limits 設計 §4.3）
 }  // namespace msg
 
 // --- 共通の値（protocol.md §3） ---
@@ -112,6 +114,7 @@ namespace capabilities {
 constexpr uint32_t POSITION_MODE = 1u << 0;
 constexpr uint32_t APPLY_AT = 1u << 1;
 constexpr uint32_t CURRENT_SENSE = 1u << 2;
+constexpr uint32_t LIMITS = 1u << 3;  // SET_LIMITS / LIMITS に対応（motion-limits 設計 §4.1）
 }  // namespace capabilities
 
 // CALIBRATE の mode（protocol.md §4）
@@ -156,6 +159,7 @@ inline int host_payload_len(uint8_t type) {
     case msg::HOST_FAULT: return 8;
     case msg::SET_REFERENCE: return 8;
     case msg::CALIBRATE: return 8;
+    case msg::SET_LIMITS: return 16;
     default: return -1;
   }
 }
@@ -169,6 +173,7 @@ inline int mcu_payload_len(uint8_t type) {
     case msg::CLOCK_SYNC_REPLY: return 28;
     case msg::AXIS_SELECT: return 8;
     case msg::CAL_RESULT: return 28;
+    case msg::LIMITS: return 24;
     default: return -1;
   }
 }
@@ -364,6 +369,15 @@ struct Calibrate {
   uint8_t mode;  // cal_mode::START / CANCEL
   uint8_t flags;  // bit0 = KEEP_POWER（電源担当軸だけが解釈。校正が終わっても主電源を保つ）
 };
+struct SetLimits {
+  uint32_t request_id;
+  uint8_t duty_max_percent;        // 1〜100。絶対上限（V1_ABS_DUTY_MAX）を超える値はクランプ
+  uint8_t duty_min_percent;        // 0〜duty_max
+  uint8_t kp_percent_per_100;
+  uint16_t ff_count_s_per_percent; // > 0
+  uint16_t deadband_count;
+  uint16_t deadband_out_count;     // ≥ deadband_count
+};
 
 struct Hello {
   uint32_t request_id;
@@ -431,6 +445,18 @@ struct CalResult {
   int8_t sign;                 // 系統プロファイルの符号 ±1
   char reason[CAL_REASON_LEN]; // ASCII、NUL 埋め
 };
+struct Limits {
+  uint32_t boot_id;
+  uint8_t duty_max_percent;        // 有効値（クランプ後）
+  uint8_t duty_min_percent;
+  uint8_t kp_percent_per_100;
+  uint8_t abs_duty_max_percent;    // 絶対上限（config.h の V1_ABS_DUTY_MAX）
+  uint16_t ff_count_s_per_percent;
+  uint16_t deadband_count;
+  uint16_t deadband_out_count;
+  uint32_t abs_max_vel_count_s;    // 絶対上限（V1_ABS_MAX_VEL_COUNT_S）
+  uint32_t abs_max_acc_count_s2;   // 絶対上限（V1_ABS_MAX_ACC_COUNT_S2）
+};
 
 // PC → MCU の 1 メッセージ。type で union の有効な要素が決まる。
 struct HostMsg {
@@ -448,6 +474,7 @@ struct HostMsg {
     HostFault host_fault;
     SetReference set_reference;
     Calibrate calibrate;
+    SetLimits set_limits;
   };
 };
 
@@ -462,6 +489,7 @@ struct McuMsg {
     ClockSyncReply clock_sync_reply;
     AxisSelect axis_select;
     CalResult cal_result;
+    Limits limits;
   };
 };
 
@@ -538,6 +566,19 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
       put_u8(out + 4, m.calibrate.mode);
       put_u8(out + 5, m.calibrate.flags);
       break;
+    case msg::SET_LIMITS: {
+      const SetLimits& l = m.set_limits;
+      put_u32(out + 0, l.request_id);
+      put_u8(out + 4, l.duty_max_percent);
+      put_u8(out + 5, l.duty_min_percent);
+      put_u8(out + 6, l.kp_percent_per_100);
+      // 7: reserved = 0
+      put_u16(out + 8, l.ff_count_s_per_percent);
+      put_u16(out + 10, l.deadband_count);
+      put_u16(out + 12, l.deadband_out_count);
+      // 14: u16 reserved = 0
+      break;
+    }
     default:
       return 0;
   }
@@ -625,6 +666,21 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       memcpy(out + 20, c.reason, CAL_REASON_LEN);
       break;
     }
+    case msg::LIMITS: {
+      const Limits& l = m.limits;
+      put_u32(out + 0, l.boot_id);
+      put_u8(out + 4, l.duty_max_percent);
+      put_u8(out + 5, l.duty_min_percent);
+      put_u8(out + 6, l.kp_percent_per_100);
+      put_u8(out + 7, l.abs_duty_max_percent);
+      put_u16(out + 8, l.ff_count_s_per_percent);
+      put_u16(out + 10, l.deadband_count);
+      put_u16(out + 12, l.deadband_out_count);
+      // 14: u16 reserved = 0
+      put_u32(out + 16, l.abs_max_vel_count_s);
+      put_u32(out + 20, l.abs_max_acc_count_s2);
+      break;
+    }
     default:
       return 0;
   }
@@ -705,6 +761,17 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
       out->calibrate.mode = get_u8(p + 4);
       out->calibrate.flags = get_u8(p + 5);
       break;
+    case msg::SET_LIMITS: {
+      SetLimits& l = out->set_limits;
+      l.request_id = get_u32(p + 0);
+      l.duty_max_percent = get_u8(p + 4);
+      l.duty_min_percent = get_u8(p + 5);
+      l.kp_percent_per_100 = get_u8(p + 6);
+      l.ff_count_s_per_percent = get_u16(p + 8);
+      l.deadband_count = get_u16(p + 10);
+      l.deadband_out_count = get_u16(p + 12);
+      break;  // 7・14 の予約は読まない
+    }
     default:
       return false;
   }
@@ -792,6 +859,20 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       c.sign = static_cast<int8_t>(get_u8(p + 16));
       memcpy(c.reason, p + 20, CAL_REASON_LEN);
       break;
+    }
+    case msg::LIMITS: {
+      Limits& l = out->limits;
+      l.boot_id = get_u32(p + 0);
+      l.duty_max_percent = get_u8(p + 4);
+      l.duty_min_percent = get_u8(p + 5);
+      l.kp_percent_per_100 = get_u8(p + 6);
+      l.abs_duty_max_percent = get_u8(p + 7);
+      l.ff_count_s_per_percent = get_u16(p + 8);
+      l.deadband_count = get_u16(p + 10);
+      l.deadband_out_count = get_u16(p + 12);
+      l.abs_max_vel_count_s = get_u32(p + 16);
+      l.abs_max_acc_count_s2 = get_u32(p + 20);
+      break;  // 14 の予約は読まない
     }
     default:
       return false;

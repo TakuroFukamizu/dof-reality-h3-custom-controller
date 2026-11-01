@@ -91,7 +91,7 @@ inline uint64_t v1_device_id_from_mac(const uint8_t mac[6]) {
 
 class V1Axis {
  public:
-  static constexpr size_t kOutboxCap = 40;   // 1 周期の最大: 受信 16 件分の ACK + STATUS + FAULT_EVENT + AXIS_SELECT + CAL_RESULT
+  static constexpr size_t kOutboxCap = 40;   // 1 周期の最大: 受信 16 件分の ACK（SET_LIMITS なら各 + LIMITS）+ STATUS + FAULT_EVENT + AXIS_SELECT + CAL_RESULT
   static constexpr size_t kDedupeDepth = 16;
 
   V1Tuning tuning;
@@ -505,6 +505,7 @@ class V1Axis {
       case v1::msg::FAULT_RESET: command(m, m.fault_reset.request_id, now); break;
       case v1::msg::SET_REFERENCE: command(m, m.set_reference.request_id, now); break;
       case v1::msg::CALIBRATE: command(m, m.calibrate.request_id, now); break;
+      case v1::msg::SET_LIMITS: command(m, m.set_limits.request_id, now); break;
       default: break;  // decode 済みなので来ない
     }
   }
@@ -520,6 +521,7 @@ class V1Axis {
       case v1::msg::FAULT_RESET: return on_fault_reset();
       case v1::msg::SET_REFERENCE: return on_set_reference(m.set_reference.reference_count);
       case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, m.calibrate.flags, now);
+      case v1::msg::SET_LIMITS: return on_set_limits(m.set_limits);
       default: return v1::ack_reason::BAD_STATE;
     }
   }
@@ -545,6 +547,7 @@ class V1Axis {
     if (reason == v1::ack_reason::NONE) {
       remember(m.type, request_id, payload, plen);
       push_ack(request_id, m.type, v1::ack_result::ACCEPTED, v1::ack_reason::NONE);
+      if (m.type == v1::msg::SET_LIMITS) push_limits();  // 受理した直後だけ、ACK の後に 1 回（DUPLICATE では送らない）
     } else {
       // 拒否は副作用が無いので記憶しない（再送は改めて評価する）
       push_ack(request_id, m.type, v1::ack_result::REJECTED, reason);
@@ -596,7 +599,7 @@ class V1Axis {
     m.hello.fw_major = id_.fw_major;
     m.hello.fw_minor = id_.fw_minor;
     m.hello.fw_patch = id_.fw_patch;
-    m.hello.capabilities = v1::capabilities::POSITION_MODE;
+    m.hello.capabilities = v1::capabilities::POSITION_MODE | v1::capabilities::LIMITS;
     m.hello.calibration_hash = calibration_hash();
     push(m);
   }
@@ -612,7 +615,9 @@ class V1Axis {
     push(m);
   }
 
-  // CONFIG: DISARMED のときだけ。§4 の表の検査だけ。epoch が変われば last_rx_seq = 0。
+  // CONFIG: DISARMED のときだけ。§4 の表の検査だけ（0 は拒否）。速度・加速度の上限は絶対上限で黙ってクランプして保存する
+  // （PC は CONFIG に絶対上限を入れ、毎フレームの SET_POSITION で実際の上限を決める。motion-limits 設計 §4.4）。
+  // epoch が変われば last_rx_seq = 0。
   uint16_t on_config(const v1::Config& c) {
     if (state_ != v1::state::DISARMED) return v1::ack_reason::BAD_STATE;
     const bool valid = c.soft_min_count < c.soft_max_count && c.max_vel_count_s > 0 && c.max_acc_count_s2 > 0 &&
@@ -623,7 +628,29 @@ class V1Axis {
       last_rx_seq_ = 0;  // seq の単調性は epoch ごと
     }
     config_ = c;
+    if (config_.max_vel_count_s > V1_ABS_MAX_VEL_COUNT_S) config_.max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
+    if (config_.max_acc_count_s2 > V1_ABS_MAX_ACC_COUNT_S2) config_.max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     has_config_ = true;
+    return v1::ack_reason::NONE;
+  }
+
+  // SET_LIMITS（motion-limits 設計 §4.2）: 状態は問わない（ACTIVE 中も受理）。検査に通れば tuning の該当項目を置き換え、
+  // Duty の上下限は絶対上限 V1_ABS_DUTY_MAX でクランプする。拒否なら tuning は変えない。LIMITS は command() が ACK の後に送る。
+  uint16_t on_set_limits(const v1::SetLimits& l) {
+    if (l.duty_max_percent == 0 || l.duty_min_percent > l.duty_max_percent || l.ff_count_s_per_percent == 0 ||
+        l.deadband_out_count < l.deadband_count) {
+      return v1::ack_reason::INVALID_PARAM;
+    }
+    int duty_max = l.duty_max_percent;
+    if (duty_max > V1_ABS_DUTY_MAX) duty_max = V1_ABS_DUTY_MAX;
+    int duty_min = l.duty_min_percent;
+    if (duty_min > duty_max) duty_min = duty_max;
+    tuning.duty_max = duty_max;
+    tuning.duty_min = duty_min;
+    tuning.kp_percent_per_100 = l.kp_percent_per_100;
+    tuning.ff_count_s_per_percent = l.ff_count_s_per_percent;
+    tuning.deadband = l.deadband_count;
+    tuning.deadband_out = l.deadband_out_count;
     return v1::ack_reason::NONE;
   }
 
@@ -909,7 +936,11 @@ class V1Axis {
       setpoint_ = p < lo ? lo : (p > hi ? hi : p);
       setpoint_vel_ = v;
     } else if (state_ == v1::state::STOPPING) {
-      const double dv = static_cast<double>(config_.max_acc_count_s2) * dt;
+      // 減速は最後に適用したフレームの max_acc で（CONFIG には絶対上限が入るので、そちらでは 40000 count/s² の急減速になる。
+      // motion-limits 設計 §4.4）。frame_max_acc_ は START で CONFIG の値から初期化され SET_POSITION ごとに更新されるが、
+      // フレームが max_acc = 0 を運ぶと 0 になり減速できないので、そのときだけ CONFIG の値に戻す。
+      const double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      const double dv = amax * dt;
       double v = setpoint_vel_;
       if (fabs(v) <= dv) {
         v = 0.0;
@@ -1223,6 +1254,24 @@ class V1Axis {
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::STATUS;
     m.status = status(now);
+    push(m);
+  }
+
+  // LIMITS（motion-limits 設計 §4.3）: いまの tuning の有効値と config.h の絶対上限。SET_LIMITS 受理直後だけ送る。
+  void push_limits() {
+    v1::McuMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::LIMITS;
+    m.limits.boot_id = id_.boot_id;
+    m.limits.duty_max_percent = static_cast<uint8_t>(tuning.duty_max);
+    m.limits.duty_min_percent = static_cast<uint8_t>(tuning.duty_min);
+    m.limits.kp_percent_per_100 = static_cast<uint8_t>(tuning.kp_percent_per_100);
+    m.limits.abs_duty_max_percent = static_cast<uint8_t>(V1_ABS_DUTY_MAX);
+    m.limits.ff_count_s_per_percent = static_cast<uint16_t>(tuning.ff_count_s_per_percent);
+    m.limits.deadband_count = static_cast<uint16_t>(tuning.deadband);
+    m.limits.deadband_out_count = static_cast<uint16_t>(tuning.deadband_out);
+    m.limits.abs_max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
+    m.limits.abs_max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     push(m);
   }
 

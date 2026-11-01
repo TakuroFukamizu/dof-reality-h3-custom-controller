@@ -226,6 +226,32 @@ struct Harness {
     return m;
   }
   v1::Ack calibrate(uint8_t mode = 1, uint8_t flags = 0) { return cmd(calibrate_msg(mode, next_rid(), flags)); }
+  // SET_LIMITS（motion-limits 設計 §4.2）。既定値は設計 §3 の新しい初期値
+  v1::HostMsg set_limits_msg(uint32_t request_id, uint8_t duty_max = 40, uint8_t duty_min = 3, uint8_t kp = 2,
+                             uint16_t ff = 100, uint16_t deadband = 10, uint16_t deadband_out = 20) {
+    v1::HostMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::SET_LIMITS;
+    m.set_limits.request_id = request_id;
+    m.set_limits.duty_max_percent = duty_max;
+    m.set_limits.duty_min_percent = duty_min;
+    m.set_limits.kp_percent_per_100 = kp;
+    m.set_limits.ff_count_s_per_percent = ff;
+    m.set_limits.deadband_count = deadband;
+    m.set_limits.deadband_out_count = deadband_out;
+    return m;
+  }
+  v1::Ack set_limits(uint8_t duty_max = 40, uint8_t duty_min = 3, uint8_t kp = 2, uint16_t ff = 100,
+                     uint16_t deadband = 10, uint16_t deadband_out = 20) {
+    return cmd(set_limits_msg(next_rid(), duty_max, duty_min, kp, ff, deadband, deadband_out));
+  }
+  std::vector<v1::Limits> limits() const {
+    std::vector<v1::Limits> r;
+    for (const v1::McuMsg& m : out) {
+      if (m.type == v1::msg::LIMITS) r.push_back(m.limits);
+    }
+    return r;
+  }
   std::vector<v1::CalResult> cal_results() const {
     std::vector<v1::CalResult> r;
     for (const v1::McuMsg& m : out) {
@@ -347,7 +373,8 @@ inline void test_hello_answers_in_every_state() {
         CHECK(m.hello.device_id == 0x5131000000000001ull);
         CHECK(m.hello.boot_id == 2309737967u);
         CHECK(m.hello.fw_major == 0 && m.hello.fw_minor == 1 && m.hello.fw_patch == 0);
-        CHECK(m.hello.capabilities == v1::capabilities::POSITION_MODE);
+        CHECK(m.hello.capabilities == (v1::capabilities::POSITION_MODE | v1::capabilities::LIMITS));
+        CHECK((m.hello.capabilities & v1::capabilities::LIMITS) != 0);  // SET_LIMITS / LIMITS 対応（設計 §4.1）
         CHECK(m.hello.calibration_hash == expect_hash);
       }
     }
@@ -450,6 +477,58 @@ inline void test_config_only_in_disarmed() {
 inline void test_request_id_zero_rejected() {
   Harness h;
   Harness::rejected(h.cmd(h.disarm_msg(0)), rs::INVALID_PARAM);
+}
+
+// CONFIG の速度・加速度上限は絶対上限（6000 / 40000）で黙ってクランプして保存する（拒否しない。motion-limits 設計 §4.4）
+inline void test_config_clamps_vel_and_acc_to_absolute_ceiling() {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_vel_count_s = 99999;
+  c.max_acc_count_s2 = 9999999;
+  c.soft_min_count = -100000;
+  c.soft_max_count = 100000;
+  c.following_error_limit_count = 100000;
+  c.overspeed_count_s = 9000;
+  Harness::accepted(h.config_with(c));
+  CHECK(h.ax.config() != nullptr);
+  CHECK(h.ax.config()->max_vel_count_s == V1_ABS_MAX_VEL_COUNT_S);
+  CHECK(h.ax.config()->max_acc_count_s2 == V1_ABS_MAX_ACC_COUNT_S2);
+  CHECK(h.ax.config()->max_vel_count_s == 6000 && h.ax.config()->max_acc_count_s2 == 40000);
+  // 絶対上限ちょうど・それ未満はそのまま
+  c.max_vel_count_s = 6000;
+  c.max_acc_count_s2 = 40000;
+  Harness::accepted(h.config_with(c));
+  CHECK(h.ax.config()->max_vel_count_s == 6000 && h.ax.config()->max_acc_count_s2 == 40000);
+  c.max_vel_count_s = 3000;
+  c.max_acc_count_s2 = 15000;
+  Harness::accepted(h.config_with(c));
+  CHECK(h.ax.config()->max_vel_count_s == 3000 && h.ax.config()->max_acc_count_s2 == 15000);
+  // 0 は今までどおり拒否
+  c.max_vel_count_s = 0;
+  Harness::rejected(h.config_with(c), rs::INVALID_PARAM);
+  // 動きにも効く: フレームの上限が大きくても 1 s の移動は 6000 count/s・40000 count/s² の軌道（≈ 5565 count）
+  Harness g;
+  c = base_config();
+  c.max_vel_count_s = 99999;
+  c.max_acc_count_s2 = 9999999;
+  c.soft_min_count = -100000;
+  c.soft_max_count = 100000;
+  c.following_error_limit_count = 100000;
+  c.overspeed_count_s = 9000;
+  Harness::accepted(g.config_with(c));
+  g.plant_vel = 10000.0;
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  for (int i = 0; i < 100; ++i) {
+    v1::HostMsg m = g.set_position_msg(100000);
+    m.set_position.max_vel_count_s = 99999;
+    m.set_position.max_acc_count_s2 = 9999999;
+    g.send(m);
+    g.idle(10);
+  }
+  CHECK(g.ax.state() == st::ACTIVE);
+  CHECK(g.ax.target_count() > 5300 && g.ax.target_count() < 5800);  // 加速度も速度もクランプされていないと 6000 / 20000 になる
 }
 
 // ---- ARM / START / STOP / DISARM ---------------------------------------------
@@ -944,6 +1023,276 @@ inline void test_stop_timeout_faults() {
   CHECK(h.ax.state() == st::STOPPING);
   h.drive(310, 2600);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::STOP_TIMEOUT);
+}
+
+// STOPPING の減速は CONFIG の max_acc ではなく最後に適用したフレームの max_acc（motion-limits 設計 §4.4）。
+// CONFIG に絶対上限 40000 が入っても、フレームが 2000 なら 2000 count/s² で止まる。
+inline void test_stopping_decelerates_with_last_frame_max_acc() {
+  auto run = [](uint32_t frame_acc, uint32_t drive_ms, uint32_t* stop_ms) {
+    Harness h;
+    v1::Config c = base_config();
+    c.max_acc_count_s2 = 40000;
+    Harness::accepted(h.config_with(c));
+    h.reach_holding_from_configured();
+    h.set_position(h.ax.actual_count());
+    Harness::accepted(h.start());
+    for (uint32_t t = 0; t < drive_ms; t += 10) {
+      v1::HostMsg m = h.set_position_msg(2600);
+      m.set_position.max_vel_count_s = 2000;
+      m.set_position.max_acc_count_s2 = frame_acc;
+      h.send(m);
+      h.idle(10);
+    }
+    CHECK(h.ax.state() == st::ACTIVE);
+    const int32_t at_stop = h.ax.target_count();
+    CHECK(at_stop > 500 && at_stop < 1500);  // まだ動いている途中（止める前に到達していない）
+    Harness::accepted(h.stop());
+    CHECK(h.ax.state() == st::STOPPING);
+    uint32_t t = 0;
+    while (h.ax.state() == st::STOPPING && t < 3000) {
+      h.set_position(2600);  // lease だけ（STOPPING では目標もフレーム上限も適用しない）
+      h.idle(10);
+      t += 10;
+    }
+    *stop_ms = t;
+    CHECK(h.ax.state() == st::HOLDING);
+    CHECK(h.ax.fault_code() == fc::NONE);
+    CHECK(h.fault_events().empty());
+    CHECK(h.ax.target_count() > at_stop);
+  };
+  // フレーム 2000 count/s²: 2000 count/s からの減速に約 1 s（CONFIG の 40000 なら 50 ms）
+  uint32_t slow_ms = 0;
+  run(2000, 1000, &slow_ms);
+  CHECK(slow_ms >= 900 && slow_ms <= 1100);
+  // フレーム 40000 count/s²: 50 ms で止まる
+  uint32_t fast_ms = 0;
+  run(40000, 500, &fast_ms);
+  CHECK(fast_ms <= 100);
+  CHECK(slow_ms > fast_ms * 5);
+}
+
+// フレームが max_acc = 0 を運ぶと frame_max_acc_ が 0 になる。STOPPING では CONFIG の値に戻して必ず減速できるようにする
+inline void test_stopping_with_zero_frame_acc_falls_back_to_config() {
+  Harness h;
+  h.reach_active();
+  h.drive(200, 2600);  // 20000 count/s² で 4000 count/s に達する
+  CHECK(h.ax.state() == st::ACTIVE);
+  v1::HostMsg m = h.set_position_msg(2600);
+  m.set_position.max_acc_count_s2 = 0;
+  h.send(m);
+  h.idle(10);
+  CHECK(h.ax.state() == st::ACTIVE);
+  Harness::accepted(h.stop());
+  CHECK(h.ax.state() == st::STOPPING);
+  h.drive(400, 2600);  // CONFIG の 20000 count/s² なら 200 ms で止まる
+  CHECK(h.ax.state() == st::HOLDING);
+  CHECK(h.ax.fault_code() == fc::NONE);
+}
+
+// ---- SET_LIMITS / LIMITS（motion-limits 設計 §4.2・§4.3） ------------------------------
+
+inline bool limits_match(const v1::Limits& l, uint8_t duty_max, uint8_t duty_min, uint8_t kp, uint16_t ff,
+                         uint16_t deadband, uint16_t deadband_out) {
+  return l.boot_id == 2309737967u && l.duty_max_percent == duty_max && l.duty_min_percent == duty_min &&
+         l.kp_percent_per_100 == kp && l.ff_count_s_per_percent == ff && l.deadband_count == deadband &&
+         l.deadband_out_count == deadband_out && l.abs_duty_max_percent == V1_ABS_DUTY_MAX &&
+         l.abs_max_vel_count_s == V1_ABS_MAX_VEL_COUNT_S && l.abs_max_acc_count_s2 == V1_ABS_MAX_ACC_COUNT_S2 &&
+         l.abs_duty_max_percent == 60 && l.abs_max_vel_count_s == 6000 && l.abs_max_acc_count_s2 == 40000;
+}
+
+inline bool tuning_is_default(const V1Tuning& t) {
+  return t.duty_max == V1_DUTY_MAX && t.duty_min == V1_DUTY_MIN && t.kp_percent_per_100 == V1_KP_PERCENT_PER_100 &&
+         t.ff_count_s_per_percent == V1_FF_COUNT_S_PER_PERCENT && t.deadband == V1_DEADBAND &&
+         t.deadband_out == V1_DEADBAND_OUT;
+}
+
+inline void test_set_limits_accepted_in_disarmed_and_reports_limits() {
+  Harness h;
+  CHECK(tuning_is_default(h.ax.tuning));  // 受理前は config.h の既定（Duty 7〜20 %）
+  CHECK(h.ax.tuning.duty_min == 7 && h.ax.tuning.duty_max == 20);
+  const std::vector<v1::McuMsg> r = h.send(h.set_limits_msg(h.next_rid(), 40, 3, 2, 100, 10, 20));
+  // ACK → LIMITS の順。状態・flags は変わらないので即時 STATUS は無い
+  CHECK(r.size() == 2);
+  CHECK(r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED && r[0].ack.reason == rs::NONE &&
+        r[0].ack.acked_type == v1::msg::SET_LIMITS && r[0].ack.request_id == h.rid);
+  CHECK(r[1].type == v1::msg::LIMITS);
+  CHECK(limits_match(r[1].limits, 40, 3, 2, 100, 10, 20));
+  CHECK(h.ax.tuning.duty_max == 40 && h.ax.tuning.duty_min == 3 && h.ax.tuning.kp_percent_per_100 == 2 &&
+        h.ax.tuning.ff_count_s_per_percent == 100 && h.ax.tuning.deadband == 10 && h.ax.tuning.deadband_out == 20);
+  CHECK(h.ax.state() == st::DISARMED);
+  // 他の調整値は触らない
+  CHECK(h.ax.tuning.stall_duty == V1_STALL_DUTY);
+  // 別の値で置き換え: LIMITS は毎回 1 つ
+  Harness::accepted(h.set_limits(30, 5, 3, 120, 8, 16));
+  const std::vector<v1::Limits> ls = h.limits();
+  CHECK(ls.size() == 2);
+  CHECK(limits_match(ls[1], 30, 5, 3, 120, 8, 16));
+  CHECK(h.ax.tuning.duty_max == 30 && h.ax.tuning.duty_min == 5 && h.ax.tuning.kp_percent_per_100 == 3 &&
+        h.ax.tuning.ff_count_s_per_percent == 120 && h.ax.tuning.deadband == 8 && h.ax.tuning.deadband_out == 16);
+  // duty_min = duty_max、deadband_out = deadband、duty_min 0 は受理
+  Harness::accepted(h.set_limits(10, 10, 0, 1, 0, 0));
+  CHECK(h.ax.tuning.duty_max == 10 && h.ax.tuning.duty_min == 10 && h.ax.tuning.kp_percent_per_100 == 0 &&
+        h.ax.tuning.deadband == 0 && h.ax.tuning.deadband_out == 0);
+  Harness::accepted(h.set_limits(40, 0));
+  CHECK(h.ax.tuning.duty_min == 0);
+  CHECK(h.limits().size() == 4);
+  // CONFIG・ARM はそのまま通る（SET_LIMITS は状態を変えない）
+  Harness::accepted(h.config());
+  h.reach_holding_from_configured();
+}
+
+inline void test_set_limits_accepted_in_active_and_takes_effect() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE);
+  h.stall = true;
+  h.raw = -2500;  // 誤差 2500 × 2 / 100 = 50 % → 既定の上限 20 %
+  h.set_position(0);
+  h.step();
+  CHECK(h.ax.duty_percent() == -20);
+  const std::vector<v1::McuMsg> r = h.send(h.set_limits_msg(h.next_rid(), 40, 3, 2, 100, 10, 20));
+  CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED &&
+        r[0].ack.acked_type == v1::msg::SET_LIMITS);
+  CHECK(r[1].type == v1::msg::LIMITS && limits_match(r[1].limits, 40, 3, 2, 100, 10, 20));
+  CHECK(h.ax.state() == st::ACTIVE);
+  h.set_position(0);
+  h.step();
+  CHECK(h.ax.duty_percent() == -40);  // 新しい上限がすぐ効く
+  h.raw = -100;  // 2 % → 新しい下限 3 %
+  h.set_position(0);
+  h.step();
+  CHECK(h.ax.duty_percent() == -3);
+  // HOLDING / ARMING / STOPPING / DISARMING / CALIBRATING でも受理
+  Harness g;
+  g.reach_holding();
+  Harness::accepted(g.set_limits());
+  CHECK(g.ax.state() == st::HOLDING);
+  Harness k;
+  Harness::accepted(k.config());
+  Harness::accepted(k.arm());
+  Harness::accepted(k.set_limits());
+  CHECK(k.ax.state() == st::ARMING);
+  Harness::accepted(k.disarm());
+  CHECK(k.ax.state() == st::DISARMING);
+  Harness::accepted(k.set_limits(35));
+  CHECK(k.ax.state() == st::DISARMING && k.ax.tuning.duty_max == 35);
+  k.idle(400);
+  Harness::accepted(k.calibrate(1));
+  CHECK(k.ax.state() == st::CALIBRATING);
+  Harness::accepted(k.set_limits(36));
+  CHECK(k.ax.state() == st::CALIBRATING && k.ax.tuning.duty_max == 36);
+  CHECK(k.limits().size() == 3);
+}
+
+inline void test_set_limits_invalid_params_rejected() {
+  Harness h;
+  const V1Tuning before = h.ax.tuning;
+  auto unchanged = [&] {
+    return h.ax.tuning.duty_max == before.duty_max && h.ax.tuning.duty_min == before.duty_min &&
+           h.ax.tuning.kp_percent_per_100 == before.kp_percent_per_100 &&
+           h.ax.tuning.ff_count_s_per_percent == before.ff_count_s_per_percent &&
+           h.ax.tuning.deadband == before.deadband && h.ax.tuning.deadband_out == before.deadband_out;
+  };
+  // duty_max = 0
+  Harness::rejected(h.set_limits(0, 0, 2, 100, 10, 20), rs::INVALID_PARAM);
+  CHECK(unchanged());
+  // duty_min > duty_max
+  Harness::rejected(h.set_limits(40, 41, 2, 100, 10, 20), rs::INVALID_PARAM);
+  CHECK(unchanged());
+  // ff = 0
+  Harness::rejected(h.set_limits(40, 3, 2, 0, 10, 20), rs::INVALID_PARAM);
+  CHECK(unchanged());
+  // deadband_out < deadband
+  Harness::rejected(h.set_limits(40, 3, 2, 100, 20, 19), rs::INVALID_PARAM);
+  CHECK(unchanged());
+  // 拒否では LIMITS を送らない
+  CHECK(h.limits().empty());
+  // request_id 0 は共通規則で INVALID_PARAM
+  Harness::rejected(h.cmd(h.set_limits_msg(0)), rs::INVALID_PARAM);
+  CHECK(unchanged() && h.limits().empty());
+  // 拒否された命令の再送は改めて評価する（内容を直せば受理）
+  Harness::accepted(h.set_limits(40, 3, 2, 100, 10, 20));
+  CHECK(h.limits().size() == 1);
+}
+
+inline void test_set_limits_clamps_duty_to_absolute_max() {
+  Harness h;
+  // duty_max 90 → 有効値 60（絶対上限）。LIMITS はクランプ後の値を返す
+  const std::vector<v1::McuMsg> r = h.send(h.set_limits_msg(h.next_rid(), 90, 3, 2, 100, 10, 20));
+  CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED);
+  CHECK(r[1].type == v1::msg::LIMITS);
+  CHECK(r[1].limits.duty_max_percent == 60 && r[1].limits.duty_min_percent == 3);
+  CHECK(r[1].limits.abs_duty_max_percent == 60);
+  CHECK(h.ax.tuning.duty_max == 60 && h.ax.tuning.duty_min == 3);
+  // duty_min も絶対上限を超えていればクランプ（検査は受けた値どうしで行う: 70 ≤ 90 は有効）
+  Harness::accepted(h.set_limits(90, 70));
+  CHECK(h.ax.tuning.duty_max == 60 && h.ax.tuning.duty_min == 60);
+  CHECK(h.limits().back().duty_max_percent == 60 && h.limits().back().duty_min_percent == 60);
+  // 100 / 100 も受理してクランプ
+  Harness::accepted(h.set_limits(100, 100));
+  CHECK(h.ax.tuning.duty_max == 60 && h.ax.tuning.duty_min == 60);
+  // ちょうど 60 はそのまま
+  Harness::accepted(h.set_limits(60, 59));
+  CHECK(h.ax.tuning.duty_max == 60 && h.ax.tuning.duty_min == 59);
+  // クランプされた上限が Duty に効く
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(90, 3, 5));  // kp 5 %/100 count
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw = -2500;  // ソフトリミット内。誤差 2500 × 5 / 100 = 125 % → 60 %
+  h.set_position(0);
+  h.step();
+  CHECK(h.ax.state() == st::HOLDING);
+  CHECK(h.ax.duty_percent() == -60);
+  CHECK(h.ax.pwm_permille() == 600);
+}
+
+inline void test_set_limits_rejected_while_faulted_and_duplicate_not_reexecuted() {
+  Harness h;
+  h.reach_holding();
+  Harness::accepted(h.host_fault());
+  CHECK(h.ax.state() == st::FAULT);
+  Harness::rejected(h.set_limits(), rs::FAULT_ACTIVE);
+  CHECK(tuning_is_default(h.ax.tuning));
+  CHECK(h.limits().empty());
+  // 減速中の異常（COMMAND_TIMEOUT で STOPPING）も fault_code ≠ NONE なので弾く
+  Harness g;
+  v1::Config c = base_config();
+  c.command_timeout_ms = 30;
+  Harness::accepted(g.config_with(c));
+  Harness::accepted(g.arm());
+  for (int i = 0; i < 62; ++i) {
+    g.set_position(0);
+    g.idle(10);
+  }
+  g.set_position(0);
+  Harness::accepted(g.start());
+  for (int i = 0; i < 30; ++i) {
+    g.set_position(2600, 500);
+    g.idle(10);
+  }
+  g.idle(35);
+  CHECK(g.ax.state() == st::STOPPING && g.ax.fault_code() == fc::COMMAND_TIMEOUT);
+  Harness::rejected(g.set_limits(), rs::FAULT_ACTIVE);
+  CHECK(g.limits().empty());
+  // 解除後は受理
+  Harness::accepted(h.fault_reset());
+  Harness::accepted(h.set_limits());
+  CHECK(h.limits().size() == 1);
+  // 同じ request_id・同じ内容の再送は DUPLICATE で、LIMITS は送らない
+  const v1::HostMsg same = h.set_limits_msg(h.rid);
+  Harness::duplicate(h.cmd(same));
+  CHECK(h.limits().size() == 1);
+  // 同じ request_id で内容が違えば新しい命令として実行する
+  Harness::accepted(h.cmd(h.set_limits_msg(h.rid, 25)));
+  CHECK(h.limits().size() == 2 && h.ax.tuning.duty_max == 25);
 }
 
 // ---- 動作中の異常 -------------------------------------------------------------
@@ -2178,6 +2527,7 @@ inline void run_all() {
   test_config_invalid_params_rejected();
   test_config_only_in_disarmed();
   test_request_id_zero_rejected();
+  test_config_clamps_vel_and_acc_to_absolute_ceiling();
   test_arm_prepare_rejections_in_order();
   test_arming_sequence_power_then_brake_then_holding();
   test_non_power_controller_never_commands_power();
@@ -2207,6 +2557,13 @@ inline void run_all() {
   test_command_timeout_while_moving_decelerates_then_faults();
   test_host_fault_during_fault_stop_keeps_pending_code();
   test_stop_timeout_faults();
+  test_stopping_decelerates_with_last_frame_max_acc();
+  test_stopping_with_zero_frame_acc_falls_back_to_config();
+  test_set_limits_accepted_in_disarmed_and_reports_limits();
+  test_set_limits_accepted_in_active_and_takes_effect();
+  test_set_limits_invalid_params_rejected();
+  test_set_limits_clamps_duty_to_absolute_max();
+  test_set_limits_rejected_while_faulted_and_duplicate_not_reexecuted();
   test_stall_causes_following_error();
   test_overspeed_faults();
   test_actual_outside_soft_limits_faults();
