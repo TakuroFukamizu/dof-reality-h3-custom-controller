@@ -326,6 +326,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `SimParams.selected_axis`。`SimMcu::select_axis(new, now_us) -> Vec<McuMsg>`: DISARMED 以外では何もしない（`select_axis_unchecked` はテスト用に規則違反を起こす）。切り替えで CONFIGURED / POSITION_REFERENCED / calibration_hash を消し、AXIS_SELECT を返し、以後の STATUS / HELLO に新しい値を載せる。`SimHandle::select_axis` / `select_axis_unchecked`。規則違反（DISARMED 以外）の切り替えでは制限値と lease を保つ（POSITION_REFERENCED だけ消す）ので、PC が書かなくなった個体は COMMAND_TIMEOUT で FAULT になる（protocol.md §1.1 の要求。`tests/server.rs` で確認）。
 - `[backend] kind = "sim"` に `report_selected_axis = true`（既定 true）。true なら各模擬軸の `selected_axis` = その軸番号（割当は選択で決まり、`device_id` は照合に使われる）。false なら 0（設定の `device_id` だけで決まる旧経路の試験用）。模擬軸の device_id は設定値、設定が 0（照合なし）なら `5131000000000000 + 軸番号`（個体は必ず device_id を持つ）。
 - serial backend の `[backend] sim_axes`: 列挙した軸は実機の代わりに模擬軸（`sim:<軸>`）で埋める（実機が足りない bring-up 用。模擬軸を先に識別するので、同じ系統を名乗る実機は競合になる）。
+- 模擬軸のポートも実ポートと同じく「閉じたら開け直す」（Issue #15。2026-11-02 00:58 の Mac のスリープ復帰で 3 軸が `status_timeout` になり、実機 2 台は 3 s 後に再識別されたのに `sim:3` だけ OFFLINE のままだった）。server.rs の `sim_port_task` がリンクの終了を見て `SERIAL_RETRY` 後に `SimHandle::attach` で同じ `SimMcu` に新しいストリームを付け直す（boot_id・基準・位置・時計はそのまま。`sim_detached` で作った模型に、ランナーだけ付け替える）。`RunningServer.sims` は模型の `view()`（検査・異常注入用。落としてもランナーは止まらない）。`UnknownDevice` になった模擬軸は開け直さない（個体の識別は変わらないので）。
 - server.rs の「primary でないポートの Status / Ack / FaultEvent を捨てる」判定は `Supervisor::axis_port` のままでよい（競合中は `None` なので全部落ちる）。`Disconnected` が primary 以外から来たら `PortClosed` に変換する既存処理で claimants から外す。
 
 ## 11. 校正（protocol.md §1.2）
