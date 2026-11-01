@@ -32,6 +32,7 @@ pub mod msg_type {
     pub const CLOCK_SYNC: u8 = 0x09;
     pub const HOST_FAULT: u8 = 0x0A;
     pub const SET_REFERENCE: u8 = 0x0B;
+    pub const CALIBRATE: u8 = 0x0C;
 
     pub const HELLO: u8 = 0x81;
     pub const ACK: u8 = 0x82;
@@ -39,6 +40,7 @@ pub mod msg_type {
     pub const FAULT_EVENT: u8 = 0x84;
     pub const CLOCK_SYNC_REPLY: u8 = 0x85;
     pub const AXIS_SELECT: u8 = 0x86;
+    pub const CAL_RESULT: u8 = 0x87;
 }
 
 /// ACK result (protocol §3.3).
@@ -63,6 +65,38 @@ pub enum AckReason {
     FaultActive = 6,
     FaultCausePresent = 7,
 }
+
+/// CALIBRATE `mode` (protocol §4 `0x0C`).
+pub mod calibrate_mode {
+    pub const CANCEL: u8 = 0;
+    pub const START: u8 = 1;
+}
+
+/// CAL_RESULT `result` (protocol §4 `0x87`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CalResultCode {
+    Ok = 0,
+    Failed = 1,
+    Cancelled = 2,
+}
+
+impl CalResultCode {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => CalResultCode::Ok,
+            1 => CalResultCode::Failed,
+            2 => CalResultCode::Cancelled,
+            _ => return None,
+        })
+    }
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Length of the CAL_RESULT `reason` field (ASCII, NUL padded).
+pub const CAL_REASON_LEN: usize = 8;
 
 /// Role flags in CONFIG.
 pub mod role_flags {
@@ -176,6 +210,62 @@ pub struct AxisSelect {
     pub mcu_state: u8,
 }
 
+/// Sent once when an end-stop calibration ends (protocol §1.2, §4 `0x87`):
+/// after the shutdown sequence and before the STATUS showing DISARMED.
+/// Counts are in the MCU's `actual_count` coordinate with the P end at 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CalResult {
+    pub boot_id: u32,
+    pub result: CalResultCode,
+    /// Step reached: 0 none, 1 to P end, 2 to N end, 3 to neutral.
+    pub step: u8,
+    /// Count of the N end (positive for sign +1, negative for sign −1).
+    pub n_end_count: Counts,
+    pub neutral_count: Counts,
+    /// Sign of the unit's axis profile (±1).
+    pub sign: i8,
+    /// ASCII reason, NUL padded (`ok`, `stall`, `slow`, `travel`, `timeout`,
+    /// `stop`, `estop`, …). See [`CalResult::reason_str`].
+    #[serde(serialize_with = "serialize_reason")]
+    pub reason: [u8; CAL_REASON_LEN],
+}
+
+impl CalResult {
+    /// All-zero placeholder (struct update syntax in tests / helpers).
+    pub const EMPTY: CalResult = CalResult {
+        boot_id: 0,
+        result: CalResultCode::Failed,
+        step: 0,
+        n_end_count: 0,
+        neutral_count: 0,
+        sign: 0,
+        reason: [0; CAL_REASON_LEN],
+    };
+
+    /// `reason` up to the first NUL, lossily as UTF-8.
+    pub fn reason_str(&self) -> String {
+        reason_str(&self.reason)
+    }
+
+    /// Build the fixed `reason` field from text (truncated to 8 bytes, NUL padded).
+    pub fn reason_bytes(text: &str) -> [u8; CAL_REASON_LEN] {
+        let mut out = [0u8; CAL_REASON_LEN];
+        for (dst, src) in out.iter_mut().zip(text.bytes()) {
+            *dst = src;
+        }
+        out
+    }
+}
+
+fn reason_str(r: &[u8; CAL_REASON_LEN]) -> String {
+    let end = r.iter().position(|&b| b == 0).unwrap_or(CAL_REASON_LEN);
+    String::from_utf8_lossy(&r[..end]).into_owned()
+}
+
+fn serialize_reason<S: serde::Serializer>(r: &[u8; CAL_REASON_LEN], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&reason_str(r))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ClockSyncReply {
     pub request_id: u32,
@@ -224,6 +314,12 @@ pub enum HostMsg {
         request_id: u32,
         reference_count: Counts,
     },
+    /// Start (`mode` 1) or cancel (`mode` 0) the MCU-driven end-stop
+    /// calibration (protocol §1.2).
+    Calibrate {
+        request_id: u32,
+        mode: u8,
+    },
 }
 
 /// Messages an axis MCU sends to the PC.
@@ -236,6 +332,7 @@ pub enum McuMsg {
     FaultEvent(FaultEvent),
     ClockSyncReply(ClockSyncReply),
     AxisSelect(AxisSelect),
+    CalResult(CalResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -313,6 +410,7 @@ pub const fn host_payload_len(msg_type: u8) -> Option<usize> {
         CLOCK_SYNC => 12,
         HOST_FAULT => 8,
         SET_REFERENCE => 8,
+        CALIBRATE => 8,
         _ => return None,
     })
 }
@@ -327,6 +425,7 @@ pub const fn mcu_payload_len(msg_type: u8) -> Option<usize> {
         FAULT_EVENT => 20,
         CLOCK_SYNC_REPLY => 28,
         AXIS_SELECT => 8,
+        CAL_RESULT => 28,
         _ => return None,
     })
 }
@@ -360,6 +459,10 @@ impl Writer {
     }
     fn u64(&mut self, v: u64) -> &mut Self {
         self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(b);
         self
     }
     fn finish(&mut self) -> Vec<u8> {
@@ -447,6 +550,7 @@ impl HostMsg {
             HostMsg::ClockSync { .. } => t::CLOCK_SYNC,
             HostMsg::HostFault { .. } => t::HOST_FAULT,
             HostMsg::SetReference { .. } => t::SET_REFERENCE,
+            HostMsg::Calibrate { .. } => t::CALIBRATE,
         }
     }
 
@@ -508,6 +612,7 @@ impl HostMsg {
                 request_id,
                 reference_count,
             } => w.u32(request_id).i32(reference_count),
+            HostMsg::Calibrate { request_id, mode } => w.u32(request_id).u8(mode).u8(0).u16(0),
         };
         w.finish()
     }
@@ -600,6 +705,14 @@ impl HostMsg {
                 request_id: r.u32()?,
                 reference_count: r.i32()?,
             },
+            t::CALIBRATE => {
+                let m = HostMsg::Calibrate {
+                    request_id: r.u32()?,
+                    mode: r.u8()?,
+                };
+                r.skip(3)?;
+                m
+            }
             other => return Err(DecodeError::UnknownType(other)),
         })
     }
@@ -620,6 +733,7 @@ impl McuMsg {
             McuMsg::FaultEvent(_) => t::FAULT_EVENT,
             McuMsg::ClockSyncReply(_) => t::CLOCK_SYNC_REPLY,
             McuMsg::AxisSelect(_) => t::AXIS_SELECT,
+            McuMsg::CalResult(_) => t::CAL_RESULT,
         }
     }
 
@@ -682,6 +796,17 @@ impl McuMsg {
                 .u8(a.prev_selected_axis)
                 .u8(a.mcu_state)
                 .u8(0),
+            McuMsg::CalResult(c) => w
+                .u32(c.boot_id)
+                .u8(c.result.to_u8())
+                .u8(c.step)
+                .u16(0)
+                .i32(c.n_end_count)
+                .i32(c.neutral_count)
+                .u8(c.sign as u8)
+                .u8(0)
+                .u16(0)
+                .bytes(&c.reason),
         };
         w.finish()
     }
@@ -776,6 +901,27 @@ impl McuMsg {
                 };
                 r.skip(1)?;
                 McuMsg::AxisSelect(a)
+            }
+            t::CAL_RESULT => {
+                let boot_id = r.u32()?;
+                let result = CalResultCode::from_u8(r.u8()?)
+                    .ok_or(DecodeError::BadField("cal_result.result"))?;
+                let step = r.u8()?;
+                r.skip(2)?;
+                let n_end_count = r.i32()?;
+                let neutral_count = r.i32()?;
+                let sign = r.u8()? as i8;
+                r.skip(3)?;
+                let reason: [u8; CAL_REASON_LEN] = r.take()?;
+                McuMsg::CalResult(CalResult {
+                    boot_id,
+                    result,
+                    step,
+                    n_end_count,
+                    neutral_count,
+                    sign,
+                    reason,
+                })
             }
             other => return Err(DecodeError::UnknownType(other)),
         })

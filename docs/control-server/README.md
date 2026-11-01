@@ -113,7 +113,12 @@ curl -sX POST -H "$AUTH" -d '{"note":"手で止めた"}' $URL/v1/fault   # 管�
 curl -sX POST -H "$AUTH" $URL/v1/fault/reset        # 原因が残っていれば 409。解除後も自動 ARM しない
 curl -sX POST -H "$AUTH" $URL/v1/center             # HOLDING から中立へ低速移動（速度・加速度 × center_speed_fraction）→ HOLDING
 curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 DISARMED のときだけ。現在位置を count 0 と定義
+curl -sX POST -H "$AUTH" $URL/v1/calibrate          # 端当て校正（機構が両端まで動く！）。全軸 DISARMED・電源担当軸を含む 3 軸。{"axes":[1,2]} で一部（1 を含むこと）
+curl -sX POST -H "$AUTH" $URL/v1/calibrate/cancel   # 校正の中止（CALIBRATE(0)）。/v1/stop でも止まる
+curl -sX POST -H "$AUTH" $URL/v1/calibration/export # OK の結果を設定ファイルの複製に書き出す（下記）
 ```
+
+- 校正（DESIGN.md §11、protocol.md §1.2）: MCU が自分で P 端 → N 端 → 中立と端当てし、CAL_RESULT を返す。status の `axes[].mcu_state` が `CALIBRATING`、終わると `axes[].calibration`（`result` / `reason` / `n_end_count` / `neutral_count` / `sign`）と `referenced = true`（P 端 = 0 の基準を MCU が作る。/v1/reference は不要）。校正中は ARM / START / CENTER / REFERENCE が 409 `calibrating`。`export` は、OK の結果がある軸の `mechanical_* / soft_* / count_at_virtual_* / device_id` を入れ替えた **設定ファイルの複製** を `--config` と同じディレクトリに `<rig_id>.calibration-<YYYYmmdd-HHMMSS>.toml`（時刻は UTC）として書く。`calibration_valid` は false のままなので、値を確認して true にし、そのファイルで起動し直す（hardware-bringup.md §5）。同名があれば 409 `exists`、OK の結果が無ければ 409 `no_calibration_result`。
 
 - 成功は 200 `{"ok":true,"rig_state":...}`、拒否は 409 `{"ok":false,"error":"<code>","blockers":[...]}`。`blockers` は `"<code>: <detail>"`。
 - 系統の割当（DESIGN.md §10）は status で見る: 最上位 `axis_conflict`（2 台以上が選んでいる軸の一覧。空なら競合なし）、各軸の `device_id`（接続中の個体）・`expected_device_id`（設定値、0 = 照合なし）・`assignment`（`"selected"`＝MCU の選択 / `"config"`＝`device_id` だけで決まった / null）・`claimants`（この軸を名乗るポートと個体。競合中は 2 つ以上）・`reference_stale`。blockers の code は `axis_conflict` / `axis_device_mismatch` / `reference_stale`。競合中は arm / start / center が 409 `axis_conflict`、WS の pose / gain も ack `reason: "axis_conflict"` で拒否（鮮度は延びない）。

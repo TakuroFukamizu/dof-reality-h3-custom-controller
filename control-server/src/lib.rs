@@ -2,6 +2,7 @@
 pub mod api;
 pub mod axis_link;
 pub mod calibration;
+pub mod calibration_export;
 pub mod compat;
 pub mod config;
 pub mod planner;

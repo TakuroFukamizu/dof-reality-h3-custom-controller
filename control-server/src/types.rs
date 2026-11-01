@@ -188,6 +188,9 @@ pub enum McuState {
     Stopping = 5,
     Disarming = 6,
     Fault = 7,
+    /// MCU-driven end-stop calibration in progress (protocol §1.2). Ends in
+    /// DISARMED whatever the outcome (CAL_RESULT says which).
+    Calibrating = 8,
 }
 
 impl McuState {
@@ -202,6 +205,7 @@ impl McuState {
             5 => Stopping,
             6 => Disarming,
             7 => Fault,
+            8 => Calibrating,
             _ => return None,
         })
     }

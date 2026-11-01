@@ -326,7 +326,7 @@ async fn stop_without_token_brakes_and_late_poses_do_not_restart() {
 async fn non_loopback_bind_is_refused() {
     let r = server::start(
         sim_cfg(),
-        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()) },
+        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()), config_path: None },
     )
     .await;
     assert!(matches!(r, Err(ServerError::NonLoopback(_))), "{:?}", r.err());
@@ -722,4 +722,153 @@ async fn local_estop_from_an_axis_is_decoded_latched_and_named_in_status() {
     }
     wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
     srv.shutdown().await;
+}
+
+// ------------------------------------------------------------------ calibration (DESIGN.md §11)
+
+/// sim.toml with unreferenced sims whose end stops are ±500 (stroke 1000:
+/// the calibrated neutral 500 is inside every soft window of sim.toml) and
+/// `calibration_valid = false` on every axis, written to `dir/sim.toml`.
+fn uncalibrated_cfg_file(dir: &std::path::Path) -> (Config, std::path::PathBuf) {
+    let text = std::fs::read_to_string(SIM)
+        .unwrap()
+        .replace("start_referenced = true", "start_referenced = false")
+        .replace("end_min_count = -3000", "end_min_count = -500")
+        .replace("end_max_count = 3000", "end_max_count = 500")
+        .replace("calibration_valid = true", "calibration_valid = false");
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let path = dir.join("sim.toml");
+    std::fs::write(&path, text).unwrap();
+    (cfg, path)
+}
+
+fn blocker_codes(snap: &h3cs::supervisor::StatusSnapshot) -> Vec<String> {
+    let mut v: Vec<String> = snap.blockers.iter().map(|b| b.split(':').next().unwrap_or(b).to_string()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+#[tokio::test]
+async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calibration_valid() {
+    let dir = std::env::temp_dir().join(format!("h3cs-server-cal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cfg, cfg_path) = uncalibrated_cfg_file(&dir);
+    let srv = start_sim_with_path(cfg.clone(), Some(cfg_path.clone())).await;
+    wait_status(&srv, 3 * S, "all connected, unreferenced", |s| {
+        s.rig_state == RigState::CalibrationRequired && s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed) && !a.referenced)
+    })
+    .await;
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.json()["error"], "not_ready");
+
+    let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let snap = wait_status(&srv, 2 * S, "all CALIBRATING", |s| s.axes.iter().all(|a| a.mcu_state == Some(McuState::Calibrating))).await;
+    assert_eq!(snap.rig_state, RigState::CalibrationRequired);
+    assert!(snap.blockers.iter().any(|b| b == "calibrating: axis1"), "{:?}", snap.blockers);
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json()["error"], "calibrating");
+    for (_, sim) in &srv.sims {
+        assert_eq!(sim.state(), McuState::Calibrating);
+    }
+
+    let snap = wait_status(&srv, 6 * S, "all CAL_RESULT OK and referenced", |s| {
+        s.axes.iter().all(|a| {
+            a.calibration.as_ref().is_some_and(|c| c.result == h3cs::protocol::CalResultCode::Ok)
+                && a.referenced
+                && a.mcu_state == Some(McuState::Disarmed)
+        })
+    })
+    .await;
+    assert!(snap.fault.is_none());
+    for a in &snap.axes {
+        let c = a.calibration.as_ref().unwrap();
+        assert_eq!((c.n_end_count, c.neutral_count, c.sign, c.reason.as_str(), c.step), (1000, 500, 1, "ok", 3));
+        assert_eq!(a.actual_count, Some(500));
+    }
+    for (_, sim) in &srv.sims {
+        let s = sim.snapshot();
+        assert!(s.referenced);
+        assert_eq!((s.end_min_count, s.end_max_count), (0, 1000), "P end = 0");
+    }
+    // ARM is now blocked only by the operator's calibration_valid = false.
+    let snap = wait_status(&srv, S, "blockers settle", |s| blocker_codes(s) == ["calibration_invalid"]).await;
+    assert_eq!(snap.blockers.len(), 3, "{:?}", snap.blockers);
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json()["error"], "not_ready");
+    assert!(r.json()["blockers"].as_array().unwrap().iter().all(|b| b.as_str().unwrap().starts_with("calibration_invalid")));
+
+    // Export: a config next to sim.toml with the measured numbers.
+    let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let body = r.json();
+    let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+    assert_eq!(path.parent(), Some(dir.as_path()));
+    assert_eq!(body["axes"].as_array().unwrap().len(), 3);
+    let out = Config::load(&path).unwrap();
+    for (i, a) in out.axes.iter().enumerate() {
+        assert_eq!((a.mechanical_min_count, a.mechanical_max_count, a.soft_min_count, a.soft_max_count), (0, 1000, 300, 700), "axis {}", i + 1);
+        assert_eq!((a.count_at_virtual_0, a.count_at_virtual_512, a.count_at_virtual_1023), (300, 500, 700));
+        assert!(!a.calibration_valid);
+        assert_eq!(a.device_id, cfg.axis(a.axis_id).unwrap().device_id, "the connected unit's id (the sims use sim.toml's)");
+    }
+    srv.shutdown().await;
+
+    // A server started from the exported file: unreferenced sims at 0, one
+    // calibration later only calibration_valid stands between it and ARM.
+    let srv = start_sim_with_path(out, Some(path.clone())).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], Some(r#"{"axes":[1,2,3]}"#)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let snap = wait_status(&srv, 8 * S, "calibrated again", |s| {
+        s.axes.iter().all(|a| a.calibration.is_some() && a.referenced && a.mcu_state == Some(McuState::Disarmed)) && blocker_codes(s) == ["calibration_invalid"]
+    })
+    .await;
+    assert_eq!(snap.rig_state, RigState::CalibrationRequired);
+    // Exporting again from a different second is a new file; the same name is never overwritten.
+    let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert!(r.status == 200 || (r.status == 409 && r.json()["error"] == "exists"), "{r:?}");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn calibrate_cancel_from_the_api_stops_the_sims_and_leaves_them_unreferenced() {
+    let dir = std::env::temp_dir().join(format!("h3cs-server-calcancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cfg, cfg_path) = uncalibrated_cfg_file(&dir);
+    let srv = start_sim_with_path(cfg, Some(cfg_path)).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    // Without the power axis: refused, nothing moves.
+    let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], Some(r#"{"axes":[2,3]}"#)).await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.json()["error"], "power_axis_required");
+    let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(&srv, 2 * S, "all CALIBRATING", |s| s.axes.iter().all(|a| a.mcu_state == Some(McuState::Calibrating))).await;
+    // /v1/stop (no token) cancels a calibration too.
+    let r = http(srv.local_addr, "POST", "/v1/stop", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(r.json()["note"].as_str().unwrap().starts_with("calibration cancelled"), "{r:?}");
+    let snap = wait_status(&srv, 3 * S, "cancelled", |s| {
+        s.axes.iter().all(|a| a.mcu_state == Some(McuState::Disarmed) && a.calibration.is_some())
+    })
+    .await;
+    for a in &snap.axes {
+        assert_eq!(a.calibration.as_ref().unwrap().result, h3cs::protocol::CalResultCode::Cancelled);
+        assert!(!a.referenced);
+    }
+    assert!(snap.fault.is_none());
+    // The export has nothing to write.
+    let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json()["error"], "no_calibration_result");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

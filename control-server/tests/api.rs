@@ -558,6 +558,14 @@ async fn status_json_has_every_documented_key() {
 
 /// Router whose admin queue and status sender the test holds directly.
 fn manual(cfg: Config) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>) {
+    manual_with_path(cfg, None)
+}
+
+/// [`manual`] with the config path the export writes next to.
+fn manual_with_path(
+    cfg: Config,
+    config_path: Option<std::path::PathBuf>,
+) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>) {
     let cfg = Arc::new(cfg);
     let (admin_tx, admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
     let (pose_tx, _pose_rx) = watch::channel(None);
@@ -572,7 +580,8 @@ fn manual(cfg: Config) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<A
         status_rx,
         TOKEN.into(),
         shutdown_rx,
-    );
+    )
+    .with_config_path(config_path);
     (api::router(state), admin_rx, status_tx)
 }
 
@@ -858,4 +867,220 @@ async fn arm_start_center_pass_the_supervisors_axis_conflict_as_409() {
     // Stop (no token) is unaffected.
     let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
     assert_eq!((st, body["ok"].as_bool()), (StatusCode::OK, Some(true)));
+}
+
+// ------------------------------------------------------------------ calibration (DESIGN.md §11)
+
+fn auth_headers() -> Vec<(&'static str, String)> {
+    vec![("authorization", bearer())]
+}
+
+#[tokio::test]
+async fn calibrate_routes_need_the_token_and_carry_the_axes() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let h = auth_headers();
+    let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for p in ["/v1/calibrate", "/v1/calibrate/cancel", "/v1/calibration/export"] {
+        let (st, body) = call(&s.app, req("POST", p, &[], "")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{p}");
+        assert_eq!(body["error"], "unauthorized");
+        let (st, _) = call(&s.app, req("GET", p, &h, "")).await;
+        assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "{p}");
+        let (st, body) = call(&s.app, req("POST", p, &[("origin", "http://evil.example")], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
+        assert_eq!(body["error"], "forbidden_origin");
+    }
+    assert!(s.seen.lock().unwrap().is_empty());
+    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, "")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, _) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[3,1]}"#)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[4]}"#)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_axis");
+    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, "{not json")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_request");
+    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[1],"mode":0}"#)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "unknown fields are refused: {body}");
+    let (st, _) = call(&s.app, req("POST", "/v1/calibrate/cancel", &h, "")).await;
+    assert_eq!(st, StatusCode::OK);
+    let ax = |n: u8| h3cs::types::AxisId::new(n).unwrap();
+    assert_eq!(
+        s.seen.lock().unwrap().clone(),
+        vec![
+            AdminCmd::Calibrate { axes: vec![] },
+            AdminCmd::Calibrate { axes: vec![ax(3), ax(1)] },
+            AdminCmd::CalibrateCancel,
+        ]
+    );
+    // Supervisor refusal → 409 with the code and blockers.
+    let s = stub(sim_cfg(), Some(|_: &AdminCmd| {
+        Err(AdminError { error: "power_axis_required".into(), blockers: vec!["power_axis_required: axis1 drives the main power".into()] })
+    }));
+    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[2]}"#)).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "power_axis_required");
+    assert_eq!(body["blockers"][0], "power_axis_required: axis1 drives the main power");
+}
+
+#[tokio::test]
+async fn calibration_routes_are_closed_to_the_lan() {
+    use axum::extract::connect_info::MockConnectInfo;
+    let mut cfg = sim_cfg();
+    cfg.server.allow_non_loopback = true;
+    let lan: std::net::SocketAddr = "192.168.1.20:50000".parse().unwrap();
+    let s = stub(cfg, Some(ok_reply));
+    let app = s.app.clone().layer(MockConnectInfo(lan));
+    let auth = bearer();
+    for p in ["/v1/calibrate", "/v1/calibrate/cancel", "/v1/calibration/export"] {
+        let (st, body) = call(&app, req("POST", p, &[("authorization", &auth)], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
+        assert_eq!(body["error"], "loopback_only");
+    }
+    assert!(s.seen.lock().unwrap().is_empty());
+}
+
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("H3CS_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("h3cs-api-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn cal_ok(n_end: i32) -> h3cs::supervisor::CalibrationResult {
+    h3cs::supervisor::CalibrationResult {
+        result: h3cs::protocol::CalResultCode::Ok,
+        step: 3,
+        n_end_count: n_end,
+        neutral_count: n_end / 2,
+        sign: if n_end < 0 { -1 } else { 1 },
+        reason: "ok".into(),
+        boot_id: 7,
+        at_ms: 1.0,
+    }
+}
+
+#[tokio::test]
+async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
+    use h3cs::calibration_export::{file_name, utc_timestamp};
+    let dir = scratch_dir("export");
+    let cfg_path = dir.join("sim.toml");
+    std::fs::copy(SIM, &cfg_path).unwrap();
+    let cfg = sim_cfg();
+    let (app, _admin_rx, status_tx) = manual_with_path(cfg.clone(), Some(cfg_path.clone()));
+    let h = auth_headers();
+    let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    // No OK result yet: 409.
+    let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "no_calibration_result");
+    assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "nothing written");
+
+    // Axis 1 OK (sign +1), axis 3 OK (sign −1), axis 2 FAILED (left alone).
+    let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    snap.axes[0].calibration = Some(cal_ok(6000));
+    snap.axes[0].device_id = h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58);
+    snap.axes[1].calibration = Some(h3cs::supervisor::CalibrationResult {
+        result: h3cs::protocol::CalResultCode::Failed,
+        reason: "stall".into(),
+        ..cal_ok(0)
+    });
+    snap.axes[2].calibration = Some(cal_ok(-6138));
+    status_tx.send_replace(Arc::new(snap));
+
+    // Overwrite refusal: the names of this second and the next already exist.
+    let now = std::time::SystemTime::now();
+    let taken: Vec<std::path::PathBuf> = [now, now + Duration::from_secs(1)]
+        .iter()
+        .map(|t| dir.join(file_name(&cfg.rig_id, &utc_timestamp(*t))))
+        .collect();
+    for p in &taken {
+        std::fs::write(p, "placeholder").unwrap();
+    }
+    let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "exists");
+    for p in &taken {
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "placeholder", "not overwritten");
+        std::fs::remove_file(p).unwrap();
+    }
+
+    let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+    assert_eq!(path.parent(), Some(dir.as_path()));
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("h3-sim.calibration-") && name.ends_with(".toml"), "{name}");
+    let axes = body["axes"].as_array().unwrap();
+    assert_eq!(axes.len(), 2);
+    assert_eq!(axes[0]["axis_id"], 1);
+    assert_eq!(axes[0]["device_id"], "51311cdbd4ba8d58");
+    assert_eq!((axes[0]["mechanical_min_count"].as_i64(), axes[0]["mechanical_max_count"].as_i64()), (Some(0), Some(6000)));
+    assert_eq!((axes[0]["soft_min_count"].as_i64(), axes[0]["soft_max_count"].as_i64()), (Some(300), Some(5700)));
+    assert_eq!(
+        (axes[0]["count_at_virtual_0"].as_i64(), axes[0]["count_at_virtual_512"].as_i64(), axes[0]["count_at_virtual_1023"].as_i64()),
+        (Some(300), Some(3000), Some(5700))
+    );
+    assert_eq!(axes[1]["axis_id"], 3);
+    assert_eq!((axes[1]["mechanical_min_count"].as_i64(), axes[1]["mechanical_max_count"].as_i64()), (Some(-6138), Some(0)));
+    assert_eq!(
+        (axes[1]["count_at_virtual_0"].as_i64(), axes[1]["count_at_virtual_512"].as_i64(), axes[1]["count_at_virtual_1023"].as_i64()),
+        (Some(-300), Some(-3069), Some(-5838)),
+        "sign −1: virtual still grows from the P end (0) toward the N end"
+    );
+
+    // The file is a valid config with those numbers, the untouched axis, the
+    // original comments and a header.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# h3-control-server が校正結果から書き出した設定"), "{text}");
+    assert!(text.contains("（UTC）"));
+    assert!(text.contains("# axis 1: device_id 51311cdbd4ba8d58 / CAL_RESULT n_end_count 6000 neutral_count 3000 sign +1"));
+    assert!(text.contains("axis 1 mechanical_max_count: 2814 -> 6000"), "previous value in the header: {text}");
+    assert!(text.contains("calibration_valid = false   # 模擬軸のみ"), "value replaced, comment kept: {text}");
+    assert!(text.contains("# 模擬軸 N は selected_axis = N を名乗る"), "other comments kept");
+    let out = Config::load(&path).unwrap();
+    let a1 = out.axis(h3cs::types::AxisId::new(1).unwrap()).unwrap();
+    assert_eq!(a1.device_id, h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58));
+    assert!(!a1.calibration_valid);
+    assert_eq!((a1.mechanical_min_count, a1.mechanical_max_count, a1.soft_min_count, a1.soft_max_count), (0, 6000, 300, 5700));
+    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (300, 3000, 5700));
+    assert_eq!(a1.decel_zone_count, 300);
+    let a2 = out.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap();
+    assert_eq!(a2, cfg.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap(), "FAILED axis left as it was");
+    let a3 = out.axis(h3cs::types::AxisId::new(3).unwrap()).unwrap();
+    assert_eq!((a3.mechanical_min_count, a3.mechanical_max_count, a3.soft_min_count, a3.soft_max_count), (-6138, 0, -5838, -300));
+    assert_eq!((a3.count_at_virtual_0, a3.count_at_virtual_512, a3.count_at_virtual_1023), (-300, -3069, -5838));
+    assert!(!a3.calibration_valid);
+    // Everything but the axis values is the running config.
+    assert_eq!(out.rig_id, cfg.rig_id);
+    assert_eq!(out.server, cfg.server);
+    assert_eq!(out.timing, cfg.timing);
+    assert_eq!(out.backend, cfg.backend);
+
+    // An invalid outcome is refused and nothing is written.
+    let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    snap.axes[0].calibration = Some(cal_ok(100)); // stroke smaller than 2 × decel
+    status_tx.send_replace(Arc::new(snap));
+    let before = std::fs::read_dir(&dir).unwrap().count();
+    let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "invalid_result");
+    assert!(body["detail"].as_str().unwrap().contains("soft_min_count"), "{body}");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+
+    // Without a config path (server not started from a file): 500.
+    let (app, _rx, tx) = manual_with_path(cfg.clone(), None);
+    let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    snap.axes[0].calibration = Some(cal_ok(6000));
+    tx.send_replace(Arc::new(snap));
+    let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "no_config_path");
+    let _ = std::fs::remove_dir_all(&dir);
 }

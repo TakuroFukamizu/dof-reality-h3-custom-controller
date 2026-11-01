@@ -12,6 +12,7 @@
   - 姿勢送信は document.hidden で止まる。隠れたタブからは送らない。
     隠れても 0（中央）を送らない: サーバーの source_freshness_ms が止める。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
+  - 校正（POST /v1/calibrate、DESIGN.md §11）は機構を両端まで動かす。確認ダイアログの後にだけ送る。
 -->
 <style>
   :root { --red: #c0392b; --green: #1e8449; --amber: #b9770e; --gray: #666; --bg: #f6f6f6; }
@@ -32,6 +33,7 @@
   td.num { text-align: right; }
   .state { font-size: 26px; font-weight: bold; padding: 4px 10px; border-radius: 4px; background: #eee; display: inline-block; }
   .state.ACTIVE, .state.HOLDING, .state.ARMING, .state.STOPPING { background: #fde3c3; color: var(--amber); }
+  td.bad { color: var(--red); font-weight: bold; }
   .state.FAULT_LATCHED { background: var(--red); color: #fff; }
   .state.READY_TO_ARM { background: #d5f5e3; color: var(--green); }
   .ok { color: var(--green); } .bad { color: var(--red); font-weight: bold; } .dim { color: var(--gray); }
@@ -66,6 +68,13 @@
     <button id="bFaultReset">FAULT RESET</button>
     <span id="sessionLabel" class="dim small">session: なし</span>
   </div>
+  <div class="row" style="margin-top:8px">
+    <button id="bCalibrate" class="warn" title="POST /v1/calibrate。全軸 DISARMED・電源担当軸を含む 3 軸に CALIBRATE を送る。機構が両端まで動く">校正（3 軸）</button>
+    <button id="bCalibrateCancel" title="POST /v1/calibrate/cancel。CALIBRATING の軸に CALIBRATE(0)">校正を中止</button>
+    <button id="bCalExport" title="POST /v1/calibration/export。OK の結果を設定ファイルの複製に書き出す（calibration_valid は false のまま）">校正結果を設定に書き出す</button>
+    <span class="dim small">校正中は ARM / START / CENTER / REFERENCE 不可。STOP でも中止できる</span>
+  </div>
+  <div id="calExport" class="small" style="margin-top:4px">書き出し: —</div>
 </section>
 
 <section>
@@ -94,12 +103,12 @@
     <thead><tr>
       <th>軸</th><th>名前</th><th>接続</th><th>port</th><th>device_id</th><th>expected</th><th>assignment</th><th>claimants</th>
       <th>mcu_state</th><th>fault_code</th><th>flags</th>
-      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>ref_stale</th><th>REFERENCE</th>
+      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>ref_stale</th><th>校正</th><th>REFERENCE</th>
     </tr></thead>
     <tbody id="axes"></tbody>
   </table>
   </div>
-  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。REFERENCE は DISARMED 時だけ（現在位置を count とみなす）。</div>
+  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。REFERENCE は DISARMED 時だけ（現在位置を count とみなす）。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral。この boot のもの）。</div>
 </section>
 
 <section>
@@ -189,6 +198,43 @@
   adminButton('bCenter', '/v1/center', { auth: true });
   adminButton('bFault', '/v1/fault', { auth: true, body: { note: 'test page' } });
   adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+  adminButton('bCalibrateCancel', '/v1/calibrate/cancel', { auth: true });
+
+  // 校正: 機構が両端まで動く。確認してからだけ送る（本文なし = 3 軸）。
+  $('bCalibrate').addEventListener('click', async () => {
+    const msg = '3 軸の端当て校正を開始します。\n\n' +
+      '機構が P 端・N 端の両方の端まで動き、その後に中立へ戻ります。\n' +
+      '・座席に人がいないこと\n・可動範囲に物や人がいないこと\n・物理非常停止を押せる人がいること\n' +
+      'を確認してください。全軸 DISARMED で、電源担当軸を含む 3 軸に送ります。\n\n開始しますか？';
+    if (!window.confirm(msg)) { log('校正: 取り消し'); return; }
+    const b = $('bCalibrate');
+    b.disabled = true;
+    try { await call('POST', '/v1/calibrate', { auth: true }); } catch (e) { /* ログ済み */ }
+    b.disabled = false;
+  });
+
+  // 書き出し: 応答の path と各軸の値を表示する（textContent）。
+  $('bCalExport').addEventListener('click', async () => {
+    const b = $('bCalExport');
+    b.disabled = true;
+    try {
+      const r = await call('POST', '/v1/calibration/export', { auth: true });
+      const out = $('calExport');
+      if (r.ok && r.json && r.json.ok) {
+        const lines = (r.json.axes || []).map((a) =>
+          'axis ' + a.axis_id + ': device_id ' + a.device_id + ' n_end ' + a.n_end_count + ' neutral ' + a.neutral_count + ' sign ' + a.sign +
+          ' / mechanical [' + a.mechanical_min_count + ', ' + a.mechanical_max_count + '] soft [' + a.soft_min_count + ', ' + a.soft_max_count +
+          '] count_at_virtual [' + a.count_at_virtual_0 + ', ' + a.count_at_virtual_512 + ', ' + a.count_at_virtual_1023 + ']');
+        out.textContent = '書き出し: ' + r.json.path + '（calibration_valid = false のまま。確認して true にする）\n' + lines.join('\n');
+        out.className = 'small ok';
+        out.style.whiteSpace = 'pre-wrap';
+      } else {
+        out.textContent = '書き出し失敗: ' + r.status + ' ' + r.text;
+        out.className = 'small bad';
+      }
+    } catch (e) { /* ログ済み */ }
+    b.disabled = false;
+  });
 
   $('bSession').addEventListener('click', async () => {
     try {
@@ -248,7 +294,7 @@
   // 軸の行は 1 回だけ作り、以後は td の中身だけ更新する（200 ms ごとに作り直すと
   // REFERENCE の入力欄がフォーカスを失い、数字を打てない）。
   const axisRows = [];
-  const COLS = 18; // REFERENCE 列を除く td の数
+  const COLS = 19; // REFERENCE 列を除く td の数（校正列を含む）
   function axisRow(i, a) {
     if (axisRows[i]) return axisRows[i];
     const tr = document.createElement('tr');
@@ -297,6 +343,19 @@
     set(c[15], fmt(a.pwm_permille), 'num');
     set(c[16], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : a.status_age_ms.toFixed(0) + ' ms', 'num');
     set(c[17], a.reference_stale ? '要再基準化' : '—', a.reference_stale ? 'bad' : '');
+    set(c[18], calText(a), calClass(a));
+  }
+  function calText(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'CALIBRATING';
+    const c = a.calibration;
+    if (!c) return '—';
+    return c.result + ' (' + c.reason + ') n_end ' + fmt(c.n_end_count) + ' neutral ' + fmt(c.neutral_count) + ' sign ' + fmt(c.sign) + ' step ' + fmt(c.step);
+  }
+  function calClass(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'bad';
+    const c = a.calibration;
+    if (!c) return '';
+    return c.result === 'OK' ? 'ok' : 'bad';
   }
 
   // 同じエラーが続いても HTTP ログには 1 回だけ出す（バナーには常に出す）。

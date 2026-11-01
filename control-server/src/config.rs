@@ -180,6 +180,11 @@ pub struct SimBackendConfig {
     /// 0 and the axis is found through the configured `device_id` alone (the
     /// fallback path for firmware without axis selection).
     pub report_selected_axis: bool,
+    /// Mechanical end stops of the simulated mechanism (boot coordinate). The
+    /// plant cannot pass them; CALIBRATE finds them (`end_min_count` is the
+    /// P end, so a calibrated sim reports `n_end_count = max − min`).
+    pub end_min_count: i32,
+    pub end_max_count: i32,
 }
 
 impl Default for SimBackendConfig {
@@ -190,6 +195,8 @@ impl Default for SimBackendConfig {
             status_period_ms: 20,
             link_latency_ms: 1,
             report_selected_axis: true,
+            end_min_count: -3000,
+            end_max_count: 3000,
         }
     }
 }
@@ -420,6 +427,12 @@ impl Config {
                 }
                 if b.status_period_ms == 0 {
                     errs.push("backend.status_period_ms must be > 0".into());
+                }
+                if b.end_min_count >= b.end_max_count {
+                    errs.push(format!(
+                        "backend.end_min_count ({}) must be < backend.end_max_count ({})",
+                        b.end_min_count, b.end_max_count
+                    ));
                 }
                 for (name, v) in [("backend.status_period_ms", b.status_period_ms), ("backend.link_latency_ms", b.link_latency_ms)] {
                     if v > MAX_TIMING_MS {

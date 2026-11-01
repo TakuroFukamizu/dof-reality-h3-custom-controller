@@ -75,6 +75,34 @@
 //! - Center is complete when the planner is at neutral with zero velocity and
 //!   every axis's STATUS.target_count (MCU setpoint) is within
 //!   [`CENTER_TOLERANCE_COUNT`] of neutral.
+//!
+//! # End-stop calibration (DESIGN.md §11, protocol §1.2)
+//!
+//! - `Calibrate { axes }` (empty = all) is refused while latched
+//!   (`fault_latched`; DESIGN.md §11 only names `not_disarmed`, this is the
+//!   safer reading), while armed (`not_disarmed`), in an axis conflict
+//!   (`axis_conflict`), when a target is not connected (`axis_disconnected`)
+//!   or not DISARMED (`mcu_not_disarmed`), when any axis is already
+//!   CALIBRATING (`calibrating`), and when the `power_controller_axis` is not
+//!   among the targets (`power_axis_required`: without it the other axes have
+//!   no 24 V and fail with `stall`). CALIBRATE(1) goes to every target; the
+//!   ACK is tracked. A REJECTED CALIBRATE is not a rig fault: it becomes the
+//!   blocker `calibrate_rejected: axisN …` (cleared by the next Calibrate /
+//!   CalibrateCancel, a CAL_RESULT, or the unit reconnecting) and, when it is
+//!   the power axis, the other targets are cancelled at once.
+//! - `CalibrateCancel` and `Stop` send CALIBRATE(0) to every axis that is
+//!   CALIBRATING or whose CALIBRATE(1) is outstanding.
+//! - While any axis is CALIBRATING the rig stays Idle (CALIBRATION_REQUIRED
+//!   through the blocker `calibrating: axisN`); `Arm` / `Start` / `Center` /
+//!   `Reference` are refused with `calibrating`. Nothing is sent to the axis
+//!   except CALIBRATE(0) (CONFIG is deferred while a CALIBRATE is outstanding
+//!   so the MCU never sees a CONFIG it must reject with BAD_STATE). STATUS
+//!   silence and disconnects are handled as for a DISARMED axis (no fault).
+//! - CAL_RESULT is kept per axis for the current boot
+//!   (`AxisSnapshot::calibration`, cleared on reboot or when another unit
+//!   takes the axis) and logged as the event `cal_result`. A successful unit
+//!   re-references itself (P end = 0, POSITION_REFERENCED): the supervisor
+//!   accepts that and also clears any `reference_stale` mark of the unit.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -87,8 +115,8 @@ use crate::compat;
 use crate::config::{Config, GameConfig, TimingConfig};
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
-    self, capabilities, role_flags, Ack, AckReason, AckResult, FaultEvent, Hello, HostMsg,
-    SetPosition, Status,
+    self, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
+    CalResultCode, FaultEvent, Hello, HostMsg, SetPosition, Status,
 };
 use crate::session::AcceptedPose;
 use crate::types::{
@@ -137,6 +165,12 @@ pub mod admin_error {
     pub const NOT_DISARMED: &str = "not_disarmed";
     /// Two units select the same axis (DESIGN.md §10.2).
     pub const AXIS_CONFLICT: &str = "axis_conflict";
+    /// Some axis is CALIBRATING (DESIGN.md §11).
+    pub const CALIBRATING: &str = "calibrating";
+    /// A target axis is not DISARMED.
+    pub const MCU_NOT_DISARMED: &str = "mcu_not_disarmed";
+    /// `Calibrate` without the main-power axis among its targets.
+    pub const POWER_AXIS_REQUIRED: &str = "power_axis_required";
 }
 
 // ------------------------------------------------------------------ inputs
@@ -172,6 +206,11 @@ pub enum LinkEvent {
         axis: AxisId,
         ev: FaultEvent,
     },
+    /// End-stop calibration ended on the MCU (protocol §1.2).
+    CalResult {
+        axis: AxisId,
+        result: CalResult,
+    },
     /// Link lost (port closed, STATUS silent past the deadline, write error).
     Disconnected {
         axis: AxisId,
@@ -202,6 +241,10 @@ pub enum AdminCmd {
     Center,
     Reference { axis: AxisId, count: Counts },
     Fault { note: String },
+    /// Start the MCU-driven end-stop calibration on `axes` (empty = all three).
+    Calibrate { axes: Vec<AxisId> },
+    /// CALIBRATE(0) to every calibrating axis.
+    CalibrateCancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -262,6 +305,21 @@ pub struct SupervisorEvent {
     pub detail: serde_json::Value,
 }
 
+/// Latest CAL_RESULT of an axis in its current boot (`AxisSnapshot::calibration`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CalibrationResult {
+    /// `OK` / `FAILED` / `CANCELLED`.
+    pub result: CalResultCode,
+    pub step: u8,
+    pub n_end_count: Counts,
+    pub neutral_count: Counts,
+    pub sign: i8,
+    pub reason: String,
+    pub boot_id: BootId,
+    /// ms since the supervisor first saw time (same clock as `fault_history`).
+    pub at_ms: f64,
+}
+
 /// One port claiming an axis (`AxisSnapshot::claimants`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClaimantSnapshot {
@@ -310,6 +368,8 @@ pub struct AxisSnapshot {
     pub status_age_ms: Option<f64>,
     pub rx_error_count: Option<u16>,
     pub stale_drop_count: Option<u16>,
+    /// Latest end-stop calibration result of this boot (DESIGN.md §11).
+    pub calibration: Option<CalibrationResult>,
 }
 
 /// GET /v1/status body (DESIGN.md §7.2). `session` and `telemetry` are filled
@@ -357,6 +417,8 @@ enum Purpose {
     FaultReset,
     Reference,
     HostFault,
+    Calibrate,
+    CalibrateCancel,
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +514,14 @@ struct AxisTrack {
     reset_rejected: Option<AckReason>,
     /// ACKed the current group command.
     group_ok: bool,
+    /// CALIBRATE(1) sent and not yet over: cleared by its rejection, a
+    /// CAL_RESULT, or a STATUS after its ACK that is not CALIBRATING.
+    cal_pending: bool,
+    /// Event ordinal of the CALIBRATE(1) ACK (see `cal_pending`).
+    cal_ack_ev: Option<u64>,
+    calibrate_rejected: Option<AckReason>,
+    /// Latest CAL_RESULT of the current boot.
+    calibration: Option<CalibrationResult>,
 }
 
 impl AxisTrack {
@@ -480,6 +550,13 @@ impl AxisTrack {
     }
     fn in_conflict(&self) -> bool {
         self.claimants.len() >= 2
+    }
+    fn calibrating(&self) -> bool {
+        self.mcu_state() == Some(McuState::Calibrating)
+    }
+    /// CALIBRATE(0) would reach a running (or just requested) calibration.
+    fn cancel_target(&self) -> bool {
+        self.connected && (self.calibrating() || self.cal_pending)
     }
     fn status_fault(&self) -> Option<FaultCode> {
         let s = self.status?;
@@ -704,6 +781,19 @@ impl Supervisor {
         }
     }
 
+    /// Axes whose MCU reports CALIBRATING.
+    pub fn calibrating_axes(&self) -> Vec<AxisId> {
+        (0..AXIS_COUNT)
+            .filter(|&i| self.axes[i].connected && self.axes[i].calibrating())
+            .filter_map(AxisId::from_index)
+            .collect()
+    }
+
+    /// Latest CAL_RESULT per axis (current boot), index = `AxisId::index()`.
+    pub fn calibration_results(&self) -> [Option<&CalibrationResult>; AXIS_COUNT] {
+        std::array::from_fn(|i| self.axes[i].calibration.as_ref())
+    }
+
     /// Last measured spread of `last_applied_frame` across axes while ACTIVE.
     pub fn frame_skew(&self) -> Option<u32> {
         self.last_frame_skew
@@ -779,6 +869,9 @@ impl Supervisor {
             if let Some(r) = t.reset_rejected {
                 b.push(format!("fault_reset_rejected: axis{n} {r:?}"));
             }
+            if let Some(r) = t.calibrate_rejected {
+                b.push(format!("calibrate_rejected: axis{n} CALIBRATE rejected ({r:?})"));
+            }
             if !t.connected {
                 continue;
             }
@@ -799,6 +892,8 @@ impl Supervisor {
             };
             if let Some(code) = t.status_fault() {
                 b.push(format!("axis_fault: axis{n} fault_code {code:?}"));
+            } else if t.calibrating() {
+                b.push(format!("calibrating: axis{n}"));
             } else if t.mcu_state() != Some(McuState::Disarmed) {
                 b.push(format!(
                     "mcu_not_disarmed: axis{n} state {}",
@@ -871,6 +966,7 @@ impl Supervisor {
             } => self.on_status(axis.index(), status, received_at.min(now), now),
             LinkEvent::Ack { axis, ack } => self.on_ack(axis.index(), ack, now),
             LinkEvent::FaultEvent { axis, ev } => self.on_fault_event(axis.index(), ev, now),
+            LinkEvent::CalResult { axis, result } => self.on_cal_result(axis.index(), result, now),
             LinkEvent::Disconnected { axis, reason } => {
                 self.on_disconnected(axis.index(), reason, now)
             }
@@ -1080,6 +1176,7 @@ impl Supervisor {
                         .map(|d| d.as_secs_f64() * 1000.0),
                     rx_error_count: s.map(|s| s.rx_error_count),
                     stale_drop_count: s.map(|s| s.stale_drop_count),
+                    calibration: t.calibration.clone(),
                 }
             })
             .collect();
@@ -1248,6 +1345,13 @@ impl Supervisor {
             // A new link / boot has not seen our HOST_FAULT.
             t.host_fault_req = None;
             t.host_fault_ack_ev = None;
+            t.cal_pending = false;
+            t.cal_ack_ev = None;
+            t.calibrate_rejected = None;
+        }
+        if rebooted || !same_unit {
+            // The result belongs to the unit and its boot (protocol §1.2).
+            t.calibration = None;
         }
         if hello.calibration_hash != self.hashes[i] {
             // MCU holds no (or another) calibration: ours must be re-ACKed.
@@ -1292,12 +1396,25 @@ impl Supervisor {
         if rebooted {
             t.configured_epoch = None;
             t.config_rejected = None;
+            t.calibration = None;
+            t.cal_pending = false;
+            t.cal_ack_ev = None;
+            t.calibrate_rejected = None;
             if let Some(h) = t.hello {
                 self.stale_refs.retain(|(d, _)| *d != h.device_id);
             }
         }
         let t = &mut self.axes[i];
         t.boot_id = Some(status.boot_id);
+        // A STATUS after the CALIBRATE ACK that is not CALIBRATING: the
+        // calibration is over (or never ran); CONFIG may be sent again.
+        if t.cal_pending
+            && t.cal_ack_ev.is_some_and(|a| self.ev > a)
+            && McuState::from_u8(status.mcu_state) != Some(McuState::Calibrating)
+        {
+            t.cal_pending = false;
+            t.cal_ack_ev = None;
+        }
         if status.flags & status_flags::CONFIGURED == 0 {
             t.configured_epoch = None;
         }
@@ -1338,6 +1455,43 @@ impl Supervisor {
             ev.fault_code
         };
         self.latch_axis_fault(axis, code, "FAULT_EVENT", now);
+    }
+
+    fn on_cal_result(&mut self, i: usize, r: CalResult, now: Instant) {
+        let Some(axis) = AxisId::from_index(i) else {
+            return;
+        };
+        if !self.axes[i].connected {
+            return;
+        }
+        let record = CalibrationResult {
+            result: r.result,
+            step: r.step,
+            n_end_count: r.n_end_count,
+            neutral_count: r.neutral_count,
+            sign: r.sign,
+            reason: r.reason_str(),
+            boot_id: r.boot_id,
+            at_ms: self.at_ms(now),
+        };
+        self.event(
+            now,
+            "cal_result",
+            serde_json::json!({"axis": axis, "result": record}),
+        );
+        let t = &mut self.axes[i];
+        t.cal_pending = false;
+        t.cal_ack_ev = None;
+        t.calibrate_rejected = None;
+        t.calibration = Some(record);
+        if r.result == CalResultCode::Ok {
+            // The unit established its own reference (P end = 0): no longer
+            // stale, whatever axis change preceded it.
+            let t = &self.axes[i];
+            if let (Some(h), Some(b)) = (t.hello, t.boot_id) {
+                self.stale_refs.remove(&(h.device_id, b));
+            }
+        }
     }
 
     fn on_disconnected(&mut self, i: usize, reason: String, now: Instant) {
@@ -1478,6 +1632,11 @@ impl Supervisor {
                         t.config_rejected = None;
                     }
                     Purpose::FaultReset => self.axes[i].reset_rejected = None,
+                    Purpose::Calibrate => {
+                        let t = &mut self.axes[i];
+                        t.calibrate_rejected = None;
+                        t.cal_ack_ev = Some(self.ev);
+                    }
                     Purpose::Reference => {
                         // This server re-referenced the unit: no longer stale.
                         let t = &self.axes[i];
@@ -1542,7 +1701,25 @@ impl Supervisor {
                     self.phase = Phase::Fault { reset: None };
                 }
             }
-            Purpose::Reference | Purpose::HostFault => {}
+            Purpose::Calibrate => {
+                let t = &mut self.axes[i];
+                t.calibrate_rejected = Some(reason);
+                t.cal_pending = false;
+                t.cal_ack_ev = None;
+                if axis == self.power_axis {
+                    // Without the power axis the others have no 24 V: cancel
+                    // them rather than let them fail one by one.
+                    let cancelled = self.send_calibrate_cancel(now);
+                    if !cancelled.is_empty() {
+                        self.event(
+                            now,
+                            "calibrate_cancelled",
+                            serde_json::json!({"axes": cancelled, "because": "power axis rejected CALIBRATE"}),
+                        );
+                    }
+                }
+            }
+            Purpose::CalibrateCancel | Purpose::Reference | Purpose::HostFault => {}
         }
     }
 
@@ -1561,7 +1738,145 @@ impl Supervisor {
                 self.latch(RigFault::Operator { note }, None, now);
                 Ok(None)
             }
+            AdminCmd::Calibrate { axes } => self.cmd_calibrate(&axes, now),
+            AdminCmd::CalibrateCancel => Ok(self.cmd_calibrate_cancel(now)),
         }
+    }
+
+    /// Refuse an admin command while any axis is CALIBRATING.
+    fn refuse_if_calibrating(&self) -> Result<(), AdminError> {
+        let calibrating: Vec<String> = self
+            .calibrating_axes()
+            .iter()
+            .map(|a| format!("calibrating: {a}"))
+            .collect();
+        if calibrating.is_empty() {
+            Ok(())
+        } else {
+            Err(AdminError::new(admin_error::CALIBRATING, calibrating))
+        }
+    }
+
+    fn cmd_calibrate(&mut self, axes: &[AxisId], now: Instant) -> Result<Option<String>, AdminError> {
+        if !self.axis_conflict().is_empty() {
+            return Err(AdminError::new(
+                admin_error::AXIS_CONFLICT,
+                self.blockers(now),
+            ));
+        }
+        match self.phase {
+            Phase::Idle(_) => {}
+            Phase::Fault { .. } => {
+                return Err(AdminError::new(admin_error::FAULT_LATCHED, self.blockers(now)))
+            }
+            _ => {
+                return Err(AdminError::new(
+                    admin_error::NOT_DISARMED,
+                    vec![format!("rig_state: {}", rig_state_name(self.state()))],
+                ))
+            }
+        }
+        self.refuse_if_calibrating()?;
+        let mut targets: Vec<AxisId> = if axes.is_empty() {
+            AxisId::ALL.to_vec()
+        } else {
+            axes.to_vec()
+        };
+        targets.sort();
+        targets.dedup();
+        if !targets.contains(&self.power_axis) {
+            return Err(AdminError::new(
+                admin_error::POWER_AXIS_REQUIRED,
+                vec![format!(
+                    "power_axis_required: {} drives the main power and must be calibrated together",
+                    self.power_axis
+                )],
+            ));
+        }
+        let disconnected: Vec<String> = targets
+            .iter()
+            .filter(|a| !self.axes[a.index()].connected)
+            .map(|a| format!("not_connected: {a}"))
+            .collect();
+        if !disconnected.is_empty() {
+            return Err(AdminError::new(admin_error::AXIS_DISCONNECTED, disconnected));
+        }
+        let not_disarmed: Vec<String> = targets
+            .iter()
+            .filter_map(|a| {
+                let t = &self.axes[a.index()];
+                match (t.status, t.status_fault(), t.mcu_state()) {
+                    (None, _, _) => Some(format!("no_status: {a}")),
+                    (Some(_), Some(code), _) => Some(format!("axis_fault: {a} fault_code {code:?}")),
+                    (Some(_), None, Some(McuState::Disarmed)) if !t.cal_pending => None,
+                    (Some(s), None, _) => Some(format!(
+                        "mcu_not_disarmed: {a} state {}",
+                        state_name(s.mcu_state)
+                    )),
+                }
+            })
+            .collect();
+        if !not_disarmed.is_empty() {
+            return Err(AdminError::new(admin_error::MCU_NOT_DISARMED, not_disarmed));
+        }
+        for a in &targets {
+            let i = a.index();
+            let id = self.take_request_id();
+            self.push_msg(
+                i,
+                HostMsg::Calibrate {
+                    request_id: id,
+                    mode: calibrate_mode::START,
+                },
+                Purpose::Calibrate,
+                now,
+            );
+            let t = &mut self.axes[i];
+            t.cal_pending = true;
+            t.cal_ack_ev = None;
+            t.calibrate_rejected = None;
+        }
+        self.event(now, "calibrate", serde_json::json!({"axes": targets}));
+        Ok(None)
+    }
+
+    fn cmd_calibrate_cancel(&mut self, now: Instant) -> Option<String> {
+        for t in &mut self.axes {
+            t.calibrate_rejected = None;
+        }
+        let cancelled = self.send_calibrate_cancel(now);
+        if cancelled.is_empty() {
+            Some("no axis calibrating".into())
+        } else {
+            self.event(now, "calibrate_cancelled", serde_json::json!({"axes": cancelled}));
+            None
+        }
+    }
+
+    /// CALIBRATE(0) to every axis that is CALIBRATING or has a CALIBRATE(1)
+    /// outstanding; returns those axes.
+    fn send_calibrate_cancel(&mut self, now: Instant) -> Vec<AxisId> {
+        let mut out = Vec::new();
+        for i in 0..AXIS_COUNT {
+            let Some(axis) = AxisId::from_index(i) else {
+                continue;
+            };
+            if !self.axes[i].cancel_target() {
+                continue;
+            }
+            let id = self.take_request_id();
+            self.push_msg(
+                i,
+                HostMsg::Calibrate {
+                    request_id: id,
+                    mode: calibrate_mode::CANCEL,
+                },
+                Purpose::CalibrateCancel,
+                now,
+            );
+            out.push(axis);
+        }
+        out
     }
 
     fn cmd_arm(&mut self, now: Instant) -> Result<Option<String>, AdminError> {
@@ -1571,6 +1886,7 @@ impl Supervisor {
                 self.blockers(now),
             ));
         }
+        self.refuse_if_calibrating()?;
         match self.phase {
             Phase::Idle(RigState::ReadyToArm | RigState::BrakedDisarmed) => {}
             Phase::Idle(_) => {
@@ -1614,6 +1930,7 @@ impl Supervisor {
                 self.blockers(now),
             ));
         }
+        self.refuse_if_calibrating()?;
         match self.phase {
             Phase::Holding {
                 start: None,
@@ -1672,7 +1989,16 @@ impl Supervisor {
                 None
             }
             Phase::Stopping { .. } => Some("already stopping".into()),
-            Phase::Idle(_) | Phase::Fault { .. } => Some("not driving".into()),
+            Phase::Idle(_) | Phase::Fault { .. } => {
+                let cancelled = self.send_calibrate_cancel(now);
+                if cancelled.is_empty() {
+                    Some("not driving".into())
+                } else {
+                    self.event(now, "calibrate_cancelled", serde_json::json!({"axes": cancelled, "because": "stop"}));
+                    let names: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
+                    Some(format!("calibration cancelled: {}", names.join(", ")))
+                }
+            }
         }
     }
 
@@ -1783,6 +2109,7 @@ impl Supervisor {
                 vec![format!("rig_state: {}", rig_state_name(self.state()))],
             ));
         }
+        self.refuse_if_calibrating()?;
         if !self.axes.get(i).is_some_and(|t| t.connected) {
             return Err(AdminError::new(
                 admin_error::AXIS_DISCONNECTED,
@@ -1995,6 +2322,7 @@ impl Supervisor {
                 && t.mcu_state() == Some(McuState::Disarmed)
                 && t.status_fault().is_none()
                 && t.host_fault_confirmed()
+                && !t.cal_pending
                 && !t.configured(self.epoch)
                 && t.config_retry_at.is_none_or(|at| now >= at)
                 && !self
@@ -2515,7 +2843,8 @@ fn request_id_of(m: &HostMsg) -> Option<u32> {
         | HostMsg::FaultReset { request_id }
         | HostMsg::ClockSync { request_id, .. }
         | HostMsg::HostFault { request_id, .. }
-        | HostMsg::SetReference { request_id, .. } => Some(request_id),
+        | HostMsg::SetReference { request_id, .. }
+        | HostMsg::Calibrate { request_id, .. } => Some(request_id),
         HostMsg::Config(c) => Some(c.request_id),
         HostMsg::SetPosition(_) => None,
     }
@@ -2535,6 +2864,7 @@ fn msg_name(t: u8) -> &'static str {
         CLOCK_SYNC => "CLOCK_SYNC",
         HOST_FAULT => "HOST_FAULT",
         SET_REFERENCE => "SET_REFERENCE",
+        CALIBRATE => "CALIBRATE",
         _ => "UNKNOWN",
     }
 }

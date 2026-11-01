@@ -128,7 +128,8 @@ fn run(path: &Path, bind: Option<SocketAddr>) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let srv = match server::start(cfg, ServerOptions { admin_token: None, bind_override: bind }).await {
+        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()) };
+        let srv = match server::start(cfg, opts).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("start failed: {e}");

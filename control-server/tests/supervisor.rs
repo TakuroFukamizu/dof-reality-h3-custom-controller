@@ -225,6 +225,10 @@ impl Rig {
                     Some(axis) => LinkEvent::FaultEvent { axis, ev },
                     None => continue,
                 },
+                McuMsg::CalResult(result) => match self.axis_of[i] {
+                    Some(axis) => LinkEvent::CalResult { axis, result },
+                    None => continue,
+                },
                 McuMsg::ClockSyncReply(_) => continue,
             };
             self.sup.on_link_event(ev, self.now);
@@ -1595,6 +1599,7 @@ fn snapshot_json_shape() {
         "status_age_ms",
         "rx_error_count",
         "stale_drop_count",
+        "calibration",
     ];
     akeys.sort_unstable();
     awant.sort_unstable();
@@ -1608,6 +1613,7 @@ fn snapshot_json_shape() {
     assert_eq!(v["axis_conflict"], serde_json::json!([]));
     assert_eq!(axis["mcu_state"], "ACTIVE");
     assert_eq!(axis["fault_code"], "NONE");
+    assert!(axis["calibration"].is_null(), "no CAL_RESULT yet");
     assert!(
         axis["current_a"].is_null(),
         "current not valid → null, not 0"
@@ -2313,4 +2319,315 @@ fn selected_axis_change_to_none_closes_the_unit_as_unknown() {
     assert_eq!(r.sup.axis_port(ax(2)), None);
     assert!(has(&r.blockers(), "unknown_device: device 5131000000000002 on port sim:2"), "{:?}", r.blockers());
     assert!(r.sup.fault().is_none());
+}
+
+// ---------- end-stop calibration (DESIGN.md §11) ----------
+
+/// Sims with ±500 end stops (stroke 1000: the calibrated rest position 500 lies
+/// inside every soft window of sim.toml) and no reference at boot.
+fn cal_rig(cfg: Config) -> Rig {
+    Rig::with(cfg, |_, p| {
+        p.start_referenced = false;
+        p.end_min_count = -500;
+        p.end_max_count = 500;
+    })
+}
+
+fn all_calibrating(r: &Rig) -> bool {
+    r.sup.calibrating_axes().len() == 3
+}
+
+fn all_disarmed(r: &Rig) -> bool {
+    r.mcu_states().iter().all(|s| *s == McuState::Disarmed)
+}
+
+#[test]
+fn calibrate_all_runs_to_cal_result_references_and_blocks_arm_meanwhile() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    assert!(has(&r.blockers(), "not_referenced: axis1"));
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.step();
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1]);
+    for (_, _, m) in r.sent_since(sent) {
+        if let HostMsg::Calibrate { mode, .. } = m {
+            assert_eq!(*mode, 1);
+        }
+    }
+    assert!(r.run_until(200, all_calibrating), "{:?}", r.mcu_states());
+    // Rig stays idle and refuses everything that would drive.
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    let b = r.blockers();
+    assert!(has(&b, "calibrating: axis1") && has(&b, "calibrating: axis2") && has(&b, "calibrating: axis3"), "{b:?}");
+    assert!(!has(&b, "mcu_not_disarmed"), "{b:?}");
+    let e = r.admin(AdminCmd::Arm).unwrap_err();
+    assert_eq!(e.error, admin_error::CALIBRATING);
+    assert!(has(&e.blockers, "calibrating: axis1"), "{:?}", e.blockers);
+    assert_eq!(r.admin(AdminCmd::Start).unwrap_err().error, admin_error::CALIBRATING);
+    assert_eq!(r.admin(AdminCmd::Center).unwrap_err().error, admin_error::CALIBRATING);
+    assert_eq!(r.admin(AdminCmd::Reference { axis: ax(2), count: 0 }).unwrap_err().error, admin_error::CALIBRATING);
+    assert_eq!(r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap_err().error, admin_error::CALIBRATING);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[0].mcu_state, Some(McuState::Calibrating));
+    assert!(snap.axes.iter().all(|a| a.calibration.is_none()));
+
+    assert!(r.run_until(3000, all_disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    // No SET_POSITION, no CONFIG, no ARM_PREPARE while calibrating.
+    assert!(r.setpos.is_empty());
+    assert_eq!(r.count(sent, msg_type::CONFIG), [0; 3]);
+    assert_eq!(r.count(sent, msg_type::ARM_PREPARE), [0; 3]);
+    assert!(r.sup.fault().is_none());
+    let snap = r.sup.snapshot(r.now);
+    for a in &snap.axes {
+        let c = a.calibration.as_ref().expect("result recorded");
+        assert_eq!(c.result, h3cs::protocol::CalResultCode::Ok);
+        assert_eq!((c.step, c.n_end_count, c.neutral_count, c.sign), (3, 1000, 500, 1));
+        assert_eq!(c.reason, "ok");
+        assert_eq!(Some(c.boot_id), a.boot_id);
+        assert!(a.referenced, "the MCU referenced itself");
+        assert_eq!(a.actual_count, Some(500));
+    }
+    assert_eq!(r.count(sent, msg_type::SET_REFERENCE), [0; 3], "no SET_REFERENCE from the PC");
+    // Referenced at the neutral and inside the soft window: ready again.
+    r.wait_state(RigState::ReadyToArm, 500);
+    assert!(r.blockers().is_empty(), "{:?}", r.blockers());
+    let (events, _) = r.sup.drain_events();
+    assert_eq!(events.iter().filter(|e| e.kind == "cal_result").count(), 3);
+    assert_eq!(events.iter().filter(|e| e.kind == "calibrate").count(), 1);
+}
+
+#[test]
+fn calibrate_rules_power_axis_connected_disarmed_and_not_armed() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    // Without the power axis (axis 1 in sim.toml): refused before anything is sent.
+    let e = r.admin(AdminCmd::Calibrate { axes: vec![ax(2), ax(3)] }).unwrap_err();
+    assert_eq!(e.error, admin_error::POWER_AXIS_REQUIRED);
+    assert!(has(&e.blockers, "power_axis_required: axis1"), "{:?}", e.blockers);
+    // A disconnected target.
+    r.disconnect(1);
+    r.run_ms(20);
+    let e = r.admin(AdminCmd::Calibrate { axes: vec![ax(1), ax(2)] }).unwrap_err();
+    assert_eq!(e.error, admin_error::AXIS_DISCONNECTED);
+    assert_eq!(e.blockers, vec!["not_connected: axis2".to_string()]);
+    // Axis 1 alone is fine (it has the power).
+    r.admin(AdminCmd::Calibrate { axes: vec![ax(1)] }).unwrap();
+    r.step();
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 0, 0]);
+    assert!(r.run_until(3000, |r| r.mcus[0].state() == McuState::Disarmed && r.sup.snapshot(r.now).axes[0].calibration.is_some()));
+    r.connect(1);
+    r.run_ms(50);
+    // A target that is not DISARMED (driven behind the supervisor's back).
+    let us = r.us();
+    let _ = r.mcus[2].handle(&HostMsg::SetReference { request_id: 9000, reference_count: 0 }, us);
+    let out = r.mcus[2].handle(&HostMsg::ArmPrepare { request_id: 9001, session_epoch: r.sup.session_epoch() }, us);
+    r.feed(2, out);
+    r.run_ms(20);
+    let e = r.admin(AdminCmd::Calibrate { axes: vec![ax(1), ax(3)] }).unwrap_err();
+    assert_eq!(e.error, admin_error::MCU_NOT_DISARMED);
+    assert!(e.blockers.iter().any(|b| b.starts_with("mcu_not_disarmed: axis3")), "{:?}", e.blockers);
+    assert!(r.sup.fault().is_none(), "an idle rig does not fault on a stray MCU state");
+
+    // Armed rig: not_disarmed.
+    let mut r = Rig::new(sim_cfg());
+    r.holding();
+    let e = r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap_err();
+    assert_eq!(e.error, admin_error::NOT_DISARMED);
+    assert_eq!(e.blockers, vec!["rig_state: HOLDING".to_string()]);
+    // Latched rig: fault_latched (safer than DESIGN §11's not_disarmed wording).
+    r.admin(AdminCmd::Fault { note: "test".into() }).unwrap();
+    r.run_ms(50);
+    assert_eq!(r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap_err().error, admin_error::FAULT_LATCHED);
+    // No CALIBRATE ever left in those refusals.
+    assert_eq!(r.count(0, msg_type::CALIBRATE), [0; 3]);
+}
+
+#[test]
+fn calibrate_cancel_and_stop_send_calibrate_0_and_result_is_cancelled() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::CalibrateCancel).unwrap();
+    r.step();
+    let cancels: Vec<usize> = r
+        .sent_since(sent)
+        .iter()
+        .filter(|(_, _, m)| matches!(m, HostMsg::Calibrate { mode: 0, .. }))
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert_eq!(cancels.len(), 3, "{:?}", r.sent_since(sent));
+    assert!(r.run_until(1000, all_disarmed));
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    for a in &snap.axes {
+        let c = a.calibration.as_ref().unwrap();
+        assert_eq!(c.result, h3cs::protocol::CalResultCode::Cancelled);
+        assert_eq!(c.reason, "stop");
+        assert!(!a.referenced, "a cancelled calibration leaves the unit unreferenced");
+    }
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    assert!(has(&r.blockers(), "not_referenced: axis2"));
+    assert!(!has(&r.blockers(), "calibrating"));
+    assert!(r.sup.fault().is_none());
+    // Cancel with nothing running is a no-op.
+    let ok = r.sup.admin(AdminCmd::CalibrateCancel, r.now).unwrap();
+    assert_eq!(ok.note.as_deref(), Some("no axis calibrating"));
+
+    // Stop also cancels.
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    let sent = r.sent.len();
+    let ok = r.sup.admin(AdminCmd::Stop, r.now).unwrap();
+    assert!(ok.note.as_deref().is_some_and(|n| n.starts_with("calibration cancelled")), "{ok:?}");
+    r.step();
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1]);
+    assert!(r.run_until(1000, all_disarmed));
+    // Stop with nothing running keeps its old note.
+    let ok = r.sup.admin(AdminCmd::Stop, r.now).unwrap();
+    assert_eq!(ok.note.as_deref(), Some("not driving"));
+}
+
+#[test]
+fn calibrate_rejected_by_the_power_axis_cancels_the_others_without_fault() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    // Sim 0 (axis 1, the power axis) swallows the CALIBRATE; the test answers
+    // REJECTED/BAD_STATE in its place.
+    r.mcus[0].set_drop_rx(true);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.step();
+    let rid = r
+        .sent_since(sent)
+        .iter()
+        .find_map(|(i, _, m)| match m {
+            HostMsg::Calibrate { request_id, mode: 1 } if *i == 0 => Some(*request_id),
+            _ => None,
+        })
+        .expect("CALIBRATE to axis 1");
+    r.pre_tick.push(LinkEvent::Ack {
+        axis: ax(1),
+        ack: Ack { request_id: rid, acked_type: msg_type::CALIBRATE, result: AckResult::Rejected, reason: AckReason::BadState },
+    });
+    let sent = r.sent.len();
+    r.step();
+    r.step();
+    let cancelled: Vec<usize> = r
+        .sent_since(sent)
+        .iter()
+        .filter(|(_, _, m)| matches!(m, HostMsg::Calibrate { mode: 0, .. }))
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert_eq!(cancelled, vec![1, 2], "the other two targets are cancelled");
+    assert!(r.sup.fault().is_none(), "a rejected CALIBRATE is not a rig fault");
+    assert!(has(&r.blockers(), "calibrate_rejected: axis1 CALIBRATE rejected (BadState)"), "{:?}", r.blockers());
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    r.mcus[0].set_drop_rx(false);
+    assert!(r.run_until(1000, all_disarmed));
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.axes[0].calibration.is_none());
+    assert_eq!(snap.axes[1].calibration.as_ref().unwrap().result, h3cs::protocol::CalResultCode::Cancelled);
+    let (events, _) = r.sup.drain_events();
+    assert!(events.iter().any(|e| e.kind == "ack_rejected"));
+    assert!(events.iter().any(|e| e.kind == "calibrate_cancelled"));
+    // The blocker clears with the next calibrate command (a cancel will do).
+    r.admin(AdminCmd::CalibrateCancel).unwrap();
+    assert!(!has(&r.blockers(), "calibrate_rejected"), "{:?}", r.blockers());
+}
+
+#[test]
+fn failed_cal_result_is_recorded_and_the_unit_stays_unreferenced() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    r.mcus[1].set_calibration_failure(Some("slow"));
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    assert!(r.run_until(3000, all_disarmed));
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    let c = snap.axes[1].calibration.as_ref().unwrap();
+    assert_eq!((c.result, c.step, c.reason.as_str()), (h3cs::protocol::CalResultCode::Failed, 1, "slow"));
+    assert!(!snap.axes[1].referenced);
+    assert!(snap.axes[0].referenced && snap.axes[2].referenced);
+    assert_eq!(snap.axes[0].calibration.as_ref().unwrap().result, h3cs::protocol::CalResultCode::Ok);
+    assert!(r.sup.fault().is_none());
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    let b = r.blockers();
+    assert!(has(&b, "not_referenced: axis2") && !has(&b, "not_referenced: axis1"), "{b:?}");
+}
+
+#[test]
+fn calibration_result_survives_a_reconnect_but_not_a_reboot() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(3000, |r| r.sup.snapshot(r.now).axes.iter().all(|a| a.calibration.is_some())));
+    // Same boot, new link.
+    r.disconnect(2);
+    r.run_ms(20);
+    r.connect(2);
+    r.run_ms(50);
+    assert!(r.sup.snapshot(r.now).axes[2].calibration.is_some(), "latest of this boot");
+    // New boot: gone (the MCU lost it too).
+    r.mcus[2].reboot(4242);
+    r.connect(2);
+    r.run_ms(50);
+    assert!(r.sup.snapshot(r.now).axes[2].calibration.is_none());
+    assert!(r.sup.snapshot(r.now).axes[0].calibration.is_some());
+}
+
+#[test]
+fn status_silence_of_a_calibrating_axis_is_not_a_fault() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    // Sim 1's STATUS stops reaching the PC for a while (link keeps ticking the model).
+    r.mcus[1].set_freeze_status(true);
+    r.run_ms(400);
+    assert!(r.sup.fault().is_none());
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    assert!(has(&r.blockers(), "status_stale: axis2"), "{:?}", r.blockers());
+    r.mcus[1].set_freeze_status(false);
+    assert!(r.run_until(3000, all_disarmed));
+    r.run_ms(50);
+    assert!(r.sup.fault().is_none());
+    // Axis 2's CAL_RESULT may have been lost in the frozen window; the others are recorded.
+    assert!(r.sup.snapshot(r.now).axes[0].calibration.is_some());
+}
+
+#[test]
+fn successful_calibration_clears_reference_stale() {
+    let mut r = cal_rig(no_cross_check_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    // Swap the units of axes 1 and 3 under one boot: both stale.
+    r.select(0, 3);
+    r.select(2, 1);
+    r.run_ms(50);
+    assert!(has(&r.blockers(), "reference_stale: axis1") && has(&r.blockers(), "reference_stale: axis3"), "{:?}", r.blockers());
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    assert!(r.run_until(3000, all_disarmed));
+    r.wait_state(RigState::ReadyToArm, 500);
+    let b = r.blockers();
+    assert!(!has(&b, "reference_stale"), "{b:?}");
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.axes.iter().all(|a| !a.reference_stale && a.referenced));
+    assert_eq!(r.count(0, msg_type::SET_REFERENCE), [0; 3]);
 }
