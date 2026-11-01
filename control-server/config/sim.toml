@@ -45,6 +45,10 @@ virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25
 center_tolerance_count = 50
+swap_pitch_roll = false
+invert_pitch = false
+invert_roll = false
+invert_yaw = false
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証の見積もり
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）。
