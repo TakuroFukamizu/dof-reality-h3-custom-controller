@@ -344,22 +344,110 @@ class FakeServerTests(unittest.TestCase):
 
     # ------------------------------------------------------------ reconnect
 
-    def test_reconnect_after_drop_uses_a_new_session(self):
+    def ws_connects(self):
+        return self.fake.paths.count("/v1/motion")
+
+    def test_reconnect_after_drop_reuses_the_session(self):
+        # Issue #15 M5: a WS drop must not mint a session (that evicts whoever
+        # holds the current one and stops the rig if it was driving).
         fake, client = self.start()
         self.connected()
         first = fake.sessions[-1]
         self.assertEqual(client.session_id, first)
         fake.drop_all()
-        wait_until(lambda: len(fake.sessions) >= 2 and client.connected and client.session_id != first,
-                   timeout=4.0, msg="reconnect")
-        second = fake.sessions[-1]
-        self.assertNotEqual(first, second)
+        wait_until(lambda: not client.connected, msg="disconnect")
+        wait_until(lambda: client.connected, timeout=4.0, msg="reconnect")
+        self.assertEqual(fake.sessions, [first], "WS retry must not POST /v1/session")
+        self.assertEqual(client.session_id, first)
         client.submit_pose(0.1, 0.0, 0.0, 0.3, frame_seq=1)
         _, q, m = wait_until(lambda: fake.poses(), msg="pose")[-1]
-        self.assertEqual(m["source_session"], second)
-        self.assertEqual(q, second)  # ?session= pinned on the WS URL
+        self.assertEqual(m["source_session"], first)
+        self.assertEqual(q, first)  # ?session= pinned on the WS URL
         # Transport only: no admin route was touched.
         self.assertTrue(set(fake.paths) <= {"/v1/session", "/v1/motion"}, fake.paths)
+
+    def test_three_ws_failures_post_session_exactly_once(self):
+        fake, client = self.start()
+        self.connected()
+        first = client.session_id
+        for _ in range(3):
+            n = self.ws_connects()
+            fake.drop_all()
+            wait_until(lambda: not client.connected, msg="disconnect")
+            wait_until(lambda: client.connected and self.ws_connects() > n, timeout=4.0, msg="reconnect")
+        self.assertEqual(fake.paths.count("/v1/session"), 1, fake.paths)
+        self.assertEqual(self.ws_connects(), 4)
+        self.assertEqual(client.session_id, first)
+        with fake.lock:
+            queries = [q for _, q in fake.conns]
+        self.assertEqual(queries, [first], "every WS connect pins the same session")
+        self.assertFalse(client.session_lost)
+        # Poses still carry the one session.
+        client.submit_pose(0.2, 0.0, 0.0, 0.3, frame_seq=1)
+        m = wait_until(lambda: fake.poses(), msg="pose")[-1][2]
+        self.assertEqual(m["source_session"], first)
+
+    def test_stale_session_then_drop_mints_a_new_session(self):
+        # stale_session means the id is not ours any more (taken over, or the
+        # server restarted): the next connection attempt must not reuse it.
+        fake, client = self.start()
+        self.connected()
+        first = client.session_id
+        fake.ack_reason = "stale_session"
+        client.submit_pose(0.1, 0.0, 0.0, 0.3, frame_seq=1)
+        wait_until(lambda: client.session_lost, msg="session_lost")
+        self.assertTrue(client.connected, "stale_session alone does not reconnect (no automatic retake)")
+        self.assertEqual(len(fake.sessions), 1)
+        fake.ack_reason = None
+        fake.drop_all()
+        wait_until(lambda: client.connected and len(fake.sessions) == 2, timeout=4.0, msg="reconnect")
+        self.assertNotEqual(client.session_id, first)
+        self.assertEqual(client.session_id, fake.sessions[-1])
+        self.assertFalse(client.session_lost)
+        client.submit_pose(0.2, 0.0, 0.0, 0.3, frame_seq=2)
+        _, q, m = wait_until(lambda: len(fake.poses()) == 2 and fake.poses(), msg="pose")[-1]
+        self.assertEqual(m["source_session"], fake.sessions[-1])
+        self.assertEqual(q, fake.sessions[-1])
+
+    def test_ws_failure_after_a_successful_post_keeps_the_new_session(self):
+        # POST /v1/session answered (the old holder is already evicted) but the
+        # WS connect failed: the next attempt must use the NEW id, not the old one.
+        fake, client = self.start()
+        self.connected()
+        first = client.session_id
+        good = client.ws_base
+        client.ws_base = "ws://127.0.0.1:%d" % free_port()  # nothing listens here
+        client.reconnect()
+        wait_until(lambda: fake.paths.count("/v1/session") == 2, timeout=3.0, msg="second POST")
+        time.sleep(0.3)  # a couple of failed WS attempts
+        self.assertFalse(client.connected)
+        self.assertEqual(len(fake.sessions), 2, "WS failure must not trigger yet another POST")
+        client.ws_base = good
+        wait_until(lambda: client.connected, timeout=4.0, msg="reconnect")
+        self.assertEqual(len(fake.sessions), 2)
+        self.assertEqual(client.session_id, fake.sessions[-1])
+        self.assertNotEqual(client.session_id, first)
+        self.assertFalse(client.session_lost)
+        client.submit_pose(0.1, 0.0, 0.0, 0.3, frame_seq=1)
+        _, q, m = wait_until(lambda: fake.poses(), msg="pose")[-1]
+        self.assertEqual(m["source_session"], fake.sessions[-1])
+        self.assertEqual(q, fake.sessions[-1])
+
+    def test_failed_session_post_is_retried_not_replaced_by_the_old_id(self):
+        # reconnect() asked for a new session; the POST failed (503). The next
+        # attempt must try the POST again, never fall back to the old id.
+        fake, client = self.start()
+        self.connected()
+        first = client.session_id
+        fake.session_gate.clear()
+        client.reconnect()
+        wait_until(lambda: not client.connected, msg="disconnect")
+        time.sleep(0.5)  # a few failed attempts
+        self.assertFalse(client.connected, "must not reconnect with the old session while POST fails")
+        self.assertGreaterEqual(fake.paths.count("/v1/session"), 2)
+        fake.session_gate.set()
+        wait_until(lambda: client.connected and len(fake.sessions) == 2, timeout=4.0, msg="new session")
+        self.assertNotEqual(client.session_id, first)
 
     def test_explicit_reconnect_new_session_and_no_resend(self):
         fake, client = self.start()
@@ -384,13 +472,16 @@ class FakeServerTests(unittest.TestCase):
         client = self.client = client_for(fake)
         client.RECV_STALL_S = 0.3
         client.start()
-        wait_until(lambda: len(fake.sessions) >= 2, timeout=3.0, msg="reconnect after stall")
+        wait_until(lambda: fake.paths.count("/v1/motion") >= 2, timeout=3.0, msg="reconnect after stall")
+        self.assertEqual(len(fake.sessions), 1, "a stall reconnects the WS, it does not mint a session")
 
     def test_stale_pose_is_dropped_at_reconnect(self):
         fake, client = self.start(freshness_ms=100)
         self.connected()
+        # Hold the client off with a refused POST /v1/session: only an explicit
+        # reconnect() goes through the POST (a WS drop would reuse the session).
         fake.session_gate.clear()
-        fake.drop_all()
+        client.reconnect()
         wait_until(lambda: not client.connected, msg="disconnect")
         client.submit_pose(0.5, 0.0, 0.0, 0.3, frame_seq=1, source_age_ms=0.0)
         time.sleep(0.25)  # > freshness 100 ms
