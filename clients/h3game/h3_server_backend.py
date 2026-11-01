@@ -16,8 +16,11 @@ each accepted POST to ``ServerBackend.submit`` and merges ``state()`` into
   pose; only a changed gain goes out as a gain-only message. Nothing is resent
   to keep the server alive, so it stops the rig when the game stops.
 - A POST from a new owner (page reload / another tab) restarts frame_seq, so
-  the backend reconnects with a new session. If the rig was ACTIVE the server
-  stops it; the operator must ARM + START again (intended).
+  the backend calls ``reconnect()``, which takes a NEW session. If the rig
+  was ACTIVE the server stops it; the operator must ARM + START again
+  (intended). This and /reconnect are the only paths that mint a session: a
+  WS drop is retried by ``MotionClient`` with the SAME session (Issue #15 M5),
+  so a flapping connection does not evict another client or stop the ride.
 - A page without frame_seq is forwarded as is; the server rejects it
   (``missing_frame_seq``) unless ``allow_missing_frame_seq`` is set. The
   reason shows in /state as ``reject_reason``.
