@@ -74,7 +74,7 @@ USB 診断行（v1 env では tick 行の下。GitHub Issue #11「列挙され�
 ## 座標と保存値
 
 - P 端 = 原点 0。N 端へ向かって増える。`ENCODER_SIGN=+1` で速度 − のときカウント増。系統ごとに校正時に符号を判定して保存する。
-- NVS `h3`: `motor`、`m{n}_stroke`、`m{n}_neutral`、`m{n}_cal`、`m{n}_sign`。
+- NVS `h3`: `motor`、`m{n}_prof`（16 byte の blob。`include/profile_blob.h`: 版・motor・sign・calibrated・stroke・neutral・保存回数・CRC-16 を 1 回の `putBytes` で書く。2026-11-02、Issue #15 M6）。旧形式の `m{n}_stroke` / `m{n}_neutral` / `m{n}_cal` / `m{n}_sign` は **blob が無いときだけ読む**（この版より前に校正した個体を再校正させないため。旧キーは消さない）。blob があるのに長さ・版・CRC・値域が合わなければ「壊れている」として既定値（未校正・sign +1）で起動し、画面（v1: 校正行に `NVS 破損→既定値 #n`、tick 行に `ERR prof`）／シリアル（従来 env: `WARN profile_invalid`）に出す。旧キーには戻らない（旧形式で起きた「行程は新・sign は旧」の混ざった保存を黙って使わないため）。保存に失敗したら `profile_dirty` を残して 2 s 後に再試行し、画面に「保存失敗 n」（v1）／`ERR nvs_save retry_in=2000ms`（従来 env）を出す。
 - 2026-10-25 時点: #3 校正済み（stroke 6160、neutral 3080、sign +1）。#1・#2 は未校正。
 - 2026-10-26 のレビュー修正（未書き込み・実機未確認）: 自動移動中の速度操作は中止（PWM 0）に統一、中立の再始動時に速度窓を取り直す、PCNT リミット跨ぎの読み直し、入力の鮮度監視、校正中は保存ストロークを信じない。
 

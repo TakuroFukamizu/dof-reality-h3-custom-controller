@@ -155,6 +155,7 @@ bool ui_dirty = true;
 ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
 uint32_t next_enc_ms = 0;
+uint32_t next_profile_save_ms = 0;  // NVS 保存に失敗したら 2 s 後に再試行（Issue #15 M6）
 uint32_t last_request_seq = 0;
 uint32_t last_manual_fault_seq = 0;
 AutoPhase last_phase = AutoPhase::Idle;
@@ -232,7 +233,9 @@ bool selectMotor(uint8_t motor) {
     return false;
   }
   profile_store_select_motor(motor);
-  const MotorProfile p = profile_store_load(motor);
+  bool invalid = false;
+  const MotorProfile p = profile_store_load(motor, &invalid);
+  if (invalid) Serial.printf("WARN profile_invalid motor=%u（NVS の保存が壊れている。既定値。CAL で上書き）\n", static_cast<unsigned>(motor));
   control_set_profile(p);
   Serial.printf("OK motor=%u cal=%d stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(motor),
                 p.calibrated ? 1 : 0, static_cast<long>(p.stroke), static_cast<long>(p.neutral),
@@ -908,15 +911,18 @@ void reportAuto(const ControlSnapshot& now) {
     publishEnc(now);
     Serial.flush();
   }
-  if (now.profile_dirty) {
+  // 校正結果の保存。失敗したら dirty を残して 2 s 後に再試行する（Issue #15 M6。以前は成否に関わらず下ろしていた）
+  if (now.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
     if (profile_store_save(now.profile)) {
       Serial.printf("AUTO saved motor=%u stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(now.profile.motor),
                     static_cast<long>(now.profile.stroke), static_cast<long>(now.profile.neutral),
                     static_cast<int>(now.profile.sign));
+      control_clear_profile_dirty();
+      next_profile_save_ms = millis() + 200;
     } else {
-      Serial.println("ERR nvs_save");
+      Serial.println("ERR nvs_save retry_in=2000ms");
+      next_profile_save_ms = millis() + 2000;
     }
-    control_clear_profile_dirty();
   }
 }
 
@@ -931,7 +937,13 @@ void setup() {
   if (!profile_store_begin()) {
     Serial.println("ERR nvs");
   }
-  control_begin(profile_store_load(profile_store_selected_motor()));
+  {
+    bool invalid = false;
+    const uint8_t motor = profile_store_selected_motor();
+    const MotorProfile initial = profile_store_load(motor, &invalid);
+    if (invalid) Serial.printf("WARN profile_invalid motor=%u（NVS の保存が壊れている。既定値で起動。CAL で上書き）\n", static_cast<unsigned>(motor));
+    control_begin(initial);
+  }
 
   if (!spriteBegin()) {
     Serial.println("ERR sprite");
@@ -1023,6 +1035,9 @@ bool ui_dirty = true;
 uint32_t next_snap_ms = 0;
 uint32_t next_render_ms = 0;
 uint32_t last_press_ms = 0;
+uint32_t next_profile_save_ms = 0;  // NVS 保存に失敗したら 2 s 後に再試行（Issue #15 M6）
+uint32_t nvs_save_failures = 0;     // 連続して失敗した回数（画面の「保存待ち」に添える。成功で 0）
+uint8_t profile_invalid_mask = 0;   // bit n = 系統 n の NVS プロファイルが壊れていて既定値で起動した（保存し直すまで表示）
 char notice[32];
 uint32_t notice_until_ms = 0;
 char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
@@ -1261,10 +1276,23 @@ void renderV1() {
     snprintf(cal_text, sizeof(cal_text), "校正中 %s %s", calStepName(vsnap.cal_live_step), vsnap.cal_live_reason);
     canvas.setTextColor(kAmber, TFT_BLACK);
   } else if (vsnap.cal_result_valid) {
+    char pending[24] = "";
+    if (vsnap.profile_dirty) {  // 保存待ち。失敗が続いていれば回数（Issue #15 M6）
+      if (nvs_save_failures > 0) {
+        snprintf(pending, sizeof(pending), "  保存失敗 %lu", static_cast<unsigned long>(nvs_save_failures));
+      } else {
+        snprintf(pending, sizeof(pending), "  保存待ち");
+      }
+    }
     snprintf(cal_text, sizeof(cal_text), "校正 %s %s  N端 %ld  中立 %ld  sign %+d%s", calResultName(vsnap.cal_result),
              vsnap.cal_reason, static_cast<long>(vsnap.cal_n_end), static_cast<long>(vsnap.cal_neutral),
-             static_cast<int>(vsnap.cal_sign), vsnap.profile_dirty ? "  保存待ち" : "");
-    canvas.setTextColor(vsnap.cal_result == v1::cal_result::OK ? kGreen : kAmber, TFT_BLACK);
+             static_cast<int>(vsnap.cal_sign), pending);
+    canvas.setTextColor(vsnap.cal_result == v1::cal_result::OK && nvs_save_failures == 0 ? kGreen : kAmber, TFT_BLACK);
+  } else if (profile_invalid_mask) {
+    // NVS のプロファイルが壊れていた系統（既定値 = 未校正・sign +1 で起動している。校正して保存し直すまで出す）
+    snprintf(cal_text, sizeof(cal_text), "校正 未実施  NVS 破損→既定値:%s%s%s", (profile_invalid_mask & 0x02) ? " #1" : "",
+             (profile_invalid_mask & 0x04) ? " #2" : "", (profile_invalid_mask & 0x08) ? " #3" : "");
+    canvas.setTextColor(kRed, TFT_BLACK);
   } else {
     snprintf(cal_text, sizeof(cal_text), "校正 この起動では未実施");
     canvas.setTextColor(kGray, TFT_BLACK);
@@ -1346,8 +1374,11 @@ void setup() {
   saved_motor = profile_store_selected_motor();
   MotorProfile profiles[4];
   for (uint8_t m = 1; m <= 3; ++m) {
-    profiles[m] = profile_store_load(m);
+    bool invalid = false;
+    profiles[m] = profile_store_load(m, &invalid);
+    if (invalid) profile_invalid_mask |= static_cast<uint8_t>(1u << m);
   }
+  if (profile_invalid_mask) noteBootError("prof");  // 壊れた系統は校正行に出す。校正して保存し直せば消える
   control_v1_begin(profiles, saved_motor);
   vsnap.selected_axis = saved_motor;
 
@@ -1378,14 +1409,21 @@ void loop() {
       saved_motor = vsnap.selected_axis;
     }
     // 校正に成功した系統プロファイル（行程・中立・符号）を NVS に保存する。従来 env と同じく loop() 側で書く
-    //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。保存の成否に関わらず flag は下ろす（同じ結果で再試行しない）。
-    if (vsnap.profile_dirty) {
-      if (!profile_store_save(vsnap.profile)) {
-        showNotice("NVS 保存失敗");
-      } else {
+    //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。失敗したら flag を残し 2 s 後に再試行する
+    //（Issue #15 M6。以前は成否に関わらず下ろしていた）。保存は 1 キーの blob なので途中で切れても混ざらない（profile_blob.h）。
+    if (vsnap.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
+      if (profile_store_save(vsnap.profile)) {
         showNotice("校正を保存");
+        control_v1_clear_profile_dirty();
+        nvs_save_failures = 0;
+        if (profile_motor_ok(vsnap.profile.motor)) profile_invalid_mask &= static_cast<uint8_t>(~(1u << vsnap.profile.motor));
+        next_profile_save_ms = millis() + 200;
+      } else {
+        nvs_save_failures += 1;
+        showNotice("NVS 保存失敗 再試行");
+        next_profile_save_ms = millis() + 2000;
+        ui_dirty = true;
       }
-      control_v1_clear_profile_dirty();
     }
     if (snapChanged(previous, vsnap)) {
       ui_dirty = true;
