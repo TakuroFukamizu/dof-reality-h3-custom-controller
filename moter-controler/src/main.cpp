@@ -1221,11 +1221,14 @@ void renderV1() {
   canvas.setFont(&fonts::lgfxJapanGothic_16);
   char cmd_text[72];
   char boost_text[12] = "";
-  if (vsnap.stall_boost > 0) {  // 停止ブースト（Issue #15 H4）: 下限への上乗せ。STATUS には出ないので画面だけ
-    snprintf(boost_text, sizeof(boost_text), "(+%d)", vsnap.stall_boost);
+  if (vsnap.stall_boost_permille > 0) {  // 停止ブースト（Issue #15 H4）: 下限への上乗せ [%]。STATUS には出ないので画面だけ
+    snprintf(boost_text, sizeof(boost_text), "(+%d.%d)", vsnap.stall_boost_permille / 10, vsnap.stall_boost_permille % 10);
   }
-  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %+d%%%s", vsnap.power_on_cmd ? "入" : "切",
-           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty, boost_text);
+  // Duty は permille を % で小数 1 桁（Issue #25 手順 8 b）。MD13S の向きの符号
+  const int duty_abs = vsnap.duty_permille < 0 ? -vsnap.duty_permille : vsnap.duty_permille;
+  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %s%d.%d%%%s", vsnap.power_on_cmd ? "入" : "切",
+           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty_permille < 0 ? "-" : "+", duty_abs / 10, duty_abs % 10,
+           boost_text);
   canvas.setTextColor(vsnap.power_on_cmd || vsnap.brake_release_cmd ? kGreen : kOrange, TFT_BLACK);
   canvas.drawString(cmd_text, 8, 70);
 
@@ -1344,7 +1347,8 @@ void renderV1() {
 bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
   return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
          a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
-         a.brake_release_cmd != b.brake_release_cmd || a.duty != b.duty || a.stall_boost != b.stall_boost ||
+         a.brake_release_cmd != b.brake_release_cmd || (a.duty_permille / 10) != (b.duty_permille / 10) ||
+         a.stall_boost_permille != b.stall_boost_permille ||
          // 制御項は 5 ms ごとに変わり得る。1 %（10 permille）刻みで見る（描き直しが受信を止めるのは df / old と同じ）
          (a.terms.ff_permille / 10) != (b.terms.ff_permille / 10) || (a.terms.p_permille / 10) != (b.terms.p_permille / 10) ||
          (a.terms.vel_count_s / 50) != (b.terms.vel_count_s / 50) || a.terms.floor_on != b.terms.floor_on ||

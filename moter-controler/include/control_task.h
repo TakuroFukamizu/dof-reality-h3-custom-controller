@@ -52,8 +52,8 @@ struct V1Snapshot {
   uint8_t selected_axis = 0;
   bool power_on_cmd = false;
   bool brake_release_cmd = false;
-  int duty = 0;                  // 符号付き %
-  int stall_boost = 0;           // 停止ブースト（Issue #15 H4）で下限に上乗せしている %（0 = なし）
+  int duty_permille = 0;         // 符号付き permille（MD13S の向き。motor_output_write_permille に渡した値）
+  int stall_boost_permille = 0;  // 停止ブースト（Issue #15 H4）で下限に上乗せしている permille（0 = なし）
   V1DutyTerms terms{};           // 位置ループの各項（Issue #25 手順 8 の計器行。permille、カウント増が正）
   int16_t pwm_permille = 0;      // STATUS と同じ pwm_permille（カウント増が正）
   bool encoder_fault_check_disabled = false;  // duty_max がしきい値より低く無パルスの ENCODER_FAULT が出ない（Issue #15 M2）

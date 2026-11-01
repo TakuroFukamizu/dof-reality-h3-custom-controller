@@ -69,6 +69,11 @@ constexpr uint32_t DIR_COAST_MS = 5;       // 反転前に PWM を落として�
 
 constexpr int SPEED_MIN = -100;
 constexpr int SPEED_MAX = 100;
+// モーター出力の内部分解能は permille（0.1 %。Issue #25 手順 8 b）。従来 env の手動速度・自動移動は整数 % のままで、
+// motor_output_write(%) が ×10 して同じ経路に入る。±1000 permille が PWM のフルスケール（(1 << PWM_BITS) − 1）
+constexpr int PERMILLE_PER_PERCENT = 10;
+constexpr int PERMILLE_MIN = SPEED_MIN * PERMILLE_PER_PERCENT;  // −1000
+constexpr int PERMILLE_MAX = SPEED_MAX * PERMILLE_PER_PERCENT;  // +1000
 
 // --- フィードバックセンサー（encoder-tester の実測に合わせる） ---
 // XH 8pin #2 = A（センサー白）→ G17、#3 = B（センサー緑）→ G18。Base15 内のレベル変換後の 3.3V。
@@ -121,12 +126,20 @@ constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始
 // 「エンコーダが死んだ」と判定する。それ未満の無パルスは FOLLOWING_ERROR（と下の停止ブースト）に任せる。
 // duty_max < V1_STALL_DUTY の SET_LIMITS は受理するが検出が無効になる（画面に警告。docs/control-server/limits.md）。
 constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
+// permille 換算（Issue #25 手順 8 b）。位置ループは v1_duty_command から PWM まで permille（0.1 %）で運ぶ。SET_LIMITS / LIMITS の
+// 線上は整数 % のまま（V1Tuning の duty_min / duty_max / stall_duty も %）で、しきい値はここの定数と v1_permille() で換算する。
+constexpr int V1_PERMILLE_PER_PERCENT = PERMILLE_PER_PERCENT;
+constexpr int V1_DUTY_MIN_PERMILLE = V1_DUTY_MIN * V1_PERMILLE_PER_PERCENT;      // 70
+constexpr int V1_DUTY_MAX_PERMILLE = V1_DUTY_MAX * V1_PERMILLE_PER_PERCENT;      // 200
+constexpr int V1_ABS_DUTY_MAX_PERMILLE = V1_ABS_DUTY_MAX * V1_PERMILLE_PER_PERCENT;  // 600
+constexpr int V1_STALL_DUTY_PERMILLE = V1_STALL_DUTY * V1_PERMILLE_PER_PERCENT;  // 100。ENCODER_FAULT しきい値の下限
 // Issue #15 H4: 停止ブースト。位置ループに積分が無いので、目標が止まっている（軌道速度 0）のに |誤差| が不感帯の外で、
 // 下限 Duty を出してもカウントが動かない（荷重とのつり合い）状態が続くと静的誤差を詰められない。auto_move.h の neutral_boost と
 // 同じく、この時間カウントが V1_STALL_BOOST_MIN_MOVE 未満しか動かないたびに下限を 1 % ずつ上げる（上限は duty_max。超えない）。
 // 誤差が不感帯に入る・誤差の符号が反転する・軌道が動き出す・ブレーキ作動のどれかで 0 に戻す。実機 11-02: kp 6 / duty_min 9 で
 // 自重のかかった軸の動き出しは約 9 %、7〜8 % では動かない。
 constexpr uint32_t V1_STALL_BOOST_MS = 200;
+constexpr int V1_STALL_BOOST_STEP_PERMILLE = 1 * V1_PERMILLE_PER_PERCENT;  // 窓ごとの上乗せ幅（1 % = 10 permille）
 constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満しか動かなければ「動いていない」（停止中のエンコーダの ±1 のちらつきで窓を取り直さない）
 // 上乗せの上限: 対象になってからこれだけ動かなければ（または上乗せが duty_max で頭打ちのまま次の窓も動かなければ）ENCODER_FAULT を
 // ラッチする（詰まった機構を duty_max で押し続けない。静止目標では無パルス判定が回らないので、ここで閉じる）。0 で時間の上限なし。

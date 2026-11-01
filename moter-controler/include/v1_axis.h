@@ -3,7 +3,7 @@
 // USB プロトコル v1 の 1 軸状態機械 V1Axis。
 // GPIO・時計・NVS・Serial を持たない（auto_move.h と同じ流儀）。制御タスクが
 //   handle_frame(受信フレーム, now_us) / tick(now_us, 生の PCNT カウント)
-// を呼び、出力（power_on_cmd / brake_release_cmd / duty_percent）と送信メッセージ列（outbox）を読む。
+// を呼び、出力（power_on_cmd / brake_release_cmd / duty_permille）と送信メッセージ列（outbox）を読む。
 // 振る舞いは docs/control-server/protocol.md §3〜§6 と、PC 側の参照モデル control-server/src/sim_axis.rs に合わせる。
 // 設計: docs/superpowers/specs/2026-10-31-moter-controler-v1-protocol-design.md §3。
 //
@@ -12,7 +12,9 @@
 //   カウントを増やしたいなら duty_signed = −sign × duty。
 // 時刻はマイクロ秒で注入する（MCU では esp_timer_get_time()）。
 // 校正（protocol.md §1.2）: CALIBRATE で従来 env と同じ端当て状態機械 AutoMachine（auto_move.h）を内蔵のまま回し、
-//   成功で P 端 = 0 の基準を自分で確立する。Duty は AutoMachine の duty_signed（MD13S の符号付き %）をそのまま出す。
+//   成功で P 端 = 0 の基準を自分で確立する。Duty は AutoMachine の duty_signed（MD13S の符号付き %）を permille にして出す。
+// 分解能（Issue #25 手順 8 b）: 位置ループの指令は v1_duty_command から motor_output まで permille（0.1 %）。V1Tuning の
+//   duty_min / duty_max / stall_duty は SET_LIMITS の線上と同じ整数 % のままで、使う所で v1_permille() で換算する。
 
 #include <math.h>
 #include <stdint.h>
@@ -66,19 +68,25 @@ inline int16_t v1_clamp_i16(double v) {
   return static_cast<int16_t>(lround(v));
 }
 
-// 位置制御の指令値（カウントが増える向きを正とした %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
-// フィードフォワード（vel / ff）＋比例（err × kp / 100）。目標が止まっている（vel = 0）ときだけ不感帯を使い、
-// 入る側 deadband / 出る側 deadband_out のヒステリシスで到達帯の縁での往復を防ぐ。
-// 0 でなければ |指令| を duty_min 以上 duty_max 以下に収める。
+// 整数 % → permille（V1Tuning の Duty しきい値の換算）
+constexpr int v1_permille(int percent) { return percent * V1_PERMILLE_PER_PERCENT; }
+
+// 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
+// フィードフォワード（vel / ff）＋比例（err × kp / 100）を permille で計算し、和を四捨五入（lround）してから整数の permille で
+// 下限・上限を掛ける（旧: 整数 % に切り捨て。5.3 % は 53 permille として出る）。目標が止まっている（vel = 0）ときだけ不感帯を
+// 使い、入る側 deadband / 出る側 deadband_out のヒステリシスで到達帯の縁での往復を防ぐ。
+// 0 でなければ |指令| を 下限（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）以上 duty_max × 10 以下に収める。
 // 下限の掛け方（Issue #15 M1、t.floor_sign_gate）: 合成値が下限未満のとき、合成値の向きが誤差の向きと逆（cmd × err < 0）なら
 // 下限まで持ち上げずに 0（惰行）。誤差 0 は「向きが一致」として扱う（旧テストの err 0・vel 600 → 下限 と同じ）。
 // gate が偽なら旧動作（合成値に下限を掛ける。目標から離れる向きの下限バーストが出る）。
-// terms を渡せば各項を書く（計器用。振る舞いは変えない）。
-inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t, V1DutyTerms* terms = nullptr) {
+// boost_permille は停止ブースト（Issue #15 H4）の上乗せ。terms を渡せば各項を書く（計器用。振る舞いは変えない）。
+inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t, int boost_permille = 0,
+                           V1DutyTerms* terms = nullptr) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
   o = V1DutyTerms{};
   o.vel_count_s = v1_clamp_i16(vel);
+  o.boost_permille = static_cast<int16_t>(boost_permille);
   const int64_t err_abs = err < 0 ? -err : err;
   if (vel == 0.0) {
     if (in_band) {
@@ -92,22 +100,25 @@ inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tunin
   } else {
     in_band = false;
   }
-  const double p = static_cast<double>(err) * t.kp_percent_per_100 / 100.0;
-  const double ff = t.ff_count_s_per_percent > 0 ? vel / t.ff_count_s_per_percent : 0.0;
-  o.p_permille = v1_clamp_i16(p * 10.0);
-  o.ff_permille = v1_clamp_i16(ff * 10.0);
-  const double cmd = p + ff;
-  if (cmd == 0.0) return 0;
-  double mag = cmd < 0 ? -cmd : cmd;
-  if (mag < t.duty_min) {
-    if (t.floor_sign_gate && cmd * static_cast<double>(err) < 0.0) return 0;  // 目標から離れる向きには下限を掛けない
-    mag = t.duty_min;
+  // 各項を permille で。P = err × kp / 100 × 10（err × kp は整数なので 10 の倍数の分子を 100 で割る: 誤差 345・kp 2 → 69.0 ちょうど）
+  const double p_pm = static_cast<double>(err * t.kp_percent_per_100) * V1_PERMILLE_PER_PERCENT / 100.0;
+  const double ff_pm = t.ff_count_s_per_percent > 0 ? vel * V1_PERMILLE_PER_PERCENT / t.ff_count_s_per_percent : 0.0;
+  o.p_permille = v1_clamp_i16(p_pm);
+  o.ff_permille = v1_clamp_i16(ff_pm);
+  const long cmd = lround(p_pm + ff_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
+  if (cmd == 0) return 0;
+  long mag = cmd < 0 ? -cmd : cmd;
+  const long duty_max_pm = v1_permille(t.duty_max);
+  long floor_pm = v1_permille(t.duty_min) + boost_permille;
+  if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
+  if (mag < floor_pm) {
+    if (t.floor_sign_gate && err != 0 && (cmd < 0) != (err < 0)) return 0;  // 目標から離れる向きには下限を掛けない
+    mag = floor_pm;
     o.floor_on = true;
   }
-  if (mag > t.duty_max) mag = t.duty_max;
-  const int m = static_cast<int>(mag);
-  const int out = cmd < 0 ? -m : m;
-  o.cmd_permille = static_cast<int16_t>(out * 10);
+  if (mag > duty_max_pm) mag = duty_max_pm;
+  const int out = static_cast<int>(cmd < 0 ? -mag : mag);
+  o.cmd_permille = static_cast<int16_t>(out);
   return out;
 }
 
@@ -297,9 +308,9 @@ class V1Axis {
 
   bool power_on_cmd() const { return power_controller() && powered_state(); }
   bool brake_release_cmd() const { return brake_release_cmd_; }
-  int duty_percent() const { return duty_; }               // 符号付き %（MD13S へそのまま）
-  int16_t pwm_permille() const {                            // 正が count の増える向き
-    return static_cast<int16_t>(-static_cast<int>(effective_sign()) * duty_ * 10);
+  int duty_permille() const { return duty_permille_; }     // 符号付き permille（MD13S の向き。motor_output_write_permille へそのまま）
+  int16_t pwm_permille() const {                            // 正が count の増える向き。実際に出している permille そのもの
+    return static_cast<int16_t>(-static_cast<int>(effective_sign()) * duty_permille_);
   }
 
   // --- 参照 -----------------------------------------------------------------
@@ -336,17 +347,20 @@ class V1Axis {
   uint64_t device_id() const { return id_.device_id; }
   uint16_t last_host_fault_code() const { return last_host_fault_code_; }
   uint64_t mcu_time_us(uint64_t now_us) const { return now_us > boot_origin_us_ ? now_us - boot_origin_us_ : 0; }
-  // 停止ブースト（Issue #15 H4）: いま Duty 下限に上乗せしている %（0 = なし）。STATUS には載せない（空きフィールドが無い）。画面用
-  int stall_boost() const { return stall_boost_; }
+  // 停止ブースト（Issue #15 H4）: いま Duty 下限に上乗せしている permille（0 = なし）。STATUS には載せない（空きフィールドが無い）。画面用
+  int stall_boost_permille() const { return stall_boost_; }
   // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
   const V1DutyTerms& duty_terms() const { return terms_; }
-  // ENCODER_FAULT を判定し始める |Duty|（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100)
-  int encoder_fault_duty_threshold() const {
-    int th = tuning.duty_max * tuning.stall_duty_ratio_percent / 100;
-    return th < tuning.stall_duty ? tuning.stall_duty : th;
+  // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
+  // 整数 % で切り捨ててから permille にするので効き目は整数 % のときと同じ: duty_max 20 → 150、14 → 10 % → 100（下限）
+  int encoder_fault_duty_threshold_permille() const {
+    const int th = tuning.duty_max * tuning.stall_duty_ratio_percent / 100;
+    return v1_permille(th < tuning.stall_duty ? tuning.stall_duty : th);
   }
   // duty_max がしきい値より低く、無パルスの ENCODER_FAULT が決して出ない（SET_LIMITS は受理するが画面で警告する）
-  bool encoder_fault_check_disabled() const { return encoder_fault_duty_threshold() > tuning.duty_max; }
+  bool encoder_fault_check_disabled() const {
+    return encoder_fault_duty_threshold_permille() > v1_permille(tuning.duty_max);
+  }
 
   uint16_t flags() const {
     uint16_t f = 0;
@@ -444,7 +458,7 @@ class V1Axis {
   double control_target_ = 0.0;
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
-  int duty_ = 0;
+  int duty_permille_ = 0;  // MD13S の向きの符号付き permille
   V1DutyTerms terms_{};  // 直近の位置ループの各項（計器）
 
   // 速度（100 ms 窓）
@@ -460,7 +474,7 @@ class V1Axis {
   int64_t stall_last_raw_ = 0;
 
   // 停止ブースト（Issue #15 H4）
-  int stall_boost_ = 0;              // duty_min への上乗せ %
+  int stall_boost_ = 0;              // duty_min への上乗せ [permille]（V1_STALL_BOOST_STEP_PERMILLE 刻み）
   bool boost_eligible_ = false;      // 前の tick で対象だった
   bool boost_window_running_ = false;
   int8_t boost_err_sign_ = 0;        // 直近に評価した誤差の符号（反転で 0 に戻す）
@@ -858,7 +872,7 @@ class V1Axis {
     cal_phase_ = CalPhase::PowerSettle;  // 主電源 ON 指令（電源担当軸のみ。powered_state で立つ）
     cal_phase_started_us_ = now;
     brake_release_cmd_ = false;
-    duty_ = 0;
+    duty_permille_ = 0;
     referenced_ = false;  // 端当てで原点を取り直す。成功したときだけ P 端 = 0 で立て直す
     cal_.cfg = cal_config;
     MotorProfile p;
@@ -929,7 +943,7 @@ class V1Axis {
     fault_code_ = code;
     stop_kind_ = StopKind::Hold;
     brake_release_cmd_ = false;
-    duty_ = 0;  // 次の tick を待たず PWM 0
+    duty_permille_ = 0;  // 次の tick を待たず PWM 0
     terms_ = V1DutyTerms{};
     stall_running_ = false;
     hold_here();
@@ -1092,13 +1106,13 @@ class V1Axis {
     return in;
   }
 
-  // 校正の各段階を進める。tick の update_duty の後に呼び、CALIBRATING の間だけ duty_ を書く。
+  // 校正の各段階を進める。tick の update_duty の後に呼び、CALIBRATING の間だけ duty_permille_ を書く。
   void tick_calibration(uint64_t now) {
     if (state_ != v1::state::CALIBRATING) return;
     const uint64_t elapsed = now - cal_phase_started_us_;
     switch (cal_phase_) {
       case CalPhase::PowerSettle:
-        duty_ = 0;
+        duty_permille_ = 0;
         if (elapsed >= ms_to_us(tuning.cal_power_settle_ms)) {
           brake_release_cmd_ = true;
           cal_phase_ = CalPhase::BrakeRelease;
@@ -1106,14 +1120,14 @@ class V1Axis {
         }
         break;
       case CalPhase::BrakeRelease:
-        duty_ = 0;
+        duty_permille_ = 0;
         if (elapsed >= ms_to_us(tuning.brake_release_wait_ms)) {
           const char* err = "";
           const AutoInputs in = cal_inputs(now);
           if (cal_.request(AutoKind::Cal, in, &err)) {
             cal_phase_ = CalPhase::Running;
             cal_phase_started_us_ = now;
-            duty_ = cal_.duty_signed;
+            duty_permille_ = v1_permille(cal_.duty_signed);  // AutoMachine は整数 %
           } else {
             cal_finish(v1::cal_result::FAILED, err, now);  // 起こらないはず（busy / not_live / brake は満たしている）
           }
@@ -1122,7 +1136,7 @@ class V1Axis {
       case CalPhase::Running: {
         const AutoInputs in = cal_inputs(now);
         cal_.tick(in);
-        duty_ = cal_.duty_signed;
+        duty_permille_ = v1_permille(cal_.duty_signed);  // AutoMachine は整数 %
         if (!cal_.active()) {
           uint8_t result = v1::cal_result::FAILED;
           if (cal_.phase == AutoPhase::Done) result = v1::cal_result::OK;
@@ -1132,13 +1146,13 @@ class V1Axis {
         break;
       }
       case CalPhase::Shutdown:
-        duty_ = 0;  // AutoMachine の finish で既に 0。ブレーキ作動待ちの間も 0
+        duty_permille_ = 0;  // AutoMachine の finish で既に 0。ブレーキ作動待ちの間も 0
         if (elapsed >= ms_to_us(tuning.brake_apply_wait_ms)) {
           push_cal_result();
           if (cal_keep_power_) {  // 他の軸の校正が終わるまで主電源を保つ（CALIBRATE(0) か期限で DISARMED）
             cal_phase_ = CalPhase::PowerHold;
             cal_phase_started_us_ = now;
-            duty_ = 0;
+            duty_permille_ = 0;
           } else {
             cal_phase_ = CalPhase::Idle;
             state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
@@ -1147,7 +1161,7 @@ class V1Axis {
         }
         break;
       case CalPhase::PowerHold:
-        duty_ = 0;
+        duty_permille_ = 0;
         if (elapsed >= ms_to_us(CAL_POWER_HOLD_TIMEOUT_MS)) end_power_hold();
         break;
       case CalPhase::Idle: break;
@@ -1182,7 +1196,7 @@ class V1Axis {
     }
     r.sign = sign_;
     brake_release_cmd_ = false;  // 終了手順: ブレーキ給電 OFF → brake_apply_wait → PWM 0 のまま主電源 OFF → DISARMED
-    duty_ = 0;
+    duty_permille_ = 0;
     cal_phase_ = CalPhase::Shutdown;
     cal_phase_started_us_ = now;
   }
@@ -1250,7 +1264,7 @@ class V1Axis {
   // 位置制御の Duty と無パルス判定
   void update_duty(uint64_t now) {
     if (!position_control_on()) {
-      duty_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
+      duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
       in_band_ = false;
       reset_stall_boost();
@@ -1261,20 +1275,14 @@ class V1Axis {
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
     stall_boost_gate(err, now);
-    V1Tuning t = tuning;
-    if (stall_boost_ > 0) {
-      t.duty_min = tuning.duty_min + stall_boost_;
-      if (t.duty_min > tuning.duty_max) t.duty_min = tuning.duty_max;
-    }
-    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, t, &terms_);  // カウント増の向きが正
-    terms_.boost_permille = static_cast<int16_t>(stall_boost_ * 10);
+    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, tuning, stall_boost_, &terms_);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
-    duty_ = -static_cast<int>(sign_) * cmd;
+    duty_permille_ = -static_cast<int>(sign_) * cmd;
     update_stall_boost(now);
     if (state_ == v1::state::FAULT) return;  // 上乗せの上限・時間切れで ENCODER_FAULT をラッチした（出力は落ちている）
 
-    // ENCODER_FAULT: |duty| ≥ しきい値（max(stall_duty, duty_max × 75 %)。Issue #15 M2）が stall_ms 続いてカウントが
+    // ENCODER_FAULT: |duty| ≥ しきい値（max(stall_duty, duty_max × 75 %) の permille。Issue #15 M2）が stall_ms 続いてカウントが
     // 変わらない（manual_guard.h の無パルス判定と同じ窓）。
     // 窓を回すのは「ブレーキ解除指令中」かつ「軌道が動いている（setpoint_vel ≠ 0）」間だけ（設計 §3）:
     //  - ブレーキ作動指令中（DISARMING）はカウントが変わらないのが正常。残った追従誤差で窓を回すと DISARM が FAULT になる。
@@ -1283,7 +1291,7 @@ class V1Axis {
     //    止まっている間は検出できず、目標が動けば STALL_MS で出る）。
     //  - しきい値を duty_max の 75 % 以上にするのは、kp を上げたとき数百 count の誤差だけで 10 % に届き、荷重で動けない軸が
     //    FOLLOWING_ERROR の前に ENCODER_FAULT になって基準を失うのを避けるため。上限近くまで出しても止まっているときだけ異常。
-    if (mag >= encoder_fault_duty_threshold() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
+    if (mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
       if (!stall_running_) {
         stall_running_ = true;
         stall_start_us_ = now;
@@ -1297,7 +1305,7 @@ class V1Axis {
         const uint64_t window = ms_to_us(tuning.stall_ms);
         if (now - stall_start_us_ >= window && now - stall_last_change_us_ >= window) {
           latch_fault(v1::fault::ENCODER_FAULT, now);
-          duty_ = 0;
+          duty_permille_ = 0;
           stall_running_ = false;
         }
       }
@@ -1335,7 +1343,8 @@ class V1Axis {
   }
 
   // 停止ブースト（Issue #15 H4）の窓。Duty を書いた後に呼ぶ。対象のまま stall_boost_ms の窓の間にカウントが
-  // stall_boost_min_move 未満しか動かなければ上乗せを 1 % 増やす（duty_max − duty_min で頭打ち）。動けば窓と時間の起点を
+  // stall_boost_min_move 未満しか動かなければ上乗せを V1_STALL_BOOST_STEP_PERMILLE（1 % = 10 permille）増やす
+  //（(duty_max − duty_min) × 10 で頭打ち）。動けば窓と時間の起点を
   // 取り直す（上乗せは保つ）。
   // 上限: 上乗せが頭打ち（Duty = duty_max）のまま次の窓も動かない、または対象になってから stall_boost_max_ms 動かない
   //（既定 2 s）なら ENCODER_FAULT をラッチする（詰まった機構か死んだエンコーダかは区別できない。静止目標では無パルス判定が
@@ -1350,7 +1359,7 @@ class V1Axis {
       boost_anchor_raw_ = raw_;
       return;
     }
-    const int max_boost = tuning.duty_max > tuning.duty_min ? tuning.duty_max - tuning.duty_min : 0;
+    const int max_boost = tuning.duty_max > tuning.duty_min ? v1_permille(tuning.duty_max - tuning.duty_min) : 0;
     if (stall_boost_ > max_boost) stall_boost_ = max_boost;  // SET_LIMITS で上限が下がった
     if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;
     const bool at_cap = stall_boost_ >= max_boost;
@@ -1365,7 +1374,8 @@ class V1Axis {
       boost_window_start_us_ = now;
       return;
     }
-    stall_boost_ += 1;
+    stall_boost_ += V1_STALL_BOOST_STEP_PERMILLE;
+    if (stall_boost_ > max_boost) stall_boost_ = max_boost;
     boost_window_start_us_ = now;
     boost_anchor_raw_ = raw_;
   }
