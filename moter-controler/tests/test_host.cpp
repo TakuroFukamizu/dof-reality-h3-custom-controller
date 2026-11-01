@@ -261,10 +261,10 @@ void test_neutral_p_control() {
   s.step(20, -22);  // 2778
   CHECK(s.m.phase == AutoPhase::Dwell);
   CHECK(s.m.duty_signed == 0);
-  s.step(50, 12);  // 2790、バンド外
+  s.step(50, 30);  // 2808、出口帯（20）の外
   CHECK(s.m.phase == AutoPhase::Moving);
   CHECK(s.m.duty_signed == NEUTRAL_DUTY_MIN);
-  s.step(20, -15);  // 2775
+  s.step(20, -30);  // 2778
   CHECK(s.m.phase == AutoPhase::Dwell);
   s.steps(4, 50, 0);
   CHECK(s.m.phase == AutoPhase::Done);
@@ -381,6 +381,91 @@ void test_set_profile_invalidates_origin() {
 }
 
 // --- 手動速度の無パルス／遅すぎ停止 ---
+// 実機 #2（2026-10-31）: 下から中立へ上がる途中で Duty が 8 % 台に落ちると 150 count/s 未満になり slow 失敗した。
+// 持ち上げ側の始動閾値より下では、失敗にせず Duty の下限を HOME_DUTY まで段階的に上げる。
+int64_t lift_rate(int duty_mag) {
+  if (duty_mag >= 10) return 60 * duty_mag;  // 10 % → 600 count/s
+  if (duty_mag >= 9) return 400;
+  return 100;                                // 7〜8 % は 100 count/s（slow）
+}
+
+void test_neutral_lift_boosts_duty_floor_instead_of_slow_fail() {
+  Sim s = calibrated_sim();  // pos 0 → 中立 2778（N 端向き = duty 負、raw 増）
+  CHECK(s.request(AutoKind::Neutral));
+  int max_duty_near_target = 0;
+  bool boosted_seen = false;
+  for (int i = 0; i < 1000 && s.m.active(); ++i) {
+    const int d = s.m.duty_signed;
+    const int mag = d < 0 ? -d : d;
+    const int64_t draw = mag == 0 ? 0 : (d < 0 ? 1 : -1) * lift_rate(mag) * 20 / 1000;  // Dwell（duty 0）では止まる
+    const int32_t err = 2778 - s.m.position(s.raw);
+    if (err > 0 && err < 400 && mag > max_duty_near_target) max_duty_near_target = mag;
+    if (mag > NEUTRAL_DUTY_MIN && mag < AUTO_DUTY_MAX && err < 700) boosted_seen = true;
+    s.step(20, draw);
+  }
+  if (s.m.phase != AutoPhase::Done) std::printf("  lift test: phase=%s reason=%s pos=%d\n", auto_phase_name(s.m.phase), s.m.reason, s.m.position(s.raw));
+  CHECK(s.m.phase == AutoPhase::Done);
+  CHECK(std::string(s.m.reason) == "ok");
+  CHECK(boosted_seen);
+  CHECK(max_duty_near_target <= HOME_DUTY);  // 上げても端当ての Duty まで
+}
+
+void test_neutral_slow_even_at_home_duty_still_fails() {
+  // 下限を HOME_DUTY まで上げても遅ければ、センサー異常や拘束なので失敗にする。
+  Sim s = calibrated_sim();
+  CHECK(s.request(AutoKind::Neutral));
+  s.step(20, 2000);  // 残り 778 → Duty 7.78 → 下限 7
+  for (int i = 0; i < 200 && s.m.active(); ++i) {
+    s.step(20, 2);  // 100 count/s のまま
+  }
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "slow");
+}
+
+void test_neutral_no_pulses_at_floor_jumps_to_home_duty() {
+  // 下限 Duty で全く動かなければ、猶予 300 ms 後に一気に HOME_DUTY へ上げる（遅すぎなら 1 % ずつ）。
+  Sim s = calibrated_sim();
+  CHECK(s.request(AutoKind::Neutral));
+  s.step(20, 2000);  // 残り 778 → 下限 7（行程開始から 20 ms）
+  CHECK(s.m.duty_signed == -NEUTRAL_DUTY_MIN);
+  s.steps(13, 20, 0);  // 行程開始から 280 ms: 猶予内
+  CHECK(s.m.duty_signed == -NEUTRAL_DUTY_MIN);
+  CHECK(s.m.active());
+  s.step(20, 0);       // 300 ms → 無パルス → 下限を HOME_DUTY に
+  CHECK(s.m.active());
+  CHECK(s.m.duty_signed == -HOME_DUTY);
+  s.steps(14, 20, 0);  // 新しい Duty にも猶予 300 ms（280 ms 時点ではまだ）
+  CHECK(s.m.active());
+  s.step(20, 0);       // HOME_DUTY でも動かない → 失敗
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "stall");
+}
+
+// 実機 #3（2026-10-31）: 目標 3069 に対し 3077/3078（帯内）と 3080（帯外）を 36 s に 213 回往復し収束しなかった。
+// Dwell に入ったら、出口帯（20）を超えるまでは Dwell のまま数える。
+void test_neutral_dwell_has_hysteresis() {
+  Sim s = calibrated_sim();
+  s.step(20, 2778);
+  CHECK(s.request(AutoKind::Neutral));
+  s.step(20, 0);
+  CHECK(s.m.phase == AutoPhase::Dwell);
+  s.step(50, 11);   // 2789、入口帯（10）の外だが出口帯（20）の中
+  CHECK(s.m.phase == AutoPhase::Dwell);
+  CHECK(s.m.duty_signed == 0);
+  s.step(50, -3);   // 2786
+  s.step(50, 2);    // 2788
+  s.step(60, 0);    // 合計 210 ms 居続けた
+  CHECK(s.m.phase == AutoPhase::Done);
+  CHECK(std::string(s.m.reason) == "ok");
+  // 出口帯を超えたら Moving に戻る
+  Sim t = calibrated_sim();
+  t.step(20, 2778);
+  t.request(AutoKind::Neutral);
+  t.step(20, 0);
+  t.step(50, 25);   // 2803
+  CHECK(t.m.phase == AutoPhase::Moving);
+}
+
 void test_manual_guard_passes_speed_while_counting() {
   ManualGuard g;
   int64_t raw = 0;
@@ -491,6 +576,38 @@ void test_manual_guard_speed_change_does_not_restart_window() {
   CHECK(g.latched);
 }
 
+// 実機 #2（2026-10-31）: +9 → −15 を 0 を挟まず送ると 100 ms 後に slow でラッチした。反転中は窓が逆向きの動きをまたぐ。
+// 速度の符号が変わったら計測をやり直す（猶予 300 ms から）。
+void test_manual_guard_sign_reversal_restarts_window() {
+  ManualGuard g;
+  int64_t raw = 0;
+  bool ever_latched = false;
+  for (uint32_t t = 0; t < 1080; t += 20) {  // +10 で 600 count/s。1080 ms は 200 ms 窓の途中
+    g.tick(t, raw, 10, true);
+    raw += 12;
+  }
+  const int64_t decel[3] = {6, 4, 2};
+  for (int i = 0; i < 3; ++i) {  // 反転直後 60 ms は惰性で前進しながら減速
+    g.tick(1080 + 20 * i, raw, -15, true);
+    if (g.latched) ever_latched = true;
+    raw += decel[i];
+  }
+  for (uint32_t t = 1140; t < 2500; t += 20) {  // その後 900 count/s で逆向きに動く（窓 1000〜1200 の正味は ≈ 0）
+    g.tick(t, raw, -15, true);
+    if (g.latched) ever_latched = true;
+    raw -= 18;
+  }
+  CHECK(!ever_latched);
+  CHECK(g.fault_seq == 0);
+  // 反転後に本当に動かなければ、猶予 300 ms 後に無パルスで止まる
+  ManualGuard h;
+  for (uint32_t t = 0; t < 1000; t += 20) h.tick(t, t, 10, true);
+  CHECK(h.tick(1000, 1000, -15, true) == -15);
+  CHECK(h.tick(1299, 1000, -15, true) == -15);
+  CHECK(h.tick(1300, 1000, -15, true) == 0);
+  CHECK(std::string(h.reason) == "stall");
+}
+
 }  // namespace
 
 int main() {
@@ -523,6 +640,11 @@ int main() {
   test_manual_guard_min_duty_stall_but_no_slow();
   test_manual_guard_relay_off_or_zero_speed_outputs_zero_and_resets();
   test_manual_guard_speed_change_does_not_restart_window();
+  test_neutral_lift_boosts_duty_floor_instead_of_slow_fail();
+  test_neutral_slow_even_at_home_duty_still_fails();
+  test_neutral_dwell_has_hysteresis();
+  test_neutral_no_pulses_at_floor_jumps_to_home_duty();
+  test_manual_guard_sign_reversal_restarts_window();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

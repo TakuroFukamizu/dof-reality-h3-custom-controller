@@ -79,9 +79,10 @@ constexpr int32_t COUNTS_PER_MOTOR_REV = 400;  // モーター軸 1 回転の 4 
 // --- 自動移動（端当て原点復帰・中立への比例制御） ---
 constexpr int HOME_DUTY = 10;                   // 端当ての Duty。10 % 250 ms で異常無く止まった
 constexpr int AUTO_DUTY_MAX = 15;               // 自動移動の上限
-constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測
+constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測（#3）。持ち上げ側で遅すぎれば HOME_DUTY まで段階的に上げる（#2 は 8 % 台で 150 count/s 未満、2026-10-31）
 constexpr int NEUTRAL_KP_PERCENT_PER_100 = 1;   // 誤差 100 カウントあたり 1 %
-constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差
+constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差（入口）
+constexpr int32_t NEUTRAL_BAND_EXIT = 20;       // Dwell 中はこれを超えるまで帯内とみなす（#3 が 3077〜3080 で往復し収束しなかった 2026-10-31）
 constexpr uint32_t STALL_MS = 200;              // 無パルス停止
 constexpr int32_t MIN_COUNT_RATE = 150;         // 駆動中にこれ未満の count/s が STALL_MS 続いたら停止判定。10 % の実測 400〜650 の 1/3 以下。片相断線の 65 count/s を弾く
 constexpr uint32_t START_GRACE_MS = 300;        // 開始直後の猶予
