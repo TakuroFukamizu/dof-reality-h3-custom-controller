@@ -1594,7 +1594,7 @@ fn snapshot_json_shape() {
         "last_applied_frame",
         "status_age_ms",
         "rx_error_count",
-        "stale_drop_count",
+        "stale_drop_count", "decode_errors",
     ];
     akeys.sort_unstable();
     awant.sort_unstable();
