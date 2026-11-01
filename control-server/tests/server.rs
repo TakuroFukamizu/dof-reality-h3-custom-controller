@@ -725,6 +725,25 @@ async fn local_estop_from_an_axis_is_decoded_latched_and_named_in_status() {
 }
 
 #[tokio::test]
+async fn admin_routes_need_no_token_by_default() {
+    // PC-local default: server.require_admin_token = false and no token given.
+    let cfg = fast_cfg();
+    assert!(!cfg.server.require_admin_token);
+    let srv = h3cs::server::start(
+        cfg,
+        h3cs::server::ServerOptions { admin_token: None, bind_override: Some("127.0.0.1:0".parse().unwrap()) },
+    )
+    .await
+    .unwrap();
+    let _ = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let r = http(srv.local_addr, "POST", "/v1/fault", &[("content-type", "application/json")], Some("{\"note\":\"test\"}")).await;
+    assert_eq!(r.status, 200, "fault without token: {}", r.body);
+    let st = http(srv.local_addr, "GET", "/v1/status", &[], None).await;
+    assert_eq!(st.json()["admin_token_required"], false, "{}", st.body);
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     // Bring-up with fewer real units: axes listed in `sim_axes` are served by
     // in-process simulators (no serial port is opened for them).
@@ -735,7 +754,12 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
         sim_axes: vec![AxisId::new(1).unwrap(), AxisId::new(2).unwrap(), AxisId::new(3).unwrap()],
         sim: h3cs::config::SimBackendConfig::default(),
     });
-    let srv = h3cs::server::start(cfg, h3cs::server::ServerOptions::default()).await.unwrap();
+    let srv = h3cs::server::start(
+        cfg,
+        h3cs::server::ServerOptions { admin_token: None, bind_override: Some("127.0.0.1:0".parse().unwrap()) },
+    )
+    .await
+    .unwrap();
     let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
     let ports: Vec<_> = st.axes.iter().map(|a| a.port.clone().unwrap()).collect();
     assert_eq!(ports, ["sim:1", "sim:2", "sim:3"]);

@@ -53,8 +53,13 @@ pub struct ServerConfig {
     /// Must be a loopback address unless `allow_non_loopback` is set.
     pub bind: String,
     pub allow_non_loopback: bool,
-    /// Admin token is read from this environment variable at start. If the
-    /// variable is unset a random token is generated and printed once.
+    /// Require `Authorization: Bearer <token>` on admin routes. Default
+    /// `false`: a PC-local setup (loopback bind) needs no token; the Origin
+    /// check still applies. Must be `true` when `allow_non_loopback` is set.
+    pub require_admin_token: bool,
+    /// Admin token is read from this environment variable at start (only when
+    /// `require_admin_token`). If the variable is unset a random token is
+    /// generated and printed once.
     pub admin_token_env: String,
     /// Allowed browser Origins for HTTP/WS. Requests without an Origin header
     /// (non-browser clients such as bridge.py) are allowed.
@@ -71,6 +76,7 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1:8892".into(),
             allow_non_loopback: false,
+            require_admin_token: false,
             admin_token_env: "H3CS_ADMIN_TOKEN".into(),
             allowed_origins: vec!["http://localhost:8891".into(), "http://127.0.0.1:8891".into()],
             max_body_bytes: 4096,
@@ -341,6 +347,9 @@ impl Config {
         }
         if s.admin_token_env.trim().is_empty() {
             errs.push("server.admin_token_env must not be empty".into());
+        }
+        if s.allow_non_loopback && !s.require_admin_token {
+            errs.push("server.require_admin_token must be true when allow_non_loopback is set".into());
         }
         if s.max_body_bytes == 0 {
             errs.push("server.max_body_bytes must be > 0".into());

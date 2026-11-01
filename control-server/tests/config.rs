@@ -100,6 +100,8 @@ fn non_loopback_bind_rejected_unless_allowed() {
     cfg.server.bind = "192.168.1.10:8892".into();
     assert_invalid(&cfg, "not a loopback");
     cfg.server.allow_non_loopback = true;
+    assert_invalid(&cfg, "require_admin_token");
+    cfg.server.require_admin_token = true;
     cfg.validate().unwrap();
 
     let mut cfg = sim();
@@ -336,6 +338,15 @@ fn all_zero_device_ids_mean_no_cross_check_and_validate() {
         a.device_id = DeviceId(0);
     }
     cfg.validate().unwrap();
+}
+
+#[test]
+fn non_loopback_bind_requires_admin_token() {
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml")).unwrap();
+    let lan = base.replacen("bind = \"127.0.0.1:8892\"", "bind = \"0.0.0.0:8892\"\nallow_non_loopback = true", 1);
+    assert!(h3cs::config::Config::from_toml_str(&lan).is_err(), "LAN bind without require_admin_token must be rejected");
+    let ok = lan.replacen("allow_non_loopback = true", "allow_non_loopback = true\nrequire_admin_token = true", 1);
+    assert!(h3cs::config::Config::from_toml_str(&ok).is_ok());
 }
 
 #[test]

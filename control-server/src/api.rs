@@ -305,7 +305,8 @@ async fn check_origin(State(st): State<AppState>, req: Request, next: Next) -> R
 }
 
 async fn require_token(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    if bearer_ok(req.headers(), &st.inner.admin_token) {
+    // Empty token = `server.require_admin_token = false` (loopback-only setup).
+    if st.inner.admin_token.is_empty() || bearer_ok(req.headers(), &st.inner.admin_token) {
         return next.run(req).await;
     }
     let mut resp = error(StatusCode::UNAUTHORIZED, "unauthorized");
@@ -495,8 +496,11 @@ async fn status(State(st): State<AppState>) -> Response {
     if !loop_alive(&st) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
     }
-    let snap = st.inner.status_rx.borrow().clone();
-    Json(&*snap).into_response()
+    let mut v = serde_json::to_value(&*st.inner.status_rx.borrow().clone()).unwrap_or(Value::Null);
+    if let Value::Object(m) = &mut v {
+        m.insert("admin_token_required".into(), Value::from(!st.inner.admin_token.is_empty()));
+    }
+    Json(v).into_response()
 }
 
 /// Default and maximum `n` of `GET /v1/events`.
@@ -591,6 +595,7 @@ fn status_json(st: &AppState) -> String {
     let mut v = serde_json::to_value(&*snap).unwrap_or(Value::Null);
     if let Value::Object(m) = &mut v {
         m.insert("type".into(), Value::from("status"));
+        m.insert("admin_token_required".into(), Value::from(!st.inner.admin_token.is_empty()));
     }
     v.to_string()
 }

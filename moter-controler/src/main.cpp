@@ -947,6 +947,7 @@ V1Snapshot vsnap;
 uint8_t saved_motor = 1;          // NVS に保存済みの系統。スナップショットの selected_axis が変わったら保存する
 bool ui_dirty = true;
 uint32_t next_snap_ms = 0;
+uint32_t next_render_ms = 0;
 uint32_t last_press_ms = 0;
 char notice[32];
 uint32_t notice_until_ms = 0;
@@ -1232,8 +1233,7 @@ void setup() {
 
 void loop() {
   M5.update();
-  v1_link_poll();
-  pollTouchV1();
+  pollTouchV1();  // USB はリンクタスク（v1_link.cpp）が扱う。loop() は画面とタッチだけ
 
   if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {
     notice[0] = '\0';
@@ -1254,7 +1254,9 @@ void loop() {
     }
   }
 
-  if (ui_dirty) {
+  // 描画は 100 ms に 1 回まで（pushSprite は数十 ms。count が毎 tick 変わると描画し続けてしまう）
+  if (ui_dirty && static_cast<int32_t>(millis() - next_render_ms) >= 0) {
+    next_render_ms = millis() + 100;
     renderV1();
     ui_dirty = false;
   }

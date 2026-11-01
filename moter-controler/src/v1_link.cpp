@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/task.h>
 #include <esp_mac.h>
 #include <esp_system.h>
 
@@ -13,12 +14,15 @@
 
 #include "v1_axis.h"  // v1_device_id_from_mac
 
+void v1_link_poll();
+
 namespace {
 
 constexpr UBaseType_t kRxDepth = 16;
 constexpr UBaseType_t kTxDepth = 32;
-constexpr int kRxBytesPerPoll = 2048;  // 1 回の loop() で読む上限（画面描画を飢えさせない）
-constexpr int kTxFramesPerPoll = 4;    // 1 回の loop() で書く上限（1 フレームの write は最大 20 ms 待つ）
+constexpr int kRxBytesPerPoll = 2048;  // 1 周期で読む上限
+constexpr int kTxFramesPerPoll = 4;    // 1 周期で書く上限（1 フレームの write は最大 20 ms 待つ）
+constexpr uint32_t kLinkPeriodMs = 1;  // リンクタスクの周期
 
 QueueHandle_t g_rx = nullptr;
 QueueHandle_t g_tx = nullptr;
@@ -28,6 +32,13 @@ std::atomic<uint32_t> g_rx_dropped{0};
 std::atomic<uint32_t> g_tx_dropped{0};
 uint64_t g_device_id = 0;
 uint32_t g_boot_id = 0;
+
+void link_task(void*) {
+  for (;;) {
+    v1_link_poll();
+    vTaskDelay(pdMS_TO_TICKS(kLinkPeriodMs));
+  }
+}
 
 }  // namespace
 
@@ -41,7 +52,9 @@ bool v1_link_begin() {
   g_device_id = v1_device_id_from_mac(mac);
   g_boot_id = esp_random();
   if (g_boot_id == 0) g_boot_id = 1;
-  return g_rx != nullptr && g_tx != nullptr;
+  if (g_rx == nullptr || g_tx == nullptr) return false;
+  // Core 0（USB の割り込みと同じ側）、制御タスク（Core 1、優先度 5）より低く loop()（優先度 1）より高い。
+  return xTaskCreatePinnedToCore(link_task, "v1link", 4096, nullptr, 3, nullptr, 0) == pdPASS;
 }
 
 void v1_link_poll() {

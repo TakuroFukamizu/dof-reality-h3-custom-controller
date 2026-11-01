@@ -34,10 +34,10 @@ status_period_ms = 100
 
 [timing]                                 # protocol.md §6 の既定値（ベンチ用の候補値）。bring-up では変えない
 planner_period_ms = 10
-set_position_valid_for_ms = 50
-mcu_command_timeout_ms = 100
+set_position_valid_for_ms = 100   # USB の遅延揺らぎ（実測で数十 ms）に対する余裕。2026-11-01 に 50 で START が BAD_STATE になった
+mcu_command_timeout_ms = 200
 mcu_stop_timeout_ms = 1500
-axis_status_timeout_ms = 200
+axis_status_timeout_ms = 300
 source_freshness_ms = 250
 arm_timeout_ms = 5000
 stop_settle_timeout_ms = 3000

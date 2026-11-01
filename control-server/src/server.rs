@@ -314,11 +314,22 @@ impl Drop for DoneGuard {
     }
 }
 
+/// The admin token, or an empty string when `server.require_admin_token` is
+/// off and none was given (admin routes then need no Authorization header).
 fn resolve_token(cfg: &Config, given: Option<String>) -> String {
     if let Some(t) = given.filter(|t| !t.is_empty()) {
         return t;
     }
     let var = &cfg.server.admin_token_env;
+    if !cfg.server.require_admin_token {
+        return match std::env::var(var) {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => {
+                tracing::info!("admin token not required (server.require_admin_token = false, loopback only)");
+                String::new()
+            }
+        };
+    }
     match std::env::var(var) {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => {

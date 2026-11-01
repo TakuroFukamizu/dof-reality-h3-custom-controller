@@ -1,9 +1,11 @@
 #pragma once
 
 // USB プロトコル v1 のリンク層（Arduino 側）。
-// loop()（Core 0）が Serial のバイトを COBS の区切りで 1 フレームずつ受信キューへ入れ、送信キューから
-// フレームを取り出して Serial.write する。制御タスク（Core 1）は受信キューから取り出し、送信キューへ積む。
-// 書き込みは loop() 側だけで行う（PC が読んでいないとき制御タスクが止まらないように）。
+// 専用のリンクタスク（Core 0、1 ms 周期）が Serial のバイトを COBS の区切りで 1 フレームずつ受信キューへ入れ、
+// 送信キューからフレームを取り出して Serial.write する。制御タスク（Core 1）は受信キューから取り出し、送信キューへ積む。
+// loop()（画面描画。pushSprite に数十 ms かかる）には USB を触らせない。2026-11-01 の実機で、描画の間に
+// SET_POSITION の受信が固まって START が「期限内の SET_POSITION なし」で拒否された（valid_for_ms = 50）。
+// 書き込みもリンクタスクだけが行う（PC が読んでいないとき制御タスクが止まらないように）。
 
 #include <stddef.h>
 #include <stdint.h>
@@ -20,8 +22,8 @@ struct V1TxFrame {
   uint8_t data[v1::MAX_WIRE_LEN];
 };
 
-bool v1_link_begin();                        // キュー生成、device_id / boot_id の決定
-void v1_link_poll();                         // loop() から毎回
+bool v1_link_begin();                        // キュー生成、device_id / boot_id の決定、リンクタスク起動
+void v1_link_poll();                         // リンクタスクの 1 周期分（受信 → 送信）。テスト・互換用。loop() から呼ばなくてよい
 bool v1_link_rx_pop(V1RxFrame* out);         // 制御タスク。無ければ false
 bool v1_link_tx_push(const v1::McuMsg& m);   // 制御タスク。満杯なら false（呼び出し側が保留 / 破棄を決める）
 uint32_t v1_link_take_rx_dropped();          // メッセージ層より下で捨てた受信フレーム数（前回呼び出しから）

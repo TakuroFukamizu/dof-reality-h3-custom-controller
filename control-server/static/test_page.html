@@ -157,7 +157,7 @@
   async function call(method, path, opts) {
     opts = opts || {};
     const headers = {};
-    if (opts.auth) headers['Authorization'] = 'Bearer ' + token();
+    if (opts.auth && token()) headers['Authorization'] = 'Bearer ' + token();
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
     let resp, text;
     try {
@@ -221,6 +221,13 @@
   }
 
   function renderStatus(s) {
+    if (s.admin_token_required === false) {
+      tokenInput.placeholder = '不要（require_admin_token = false）';
+      tokenInput.disabled = true;
+    } else if (s.admin_token_required === true) {
+      tokenInput.placeholder = 'H3CS_ADMIN_TOKEN';
+      tokenInput.disabled = false;
+    }
     state.lastStatus = s;
     const rig = $('rigState');
     rig.textContent = s.rig_state;
