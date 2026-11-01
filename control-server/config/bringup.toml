@@ -60,7 +60,7 @@ center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s 
 # !!! gain は 0.5 まで（example.toml / sim.toml の値が上げ切った先の目標）。実行時は試験ページか POST /v1/limits、
 # !!! 決めた値はここに書く。上限はファームの絶対上限（Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0。
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）
-max_gain = 0.15                  # 向きの確認中は 0.15（仮想 512 ± 77、軸 1 で約 ±370 count）
+max_gain = 0.5                  # 0.15 → 0.5（向きの確認が済んだので。gain 1.0 でソフトリミットいっぱい）
 max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）より遅い
 max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
@@ -82,7 +82,7 @@ kind = "serial"
 #   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
 # （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
 # 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
-ports = ["/dev/cu.usbmodem214101", "/dev/cu.usbmodem214501", "/dev/cu.usbmodem214301"]  # 2026-11-01 のハブ: 1C:DB / 68:EE / 30:ED（差し込み口で変わる。list-ports と SER= で確認）
+ports = ["/dev/cu.usbmodem11501", "/dev/cu.usbmodem11101", "/dev/cu.usbmodem11301"]  # 2026-11-01 のハブ: 1C:DB / 68:EE / 30:ED（差し込み口で変わる。list-ports と SER= で確認）
 baud = 115200
 # 実機が足りないときは、その軸を模擬軸で代替できる（例: sim_axes = [3]。その軸の ports は書かない）。
 # 模擬軸は目標に完全に追従するので、その軸の pose を中立に保てば動かない扱いになる。その軸の校正値は
@@ -105,15 +105,15 @@ name = "右手前リフト (motor #1)"
 #   2. 従来 env の NEUTRAL で止めた位置で /v1/reference を取った直後、status の actual_count が count_at_virtual_512 と ±30 以内
 #   3. 座席に人がいない。物理非常停止（24V の遮断）を押せる人がいる
 #   向き（仮想 0→1023 が上か下か）は §7 で低ゲインで確認する。逆なら count_at_virtual_0 と 1023 の値を入れ替えて再起動
-calibration_valid = false
-count_at_virtual_0 = 300        # = soft_min_count。向きは仮（count 増 = 仮想位置 増）
+calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
+count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 2775     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
 count_at_virtual_1023 = 5251    # = soft_max_count
 mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
 mechanical_max_count = 5551     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
-soft_min_count = 300            # mechanical_min + decel_zone
-soft_max_count = 5251           # mechanical_max − decel_zone
-decel_zone_count = 300
+soft_min_count = 150            # mechanical_min + decel_zone
+soft_max_count = 5401           # mechanical_max − decel_zone
+decel_zone_count = 150        # 300 → 150（2026-11-01: 両端の余裕が大きすぎるとの指摘。端当ての実測端から 150 count ≈ 0.4 回転）
 
 # ---------------------------------------------------------------------------
 # 軸 2: 左リフト (motor #2)。P 端 = 下限。過去の記録: stroke 5462 / neutral 2731（68:EE、2026-10-31）
@@ -123,15 +123,15 @@ axis_id = 2
 device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
 name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
-calibration_valid = false
-count_at_virtual_0 = 300
+calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
+count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 2731     # = stroke / 2
 count_at_virtual_1023 = 5162
 mechanical_min_count = 0
 mechanical_max_count = 5462
-soft_min_count = 300
-soft_max_count = 5162
-decel_zone_count = 300
+soft_min_count = 150            # mechanical_min + decel_zone
+soft_max_count = 5312           # mechanical_max − decel_zone
+decel_zone_count = 150        # 300 → 150（2026-11-01: 両端の余裕が大きすぎるとの指摘。端当ての実測端から 150 count ≈ 0.4 回転）
 
 # ---------------------------------------------------------------------------
 # 軸 3: 後部ヨー (motor #3)。P 端 = 右端。過去の記録: stroke 6160 / neutral 3080（30:ED、2026-10-25。
@@ -143,12 +143,12 @@ axis_id = 3
 device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
 name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
-calibration_valid = false
-count_at_virtual_0 = 300
+calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
+count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 3069     # = stroke / 2（2026-10-31 の校正 6138 / 3069。10-26 は 6159 / 3079）
 count_at_virtual_1023 = 5838
 mechanical_min_count = 0
 mechanical_max_count = 6138     # 2026-10-31 の CAL。校正ごとに ±20 程度ぶれる
-soft_min_count = 300
-soft_max_count = 5838
-decel_zone_count = 300
+soft_min_count = 150            # mechanical_min + decel_zone
+soft_max_count = 5988           # mechanical_max − decel_zone
+decel_zone_count = 150        # 300 → 150（2026-11-01: 両端の余裕が大きすぎるとの指摘。端当ての実測端から 150 count ≈ 0.4 回転）
