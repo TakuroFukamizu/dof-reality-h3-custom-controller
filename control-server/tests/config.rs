@@ -142,6 +142,22 @@ fn limits_rules() {
         (|c| c.limits.deadband_out_count = 5, "limits.deadband_out_count"),
         // overspeed must be >= 1.5 x max_vel (3000 -> 4500)
         (|c| c.limits.overspeed_count_s = 4499, "limits.overspeed_count_s"),
+        // kp = 0 cannot hold position at rest.
+        (|c| c.limits.kp_percent_per_100 = 0, "limits.kp_percent_per_100"),
+        // kp x following_error / 100 must reach duty_min, or the loop never
+        // exceeds the floor before FOLLOWING_ERROR (2026-11-01: 2 x 400 / 100 = 8 %
+        // against a 9 % breakaway). sim: 2 x 800 / 100 = 16 >= 3; make it 2 x 100 = 2 < 3.
+        (|c| c.limits.following_error_limit_count = 100, "limits.kp_percent_per_100"),
+        (
+            |c| {
+                c.limits.kp_percent_per_100 = 1;
+                c.limits.duty_min_percent = 9;
+            },
+            "limits.kp_percent_per_100",
+        ),
+        // CENTER's measured tolerance must cover the firmware deadband.
+        (|c| c.game.center_tolerance_count = 0, "game.center_tolerance_count"),
+        (|c| c.game.center_tolerance_count = 19, "game.center_tolerance_count"),
     ];
     for (mutate, needle) in cases {
         let mut cfg = sim();
@@ -151,6 +167,20 @@ fn limits_rules() {
     let mut cfg = sim();
     cfg.limits.overspeed_count_s = 4500;
     cfg.validate().unwrap();
+    // Exactly at the authority boundary is accepted (kp 1 x 300 / 100 = 3 % = duty_min 3).
+    let mut cfg = sim();
+    cfg.limits.kp_percent_per_100 = 1;
+    cfg.limits.following_error_limit_count = 300;
+    cfg.validate().unwrap();
+    // The bring-up numbers verified on hardware 2026-11-02 pass: kp 6 x 400 / 100 = 24 >= 9.
+    let mut cfg = sim();
+    cfg.limits.kp_percent_per_100 = 6;
+    cfg.limits.following_error_limit_count = 400;
+    cfg.limits.duty_min_percent = 9;
+    cfg.limits.duty_max_percent = 20;
+    cfg.validate().unwrap();
+    assert_eq!(cfg.game.center_tolerance_count, 50);
+    assert_eq!(cfg.timing.center_reach_timeout_ms, 5000);
     // Defaults are the documented initial values.
     let d = LimitsConfig::default();
     assert_eq!((d.max_gain, d.max_vel_count_s, d.max_acc_count_s2, d.duty_max_percent), (0.5, 3000, 15000, 40));

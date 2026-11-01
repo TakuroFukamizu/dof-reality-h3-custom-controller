@@ -43,6 +43,7 @@ arm_timeout_ms = 5000
 stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 25                # USB の遅延揺らぎ（status_age 2〜80 ms）と模擬軸の混在で 7 フレームずれて FAULT になった（2026-11-01）。bring-up 用。実機 3 台で詰め直す
+center_reach_timeout_ms = 5000     # /v1/center で目標が中立に着いてから実位置が game.center_tolerance_count に入るまでの猶予。過ぎたら FAULT（StopTimeout）
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 
@@ -52,6 +53,7 @@ clamp_out_of_range = true
 virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
+center_tolerance_count = 50      # 中立到達は全軸の「実位置」がこの範囲に入って初めて成立（deadband_out 20 以上）。11-01 に #2 が 280 count 手前で「到達」になったため
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
 # !!! bring-up 用に低い値（旧 PR と同じ動き: gain 0.15、600 count/s、2000 count/s²、Duty 7〜20 %）。
@@ -65,8 +67,8 @@ max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）�
 max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
-duty_min_percent = 7             # 7 % で動くことを実測。低速の段付きが出たら 5 → 3 を試す（limits.md §4）
-kp_percent_per_100 = 2           # 誤差 100 count あたり 2 %
+duty_min_percent = 9             # 11-02 実測: 7〜8 % では自重のかかった #2 が動かず、9 % で動き出す。HOLDING 10 s でハンチングなし
+kp_percent_per_100 = 6           # 11-02: 2 だと 9 % に達する前に誤差が following_error 400 を超えて FAULT した（kp × 400 / 100 = 8 % < 9 %）
 ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
 deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
 deadband_out_count = 20          # 同（出る側）
