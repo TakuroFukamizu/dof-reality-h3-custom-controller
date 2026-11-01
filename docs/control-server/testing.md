@@ -46,7 +46,7 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 
 | スイート | 件数 | 内容 | 段階 |
 | --- | ---: | --- | --- |
-| `clients/python/tests/test_motion_client.py` | 28 | 偽サーバー相手: 送信規則（新しい submit だけ送る、seq 単調、source_age をキュー待ちで作り直さない）、再接続とバックオフ、stale_session 後に取り返さない、送信がブロックしない、float にできない巨大な整数・2⁶⁴−1 を超える frame_seq は例外ではなく `False`、`axis_conflict` の拒否では再接続せず送り続けてログは 1 回（他の拒否理由では `axis_conflict` を立てない）、`_summary` に各軸の割当（port / device_id / claimants / `reference_stale`）と競合を出し古い形の status でも落ちない、`submit_limits`（合成・Pose より先に送る・省略項目は送らない・ack が `last_limits_ack`・拒否も入る） | 1 |
+| `clients/python/tests/test_motion_client.py` | 32 | 偽サーバー相手: 送信規則（新しい submit だけ送る、seq 単調、source_age をキュー待ちで作り直さない）、再接続とバックオフ、**WS の再接続は同じ session を使い回す**（切断 3 回で `POST /v1/session` は 1 回、受信停止の再接続でも発行しない、`stale_session` の後の再接続では新 session、`reconnect()` の POST が 503 で失敗したら次も POST し直して古い id に戻らない、POST は成功したが WS の接続に失敗したら次は**新しい** id で繋ぐ（古い id に戻らない）。Issue #15 M5）、stale_session 後にその場では取り返さない、送信がブロックしない、float にできない巨大な整数・2⁶⁴−1 を超える frame_seq は例外ではなく `False`、`axis_conflict` の拒否では再接続せず送り続けてログは 1 回（他の拒否理由では `axis_conflict` を立てない）、`_summary` に各軸の割当（port / device_id / claimants / `reference_stale`）と競合を出し古い形の status でも落ちない、`submit_limits`（合成・Pose より先に送る・省略項目は送らない・ack が `last_limits_ack`・拒否も入る） | 1 |
 | `clients/python/tests/test_against_server.py` | 8 | 実サーバー（sim）: ARM しない、gain 上限（0.5）、`submit_limits` で gain の上限が変わり速度は 6000 で切られ status / `GET /v1/limits` に出て新 session で戻る、frame_seq なしの拒否、同じ frame_seq で鮮度が切れる、トークンなしの stop、走行中の再接続で停止、クライアントが許す最大の frame_seq（2⁶⁴−1）をサーバーが受理 | 2 |
 | `clients/h3game/tests/test_server_backend.py` | 32 | bridge 用バックエンド層（偽クライアント）: frame_seq の扱い、owner 変更、無効値（float にできない巨大な整数、2⁶⁴−1 を超える frame_seq は `invalid` で、以後のフレームを塞がない）、`/state` のキー（session を取られたら `connected` は false、status の `axis_conflict` と blockers・ack の拒否理由から `hud_note`「系統の競合(軸1、入力拒否)」「個体の不一致」「再基準化が必要」を作る、他の blocker は載せず届いていなければ `null`、壊れた入力でも落ちない）、並行 POST、POST の `limits` オブジェクトの転送（姿勢と独立・未知キーは無視・数値でなければ `invalid`） | 2 |
 | `clients/h3game/tests/test_patch.py` | 11 | パッチの適用（blob SHA・変更ファイル・正本との一致）、index.html の隠れたときの規則（0 ＋表示中に最後に送った frame_seq）と server 用の HUD 表示（`hud_note` を `srvNote()` に足す）、legacy は元の bridge と同じ応答、server・dry は serial / h3_direct を import しない、サーバー不在でも POST が待たされない、壊れた数値の POST にも応答して `invalid` に数える、ポート使用中の 2 つ目の bridge はサーバーへ 1 回も要求せずに終わる、LAN のアドレスからの `GET /reconnect`・`/claim` は無視（LAN の IPv4 アドレスが無ければこの 1 件は skip） | 2 |
@@ -149,6 +149,24 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 | `clients/h3game/tests` | Ran 50、OK（skip なし。`test_browser.py` もヘッドレス Chromium で実行） |
 | `e2e_sim.sh` | PASS、チェック 120 / 120（`--out` を作業用ディレクトリにしたので runs/ には置いていない） |
 | 試験ページ（ヘッドレス Chromium、sim） | 手で書いた Playwright スクリプトで確認（リポジトリには入れていない）: 読み込みだけでは POST も session 発行も無し → ARM が 401 の本文ごとログに出る → トークン（sessionStorage）→ session（`max_gain` 0.35 がスライダー上限）→ pitch=+1 で送信開始（50 Hz、ack accepted、`effective_gain=0.35`）→ ARM → HOLDING → START → ACTIVE で目標 [700, −140, 0] → `document.hidden` を偽装すると送信が止まり WS が閉じ（seq 138 のまま）、サーバーは鮮度切れで STOPPING → BRAKED_DISARMED、その間も目標は [700, −140, 0] のまま（中央へ動かない）→ 表示に戻しても自動再開しない → トークン無しの STOP 200 → FAULT → FAULT_LATCHED 表示 → FAULT RESET → READY_TO_ARM → REFERENCE の count 欄に 250 ms 間隔で `2731` を打っても status の再描画（200 ms）で消えない → REFERENCE（確認ダイアログ）200 → DISARM 200。ページエラー・console エラー 0。ブラウザーが同一 origin の POST に付けた `Origin: http://127.0.0.1:<port>` をサーバーが通した |
+
+## 2026-11-02 の結果（Issue #15 M5 / M4（ページ）/ L2: Python の session 使い回し、ジョイスティックページの入力衛生、stale_session で送信停止）
+
+環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、node 26.3、Python 3.14 ＋ websockets 17（`clients/python/.venv`）、Playwright（npx のキャッシュ）＋ chromium_headless_shell 1243。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 全スイート通過（`api.rs` 36 を含む。ページの配信・埋め込み HTML の検査は変更なし） |
+| `test_motion_client.py` | 32 passed（28 ＋ 4。既存の「切断で新 session」「受信停止で新 session」「session 拒否で止める」は使い回しの規則に合わせて書き換え） |
+| `test_against_server.py` | 8 passed（実サーバー sim。`reconnect()` で走行中に止まる挙動は変わらず） |
+| ページの JS | 2 つの `<script>` を `vm.Script` で構文検査、`$()` の id は全部存在、重複なし。`H3Joy` を node で評価: `pickDefault` はペダルだけ／ハンドルだけ（Logitech G29、Thrustmaster T300RS）／id 不明で軸 4＋ボタン 12（旧ヒューリスティックなら stick）／軸 1 本の joystick → **null**、ペダル＋T.16000M → T.16000M、T.Flight Hotas → 選ぶ、`mapping = standard` のパッド → 選ぶ、`poseFrom` は割り当てた軸が機器に無ければ null、`readPads` が `mapping` を写す（無ければ `""`） |
+| ジョイスティック試験ページ（ヘッドレス Chromium、sim、空きポート） | 手で書いた Playwright スクリプト（リポジトリには入れていない。`navigator.getGamepads` を差し替え）。44 項目すべて通過、ページエラー・console エラー 0: 読み込みだけでは session なし → **ペダルだけ**では自動で選ばず（padState「スティックと判定できる機器が無い」、バナー「一覧から選んでください」、localStorage に保存しない、frame_seq 0 のまま）→ T.16000M が出ると自動で選びバナーが消え frame_seq が進む → 送信開始で ack accepted、`requested_pose` roll 0.4737 → **pitch を axis 7（機器に無い）に割り当てる**と frame_seq が止まり（22 → 22）seq は進み（最後の姿勢を送り続ける）、バナー「割り当てた軸が機器に無い（roll axis 0 / pitch axis 7、機器の軸は 4 本）」、サーバーの `requested_pose` は 0.4737 のまま（0 にならない）で `fresh = false` → axis 1 に戻すと再開しバナーが消える → **別のクライアントが `POST /v1/session`** → 次の ack が `stale_session` → WS が閉じ（`closed (stale_session)` 赤）、ボタンが「送信開始」に戻り、seq が止まり、サーバーの `last_seq` も増えない → 再読み込み（選択は残る）で機器なしのまま送信開始 → 「姿勢がまだ無い: 送らない」で seq 0、サーバーの `requested_pose` null（**0 をでっち上げて送らない**）→ 機器が戻ると実値で流れ始める |
+| `clients/h3game/tests` | Ran 51、OK（skip なし。`H3GAME_SRC` に既存のクローン、`H3CS_BINARY` にこの worktree のビルド。パッチは M5 のクライアント本体と `h3_server_backend.py` の docstring（WS 切断は同じ session、新 session は owner 変更の `reconnect()` と `/reconnect` だけ）で作り直したもの） |
+| 試験ページ（同上） | token → session 発行 → pitch 0.5 で送信開始、accepted → **送信中に「session 発行」**: 送信が先に止まり（`closed (session 発行)`）、stale_session は 1 件も出ない、seq 停止 → 送信開始で新 session の WS が開き accepted → 別のクライアントが session を発行 → ack `stale_session` で送信停止・ボタン「送信開始」・seq 停止 → session 発行 → 送信開始 → 「制限を送る」の ack が従来どおり limAck に出る（stale_session の判定を limits の ack より前に置いた影響なし）。`motion_limits.pending` が無いサーバーでは「(pending」を出さない |
+
+変えたこと: `clients/python/h3_motion_client.py`（WS 再接続で session を使い回す。新 session は「無い／stale_session／reconnect()」のときだけ）、`static/joystick_page.html`（自動選択はスティックと判定できる機器だけ・null 姿勢 = 喪失・0 を作らない・`motion_limits.pending` の表示・stale_session で停止）、`static/test_page.html`（stale_session で停止・送信中の「session 発行」は先に送信を止める・`pending` の表示）。サーバーは変えていない。実機ではまだ使っていない。
+
+既知の副作用（設計判断として残す）: Python クライアントは**サーバー再起動**のあと、使い回した id が新プロセスに知られていないので最初の Pose が `stale_session` になり `session_lost` で止まる（以前は自動で新 session を取って復帰した）。復帰は `reconnect()`（bridge は `/reconnect`）か次の WS 切断。status の `session.source_session_prefix` が null（誰も持っていない）なら誰も追い出さずに発行できるので、それを見て自動復帰する案はあるが未実装。
 
 ## 2026-11-01 の結果（ジョイスティック試験ページ `GET /joystick` の追加後）
 

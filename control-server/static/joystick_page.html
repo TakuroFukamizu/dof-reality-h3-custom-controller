@@ -22,6 +22,10 @@
     スティックを読めたときだけ frame_seq を進めて送る。描画（棒・数値）だけ requestAnimationFrame で行い、
     描画が止まっても frame_seq と送信は止まらない。隠れても 0（中央）は送らない: 止めたいときは STOP か「送信停止」。
   - 選んだスティックが見えなくなったら、最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+    割り当てた軸が機器に無い（poseFrom が null）ときも同じ「喪失」扱い。一度も読めていなければ何も送らない（0 を作らない）。
+  - 自動選択はスティックと判定できる機器だけ（軸 2 本以上＋id / mapping）。ペダルやハンドルは静止で ±1 を出すので、
+    間違って選ぶと START で端へ飛ぶ。該当が無ければバナーで知らせ、操作者が一覧から選ぶ（Issue #15 M4）。
+  - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。再開は「送信開始」で新しい session（Issue #15 L2）。
   - 操作ボタン（ARM / START / DISARM / FAULT RESET）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
     （判定はサーバーが正。STOP は常に押せる）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
@@ -122,10 +126,10 @@
 <div class="cols">
 <section>
   <h2>ジョイスティック <span class="dim small">Gamepad API</span></h2>
-  <div class="dim small">ブラウザは<b>ボタンを 1 回押すか大きく倒す</b>まで機器を出さない。既定は h3game と同じ判定（T.16000M / Thrustmaster / joystick / stick / HOTAS、または軸 3 以上＋ボタン 4 以上）で最初に見つかったもの。選択は localStorage に保存。</div>
+  <div class="dim small">ブラウザは<b>ボタンを 1 回押すか大きく倒す</b>まで機器を出さない。自動で選ぶのは「軸 2 本以上で、id（T.16000M / joystick / stick / HOTAS / pad / joy / controller。Thrustmaster だけでは同社のハンドルも通るので入れない）か mapping = standard がスティックだと言っている」機器だけ（ペダル・ハンドル等には落ちない。該当が無ければ一覧から選ぶ）。選択は localStorage に保存。</div>
   <div class="row" style="margin-top:6px">
     <label>使用するスティック <select id="padSelect"><option value="">（未検出）</option></select></label>
-    <button id="bPadDefault" title="h3game の isStick で最初に見つかるものを選ぶ">自動で選ぶ</button>
+    <button id="bPadDefault" title="スティックと判定できる機器（軸 2 本以上＋id / mapping）で最初に見つかるものを選ぶ">自動で選ぶ</button>
     <span id="padState" class="dim small">—</span>
   </div>
   <div style="overflow-x:auto; margin-top:6px">
@@ -198,7 +202,8 @@
   <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
   <div class="dim small" style="margin-top:4px">
     「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
-    スティックを離せば（不感帯の内側なら）0 を送る。スティックが見えなくなったら最後の値のまま frame_seq を止める（サーバーが鮮度切れで減速停止する）。
+    スティックを離せば（不感帯の内側なら）0 を送る。スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（サーバーが鮮度切れで減速停止する）。
+    ack が stale_session（別のクライアントが session を発行した・サーバー再起動）なら送信を止める。再開は「送信開始」。
   </div>
 </section>
 
@@ -226,13 +231,19 @@
 // h3game の web/input.js と同じ式。DOM もネットワークも触らない。
 window.H3Joy = (function () {
   'use strict';
-  // input.js: isStick / isPedal（id の正規表現、または軸・ボタンの数）
+  // input.js: isStick / isPedal（id の正規表現、または軸・ボタンの数）。表示用の判定で、自動選択には使わない
   const isStick = (p) => /t\.16000|thrustmaster|joystick|stick|hotas/i.test(p.id) || (p.axes.length >= 3 && p.buttons.length >= 4);
   const isPedal = (p) => /pedal|rudder|saitek|crosswind|logitech g/i.test(p.id) || (p.axes.length <= 3 && p.buttons.length <= 1);
-  // 既定のスティック: isStick かつ isPedal でない最初のもの（index 順）。無ければ最初の機器。
+  // 自動選択してよい機器（Issue #15 M4）: 軸 2 本以上、かつ id か mapping がスティック／パッドだと言っている。
+  // 軸・ボタンの本数だけでは選ばない（ペダルやハンドルは静止で ±1 を出すので、間違って選ぶと START で端へ飛ぶ）。
+  // "thrustmaster" は入れない: 同社のハンドル（T300 / T248、ペダルの軸が静止で ±1）も通ってしまう。スティックは
+  // T.16000M / T.Flight Hotas / T.Flight Stick X のどれも t\.16000 / hotas / stick で拾える。
+  const STICK_ID = /t\.16000|joystick|stick|hotas|pad|joy|controller/i;
+  const looksLikeStick = (p) => p.axes.length >= 2 && !isPedal(p) && (p.mapping === 'standard' || STICK_ID.test(p.id));
+  // 既定のスティック: looksLikeStick の最初のもの（index 順）。無ければ null（操作者が一覧から選ぶ）。
   function pickDefault(pads) {
     const sorted = pads.slice().sort((a, b) => a.index - b.index);
-    return sorted.find((p) => isStick(p) && !isPedal(p)) || sorted[0] || null;
+    return sorted.find(looksLikeStick) || null;
   }
   // 選んだ機器を探す: 同じ index と id → 同じ id（index が変わった）→ null
   function findPad(pads, sel) {
@@ -276,11 +287,11 @@ window.H3Joy = (function () {
     let gp = [];
     try { gp = navigator.getGamepads ? Array.from(navigator.getGamepads()) : []; } catch (e) { gp = []; }
     return gp.filter((g) => g).map((g) => ({
-      id: String(g.id), index: g.index, axes: Array.from(g.axes, Number),
+      id: String(g.id), index: g.index, mapping: String(g.mapping || ''), axes: Array.from(g.axes, Number),
       buttons: Array.from(g.buttons, (b) => !!(b && b.pressed)),
     }));
   }
-  return { isStick, isPedal, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, readPads };
+  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, readPads };
 })();
 </script>
 <script>
@@ -294,7 +305,8 @@ window.H3Joy = (function () {
   const state = {
     session: null, maxGain: null, lastStatus: null, ws: null, streaming: false, seq: 0, frameSeq: 0,
     pollBusy: false, lastPollError: null,
-    pads: [], sel: null, pad: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null, padLost: false,
+    pads: [], sel: null, pad: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null,
+    padLost: false, lostWhy: '', noAutoPick: false,
   };
 
   $('hostLabel').textContent = location.host;
@@ -414,7 +426,10 @@ window.H3Joy = (function () {
     $('targets').textContent = Array.isArray(s.target_counts) ? s.target_counts.join(', ') : '—';
     const ml = s.motion_limits;
     if (ml) {
-      $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '');
+      // pending: 全軸の SET_LIMITS 確認待ち（別 PR で追加。無いサーバーでは出さない）
+      const pending = (ml.pending !== undefined && ml.pending !== null && ml.pending !== false && !(Array.isArray(ml.pending) && !ml.pending.length));
+      $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '') + (pending ? ' (pending: ' + fmt(ml.pending) + ')' : '');
+      $('limEff').className = pending ? 'mono bad' : 'mono';
       $('limCeil').textContent = limitsText(ml.ceiling);
       if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) setMaxGain(ml.effective.max_gain);
     }
@@ -645,7 +660,10 @@ window.H3Joy = (function () {
   });
   $('bPadDefault').addEventListener('click', () => {
     const p = J.pickDefault(state.pads);
-    if (!p) { log('スティック: 機器が見えていない（ボタンを 1 回押す）', true); return; }
+    if (!p) {
+      log(state.pads.length ? 'スティック: スティックと判定できる機器が無い（ペダル・ハンドル等は自動で選ばない）。一覧から選ぶ' : 'スティック: 機器が見えていない（ボタンを 1 回押す）', true);
+      return;
+    }
     state.sel = { id: p.id, index: p.index }; saveMap(); padsKey = '';
     log('スティック（自動）: #' + p.index + ' ' + p.id);
   });
@@ -657,19 +675,25 @@ window.H3Joy = (function () {
   // 描画は別（rAF の frame()）。描画が止まっても（タブが隠れる・別ウィンドウに覆われる）ここは止まらない。
   function tick() {
     state.pads = J.readPads();
+    state.noAutoPick = false;
     if (!state.sel && state.pads.length) {
       const p = J.pickDefault(state.pads);
       if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); log('スティック（自動）: #' + p.index + ' ' + p.id); }
+      else state.noAutoPick = true; // スティックと判定できる機器が無い: 操作者が一覧から選ぶ（ペダル等に落ちない）
     }
     const pad = J.findPad(state.pads, state.sel);
     state.pad = pad;
-    if (pad) {
-      state.pose = J.poseFrom(pad, state.map, state.dead);
-      state.frameSeq += 1; // スティックを読めた刻みだけ進む
+    // 姿勢が計算できた刻みだけ frame_seq を進める。スティックが見えない・割り当てた軸が機器に無い（null）は
+    // どちらも「喪失」: 最後の姿勢のまま frame_seq を止める（0 を作って送らない。Issue #15 M4）。
+    const pose = pad ? J.poseFrom(pad, state.map, state.dead) : null;
+    if (pose) {
+      state.pose = pose;
+      state.frameSeq += 1;
       state.padLost = false;
+      state.lostWhy = '';
     } else {
-      // スティックが見えない: 最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
       state.padLost = !!(state.sel && state.streaming);
+      state.lostWhy = pad ? ('割り当てた軸が機器に無い（roll axis ' + state.map.roll.axis + ' / pitch axis ' + state.map.pitch.axis + '、機器の軸は ' + pad.axes.length + ' 本）') : 'スティックが見えない';
     }
     sendPose();
   }
@@ -732,20 +756,30 @@ window.H3Joy = (function () {
     renderPadList();
     const pad = state.pad;
     const banner = $('padBanner');
-    if (pad) {
+    const readable = pad && !state.lostWhy;
+    if (readable) {
       $('padState').textContent = '読み取り中: #' + pad.index + ' ' + pad.id;
       $('padState').className = 'ok small';
-      if (banner.className.indexOf('show') >= 0) banner.className = 'banner warn';
-    } else {
-      $('padState').textContent = state.sel ? '選んだスティックが見えない: #' + state.sel.index + ' ' + state.sel.id : '未選択（ボタンを 1 回押すと一覧に出る）';
+    } else if (pad) {
+      $('padState').textContent = '#' + pad.index + ' ' + pad.id + ': ' + state.lostWhy;
       $('padState').className = 'bad small';
-      if (state.streaming) {
-        banner.textContent = 'スティックが見えない: 最後の姿勢のまま frame_seq を止めている（サーバーの鮮度切れで減速停止する）。STOP で止めてもよい';
-        banner.className = 'banner warn show';
-      }
+    } else {
+      $('padState').textContent = state.sel ? '選んだスティックが見えない: #' + state.sel.index + ' ' + state.sel.id
+        : (state.noAutoPick ? '未選択: スティックと判定できる機器が無い（一覧から選ぶ）' : '未選択（ボタンを 1 回押すと一覧に出る）');
+      $('padState').className = 'bad small';
     }
-    // 見えているあいだはいまの値、見えなくなったら棒も 0 に戻す（送っている最後の姿勢は sentPose に出る）
-    renderStick(pad, pad ? state.pose : null);
+    // バナー: 送信中の喪失（見えない／軸が範囲外）は警告。未選択で自動選択できない機器だけのときも知らせる。
+    if (state.padLost) {
+      banner.textContent = state.lostWhy + ': 最後の姿勢のまま frame_seq を止めている（サーバーの鮮度切れで減速停止する。姿勢がまだ無ければ何も送らない）。STOP で止めてもよい';
+      banner.className = 'banner warn show';
+    } else if (!state.sel && state.noAutoPick) {
+      banner.textContent = 'スティックと判定できる機器が見つからない（ペダル・ハンドル等は自動で選ばない）。使う機器を「使用するスティック」から選んでください';
+      banner.className = 'banner warn show';
+    } else if (banner.className.indexOf('show') >= 0) {
+      banner.className = 'banner warn';
+    }
+    // 読めているあいだはいまの値、喪失中は棒を 0 に戻す（送っている最後の姿勢は sentPose に出る）
+    renderStick(pad, readable ? state.pose : null);
     $('frameSeq').textContent = String(state.frameSeq);
     requestAnimationFrame(frame);
   }
@@ -766,26 +800,33 @@ window.H3Joy = (function () {
   }
 
   // 送信を止める。50 Hz の刻み（スティックの読み取り）は止めない: sendPose が WS の無いときは何もしない。
-  function stopStream(reason) {
+  // bad = 操作者の意図しない停止（stale_session など）。理由を赤で残し、再開は「送信開始」を押す。
+  function stopStream(reason, bad) {
     state.streaming = false;
     state.padLost = false;
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
     $('padBanner').className = 'banner warn';
-    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), !!bad);
   }
 
-  // 送る姿勢: 0 固定なら 0、そうでなければ最後に読んだスティックの値（yaw は常に 0）
+  // 送る姿勢: 0 固定なら 0、そうでなければ最後に読んだスティックの値（yaw は常に 0）。
+  // まだ一度も読めていなければ null（0 をでっち上げて送らない。Issue #15 M4）。
   function currentPose() {
     if (state.zero) return { pitch: 0, roll: 0 };
     const p = state.pose;
-    return p ? { pitch: p.pitch, roll: p.roll } : { pitch: 0, roll: 0 };
+    return p ? { pitch: p.pitch, roll: p.roll } : null;
   }
 
   function sendPose() {
     const ws = state.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const p = currentPose();
+    if (!p) {
+      $('sentPose').textContent = '（姿勢がまだ無い: 送らない）';
+      $('sentPose').className = 'mono bad';
+      return;
+    }
     state.seq += 1;
     const msg = {
       type: 'pose', protocol: 1, source_session: state.session,
@@ -795,7 +836,7 @@ window.H3Joy = (function () {
     };
     ws.send(JSON.stringify(msg));
     $('seq').textContent = String(state.seq);
-    $('sentPose').textContent = 'pitch ' + p.pitch.toFixed(3) + ' roll ' + p.roll.toFixed(3) + ' yaw 0 gain ' + msg.gain.toFixed(2) + (state.zero ? '（0 固定）' : '') + (state.padLost ? '（スティック喪失: frame_seq 停止）' : '');
+    $('sentPose').textContent = 'pitch ' + p.pitch.toFixed(3) + ' roll ' + p.roll.toFixed(3) + ' yaw 0 gain ' + msg.gain.toFixed(2) + (state.zero ? '（0 固定）' : '') + (state.padLost ? '（喪失: ' + state.lostWhy + '、frame_seq 停止）' : '');
     $('sentPose').className = 'mono' + (state.padLost ? ' bad' : '');
   }
 
@@ -827,6 +868,12 @@ window.H3Joy = (function () {
       a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +
         ' effective_gain=' + fmt(m.effective_gain) + ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし') + ' fresh=' + fmt(m.fresh);
       a.className = m.accepted ? 'ok' : 'bad';
+      // stale_session: この session はもう自分のものではない（別のクライアントが発行した／サーバー再起動）。
+      // 50 Hz で拒否され続けても意味が無いので送信を止める（Python クライアントと同じ）。再開は「送信開始」（新 session）。
+      if (m.accepted === false && m.reason === 'stale_session' && state.ws === ws) {
+        stopStream('stale_session', true);
+        log('WS: ack stale_session — session が無効になった（別のクライアントが session を発行したか、サーバーが再起動した）。送信を止めた。再開は「送信開始」', true);
+      }
     };
     ws.onerror = () => { setWsState('error', true); };
     ws.onclose = (ev) => { if (state.ws === ws) stopStream('close ' + ev.code); };
