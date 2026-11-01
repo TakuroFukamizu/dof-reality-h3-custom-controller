@@ -12,6 +12,7 @@ DOF Reality H3 のオリジナル制御基板が故障したため、制御部�
 | --- | --- |
 | [h3-original/](h3-original/README.md) | DOF Reality H3 の既存構成・実装の調査結果。電源基板、制御基板、モータードライバと Protection Board、モーターとフィードバックセンサー、ブレーキ、故障診断の経緯 |
 | [cores3-controller/](cores3-controller/README.md) | 作成中の M5Stack CoreS3 による 3 系統独立制御系の設計。全体アーキテクチャ、ハードウェア配線と GPIO 割当、ファームウェア設計、安全設計、進捗と未確定事項 |
+| [control-server/](control-server/README.md) | PC 側コントロールサーバー h3-control-server。計画（architecture.md）、PC ⇄ CoreS3 USB プロトコル v1（protocol.md）、使い方・試験・e2e 記録、実機 bring-up 手順（[hardware-bringup.md](control-server/hardware-bringup.md)）。PC 側は実装済み・模擬軸でのみ試験済み |
 
 ## 関連するコード
 
@@ -19,6 +20,9 @@ DOF Reality H3 のオリジナル制御基板が故障したため、制御部�
 | --- | --- |
 | `moter-controler/` | CoreS3 1 台で MD13S・主電源リレー・ブレーキリレーをタッチ操作とシリアルコマンドで動かす最初のプログラム |
 | `encoder-tester/` | 主電源投入・ブレーキ解除・有限時間の PWM 駆動とエンコーダ計数を同じ時系列で記録する単軸試験ツール（別フォルダ。`docs/runs/` に実施記録） |
+| `control-server/` | h3-control-server（Rust）。Game API・管理 API、3 軸の校正・プランナー・状態機械、USB プロトコル v1、MCU 参照モデル（`src/sim_axis.rs`）。設計は `control-server/DESIGN.md` |
+| `clients/python/` | Game API の Python クライアント `h3_motion_client.py`（標準ライブラリ＋ websockets） |
+| `clients/h3game/` | 既存ゲーム h3game の bridge.py を h3-control-server へつなぐパッチとバックエンド層（h3game リポジトリには push していない） |
 
 ## 安全上の前提
 

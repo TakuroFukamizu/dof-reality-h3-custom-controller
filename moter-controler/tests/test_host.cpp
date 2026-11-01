@@ -6,8 +6,6 @@
 #include "manual_guard.h"
 #include "motor_profile.h"
 
-namespace {
-
 int g_pass = 0;
 int g_fail = 0;
 
@@ -20,6 +18,12 @@ int g_fail = 0;
       std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);        \
     }                                                                    \
   } while (0)
+
+// USB プロトコル v1（CHECK を使うのでこの位置で include する）
+#include "test_v1_codec.h"
+#include "test_v1_axis.h"
+
+namespace {
 
 void test_motor_profile() {
   CHECK(std::string(p_end_label(1)) == "下限");
@@ -645,6 +649,8 @@ int main() {
   test_neutral_dwell_has_hysteresis();
   test_neutral_no_pulses_at_floor_jumps_to_home_duty();
   test_manual_guard_sign_reversal_restarts_window();
+  v1test::run_all();
+  v1axis_test::run_all();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

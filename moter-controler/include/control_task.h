@@ -41,3 +41,51 @@ void control_request(AutoKind kind);
 void control_set_profile(const MotorProfile& p);
 void control_clear_profile_dirty();
 ControlSnapshot control_snapshot();
+
+#if MC_PROTO_V1
+// --- USB プロトコル v1（MC_PROTO_V1）。制御タスクは V1Axis を回し、G2 / G13 / PWM を直接書く ---
+struct V1Snapshot {
+  uint8_t state = 0;             // v1::state::*
+  uint16_t fault_code = 0;       // v1::fault::*
+  uint16_t flags = 0;            // STATUS flags
+  uint8_t selected_axis = 0;
+  bool power_on_cmd = false;
+  bool brake_release_cmd = false;
+  int duty = 0;                  // 符号付き %
+  int32_t actual = 0;
+  int32_t target = 0;
+  int32_t velocity = 0;          // count/s（100 ms 窓）
+  int32_t following_error = 0;
+  bool configured = false;
+  bool referenced = false;
+  bool estop_latched = false;
+  bool has_rx = false;
+  uint32_t last_rx_age_ms = 0;   // PC から最後に何か受けてからの経過
+  uint16_t rx_error_count = 0;
+  uint16_t stale_drop_count = 0;
+  uint32_t tx_dropped = 0;
+  uint32_t tick_count = 0;
+  uint32_t max_tick_gap_us = 0;  // 起動からの tick 間隔の最大
+  uint64_t device_id = 0;
+  uint32_t boot_id = 0;
+  // 校正（CALIBRATING / CAL_RESULT）
+  uint8_t cal_live_step = 0;         // 校正中の段階（v1::cal_step::*。校正中でなければ 0）
+  char cal_live_reason[24] = "";     // AutoMachine の直近の理由（"retreat" など）
+  bool cal_result_valid = false;     // この boot で CAL_RESULT を送ったことがある
+  uint8_t cal_result = 0;            // v1::cal_result::*
+  uint8_t cal_step = 0;              // 終了時の段階
+  int32_t cal_n_end = 0;
+  int32_t cal_neutral = 0;
+  int8_t cal_sign = 1;
+  char cal_reason[9] = "";           // NUL 終端済み
+  bool profile_dirty = false;        // 成功した校正のプロファイルが未保存（loop() が NVS に保存して clear する）
+  MotorProfile profile{};
+};
+
+// signs は系統 1..3 の符号（index = motor。[0] は未使用）。selected_axis は NVS の motor。
+void control_v1_begin(const int8_t signs[4], uint8_t selected_axis);
+void control_v1_select_axis(uint8_t axis);   // DISARMED のときだけ V1Axis が受け付ける
+void control_v1_set_estop(bool latched);     // 画面の非常停止（ラッチ / 解除）
+void control_v1_clear_profile_dirty();       // loop() が NVS に保存した後に呼ぶ
+V1Snapshot control_v1_snapshot();
+#endif

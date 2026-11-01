@@ -1,0 +1,1162 @@
+From d21e7e13856f53240a57882b75910c0931eaa41f Mon Sep 17 00:00:00 2001
+From: Takuro Fukamizu <takuro.f.1987@gmail.com>
+Date: Fri, 30 Oct 2026 09:57:21 +0900
+Subject: [PATCH] h3game: add H3_BACKEND=server (h3-control-server) and
+ frame_seq freshness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+bridge.py
+- H3_BACKEND=legacy|server|dry (default legacy: seat path unchanged; H3_DRY=1 still
+  means dry and wins over server). H3_SERVER_URL defaults to
+  http://127.0.0.1:8892.
+- server: never imports h3_direct / serial. connect() only opens the
+  transport to the control server (no ARM, START or centering); the 60 Hz
+  USB resend, the 1 s fade to center and auto_sway are off; "auto" requests
+  are ignored and counted (auto_ignored). do_POST hands the accepted body
+  (pitch, roll, yaw, gain, frame_seq, frame_age_ms) to the backend without
+  waiting on the network; an exception from the backend is logged and
+  counted (backend_errors) and the POST still gets its answer. /state
+  keeps its keys and adds backend, rig_state, armed, calibration_valid,
+  fault, server_url, effective_gain, axis_conflict, hud_note and more.
+  /reconnect re-opens the transport only. The /state poll never counts as
+  game liveness.
+- All modes: bind the HTTP port before connect(). A second launch on a busy
+  port exits without touching the seat or the server (in server mode it
+  used to take the server session first, which stopped the ride and locked
+  out the running bridge).
+- All modes: GET /reconnect and /claim from a non-loopback peer are ignored
+  ({"ignored": true}), like the POSTs already were. Either one stopped the
+  ride from any device on the LAN; the page opened from another PC is
+  view-only anyway.
+
+web/index.html
+- Count completed rAF frames (frame_seq) and send frame_seq and frame_age_ms
+  with every seat POST. frame_seq does not advance while the tab is hidden.
+- While hidden the POST still carries zeros (legacy unchanged) but repeats
+  the frame_seq last POSTed while visible (and that frame's age). rAF runs
+  ahead of the 30 Hz POST, so sending the current frameSeq would pair zeros
+  with a frame the server has not seen and drive the seat toward center.
+- Server mode only (st.backend === "server"): the play HUD and the setup
+  card add rig_state, a lost session, FAULT, the server's axis-assignment
+  note (/state hud_note: 系統の競合 / 個体の不一致 / 再基準化が必要) and a
+  capped gain to the connection text. /state "connected" is false once
+  another client took the session, so the page no longer says "接続中" /
+  "席 OK" while this bridge's poses go nowhere. Legacy pages look the same.
+
+New files: h3_server_backend.py (adapter), h3_motion_client.py (copy of
+the client from dof-reality-h3-custom-controller). Server mode needs
+`pip install websockets` (>= 13). The backend does nothing about an
+axis_conflict reject besides reporting it (poses keep flowing; the server
+accepts them again once the operator fixes the CoreS3 selection).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ku3d95v3E4cEBdkTwSXWsv
+---
+ h3game/bridge.py            |  43 ++-
+ h3game/h3_motion_client.py  | 658 ++++++++++++++++++++++++++++++++++++
+ h3game/h3_server_backend.py | 274 +++++++++++++++
+ h3game/web/index.html       |  14 +-
+ 4 files changed, 979 insertions(+), 10 deletions(-)
+ create mode 100644 h3game/h3_motion_client.py
+ create mode 100644 h3game/h3_server_backend.py
+
+diff --git a/h3game/bridge.py b/h3game/bridge.py
+index 807b4d9..8f51d92 100644
+--- a/h3game/bridge.py
++++ b/h3game/bridge.py
+@@ -4,6 +4,8 @@
+   → ブラウザで http://localhost:8891 を開く(大きいディスプレイに出す)
+ H3 が未接続でも「空回りモード」で画面だけ動く。
+ H3_DRY=1 を付けると、H3 がつながっていても席には何も送らない(画面の確認用)。
++H3_BACKEND=legacy(既定。USB 直結の旧 H3) / server(制御サーバー h3-control-server 経由) / dry(H3_DRY=1 と同じ)。
++  server では USB を開かず、H3_SERVER_URL(既定 http://127.0.0.1:8892)へ送るだけ。ARM・START はサーバー側で人が行う。
+ """
+ import json, os, sys, threading, time
+ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+@@ -107,12 +109,28 @@ sync = {"text": "{}", "frame": b""}   # 観戦用: プレイ中の画面の様
+ owner = 0               # 一番新しく開いた画面だけを受け付ける(古いタブの信号は無視)
+ 
+ DRY = bool(os.environ.get("H3_DRY"))   # 席に何も送らない
++BACKEND = os.environ.get("H3_BACKEND") or "legacy"   # 席へのつなぎ方: legacy / server / dry
++if BACKEND not in ("legacy", "server", "dry"): sys.exit("H3_BACKEND は legacy / server / dry のどれか: %r" % BACKEND)
++DRY = DRY or BACKEND == "dry"          # H3_DRY=1 は server より優先(どこにも送らない)
++SERVER = BACKEND == "server" and not DRY
++SERVER_URL = os.environ.get("H3_SERVER_URL", "http://127.0.0.1:8892")
++backend = None          # server のときの接続(h3_server_backend.ServerBackend)
++if BACKEND != "legacy": state["backend"] = "server" if SERVER else "dry"
++
++def view():
++    # /state の中身。server では制御サーバーの状態(rig_state, armed など)を足した写しを返す
++    return {**state, **backend.state()} if backend else state
+ 
+ def connect():
+-    global rig
++    global rig, backend
+     if DRY:
+         state["connected"], state["port"] = False, None
+         return print("H3_DRY: 席には送りません(空回りモード)")
++    if SERVER:   # 制御サーバーへの通信を張る(張り直す)だけ。ARM・START・中央へ動かす は しない
++        if backend: return backend.reconnect()
++        from h3_server_backend import ServerBackend
++        backend = ServerBackend(SERVER_URL); backend.start()
++        return print("制御サーバー:", SERVER_URL, "(ARM・START はサーバーの管理 API で人が行う)")
+     try:
+         from h3_direct import H3
+         rig = H3(gain=state["gain"])
+@@ -131,9 +149,10 @@ def auto_sway(t):
+ 
+ def watcher():
+     # 未接続のあいだ 3秒ごとに USB を探して、見つかったら自動でつなぐ
++    # server では何もしない(つなぎ直しは h3_motion_client が行い、状態は /state のたびに読む)
+     while True:
+         time.sleep(3)
+-        if not state["connected"] and not DRY:
++        if not state["connected"] and not DRY and not SERVER:
+             try:
+                 from h3_direct import find_port
+                 find_port()
+@@ -144,6 +163,7 @@ def watcher():
+ def sender():
+     global rig
+     # 60回/秒で最新の傾きを送り続ける(止めると本体が力を弱めるため)
++    if SERVER: return   # server では再送・1秒で中央へ戻す・自動揺れ をしない(画面が止まればサーバーが止める)
+     while True:
+         if state["auto"] and time.time() - last_cmd > 2.0:
+             state["pitch"], state["roll"], state["yaw"] = auto_sway(time.time())
+@@ -186,8 +206,10 @@ class H(BaseHTTPRequestHandler):
+             return
+         if path == "/state":
+             state["last_cmd_age"] = round(time.time() - last_cmd, 1) if last_cmd else None
+-            return self._json(state)
+-        if path == "/reconnect": connect(); return self._json(state)
++            return self._json(view())      # 読むだけ。ゲームが動いている証拠には数えない
++        if path in ("/reconnect", "/claim") and self.client_address[0] not in ("127.0.0.1", "::1"):
++            return self._json({"ignored": True})      # 他のPCの画面は つなぎ直し・操作権の移動 をできない(席を止められるため)
++        if path == "/reconnect": connect(); return self._json(view())
+         if path == "/hid": return self._json(hid_list())
+         if path == "/claim":                          # 席の操作権をこの画面に移す(確認画面の「席を試す」用)
+             global owner; owner += 1; return self._json({"owner": owner})
+@@ -234,20 +256,29 @@ class H(BaseHTTPRequestHandler):
+             state["ignored"] = state.get("ignored", 0) + 1
+             return self._json({"ignored": True})
+         state["last_cmd_age"] = 0.0
+-        if "auto" in d: state["auto"] = bool(d["auto"])
++        if "auto" in d and SERVER:         # server では自動揺れを受け付けない(数だけ残す)
++            state["auto_ignored"] = state.get("auto_ignored", 0) + 1
++        elif "auto" in d: state["auto"] = bool(d["auto"])
+         if any(k in d for k in ("pitch", "roll", "yaw")): last_cmd = time.time()
+         for k in ("pitch", "roll", "yaw"):
+             if k in d: state[k] = max(-1.0, min(1.0, float(d[k])))
+         if "gain" in d: state["gain"] = max(0.0, min(1.0, float(d["gain"])))
++        if SERVER:   # 受け取った指令(frame_seq 付き)を渡すだけ。通信は待たない
++            try: backend.submit(o, d, state)
++            except Exception as e:   # 渡せない指令でも応答は返す(席へは何も送らない)
++                state["backend_errors"] = state.get("backend_errors", 0) + 1
++                print("制御サーバーへの受け渡しエラー:", repr(e))
+         self._json(state)
+ 
+ if __name__ == "__main__":
++    srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)   # 先にポートを取る。取れない(2つ目の起動など)なら席にもサーバーにも触らずに終わる
+     connect()
+     threading.Thread(target=sender, daemon=True).start()
+     threading.Thread(target=watcher, daemon=True).start()
+     threading.Thread(target=joy_thread, daemon=True).start()
+     print(f"画面: http://localhost:{PORT}")
+     try:
+-        ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
++        srv.serve_forever()
+     finally:
+         if rig: rig.close()
++        if backend: backend.close()   # 席は止めない(指令が途切れればサーバーが止める)
+diff --git a/h3game/h3_motion_client.py b/h3game/h3_motion_client.py
+new file mode 100644
+index 0000000..5f23a87
+--- /dev/null
++++ b/h3game/h3_motion_client.py
+@@ -0,0 +1,658 @@
++# Copy of clients/python/h3_motion_client.py in dof-reality-h3-custom-controller
++# (canonical source). Edit there and copy here; do not change this copy alone.
++"""Game-side client for h3-control-server (DESIGN.md §7, §8).
++
++Usage from a game / bridge:
++
++    client = MotionClient("http://127.0.0.1:8892")
++    client.start()
++    client.submit_pose(pitch, roll, yaw, gain, frame_seq=n, source_age_ms=age)
++    ...
++    client.close()
++
++Contract (what this client does and never does):
++
++- ``submit_pose`` / ``submit_gain`` only store the value in a single
++  latest-value slot and return; they never touch the network.
++- A background thread gets a session (POST /v1/session), opens
++  WS /v1/motion and sends the slot only when something new was submitted.
++  Nothing is resent to keep the server alive: if the game stops submitting,
++  the server's freshness runs out and it stops the rig.
++- ``source_age_ms`` sent = submitted age + time spent waiting in the slot.
++- On any transport error it reconnects with backoff and a NEW session.
++  Connecting never arms, starts or centers the rig (admin API, operator only).
++  A new session while the rig is ACTIVE makes the server stop the rig
++  (drive is bound to the session current at START); ARM + START again.
++- ``frame_seq`` is passed through as given. The server's default config
++  requires it (``require_frame_seq``); it is never invented here.
++- No admin token handling: arm / start / disarm belong to the operator CLI.
++- An ``axis_conflict`` reject (two CoreS3 units selected the same 系統,
++  DESIGN.md §10) is an operator problem, not a transport problem: the client
++  keeps sending (the server accepts again as soon as the selection is fixed),
++  never reconnects because of it, and logs it once per episode. It is exposed
++  as ``axis_conflict`` / ``last_reject``.
++
++Dependencies: Python >= 3.9, stdlib + ``websockets>=13`` (sync client).
++
++CLI for operators: ``python3 h3_motion_client.py status|stop [--url URL]``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import inspect
++import json
++import logging
++import math
++import numbers
++import sys
++import threading
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any, Callable, Dict, List, Optional
++
++try:
++    from websockets.exceptions import ConnectionClosed
++    from websockets.sync.client import connect as _ws_connect
++except ImportError:  # pragma: no cover - CLI status/stop work without it
++    _ws_connect = None  # type: ignore[assignment]
++
++    class ConnectionClosed(Exception):  # type: ignore[no-redef]
++        pass
++
++
++__all__ = ["MotionClient", "fetch_status", "request_stop", "DEFAULT_URL", "PROTOCOL_VERSION"]
++
++DEFAULT_URL = "http://127.0.0.1:8892"
++PROTOCOL_VERSION = 1
++
++# Fallback if the session response lacks it (server default).
++_DEFAULT_FRESHNESS_MS = 250.0
++_BACKOFF_MIN_S = 0.2
++_BACKOFF_MAX_S = 2.0
++# A connection must stay up this long before the backoff resets, so a server
++# that accepts and drops at once does not get a new session every 0.2 s.
++_BACKOFF_RESET_AFTER_S = 1.0
++
++# Bypass *_proxy env vars: the server is local.
++_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++
++
++# ---------------------------------------------------------------- HTTP helpers
++
++
++def _url(base_url: str, path: str) -> str:
++    return base_url.rstrip("/") + path
++
++
++def _http_json(method: str, url: str, timeout: float) -> Any:
++    """Send a request (POST with an empty body); return (status, parsed JSON or None)."""
++    data = b"" if method == "POST" else None
++    req = urllib.request.Request(url, data=data, method=method, headers={"Accept": "application/json"})
++    try:
++        with _HTTP.open(req, timeout=timeout) as resp:
++            status, body = resp.status, resp.read()
++    except urllib.error.HTTPError as e:
++        with e:
++            status, body = e.code, e.read()
++    try:
++        parsed = json.loads(body.decode("utf-8")) if body else None
++    except ValueError:
++        parsed = None
++    return status, parsed
++
++
++def fetch_status(base_url: str = DEFAULT_URL, timeout: float = 1.0) -> dict:
++    """GET /v1/status. Raises on transport errors and non-200 answers."""
++    status, body = _http_json("GET", _url(base_url, "/v1/status"), timeout)
++    if status != 200 or not isinstance(body, dict):
++        err = body.get("error") if isinstance(body, dict) else None
++        raise RuntimeError("GET /v1/status: HTTP %s %s" % (status, err or ""))
++    return body
++
++
++def request_stop(base_url: str = DEFAULT_URL, timeout: float = 1.5) -> bool:
++    """POST /v1/stop (no token). True only for 200 {"ok": true}; never raises.
++
++    False includes 503 ``control_loop_unavailable``: the stop may still run
++    when the loop catches up, but that is not confirmed.
++    """
++    try:
++        status, body = _http_json("POST", _url(base_url, "/v1/stop"), timeout)
++    except Exception:  # noqa: BLE001 - stop must never raise
++        return False
++    return status == 200 and isinstance(body, dict) and body.get("ok") is True
++
++
++def _ws_url(base_url: str, session: str) -> str:
++    u = urllib.parse.urlsplit(base_url)
++    scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(u.scheme, "ws")
++    path = u.path.rstrip("/") + "/v1/motion"
++    query = urllib.parse.urlencode({"session": session})
++    return urllib.parse.urlunsplit((scheme, u.netloc, path, query, ""))
++
++
++def _connect_kwargs(timeout: float) -> Dict[str, Any]:
++    kw: Dict[str, Any] = {"open_timeout": timeout, "close_timeout": 0.5, "compression": None}
++    if _ws_connect is not None:
++        try:
++            # websockets >= 15 reads *_proxy env vars by default; the server is local.
++            if "proxy" in inspect.signature(_ws_connect).parameters:
++                kw["proxy"] = None
++        except (TypeError, ValueError):  # pragma: no cover
++            pass
++    return kw
++
++
++def _is_num(x: Any) -> bool:
++    return isinstance(x, numbers.Real) and not isinstance(x, bool)
++
++
++# Server parses frame_seq as u64; anything larger gets bad_message.
++MAX_FRAME_SEQ = 2**64 - 1
++
++
++def _finite(x: Any) -> bool:
++    """Real, not bool, and finite as a float (huge ints count as invalid, not raise)."""
++    if not _is_num(x):
++        return False
++    try:
++        return math.isfinite(float(x))
++    except (OverflowError, TypeError, ValueError):
++        return False
++
++
++# ---------------------------------------------------------------- client
++
++
++class _Pending:
++    __slots__ = ("pitch", "roll", "yaw", "gain", "frame_seq", "source_age_ms", "submitted_at")
++
++    def __init__(self, pitch, roll, yaw, gain, frame_seq, source_age_ms, submitted_at):
++        self.pitch = pitch
++        self.roll = roll
++        self.yaw = yaw
++        self.gain = gain
++        self.frame_seq = frame_seq
++        self.source_age_ms = source_age_ms
++        self.submitted_at = submitted_at
++
++    def age_ms(self, now: float) -> float:
++        return self.source_age_ms + max(0.0, now - self.submitted_at) * 1000.0
++
++
++class MotionClient:
++    """Latest-value pose sender for WS /v1/motion (see module docstring)."""
++
++    #: status() returns None when the last status message is older than this.
++    STATUS_MAX_AGE_S = 2.0
++    #: No message for this long → reconnect. Status arrives every
++    #: server.status_period_ms (default 100), so this only catches a wedged
++    #: server. Kept generous: a reconnect while ACTIVE stops the rig.
++    RECV_STALL_S = 10.0
++
++    def __init__(
++        self,
++        base_url: str = DEFAULT_URL,
++        *,
++        on_status: Optional[Callable[[dict], None]] = None,
++        connect_timeout: float = 1.0,
++        logger: Optional[logging.Logger] = None,
++    ) -> None:
++        if _ws_connect is None:
++            raise RuntimeError("MotionClient needs the 'websockets' package (>= 13)")
++        self.base_url = base_url.rstrip("/")
++        self.on_status = on_status
++        self.connect_timeout = float(connect_timeout)
++        self.log = logger or logging.getLogger("h3_motion_client")
++
++        self._cond = threading.Condition()
++        # Everything below is guarded by self._cond. Never do I/O while holding it.
++        self._pose: Optional[_Pending] = None
++        self._gain: Optional[float] = None  # pending gain-only update
++        self._closing = False
++        self._reconnect_req = False
++        self._conn_failed = False  # set by the reader when its connection ends
++        self._ws = None
++        self._conn_id = 0
++        self._connected = False
++        self._session: Optional[str] = None
++        self._session_info: Optional[dict] = None
++        self._session_lost = False
++        self._seq = 0
++        self._last_ack: Optional[dict] = None
++        self._last_reject: Optional[dict] = None  # last ack with accepted=False
++        self._axis_conflict = False  # last ack was rejected with axis_conflict
++        self._status: Optional[dict] = None
++        self._status_at = 0.0
++        self._warned_no_frame_seq = False
++        self._fail_logged = False  # worker thread only
++
++        self._thread: Optional[threading.Thread] = None
++
++    # ------------------------------------------------------------ public API
++
++    def start(self) -> None:
++        """Start the background thread (idempotent). Returns immediately."""
++        with self._cond:
++            if self._thread is not None:
++                return
++            self._closing = False
++            t = threading.Thread(target=self._run, name="h3-motion-client", daemon=True)
++            self._thread = t
++        t.start()
++
++    def close(self, timeout: float = 3.0) -> None:
++        """Stop the thread and close the connection. Does NOT stop the rig:
++        without new poses the server's freshness expires and it stops itself.
++        Call stop() first for an immediate stop."""
++        with self._cond:
++            self._closing = True
++            t = self._thread
++            ws = self._ws
++            self._cond.notify_all()
++        if t is None:
++            return
++        t.join(timeout)
++        if t.is_alive() and ws is not None:
++            # Worker stuck in a blocking send: break the socket.
++            try:
++                ws.socket.shutdown(2)
++            except Exception:  # noqa: BLE001
++                pass
++            t.join(1.0)
++        with self._cond:
++            self._thread = None
++
++    def submit_pose(
++        self,
++        pitch: float,
++        roll: float,
++        yaw: float,
++        gain: float,
++        frame_seq: Optional[int] = None,
++        source_age_ms: float = 0.0,
++    ) -> bool:
++        """Store the latest pose; never blocks on the network.
++
++        ``frame_seq`` must advance on every completed game update (same
++        frame_seq resent never extends freshness). ``source_age_ms`` is how
++        old the pose already is (ms since the game produced it).
++        Returns False (and stores nothing) for non-finite / invalid input,
++        including frame_seq outside 0..MAX_FRAME_SEQ (the server's u64).
++        """
++        now = time.monotonic()
++        vals = (pitch, roll, yaw, gain, source_age_ms)
++        if not all(_finite(v) for v in vals) or source_age_ms < 0:
++            self.log.warning("submit_pose: invalid value dropped %r", vals)
++            return False
++        if frame_seq is not None and (not isinstance(frame_seq, numbers.Integral) or isinstance(frame_seq, bool)
++                                      or not 0 <= frame_seq <= MAX_FRAME_SEQ):
++            self.log.warning("submit_pose: invalid frame_seq dropped %r", frame_seq)
++            return False
++        p = _Pending(float(pitch), float(roll), float(yaw), float(gain),
++                     None if frame_seq is None else int(frame_seq), float(source_age_ms), now)
++        with self._cond:
++            self._pose = p
++            self._gain = None  # the pose carries the newer gain
++            self._cond.notify_all()
++        return True
++
++    def submit_gain(self, gain: float) -> bool:
++        """Gain-only update (never extends pose freshness on the server)."""
++        if not _finite(gain):
++            self.log.warning("submit_gain: invalid gain dropped %r", gain)
++            return False
++        with self._cond:
++            if self._pose is not None:
++                self._pose.gain = float(gain)  # unsent pose: just carry the new gain
++            else:
++                self._gain = float(gain)
++            self._cond.notify_all()
++        return True
++
++    def status(self) -> Optional[dict]:
++        """Latest status snapshot from the WS (GET /v1/status shape), or None
++        if none yet or older than STATUS_MAX_AGE_S. Treat it as read-only."""
++        with self._cond:
++            if self._status is None or time.monotonic() - self._status_at > self.STATUS_MAX_AGE_S:
++                return None
++            return self._status
++
++    @property
++    def connected(self) -> bool:
++        """Session issued and WS open (transport only; says nothing about ARM)."""
++        with self._cond:
++            return self._connected
++
++    @property
++    def session_lost(self) -> bool:
++        """True after a ``stale_session`` ack: another client took the session.
++        Poses are not sent any more; call reconnect() to take it back."""
++        with self._cond:
++            return self._session_lost
++
++    @property
++    def session_id(self) -> Optional[str]:
++        """Full id of our current session (status shows only its first 8 chars)."""
++        with self._cond:
++            return self._session
++
++    @property
++    def session_info(self) -> Optional[dict]:
++        """Last POST /v1/session response (max_gain, source_freshness_ms, ...)."""
++        with self._cond:
++            return None if self._session_info is None else dict(self._session_info)
++
++    @property
++    def last_ack(self) -> Optional[dict]:
++        with self._cond:
++            return self._last_ack
++
++    @property
++    def last_reject(self) -> Optional[dict]:
++        """Last ack with ``accepted: false`` (its ``reason`` is the code, e.g.
++        ``axis_conflict``), or None if nothing was rejected yet. Not cleared by
++        a later accepted ack: compare with ``last_ack`` to see which is newer."""
++        with self._cond:
++            return self._last_reject
++
++    @property
++    def axis_conflict(self) -> bool:
++        """True while the server rejects our input with ``axis_conflict``
++        (two units selected the same 系統; DESIGN.md §10). Cleared by the next
++        ack that is accepted or rejected for another reason. Poses are still
++        sent meanwhile; the operator fixes the selection on the CoreS3."""
++        with self._cond:
++            return self._axis_conflict
++
++    def reconnect(self) -> None:
++        """Drop the connection and reconnect now with a new session.
++        Transport only: never arms or starts. If the rig is ACTIVE, the new
++        session makes the server stop it (operator must ARM + START again)."""
++        with self._cond:
++            self._reconnect_req = True
++            self._cond.notify_all()
++
++    def stop(self, timeout: float = 1.5) -> bool:
++        """POST /v1/stop. True only if the server confirmed; never raises."""
++        return request_stop(self.base_url, timeout)
++
++    # ------------------------------------------------------------ worker
++
++    def _run(self) -> None:
++        backoff = _BACKOFF_MIN_S
++        while True:
++            with self._cond:
++                if self._closing:
++                    return
++                self._reconnect_req = False
++            up_since = self._connect_and_serve()
++            with self._cond:
++                if self._closing:
++                    return
++                explicit = self._reconnect_req
++            if explicit or (up_since is not None and time.monotonic() - up_since >= _BACKOFF_RESET_AFTER_S):
++                backoff = _BACKOFF_MIN_S
++            if explicit:
++                continue
++            with self._cond:
++                # Interruptible by close() / reconnect().
++                self._cond.wait_for(lambda: self._closing or self._reconnect_req, timeout=backoff)
++            backoff = min(backoff * 2.0, _BACKOFF_MAX_S)
++
++    def _motion_url(self, session: str) -> str:
++        # Separate method so tests can point the WS at another port.
++        return _ws_url(self.base_url, session)
++
++    def _connect_and_serve(self) -> Optional[float]:
++        """One connection. Returns the time it came up, or None if it never did."""
++        up_since: Optional[float] = None
++        try:
++            status, info = _http_json("POST", _url(self.base_url, "/v1/session"), self.connect_timeout)
++            if status != 200 or not isinstance(info, dict) or not isinstance(info.get("source_session"), str):
++                raise RuntimeError("POST /v1/session: HTTP %s %r" % (status, info))
++            if info.get("protocol", PROTOCOL_VERSION) != PROTOCOL_VERSION:
++                raise RuntimeError("server protocol %r != %d" % (info.get("protocol"), PROTOCOL_VERSION))
++            session = info["source_session"]
++            # Context-manager form works on websockets 13..17+ (17.1 warns otherwise).
++            with _ws_connect(self._motion_url(session), **_connect_kwargs(self.connect_timeout)) as ws:
++                up_since = time.monotonic()
++                self._fail_logged = False
++                self._serve(ws, session, info)
++        except Exception as e:  # noqa: BLE001
++            if up_since is None:
++                # Warn once per outage, then stay quiet while retrying.
++                (self.log.debug if self._fail_logged else self.log.warning)("connect failed: %s", e)
++                self._fail_logged = True
++            else:
++                self.log.warning("connection error: %s", e)
++        return up_since
++
++    def _serve(self, ws, session: str, info: dict) -> None:
++        freshness_ms = info.get("source_freshness_ms")
++        if not _is_num(freshness_ms):
++            freshness_ms = _DEFAULT_FRESHNESS_MS
++        dropped_age = None
++        with self._cond:
++            self._conn_id += 1
++            conn_id = self._conn_id
++            self._ws = ws
++            self._session = session
++            self._session_info = info
++            self._session_lost = False
++            self._conn_failed = False
++            self._connected = True
++            self._axis_conflict = False  # a still-present conflict is logged again on this connection
++            # A pose that waited through the outage and is already stale is
++            # useless to the new session: drop it instead of sending.
++            if self._pose is not None:
++                age = self._pose.age_ms(time.monotonic())
++                if age >= freshness_ms:
++                    self._pose = None
++                    dropped_age = age
++            closing = self._closing
++        self.log.info("connected, session %s...", session[:8])
++        if dropped_age is not None:
++            self.log.info("dropped pose stale at reconnect (%.0f ms old)", dropped_age)
++
++        reader = threading.Thread(target=self._read_loop, args=(ws, conn_id),
++                                  name="h3-motion-client-rx", daemon=True)
++        reader.start()
++        try:
++            if not closing:
++                self._send_loop(ws, session, info)
++        except Exception as e:  # noqa: BLE001
++            self.log.warning("connection error: %s", e)
++        finally:
++            with self._cond:
++                self._connected = False
++                self._ws = None
++            try:
++                ws.close()
++            except Exception:  # noqa: BLE001
++                pass
++            reader.join(2.0)
++            self.log.info("disconnected")
++
++    def _send_loop(self, ws, session: str, info: dict) -> None:
++        require_frame_seq = info.get("require_frame_seq") is not False
++        while True:
++            with self._cond:
++                self._cond.wait_for(lambda: (self._closing or self._reconnect_req or self._conn_failed
++                                             or self._pose is not None or self._gain is not None))
++                if self._closing or self._reconnect_req or self._conn_failed:
++                    return
++                if self._session_lost:
++                    # Not our session any more: drop instead of sending into rejection.
++                    self._pose = None
++                    self._gain = None
++                    continue
++                pose, gain = self._pose, self._gain
++                self._pose = None
++                self._gain = None
++                msgs: List[str] = []
++                now = time.monotonic()
++                if pose is not None:
++                    if pose.frame_seq is None and require_frame_seq and not self._warned_no_frame_seq:
++                        self._warned_no_frame_seq = True
++                        self.log.warning("server requires frame_seq; poses without it are rejected")
++                    self._seq += 1
++                    m: Dict[str, Any] = {
++                        "type": "pose", "protocol": PROTOCOL_VERSION, "source_session": session,
++                        "seq": self._seq, "source_age_ms": pose.age_ms(now),
++                        "pitch": pose.pitch, "roll": pose.roll, "yaw": pose.yaw, "gain": pose.gain,
++                    }
++                    if pose.frame_seq is not None:
++                        m["frame_seq"] = pose.frame_seq
++                    msgs.append(json.dumps(m, allow_nan=False))
++                if gain is not None:
++                    self._seq += 1
++                    msgs.append(json.dumps({"type": "gain", "protocol": PROTOCOL_VERSION,
++                                            "source_session": session, "seq": self._seq, "gain": gain},
++                                           allow_nan=False))
++            for text in msgs:  # outside the lock
++                ws.send(text)
++
++    def _read_loop(self, ws, conn_id: int) -> None:
++        try:
++            while True:
++                try:
++                    raw = ws.recv(timeout=self.RECV_STALL_S)
++                except TimeoutError:
++                    self.log.warning("no message for %.1f s; reconnecting", self.RECV_STALL_S)
++                    return
++                self._handle_message(raw)
++        except ConnectionClosed:
++            pass
++        except Exception as e:  # noqa: BLE001
++            self.log.debug("reader ended: %s", e)
++        finally:
++            with self._cond:
++                if self._conn_id == conn_id:
++                    self._conn_failed = True
++                    self._cond.notify_all()
++
++    def _handle_message(self, raw: Any) -> None:
++        try:
++            msg = json.loads(raw)
++        except (TypeError, ValueError):
++            self.log.debug("ignoring non-JSON message")
++            return
++        if not isinstance(msg, dict):
++            return
++        kind = msg.get("type")
++        if kind == "ack":
++            reason = msg.get("reason")
++            rejected = msg.get("accepted") is False
++            with self._cond:
++                self._last_ack = msg
++                if rejected:
++                    self._last_reject = msg
++                lost = rejected and reason == "stale_session" and not self._session_lost
++                if lost:
++                    self._session_lost = True
++                # Edge-triggered: one warning per conflict episode, not per rejected pose.
++                conflict = rejected and reason == "axis_conflict"
++                conflict_began = conflict and not self._axis_conflict
++                conflict_ended = self._axis_conflict and not conflict
++                self._axis_conflict = conflict
++            if lost:
++                self.log.warning("session taken over by another client; not sending poses (reconnect() to retake)")
++            elif conflict_began:
++                self.log.warning("axis_conflict: two CoreS3 units selected the same axis; server rejects our input "
++                                 "until the operator fixes the selection (still sending, not reconnecting)")
++            elif conflict_ended:
++                self.log.info("axis_conflict cleared")
++            elif rejected:
++                self.log.debug("pose rejected: %s", reason)
++        elif kind == "status":
++            msg.pop("type", None)
++            with self._cond:
++                self._status = msg
++                self._status_at = time.monotonic()
++            cb = self.on_status
++            if cb is not None:
++                try:
++                    cb(msg)
++                except Exception:  # noqa: BLE001
++                    self.log.exception("on_status callback failed")
++
++
++# ---------------------------------------------------------------- CLI
++
++
++def _claimants(a: dict) -> str:
++    """``port(device_id), port(device_id)`` from axes[].claimants (DESIGN.md §10.2); ``-`` if none."""
++    items = a.get("claimants")
++    if not isinstance(items, list) or not items:
++        return "-"
++    out = []
++    for c in items:
++        if isinstance(c, dict):
++            out.append("%s(%s)" % (c.get("port"), c.get("device_id")))
++        else:
++            out.append(str(c))
++    return ", ".join(out)
++
++
++def _summary(st: dict) -> str:
++    sess = st.get("session") or {}
++    conflict = st.get("axis_conflict")
++    if not isinstance(conflict, list):
++        conflict = []
++    lines = [
++        "rig_state:         %s" % st.get("rig_state"),
++        "armed:             %s" % st.get("armed"),
++        "active_source:     %s" % st.get("active_source"),
++        "calibration_valid: %s" % st.get("calibration_valid"),
++        "fault:             %s" % json.dumps(st.get("fault"), ensure_ascii=False),
++        "blockers:          %s" % json.dumps(st.get("blockers"), ensure_ascii=False),
++        # Axes claimed by two or more CoreS3 units (same 系統 selected on both):
++        # the server refuses ARM / START / poses until the operator fixes it.
++        "axis_conflict:     %s" % (json.dumps(conflict) if conflict else "none"),
++        "session:           %s fresh=%s age_ms=%s last_seq=%s last_frame_seq=%s" % (
++            sess.get("source_session_prefix"), sess.get("fresh"), sess.get("source_age_ms"),
++            sess.get("last_seq"), sess.get("last_frame_seq")),
++        "effective_gain:    %s limits=%s" % (st.get("effective_gain"), st.get("limits")),
++    ]
++    for a in st.get("axes") or []:
++        if not isinstance(a, dict):
++            continue
++        lines.append("axis %s: connected=%s mcu_state=%s fault_code=%s actual_count=%s target_count=%s" % (
++            a.get("axis_id"), a.get("connected"), a.get("mcu_state"), a.get("fault_code"),
++            a.get("actual_count"), a.get("target_count")))
++        # Assignment (DESIGN.md §10): which unit drives this axis and why.
++        # assignment: "selected" (MCU's 系統 selection) / "config" (device_id only) / None.
++        lines.append("        device_id=%s expected=%s assignment=%s%s claimants=%s" % (
++            a.get("device_id"), a.get("expected_device_id"), a.get("assignment"),
++            " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
++        if a.get("reference_stale"):
++            lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
++    return "\n".join(lines)
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description="h3-control-server status / stop (no admin token)")
++    ap.add_argument("command", choices=["status", "stop"])
++    ap.add_argument("--url", default=DEFAULT_URL, help="server base URL (default %(default)s)")
++    ap.add_argument("--json", action="store_true", help="status: print the full JSON")
++    ap.add_argument("--timeout", type=float, default=1.5)
++    args = ap.parse_args(argv)
++    if args.command == "stop":
++        ok = request_stop(args.url, args.timeout)
++        print("stop: confirmed" if ok else "stop: NOT confirmed (server down, 503 or refused); check status")
++        return 0 if ok else 1
++    try:
++        st = fetch_status(args.url, args.timeout)
++    except Exception as e:  # noqa: BLE001
++        print("status: %s" % e, file=sys.stderr)
++        return 1
++    print(json.dumps(st, indent=2, ensure_ascii=False) if args.json else _summary(st))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/h3game/h3_server_backend.py b/h3game/h3_server_backend.py
+new file mode 100644
+index 0000000..6cefd6c
+--- /dev/null
++++ b/h3game/h3_server_backend.py
+@@ -0,0 +1,274 @@
++"""h3-control-server backend for h3game bridge.py (H3_BACKEND=server).
++
++Canonical source: clients/h3game/h3_server_backend.py in
++dof-reality-h3-custom-controller (copied into h3game/ by the patch).
++
++bridge.py keeps its HTTP API, owner check and /state; in server mode it hands
++each accepted POST to ``ServerBackend.submit`` and merges ``state()`` into
++/state. Rules (DESIGN.md §0, §8; architecture.md §4):
++
++- Never opens serial, never imports h3_direct. Never arms, starts or centers:
++  connecting only gets a session and reads status (operator uses the admin API).
++- ``submit`` only fills the MotionClient's latest-value slot: it never waits
++  on the network, so the bridge's HTTP handler never blocks on the server.
++- Freshness comes from the page's ``frame_seq``. A POST that repeats the last
++  frame_seq (frozen game loop, hidden tab sending zeros) is not forwarded as a
++  pose; only a changed gain goes out as a gain-only message. Nothing is resent
++  to keep the server alive, so it stops the rig when the game stops.
++- A POST from a new owner (page reload / another tab) restarts frame_seq, so
++  the backend reconnects with a new session. If the rig was ACTIVE the server
++  stops it; the operator must ARM + START again (intended).
++- A page without frame_seq is forwarded as is; the server rejects it
++  (``missing_frame_seq``) unless ``allow_missing_frame_seq`` is set. The
++  reason shows in /state as ``reject_reason``.
++- /state ``connected`` is False once another client took the session
++  (``session_lost``): this bridge's poses are dropped until /reconnect, so the
++  page must not say the seat is connected.
++- 系統 (axis) assignment problems (DESIGN.md §10) are shown to the player in
++  Japanese through ``hud_note`` (built from the status ``blockers`` codes and
++  the WS reject reason): 系統の競合 (``axis_conflict``), 個体の不一致
++  (``axis_device_mismatch``), 再基準化が必要 (``reference_stale``). The bridge
++  does nothing about them (operator fixes the selection on the CoreS3); the
++  server already refuses ARM / START / poses meanwhile.
++
++Python >= 3.9, stdlib + websockets>=13 (through h3_motion_client).
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++import numbers
++import threading
++from typing import Any, Callable, Dict, List, Optional
++
++DEFAULT_URL = "http://127.0.0.1:8892"
++AXES = ("pitch", "roll", "yaw")
++
++# Blocker codes (the text before ':' in StatusSnapshot.blockers[], DESIGN.md
++# §7.2 / §10.2) and WS ack reject reasons that the player should see in
++# Japanese. Other codes stay operator-facing (status / check-config).
++HUD_TEXT = {
++    "axis_conflict": "系統の競合",          # 2 台の CoreS3 が同じ系統を選択している
++    "axis_device_mismatch": "個体の不一致",  # 設定の device_id と選択された個体が違う
++    "reference_stale": "再基準化が必要",     # 同じ boot のまま系統が変わった個体
++}
++REJECT_SUFFIX = "入力拒否"  # the WS ack said axis_conflict: our poses are being refused right now
++
++
++def blocker_code(b: Any) -> Optional[str]:
++    """``"<code>: <detail>"`` → ``"<code>"``; None for anything that is not a string."""
++    if not isinstance(b, str):
++        return None
++    return b.split(":", 1)[0].strip() or None
++
++
++def hud_note(blockers: Any, axis_conflict: Any = None, reject_reason: Any = None) -> Optional[str]:
++    """Japanese one-liner for the game HUD, or None when there is nothing to say.
++
++    ``blockers`` / ``axis_conflict`` are the StatusSnapshot fields (any shape
++    tolerated), ``reject_reason`` the reason of the last rejected WS ack. Each
++    phrase appears once, e.g. ``系統の競合(軸1、入力拒否) / 再基準化が必要``.
++    """
++    parts: List[str] = []
++    seen = set()
++    codes = [blocker_code(b) for b in blockers] if isinstance(blockers, list) else []
++    rejected = reject_reason == "axis_conflict"
++    if rejected and "axis_conflict" not in codes:
++        codes.append("axis_conflict")  # the reject can arrive before (or without) the blocker
++    axes = [a for a in axis_conflict if isinstance(a, int) and not isinstance(a, bool)] \
++        if isinstance(axis_conflict, list) else []
++    for code in codes:
++        if code is None or code not in HUD_TEXT or code in seen:
++            continue
++        seen.add(code)
++        text = HUD_TEXT[code]
++        if code == "axis_conflict":
++            detail = []
++            if axes:
++                detail.append("軸%s" % ",".join(str(a) for a in sorted(set(axes))))
++            if rejected:
++                detail.append(REJECT_SUFFIX)
++            if detail:
++                text += "(%s)" % "、".join(detail)
++        parts.append(text)
++    return " / ".join(parts) if parts else None
++
++# Return values of submit() (also the keys of ServerBackend.stats).
++SENT = "sent"            # pose put in the client slot
++GAIN_ONLY = "gain_only"  # same frame_seq, gain changed → gain-only message
++REPEAT = "repeat"        # same frame_seq, nothing new → not forwarded
++OLD_FRAME = "old_frame"  # frame_seq went backwards for the same owner → dropped
++INVALID = "invalid"      # non-numeric / non-finite / bad frame_seq or age → dropped
++NOTHING = "nothing"      # no pose keys, no gain
++
++# The server parses frame_seq as u64: a larger value would be stored here,
++# rejected there (bad_message) and then block every later frame as old_frame.
++MAX_FRAME_SEQ = 2**64 - 1
++
++
++def _num(v: Any) -> Optional[float]:
++    """float(v) like bridge.py does, but None for anything non-finite or unparsable."""
++    try:
++        f = float(v)
++    except (TypeError, ValueError, OverflowError):  # OverflowError: JSON int beyond float
++        return None
++    return f if math.isfinite(f) else None
++
++
++def _frame_seq(v: Any) -> Optional[int]:
++    if isinstance(v, bool) or not isinstance(v, numbers.Integral) or not 0 <= v <= MAX_FRAME_SEQ:
++        raise ValueError(v)
++    return int(v)
++
++
++class ServerBackend:
++    """Bridge-side adapter around MotionClient (see module docstring)."""
++
++    def __init__(
++        self,
++        url: str = DEFAULT_URL,
++        client_factory: Optional[Callable[[str], Any]] = None,
++        logger: Optional[logging.Logger] = None,
++    ) -> None:
++        if client_factory is None:
++            from h3_motion_client import MotionClient  # needs websockets
++
++            client_factory = MotionClient
++        self.url = url.rstrip("/")
++        self.log = logger or logging.getLogger("h3_server_backend")
++        self.client = client_factory(self.url)
++        self._lock = threading.Lock()
++        self._owner: Optional[int] = None
++        self._frame_seq: Optional[int] = None
++        self._pose = {k: 0.0 for k in AXES}
++        self._gain: Optional[float] = None
++        self.stats: Dict[str, int] = {k: 0 for k in (SENT, GAIN_ONLY, REPEAT, OLD_FRAME, INVALID)}
++        self.stats["new_page"] = 0
++
++    # ------------------------------------------------------------ lifecycle
++
++    def start(self) -> None:
++        """Start the client thread; returns at once (no ARM / START / center)."""
++        self.client.start()
++
++    def reconnect(self) -> None:
++        """Re-establish the transport with a new session. Never re-arms."""
++        self.client.reconnect()
++
++    def close(self) -> None:
++        """Close the connection. Does not stop the rig: without new poses the
++        server's freshness expires and it stops by itself."""
++        self.client.close()
++
++    # ------------------------------------------------------------ input
++
++    def submit(self, owner: int, d: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> str:
++        """Hand one accepted POST body ``d`` to the client; never blocks.
++
++        ``owner`` is the owner number that passed the bridge's check.
++        ``fallback`` supplies values for keys missing from ``d`` (bridge state).
++        """
++        fallback = fallback or {}
++        with self._lock:
++            if self._owner is not None and owner != self._owner:
++                # New page: its frame_seq starts over, the old session's would reject it.
++                self._frame_seq = None
++                self.stats["new_page"] += 1
++                self.log.info("new page (owner %s -> %s): reconnecting with a new session", self._owner, owner)
++                self.client.reconnect()
++            self._owner = owner
++            return self._submit_locked(d, fallback)
++
++    def _submit_locked(self, d: Dict[str, Any], fallback: Dict[str, Any]) -> str:
++        has_pose = any(k in d for k in AXES)
++        raw_gain = d["gain"] if "gain" in d else (self._gain if self._gain is not None else fallback.get("gain"))
++        gain = _num(raw_gain)
++        if not has_pose and "frame_seq" not in d:
++            if "gain" not in d:
++                return NOTHING
++            return self._gain_only(gain)
++
++        pose = {}
++        for k in AXES:
++            pose[k] = _num(d[k]) if k in d else self._pose[k]
++        try:
++            fs = None if d.get("frame_seq") is None else _frame_seq(d.get("frame_seq"))
++        except ValueError:
++            return self._count(INVALID)
++        age = 0.0 if d.get("frame_age_ms") is None else _num(d.get("frame_age_ms"))
++        if gain is None or age is None or age < 0 or any(v is None for v in pose.values()):
++            return self._count(INVALID)
++
++        if fs is not None and self._frame_seq is not None:
++            if fs < self._frame_seq:
++                return self._count(OLD_FRAME)
++            if fs == self._frame_seq:
++                # No new game frame: never a pose (would look alive); gain may still change.
++                if gain != self._gain:
++                    return self._gain_only(gain)
++                return self._count(REPEAT)
++
++        if not self.client.submit_pose(pose["pitch"], pose["roll"], pose["yaw"], gain,
++                                       frame_seq=fs, source_age_ms=age):
++            return self._count(INVALID)
++        self._pose = pose
++        self._gain = gain
++        if fs is not None:
++            self._frame_seq = fs
++        return self._count(SENT)
++
++    def _gain_only(self, gain: Optional[float]) -> str:
++        if gain is None or not self.client.submit_gain(gain):
++            return self._count(INVALID)
++        self._gain = gain
++        return self._count(GAIN_ONLY)
++
++    def _count(self, result: str) -> str:
++        self.stats[result] += 1
++        return result
++
++    # ------------------------------------------------------------ status
++
++    def state(self) -> Dict[str, Any]:
++        """Keys merged into bridge /state. Unknown values are None (not 0/False)."""
++        c = self.client
++        st = c.status()  # None when no status for 2 s
++        reachable = bool(c.connected) and st is not None
++        st = st if reachable else None
++        rig = st.get("rig_state") if st else None
++        sess = (st or {}).get("session") or {}
++        sid = c.session_id
++        mine = bool(sid) and sess.get("source_session_prefix") == sid[:8]
++        ack = c.last_ack or {}
++        with self._lock:
++            frame_seq = self._frame_seq
++            stats = dict(self.stats)
++        lost = bool(c.session_lost)
++        reject = ack.get("reason") if ack.get("accepted") is False else None
++        conflict = st.get("axis_conflict") if st else None
++        return {
++            "backend": "server",
++            "server_url": self.url,
++            # Existing keys, server meaning: reachable, every axis identified and
++            # this bridge still owns the session (otherwise its poses go nowhere).
++            "connected": reachable and rig not in (None, "OFFLINE") and not lost,
++            "port": "%s %s%s" % (self.url, rig, " SESSION_LOST" if lost else "") if reachable else self.url,
++            "server_reachable": reachable,
++            "rig_state": rig,
++            "armed": st.get("armed") if st else None,
++            "calibration_valid": st.get("calibration_valid") if st else None,
++            "fault": st.get("fault") if st else None,
++            "blockers": st.get("blockers") if st else None,
++            "effective_gain": st.get("effective_gain") if st else None,
++            "session_fresh": sess.get("fresh") if mine else None,
++            "session_lost": lost,
++            "reject_reason": ack.get("reason"),
++            # Axes claimed by 2+ CoreS3 units (same 系統 selected), DESIGN.md §10.
++            "axis_conflict": conflict if isinstance(conflict, list) else None,
++            # Japanese text for the page (系統の競合 / 個体の不一致 / 再基準化が必要);
++            # None when the server is unreachable or there is nothing to show.
++            "hud_note": hud_note(st.get("blockers"), conflict, reject) if st else None,
++            "frame_seq": frame_seq,
++            "pose_stats": stats,
++        }
+diff --git a/h3game/web/index.html b/h3game/web/index.html
+index 5582760..e03df5c 100644
+--- a/h3game/web/index.html
++++ b/h3game/web/index.html
+@@ -106,9 +106,14 @@ function readInput(){const v=H3Input.values();const b1=H3Input.buttons('stick1')
+ 
+ // ---- 席: target に -1..1 を入れると、なめらかに追いかけて 30回/秒 で bridge に送る ----
+ let target={pitch:0,roll:0,yaw:0},cur={pitch:0,roll:0,yaw:0},st={};
++function srvNote(){if(st.backend!=='server')return'';const g=st.effective_gain;   // server: 接続中でも席が動くとは限らない(ARM・START は人が行う)
++ return ' '+(st.rig_state||'?')+(st.session_lost?' 別の画面か bridge に取られた(つなぎ直す)':'')+(st.fault?' FAULT':'')+(st.hud_note?' '+st.hud_note:'')+(g!=null&&Math.abs(g-cfg.gain)>0.001?' 揺れは '+(+g).toFixed(2)+' に制限':'')}
++let frameSeq=0,frameAt=performance.now();   // 描画フレームの通し番号と、その時刻(制御サーバーが「ゲームが止まっていないか」を見る)
++let sentSeq=0,sentAt=frameAt;   // 表示中に最後に送ったフレーム。隠れている間はこれを繰り返す(0 は新しいフレームとして送らない)
+ function sendSeat(){if(STANDALONE)return;
+- const o={owner:OWNER,gain:cfg.gain};
+- for(const a of AX)o[a]=document.hidden?0:cur[a]*(cfg.inv[a]?-1:1);   // 画面が隠れたら中央へ
++ const h=document.hidden;if(!h){sentSeq=frameSeq;sentAt=frameAt}
++ const o={owner:OWNER,gain:cfg.gain,frame_seq:sentSeq,frame_age_ms:Math.max(0,performance.now()-sentAt)};
++ for(const a of AX)o[a]=h?0:cur[a]*(cfg.inv[a]?-1:1);   // 画面が隠れたら中央へ
+  fetch('/',{method:'POST',body:JSON.stringify(o)}).catch(()=>{})}
+ if(!STANDALONE){setInterval(sendSeat,1000/30);
+  const poll=()=>fetch('/state').then(r=>r.json()).then(s=>st=s).catch(()=>{st={down:true}});poll();setInterval(poll,1000)}
+@@ -142,7 +147,7 @@ function renderSetup(inp){const v=inp.raw;
+   st.connected?'<span class="ok">席 OK。</span>':'<span class="ng">席が未接続(画面だけ動きます)。</span>';
+  $('hint').innerHTML=seat+' '+(have===3?'<span class="ok">入力 3/3 OK。</span>':`<span class="wait">入力 ${have}/3。</span> 見えていない機器はボタンを1回押すか大きく倒す。無くてもキーボードで遊べます。`);
+  $('h3st').innerHTML=STANDALONE?'bridge 経由(http://localhost:8891)で開くと席が動きます':st.down?'<span class="ng">● bridge に届きません</span>':
+-  st.connected?`<span class="ok">● H3 接続中</span> <span class="sub">${st.port||''}</span>`:'<span class="ng">● H3 未接続</span> <span class="sub">USB と電源を確認。挿すと数秒で自動でつながります</span>';
++  st.connected?`<span class="ok">● H3 接続中</span> <span class="sub">${st.port||''}${srvNote()}</span>`:st.backend==='server'?`<span class="ng">● 制御サーバーで運転できない</span> <span class="sub">${st.port||''}${srvNote()}</span>`:'<span class="ng">● H3 未接続</span> <span class="sub">USB と電源を確認。挿すと数秒で自動でつながります</span>';
+  $('bLive').classList.toggle('on',live);$('bLive').textContent=live?'スティックで席を動かす: 入(押すと切)':'スティックで席を動かす(テスト)';
+  // 席の動き: 試し揺れ > スティック連動 > 中央
+  if(swayT>0){const s=Math.sin(performance.now()/300)*0.5;for(const a of AX)target[a]=a===swayAxis?s:0}
+@@ -175,9 +180,10 @@ function frame(now){const dt=Math.min(0.05,(now-last)/1000);last=now;
+  const inp=readInput();let smooth=0.12;
+  if(phase==='setup'){if(swayT>0)swayT-=dt;renderSetup(inp)}
+  else{const m=Game.update(dt,inp)||{};smooth=m.smooth||0.12;for(const a of AX)target[a]=clamp(+m[a]||0);Game.draw(cx,W,H);
+-  $('hud').textContent=(st.connected?'● H3 接続中':'● H3 未接続')+(Mic.ok()?'　● マイク':'　× マイク')+'　Esc: 設定に戻る'}
++  $('hud').textContent=(st.connected?'● H3 接続中':'● H3 未接続')+srvNote()+(Mic.ok()?'　● マイク':'　× マイク')+'　Esc: 設定に戻る'}
+  const f=1-Math.pow(1-smooth,dt*60);for(const a of AX)cur[a]+=(target[a]-cur[a])*f;   // 急な動きをならす
+  if(phase==='setup')renderSeat();
++ if(!document.hidden){frameSeq++;frameAt=performance.now()}   // 1フレーム分の更新が最後まで済んだ(隠れている間は進めない)
+  requestAnimationFrame(frame)}
+ Mic.init();addEventListener('pointerdown',()=>Mic.resume());
+ H3Input.load().then(()=>requestAnimationFrame(frame));
+-- 
+2.50.1 (Apple Git-155)
+
