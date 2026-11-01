@@ -166,9 +166,9 @@ v1 ファームの端当て校正（protocol.md §1.2、DESIGN.md §11）を使�
 1. 3 軸が接続され、全軸 `DISARMED`（status の `axes[].mcu_state`）であること。`calibration_valid = false` のままでよい（校正に CONFIG も基準も要らない）。
 2. 試験ページの「校正（3 軸）」（確認ダイアログあり）、または `curl -sX POST -H "$AUTH" $URL/v1/calibrate`。電源担当軸（系統 1）を含めないと 409 `power_axis_required`（他の軸は 24V が無く端当てに失敗する）。
 3. status: 各軸が `CALIBRATING`（blockers に `calibrating: axisN`。この間 ARM / START / CENTER / REFERENCE は 409 `calibrating`）。止めるなら「校正を中止」/ `POST /v1/calibrate/cancel` / STOP。
-4. 終わると各軸の `calibration` に `result`（`OK` / `FAILED` / `CANCELLED`）・`reason`・`n_end_count`（N 端の count。P 端 = 0）・`neutral_count`・`sign`。`OK` の軸は `referenced = true`（MCU が P 端 = 0 の基準を自分で作る。/v1/reference は不要）で中立に止まっている。`FAILED`（`stall` / `slow` / `travel` / `timeout` …）なら従来 env の §1.2 と同じ切り分け。
+4. 終わると各軸の `calibration` に `result`（`OK` / `FAILED` / `CANCELLED`）・`reason`・`n_end_count`（N 端の count。P 端 = 0）・`neutral_count`・`sign`。`OK` の軸は `referenced = true`（MCU が P 端 = 0 の基準を自分で作る。/v1/reference は不要）で中立に止まっている。同時にその軸は `calibration_stale = true` になり、blockers に `calibration_stale: axisN recalibrated (stroke S, neutral N); export and reload config before ARM` が出る（MCU の原点・行程・向きが測り直されたので、いま動いているサーバーの設定の幾何は承認済みとみなさない。Issue #15 H3）。**この印は 5.→6. で export したファイルでサーバーを起動し直すまで消えない**（CoreS3 の再接続・再起動でも消えない。旧設定のまま再起動しても消えるので、起動する `--config` が export したファイルであることは操作者が確かめる）。`FAILED`（`stall` / `slow` / `travel` / `timeout` …）なら従来 env の §1.2 と同じ切り分け。
 5. 「校正結果を設定に書き出す」/ `POST /v1/calibration/export`。`bringup.toml` と同じディレクトリに `h3-bringup-01.calibration-<YYYYmmdd-HHMMSS>.toml`（UTC）が書かれる: OK の軸の `mechanical_* / soft_* / count_at_virtual_* / device_id` が結果から置き換わり、コメントと他の軸はそのまま、`calibration_valid = false` のまま、先頭に生の結果と置き換え前の値。
-6. そのファイルを見て、`n_end_count` が過去の記録（§5.3、±30）と合うこと・`sign` が §5.2 の前提と合うことを確かめ、§5.5 の手順で `calibration_valid = true` にして `--config` にそのファイルを指定して起動し直す。基準は boot ごとに消える（§5.1 の末尾）ので、再起動後は校正をやり直すか、中立で止まっていれば §5.1 の /v1/reference で `count_at_virtual_512` を入れる。
+6. そのファイルを見て、`n_end_count` が過去の記録（§5.3、±30）と合うこと・`sign` が §5.2 の前提と合うことを確かめ、§5.5 の手順で `calibration_valid = true` にして `--config` にそのファイルを指定して起動し直す（この再起動で 4. の `calibration_stale` が消える。再起動せずに ARM はできない）。基準は boot ごとに消える（§5.1 の末尾）ので、再起動後は校正をやり直すか、中立で止まっていれば §5.1 の /v1/reference で `count_at_virtual_512` を入れる。
 
 以下 §5.1〜§5.4 は、校正に対応していないファーム・校正が失敗するときの手動の手順（そのまま使える）。
 

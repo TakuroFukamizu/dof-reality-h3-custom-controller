@@ -32,6 +32,9 @@ stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 5
 center_reach_timeout_ms = 5000
+rest_velocity_count_s = 50
+rest_error_count = 50
+rest_dwell_ms = 200
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 

@@ -796,13 +796,19 @@ async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calib
         assert!(s.referenced);
         assert_eq!((s.end_min_count, s.end_max_count), (0, 1000), "P end = 0");
     }
-    // ARM is now blocked only by the operator's calibration_valid = false.
-    let snap = wait_status(&srv, S, "blockers settle", |s| blocker_codes(s) == ["calibration_invalid"]).await;
-    assert_eq!(snap.blockers.len(), 3, "{:?}", snap.blockers);
+    // ARM is now blocked only by the operator's calibration_valid = false and
+    // by the recalibration itself (Issue #15 H3: the geometry this server
+    // started with is no longer approved; a restart with the export clears it).
+    let snap = wait_status(&srv, S, "blockers settle", |s| blocker_codes(s) == ["calibration_invalid", "calibration_stale"]).await;
+    assert_eq!(snap.blockers.len(), 6, "{:?}", snap.blockers);
+    assert!(snap.axes.iter().all(|a| a.calibration_stale));
     let r = admin(srv.local_addr, "/v1/arm").await;
     assert_eq!(r.status, 409);
     assert_eq!(r.json()["error"], "not_ready");
-    assert!(r.json()["blockers"].as_array().unwrap().iter().all(|b| b.as_str().unwrap().starts_with("calibration_invalid")));
+    assert!(r.json()["blockers"].as_array().unwrap().iter().all(|b| {
+        let b = b.as_str().unwrap();
+        b.starts_with("calibration_invalid") || b.starts_with("calibration_stale")
+    }));
 
     // Export: a config next to sim.toml with the measured numbers.
     let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
@@ -820,14 +826,19 @@ async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calib
     }
     srv.shutdown().await;
 
-    // A server started from the exported file: unreferenced sims at 0, one
-    // calibration later only calibration_valid stands between it and ARM.
+    // A server started from the exported file: the restart cleared the
+    // calibration_stale mark; the unreferenced sims at 0 need a reference,
+    // and a calibration later only calibration_valid plus the fresh
+    // calibration_stale stand between it and ARM.
     let srv = start_sim_with_path(out, Some(path.clone())).await;
-    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    let snap = wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    assert!(snap.axes.iter().all(|a| !a.calibration_stale), "{:?}", snap.blockers);
+    assert!(!blocker_codes(&snap).iter().any(|c| c == "calibration_stale"), "{:?}", snap.blockers);
     let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], Some(r#"{"axes":[1,2,3]}"#)).await;
     assert_eq!(r.status, 200, "{r:?}");
     let snap = wait_status(&srv, 8 * S, "calibrated again", |s| {
-        s.axes.iter().all(|a| a.calibration.is_some() && a.referenced && a.mcu_state == Some(McuState::Disarmed)) && blocker_codes(s) == ["calibration_invalid"]
+        s.axes.iter().all(|a| a.calibration.is_some() && a.referenced && a.mcu_state == Some(McuState::Disarmed))
+            && blocker_codes(s) == ["calibration_invalid", "calibration_stale"]
     })
     .await;
     assert_eq!(snap.rig_state, RigState::CalibrationRequired);

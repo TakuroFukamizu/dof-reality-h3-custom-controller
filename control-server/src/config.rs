@@ -114,6 +114,17 @@ pub struct TimingConfig {
     /// be within `game.center_tolerance_count` of neutral within this, or the rig
     /// faults (StopTimeout) instead of reporting `center_reached` on a lagging axis.
     pub center_reach_timeout_ms: u64,
+    /// Measured rest (Issue #15 H1): an axis is "at rest" when STATUS reports
+    /// |velocity_count_s| <= `rest_velocity_count_s` AND
+    /// |following_error_count| <= `rest_error_count`, continuously for
+    /// `rest_dwell_ms`. STOPPING (Decel -> Hold, Hold -> DISARM) and the
+    /// post-center settle require every axis at rest, not just a trajectory
+    /// at velocity 0: the MCU declares HOLDING when its SETPOINT stops, while a
+    /// gravity-loaded axis can still be moving / hundreds of counts off.
+    pub rest_velocity_count_s: u32,
+    /// Must cover the firmware deadband (`limits.deadband_out_count`).
+    pub rest_error_count: u32,
+    pub rest_dwell_ms: u64,
     /// Handshake: HELLO_REQ retry period and overall timeout per port.
     pub hello_retry_ms: u64,
     pub hello_timeout_ms: u64,
@@ -133,6 +144,9 @@ impl Default for TimingConfig {
             stop_hold_ms: 1000,
             max_frame_skew: 5,
             center_reach_timeout_ms: 5000,
+            rest_velocity_count_s: 50,
+            rest_error_count: 50,
+            rest_dwell_ms: 200,
             hello_retry_ms: 200,
             hello_timeout_ms: 2000,
         }
@@ -443,6 +457,9 @@ impl Config {
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.max_frame_skew", u64::from(t.max_frame_skew)),
             ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_velocity_count_s", u64::from(t.rest_velocity_count_s)),
+            ("timing.rest_error_count", u64::from(t.rest_error_count)),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
         ] {
@@ -461,6 +478,7 @@ impl Config {
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
             ("server.status_period_ms", s.status_period_ms),
@@ -481,6 +499,22 @@ impl Config {
             errs.push(format!(
                 "timing.mcu_command_timeout_ms ({}) must be > timing.planner_period_ms ({})",
                 t.mcu_command_timeout_ms, t.planner_period_ms
+            ));
+        }
+        // The rest dwell is part of every stop: it must fit in the settle window.
+        if t.stop_settle_timeout_ms > 0 && t.rest_dwell_ms >= t.stop_settle_timeout_ms {
+            errs.push(format!(
+                "timing.rest_dwell_ms ({}) must be < timing.stop_settle_timeout_ms ({})",
+                t.rest_dwell_ms, t.stop_settle_timeout_ms
+            ));
+        }
+        if t.rest_error_count > 0 && u32::from(self.limits.deadband_out_count) > t.rest_error_count {
+            // The firmware stops correcting inside deadband_out, so a rest
+            // tolerance tighter than that could never be met: every STOP would
+            // time out.
+            errs.push(format!(
+                "timing.rest_error_count ({}) must be >= limits.deadband_out_count ({})",
+                t.rest_error_count, self.limits.deadband_out_count
             ));
         }
 
