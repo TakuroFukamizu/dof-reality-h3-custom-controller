@@ -41,60 +41,251 @@
     （判定はサーバーが正。STOP は常に押せる）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
 -->
+<!--
+  見た目（2026-11）: 管制卓風の暗い画面。情報の順位は 1. rig_state と fault、2. STOP / ARM / START / DISARM / 中央へ、
+  3. 倒し量と指令姿勢（XY）、4. 3 系統の表、5. 制限と札、6. ログ。装飾はすべて CSS（外部資源・画像・フォントの読み込みは無し）。
+  JS は element の id と、#xy の子の順（u = 輪, b = 塗り）、.bar の先頭の i、#rateCtl の中身、表の列の順に依存する。
+  JS が className を書き換える要素（#rigState, バナー, #padState, #rateCtl, 札, #limEff, #sentPose, .ok / .bad の値, 表の td）は
+  id か JS が付けるクラス名だけで装飾する（markup に足したクラスは最初の更新で消える）。
+-->
 <style>
-  :root { --red: #c0392b; --green: #1e8449; --amber: #b9770e; --blue: #1f618d; --gray: #666; --bg: #f6f6f6; }
-  body { font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 0; padding: 12px 16px; background: var(--bg); color: #222; font-size: 14px; }
-  h1 { font-size: 18px; margin: 0 0 8px; }
-  h2 { font-size: 15px; margin: 0 0 6px; border-bottom: 1px solid #ccc; padding-bottom: 2px; }
-  section { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
-  button { font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid #888; background: #eee; cursor: pointer; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  button.stop { background: var(--red); color: #fff; border-color: #922b21; font-size: 22px; font-weight: bold; padding: 14px 36px; }
-  button.on { background: #d5f5e3; border-color: var(--green); }
-  input[type=text], input[type=password], input[type=number], select { font: inherit; padding: 4px 6px; border: 1px solid #aaa; border-radius: 4px; }
-  input[type=number] { width: 5em; }
-  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
-  th, td { border: 1px solid #ddd; padding: 3px 5px; text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; }
-  th { background: #f0f0f0; }
-  td.num { text-align: right; }
-  .state { font-size: 26px; font-weight: bold; padding: 4px 10px; border-radius: 4px; background: #eee; display: inline-block; }
-  .state.ACTIVE, .state.HOLDING, .state.ARMING, .state.STOPPING { background: #fde3c3; color: var(--amber); }
-  .state.FAULT_LATCHED { background: var(--red); color: #fff; }
-  .state.READY_TO_ARM { background: #d5f5e3; color: var(--green); }
-  .ok { color: var(--green); } .bad { color: var(--red); font-weight: bold; } .dim { color: var(--gray); }
-  td.bad { color: var(--red); font-weight: bold; }
-  .log { font-family: Menlo, Consolas, monospace; font-size: 12px; background: #fafafa; border: 1px solid #e5e5e5; padding: 6px; margin: 4px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-  .banner { padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; display: none; }
+  :root {
+    --bg: #050806; --panel: #090d0a; --panel2: #0d130f; --line: #253028; --line2: #46604f;
+    --ink: #e6e8df; --muted: #8f9a91; --dim: #61796a;
+    --orange: #ff8a00; --blue: #69c3e6; --green: #51e593; --yellow: #f6de30; --red: #ff382f; --red2: #c81e15;
+    --amber: var(--orange);
+    --cond: "DIN Condensed", "Avenir Next Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+    --mincho: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+    --sans: "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif;
+    --mono: "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body { margin: 0; padding: 0 0 40px; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+  a { color: var(--muted); }
+  a:hover { color: var(--orange); }
+  b { font-weight: 700; }
+  ::selection { background: var(--orange); color: #000; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+
+  /* ---- 最上段: 管理帯 */
+  h1 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; min-height: 40px; margin: 0; padding: 6px 20px;
+       border-bottom: 1px solid var(--line); font: 700 12px/1.4 var(--mono); letter-spacing: .1em; color: var(--orange); }
+  h1 .small { font-weight: 400; letter-spacing: .06em; }
+  h1 a { margin-left: auto !important; text-decoration: none; border: 1px solid var(--line2); padding: 2px 10px; letter-spacing: .04em; }
+
+  /* ---- バナー: 縞の縁 + 判定文 */
+  .banner { display: none; margin: 10px 20px 0; padding: 8px 12px 8px 24px; font-size: 13px; line-height: 1.5; position: relative; }
   .banner.show { display: block; }
-  .banner.bad { background: #fadbd8; color: var(--red); }
-  .banner.warn { background: #fdebd0; color: var(--amber); }
-  .small { font-size: 12px; }
-  .mono { font-family: Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-  /* 軸の表示: 値と棒（中央 0、右が + ） */
-  .axis { display: grid; grid-template-columns: 4em 1fr; gap: 6px 10px; align-items: center; margin: 6px 0; }
-  .axis .ctl { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-  .bar { position: relative; height: 14px; background: #eee; border: 1px solid #ccc; border-radius: 3px; overflow: hidden; }
-  .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #999; }
-  .bar i { position: absolute; top: 0; bottom: 0; background: var(--blue); }
-  .bar.raw i { background: #aab7c4; }
-  .big { font-size: 28px; font-weight: bold; }
-  .xy { position: relative; width: 140px; height: 140px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; }
-  .xy::before, .xy::after { content: ""; position: absolute; background: #ddd; }
+  .banner::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 12px; }
+  .banner.bad { color: #ffd9d6; background: #2a0a08; border: 1px solid var(--red); }
+  .banner.bad::before { background: repeating-linear-gradient(135deg, var(--red) 0 6px, #2a0a08 6px 12px); }
+  .banner.warn { color: #fff3b0; background: #221f06; border: 1px solid var(--yellow); }
+  .banner.warn::before { background: repeating-linear-gradient(135deg, var(--yellow) 0 6px, #221f06 6px 12px); }
+
+  /* ---- 1. 指令帯: rig_state / fault / STOP / 操作 */
+  .command { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(300px, 400px); gap: 0; margin: 12px 20px 0;
+             border-top: 4px solid var(--line2); border-bottom: 1px solid var(--line2); background: var(--panel); }
+  .command > div { padding: 12px 16px; min-width: 0; }
+  .state-block { border-right: 1px solid var(--line); }
+  .eyebrow { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font: 700 12px var(--mono); letter-spacing: .14em; color: var(--orange); margin-bottom: 6px; }
+  .eyebrow .small { font-weight: 400; letter-spacing: .04em; }
+  /* rig_state: 画面の主語。コンデンスドの極太を clamp で。語の左に状態色の帯、横に CSS の和文判定語（生の記号も残す） */
+  .state { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 .3em; width: 100%; padding: 2px 12px 6px 14px;
+           border-left: 10px solid var(--muted); color: var(--muted); background: transparent;
+           font: 700 clamp(34px, 5.5vw, 72px)/1 var(--cond); letter-spacing: -.01em; overflow-wrap: anywhere; }
+  .state::after { font: 900 .5em/1 var(--mincho); letter-spacing: .05em; }
+  .state.OFFLINE::after { content: "未接続"; }
+  .state.CONNECTED_DISARMED::after { content: "接続"; }
+  .state.BRAKED_DISARMED::after { content: "制動"; }
+  .state.CALIBRATION_REQUIRED::after { content: "要校正"; }
+  .state.READY_TO_ARM::after { content: "待機"; }
+  .state.ARMING::after { content: "投入中"; }
+  .state.HOLDING::after { content: "保持"; }
+  .state.ACTIVE::after { content: "運転"; }
+  .state.STOPPING::after { content: "停止中"; }
+  .state.FAULT_LATCHED::after { content: "異常"; }
+  .state.CALIBRATION_REQUIRED, .state.ARMING, .state.HOLDING, .state.STOPPING { color: var(--yellow); border-left-color: var(--yellow); }
+  .state.READY_TO_ARM { color: var(--green); border-left-color: var(--green); }
+  .state.ACTIVE { color: #050806; background: var(--orange); border-left-color: #ffd199; }
+  .state.FAULT_LATCHED { color: #0a0202; background: var(--red); border-left-color: #ffd9d6; animation: fault-blink 1s steps(1, end) infinite; }
+  @keyframes fault-blink { 0%, 100% { background: var(--red); } 50% { background: var(--red2); } }
+  .meta { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 10px; font: 12px/1.6 var(--mono); color: var(--muted); }
+  .meta b { color: var(--ink); font-weight: 600; }
+  .meta .ok { color: var(--green); }
+  .fault-line { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font: 13px/1.6 var(--mono); color: var(--muted); }
+  .fault-line > span { overflow-wrap: anywhere; }
+  .fault-line .ok { color: var(--green); }
+  .fault-line .bad { color: var(--red); font-weight: 700; }
+  #fault.bad { display: inline-block; padding: 0 6px; background: var(--red); color: #0a0202; }
+
+  /* STOP: 最も目立つ操作。縞の枠の中の赤い矩形。常に押せる（JS は disabled にしない） */
+  .stop-block { display: flex; align-items: center; justify-content: center; border-right: 1px solid var(--line); }
+  .stop-frame { padding: 8px; background: repeating-linear-gradient(45deg, var(--red) 0 10px, var(--bg) 10px 20px); }
+  button.stop { display: block; margin: 0; min-width: 200px; min-height: 104px; padding: 16px 32px; border: 0; border-radius: 0;
+                background: var(--red); color: #0a0202; font: 900 clamp(32px, 3.2vw, 44px)/1 var(--cond); letter-spacing: .18em; text-indent: .18em;
+                cursor: pointer; box-shadow: inset 0 0 0 3px #0a0202, inset 0 0 0 5px var(--red); }
+  button.stop:hover { background: #ff5a52; }
+  button.stop:active { background: #ffffff; }
+  button.stop:disabled { opacity: 1; cursor: pointer; }
+
+  /* 操作: 直角、細い枠、コンデンスドの大文字。押せないものは薄く。START は緑で区別 */
+  .ops-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { font: 700 15px/1.2 var(--cond); letter-spacing: .08em; padding: 10px 16px; min-height: 42px; border-radius: 0;
+           border: 1px solid var(--line2); background: var(--panel2); color: var(--ink); cursor: pointer; touch-action: manipulation; }
+  button:hover { border-color: var(--orange); color: var(--orange); }
+  button:disabled { opacity: .35; cursor: default; }
+  button:disabled:hover { border-color: var(--line2); color: var(--ink); }
+  button.on { background: var(--orange); color: #050806; border-color: var(--orange); }
+  #bStart { border-color: var(--green); color: var(--green); }
+  #bStart:hover { background: var(--green); color: #050806; }
+  #bFaultReset { border-color: var(--red); color: #ffb3ad; }
+  #bFaultReset:disabled { border-color: var(--line2); color: var(--ink); }
+  #bCmdCenter { border-color: var(--blue); color: var(--blue); }
+  .token-row { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; color: var(--muted); }
+  .token-row label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink); }
+  .hint { margin-top: 8px; font-size: 11px; line-height: 1.6; color: var(--dim); }
+
+  /* ---- 入力: 直角、暗い面、橙のアクセント */
+  input[type=text], input[type=password], input[type=number], select {
+    font: 13px var(--mono); padding: 6px 8px; border: 1px solid var(--line2); border-radius: 0; background: #070b08; color: var(--ink); min-height: 34px; }
+  input[type=number] { width: 5em; }
+  input:disabled, select:disabled { opacity: .45; }
+  input[type=range] { accent-color: var(--orange); min-height: 24px; }
+  input[type=checkbox] { accent-color: var(--orange); width: 16px; height: 16px; vertical-align: -3px; }
+  ::placeholder { color: var(--dim); }
+
+  /* ---- 面: 番号付きの見出し、1px の罫 */
+  body { counter-reset: sec; }
+  section.panel { background: var(--panel); border: 1px solid var(--line); padding: 12px 14px 14px; min-width: 0; }
+  h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 0 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line);
+       font: 700 14px/1.3 var(--sans); color: var(--orange); letter-spacing: .04em; }
+  h2::before { counter-increment: sec; content: counter(sec, decimal-leading-zero); font: 700 12px var(--mono); letter-spacing: .1em;
+               padding: 1px 5px; border: 1px solid var(--orange); }
+  h2 .small { font: 400 11px/1.4 var(--mono); color: var(--dim); letter-spacing: 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 14px 20px 0; }
+  .stack { margin: 14px 20px 0; display: grid; gap: 14px; }
+  .setup { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 14px 20px 0; }
+  .setup section.panel { font-size: 13px; }
+  .setup h2 { color: var(--muted); }
+  .setup h2::before { border-color: var(--muted); }
+
+  /* ---- 3. 主図: 倒し量（橙の輪）と指令姿勢（青の塗り） */
+  .figure-body { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: flex-start; }
+  .xy { position: relative; flex: none; width: 280px; height: 280px; border: 1px solid var(--line2); background-color: #060a07;
+        background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+        background-size: 28px 28px; background-position: 50% 50%; }
+  .xy::before, .xy::after { content: ""; position: absolute; background: var(--line2); }
   .xy::before { left: 50%; top: 0; bottom: 0; width: 1px; }
   .xy::after { top: 50%; left: 0; right: 0; height: 1px; }
-  .xy b { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--blue); left: 50%; top: 50%; }
-  /* 輪 = 倒し量（スティック）、塗り = 指令姿勢（送る値）。位置モードでは重なる */
-  .xy u { position: absolute; width: 12px; height: 12px; margin: -7px 0 0 -7px; border: 2px solid var(--amber); border-radius: 50%; left: 50%; top: 50%; text-decoration: none; box-sizing: content-box; }
-  label.sl { display: grid; grid-template-columns: 4em 1fr 4.5em; gap: 8px; align-items: center; margin: 4px 0; }
+  /* 塗り = 指令姿勢（送る値） */
+  .xy b { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; background: var(--blue); left: 50%; top: 50%;
+          box-shadow: 0 0 0 1px #050806; }
+  /* 輪 = 倒し量（スティック）。位置モードでは重なる */
+  .xy u { position: absolute; width: 20px; height: 20px; margin: -11px 0 0 -11px; border: 2px solid var(--orange); left: 50%; top: 50%;
+          text-decoration: none; box-sizing: content-box; }
+  .xy u::before, .xy u::after { content: ""; position: absolute; background: var(--orange); }
+  .xy u::before { left: 50%; top: -6px; bottom: -6px; width: 1px; margin-left: -.5px; }
+  .xy u::after { top: 50%; left: -6px; right: -6px; height: 1px; margin-top: -.5px; }
+  .readouts { display: grid; grid-template-columns: auto auto; gap: 8px 28px; flex: 1 1 260px; min-width: 0; }
+  .readouts > div > .dim { font: 11px/1.4 var(--mono); letter-spacing: .04em; margin-bottom: 4px; }
+  .readouts > div > div:not(.dim) { display: grid; grid-template-columns: 3.2em 1fr; align-items: baseline; font: 12px var(--mono); color: var(--muted); }
+  .big { font: 600 34px/1.15 var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+  #rollBig, #pitchBig { color: var(--orange); }
+  #rollCmd, #pitchCmd { color: var(--blue); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; grid-column: 1 / -1; font: 11px var(--mono); color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; vertical-align: -1px; margin-right: 6px; }
+  .legend .l-stick { border: 2px solid var(--orange); width: 8px; height: 8px; }
+  .legend .l-cmd { background: var(--blue); }
+  .echo { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 2px 18px; padding-top: 8px; border-top: 1px dashed var(--line); font: 12px/1.6 var(--mono); color: var(--muted); }
+  .echo b { color: var(--ink); font-weight: 600; }
+
+  /* ---- 送信 */
+  label.sl { display: grid; grid-template-columns: 4em 1fr 4.5em; gap: 8px; align-items: center; margin: 6px 0; font: 13px var(--mono); }
   label.sl.w { grid-template-columns: 6em 1fr 4.5em; }
-  .flag { display: inline-block; padding: 1px 6px; border: 1px solid #ccc; border-radius: 3px; margin-right: 4px; color: #999; font-size: 12px; }
-  .flag.on { background: #fdebd0; color: var(--amber); border-color: var(--amber); font-weight: bold; }
-  .off { opacity: 0.5; }
-  .btns span { display: inline-block; min-width: 1.4em; text-align: center; border: 1px solid #ccc; border-radius: 3px; margin: 1px; font-size: 11px; }
-  .btns span.on { background: var(--amber); color: #fff; border-color: var(--amber); }
+  label.sl span { text-align: right; color: var(--orange); }
+  .off { opacity: .4; }
+  .kv { display: flex; flex-wrap: wrap; gap: 2px 18px; font: 12px/1.7 var(--mono); color: var(--muted); }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .kv .ok, .ok { color: var(--green); }
+  .bad { color: var(--red); font-weight: 700; }
+  .dim { color: var(--muted); }
+  .small { font-size: 12px; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  #sentPose, #ack { font: 12px/1.6 var(--mono); overflow-wrap: anywhere; }
+  #wsState.bad { background: var(--red); color: #0a0202; padding: 0 6px; }
+  .stream-note { font-size: 11px; line-height: 1.7; color: var(--dim); margin-top: 8px; }
+
+  /* ---- 札: 消灯は輪郭、点灯は黄の塗り */
+  .flag { display: inline-block; padding: 2px 8px; border: 1px solid var(--line2); margin-right: 6px; color: var(--dim); font: 12px var(--mono); letter-spacing: .04em; }
+  .flag.on { background: var(--yellow); color: #171400; border-color: var(--yellow); font-weight: 700; }
+  /* motion_limits の pending（JS は bad を付ける）: 保留 = 黄 */
+  #limEff.bad { color: var(--yellow); font-weight: 700; }
+  .limits-row { display: flex; flex-direction: column; gap: 4px; font: 12px/1.7 var(--mono); color: var(--muted); }
+  .limits-row > span > span { color: var(--orange); letter-spacing: .04em; }
+  .limits-row b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+
+  /* ---- 表: 罫線と桁揃え。列の順は JS が index で書く */
+  .tbl { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font: 12.5px/1.4 var(--mono); font-variant-numeric: tabular-nums; }
+  th, td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; white-space: nowrap; }
+  th { font: 700 11px var(--mono); letter-spacing: .1em; color: var(--orange); border-bottom: 1px solid var(--line2); }
+  td { color: var(--ink); }
+  td.num { text-align: right; }
+  td.ok { color: var(--green); }
+  td.bad { color: #0a0202; background: var(--red); font-weight: 700; }
+  td.num.bad { color: var(--red); background: transparent; }
+  tbody tr:nth-child(even) td { background: #0b100c; }
+  tbody tr:nth-child(even) td.bad { background: var(--red); }
+  tbody tr:nth-child(even) td.num.bad { background: #0b100c; }
+  #axes td:first-child { color: var(--orange); font-weight: 700; }
+
+  /* ---- 軸の割当: 値と棒（中央 0、右が +） */
+  .axis { display: grid; grid-template-columns: 4em 1fr; gap: 6px 10px; align-items: center; margin: 8px 0; }
+  .axis > b { font: 700 18px var(--cond); letter-spacing: .06em; color: var(--orange); }
+  .axis .ctl { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+  .axis .ctl label { display: flex; align-items: center; gap: 4px; }
+  .bar { position: relative; height: 14px; background: #070b08; border: 1px solid var(--line2); overflow: hidden; }
+  .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line2); }
+  .bar i { position: absolute; top: 0; bottom: 0; background: var(--orange); }
+  .bar.raw i { background: var(--dim); }
+  .btns span { display: inline-block; min-width: 1.6em; text-align: center; border: 1px solid var(--line); margin: 1px; font: 11px/1.6 var(--mono); color: var(--dim); }
+  .btns span.on { background: var(--orange); color: #050806; border-color: var(--orange); }
+  #padState { font-size: 12px; }
+  #padState.bad { color: var(--red); font-weight: 700; }
+  #padState.ok { color: var(--green); }
+
+  /* ---- ログ */
+  .log { font: 11.5px/1.5 var(--mono); background: #030504; border: 1px solid var(--line); padding: 8px; margin: 0; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; color: var(--muted); }
+  .log .bad { color: var(--red); font-weight: 400; }
+
+  /* ---- 狭い幅: 主状態 → 操作 → 主図 → 表 の順を保つ */
+  @media (max-width: 1100px) {
+    .command { grid-template-columns: minmax(0, 1fr) auto; }
+    .ops-block { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+  }
+  @media (max-width: 760px) {
+    h1, .banner, .command, .workspace, .stack, .setup { margin-left: 10px; margin-right: 10px; }
+    h1 { padding: 6px 10px; }
+    .command { grid-template-columns: 1fr; }
+    .command > div { padding: 10px 12px; }
+    .state-block, .stop-block { border-right: 0; }
+    .state { font-size: clamp(30px, 10vw, 44px); border-left-width: 8px; padding-left: 10px; }
+    .stop-block { padding: 10px 12px; }
+    .stop-frame { width: 100%; }
+    button.stop { width: 100%; min-height: 84px; }
+    .ops-row button { flex: 1 1 40%; min-height: 48px; }
+    .workspace, .setup { grid-template-columns: 1fr; }
+    .xy { width: 240px; height: 240px; margin: 0 auto; }
+    .figure-body { justify-content: center; }
+    .readouts { grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+    .big { font-size: 28px; }
+    .meta, .fault-line, .kv { gap: 2px 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
@@ -102,67 +293,166 @@
 <div id="pollBanner" class="banner bad"></div>
 <div id="padBanner" class="banner warn"></div>
 
-<section>
-  <div class="row">
-    <button id="bStop" class="stop" title="POST /v1/stop（トークン不要）。物理非常停止ではない">STOP</button>
-    <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
-    <span class="dim small">sessionStorage に保存（このタブだけ）</span>
-  </div>
-  <div class="row" style="margin-top:8px">
-    <button id="bArm">ARM</button>
-    <button id="bStart">START</button>
-    <button id="bDisarm">DISARM</button>
-    <button id="bFaultReset">FAULT RESET</button>
-    <span class="dim small">順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</span>
-  </div>
-</section>
-
-<section>
-  <h2>リグ状態 <span class="dim small">GET /v1/status（200 ms）</span> <span id="statusAge" class="dim small"></span></h2>
-  <div class="row">
+<!-- 1. 指令帯: rig_state と fault、STOP、操作 -->
+<section class="command">
+  <div class="state-block">
+    <div class="eyebrow">リグ状態 <span class="dim small">GET /v1/status（200 ms）</span> <span id="statusAge" class="dim small"></span></div>
     <span id="rigState" class="state">—</span>
-    <span>armed: <b id="armed">—</b></span>
-    <span>active_source: <b id="activeSource">—</b></span>
-    <span>session: <b id="statusSession">—</b></span>
-    <span>fresh: <b id="fresh">—</b></span>
+    <div class="meta">
+      <span>armed: <b id="armed">—</b></span>
+      <span>active_source: <b id="activeSource">—</b></span>
+      <span>session: <b id="statusSession">—</b></span>
+      <span>fresh: <b id="fresh">—</b></span>
+    </div>
+    <div class="fault-line">
+      <span>fault: <span id="fault">—</span></span>
+      <span>axis_conflict: <b id="axisConflict">—</b></span>
+      <span>blockers: <span id="blockers" class="dim">—</span></span>
+    </div>
   </div>
-  <div class="row" style="margin-top:6px">
-    <span>effective_gain: <b id="effGain">—</b></span>
-    <span>limits: <b id="limits">—</b></span>
-    <span>requested_pose: <b id="reqPose" class="mono">—</b></span>
-    <span>target_counts: <b id="targets" class="mono">—</b></span>
+  <div class="stop-block">
+    <div class="stop-frame"><button id="bStop" class="stop" title="POST /v1/stop（トークン不要）。物理非常停止ではない">STOP</button></div>
   </div>
-  <div class="row" style="margin-top:6px">
-    <span>motion_limits 有効値 (max_gain / max_vel / max_acc / duty_max): <b id="limEff" class="mono">—</b></span>
-    <span>上限: <b id="limCeil" class="mono">—</b></span>
+  <div class="ops-block">
+    <div class="ops-row">
+      <button id="bArm">ARM</button>
+      <button id="bStart">START</button>
+      <button id="bDisarm">DISARM</button>
+      <button id="bFaultReset">FAULT RESET</button>
+      <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
+    </div>
+    <div class="token-row">
+      <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
+      <span class="dim small">sessionStorage に保存（このタブだけ）</span>
+    </div>
+    <div class="hint">順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</div>
   </div>
-  <div style="margin-top:6px">blockers: <span id="blockers" class="dim">—</span></div>
-  <div style="margin-top:4px">fault: <span id="fault">—</span> <span style="margin-left:12px">axis_conflict: <b id="axisConflict">—</b></span></div>
 </section>
 
-<div class="cols">
-<section>
-  <h2>ジョイスティック <span class="dim small">Gamepad API</span></h2>
+<div class="workspace">
+<!-- 3. 主図: 倒し量と指令姿勢 -->
+<section class="panel">
+  <h2>倒し量と指令姿勢 <span class="small">横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）</span></h2>
+  <div class="figure-body">
+    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）。輪 = 倒し量、塗り = 指令姿勢（送る値）"><u></u><b></b></div>
+    <div class="readouts">
+      <div><div class="dim small">倒し量（不感帯の後、−1..1）</div>
+        <div>roll <span id="rollBig" class="big mono">0.00</span></div>
+        <div>pitch <span id="pitchBig" class="big mono">0.00</span></div></div>
+      <div><div class="dim small">指令姿勢（pose として送る値）</div>
+        <div>roll <span id="rollCmd" class="big mono">—</span></div>
+        <div>pitch <span id="pitchCmd" class="big mono">—</span></div></div>
+      <div class="legend"><span><i class="l-stick"></i>輪 = 倒し量（スティック）</span><span><i class="l-cmd"></i>塗り = 指令姿勢（送る値）</span></div>
+      <div class="echo">
+        <span>requested_pose: <b id="reqPose" class="mono">—</b></span>
+        <span>target_counts: <b id="targets" class="mono">—</b></span>
+      </div>
+      <div class="dim small" id="cmdNote" style="grid-column:1/-1">速度モード: 倒し量 × rate × dt を積分したものが指令姿勢。位置モード: 倒し量 = 指令姿勢（yaw は 0）</div>
+    </div>
+  </div>
+</section>
+
+<!-- 2'. 送信（session / WS） -->
+<section class="panel">
+  <h2>送信 <span class="small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
+  <!-- 入力モード（localStorage）。既定は「速度」: 倒し量 = 姿勢の変化の速さ。サーバーに送るものは pose + gain のまま -->
+  <div class="row">
+    <label>入力モード <select id="inMode">
+      <option value="rate">速度（倒し量 = 姿勢の変化の速さ）</option>
+      <option value="pos">位置（倒し量 = 姿勢）</option>
+    </select></label>
+    <span class="dim small" id="modeNote"></span>
+  </div>
+  <div id="rateCtl">
+    <label class="sl w" title="倒し切ったときの姿勢の変化の速さ。1.0 = 中央から端まで 1 秒。サーバーの max_vel がそれより遅ければサーバーの制限で頭打ちになる（velocity_limited が点く）">rate <input type="range" id="rate" min="0.2" max="3" step="0.1" value="1.0"><span id="rateV">1.0 /s</span></label>
+    <div class="row small">
+      <label title="倒し量が 0（不感帯の内側）のあいだ、指令姿勢を中央へ戻す。切なら離した姿勢で止まる"><input type="checkbox" id="rtc"> 離すと中央へ戻る</label>
+      <label class="sl w" style="display:inline-grid; margin:0" title="中央へ戻る速さ（全ストローク/秒）">戻る速さ <input type="range" id="rtcSpeed" min="0.1" max="3" step="0.1" value="0.5"><span id="rtcSpeedV">0.5 /s</span></label>
+      <label title="実験的。倒し量の変化の速さ（d|倒し量|/dt を約 0.15 s で平滑）で rate を 1〜4 倍にする。弾くように倒すと速く、ゆっくり押すと普通の rate。離す動きでは増やさない"><input type="checkbox" id="momentum"> 勢い（実験的）</label>
+      <span id="momentumV" class="mono dim">×1.00</span>
+    </div>
+  </div>
+  <!-- 既定 1.0 = スティック全開でソフトリミット内の端まで。安全側の上限はサーバーの max_gain（setMaxGain でスライダーの最大に反映） -->
+  <label class="sl w">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
+  <div class="row" style="margin-top:8px">
+    <button id="bStream">送信開始</button>
+    <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
+  </div>
+  <div class="kv" style="margin-top:8px">
+    <span>WS: <b id="wsState">closed</b></span>
+    <span>seq: <b id="seq" class="mono">0</b></span>
+    <span>frame_seq: <b id="frameSeq" class="mono">0</b></span>
+    <span>max_gain: <b id="maxGain">—</b></span>
+    <span>session: <b id="sessionLabel" class="mono">なし</b></span>
+  </div>
+  <div class="kv" style="margin-top:4px"><span>送っている pose: <span id="sentPose" class="mono dim">—</span></span></div>
+  <div class="kv" style="margin-top:4px"><span>最後の ack: <span id="ack" class="dim">—</span></span></div>
+  <div class="stream-note">
+    「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
+    位置モード: スティックを離せば（不感帯の内側なら）0 を送る。速度モード: 離せばその姿勢で止まる（「離すと中央へ戻る」なら戻る速さで 0 へ）。「中央へ」で指令姿勢を 0 に。
+    スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（速度モードの積分も止まる。サーバーが鮮度切れで減速停止する）。
+    ack が stale_session（別のクライアントが session を発行した・サーバー再起動）なら送信を止める。再開は「送信開始」。
+  </div>
+</section>
+</div>
+
+<div class="stack">
+<!-- 4. 3 系統 -->
+<section class="panel">
+  <h2>3 系統 <span class="small">actual = エンコーダーの値（count）</span></h2>
+  <div class="tbl">
+  <table>
+    <thead><tr>
+      <th>軸</th><th>名前</th><th>接続</th><th>mcu_state</th><th>fault_code</th><th>flags</th>
+      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>decode_errors</th><th>校正</th>
+    </tr></thead>
+    <tbody id="axes"></tbody>
+  </table>
+  </div>
+  <div class="dim small" style="margin-top:6px">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral / sign）。</div>
+</section>
+
+<!-- 5. 制限と札 -->
+<section class="panel">
+  <h2>制限と札 <span class="small">status の limits / motion_limits</span></h2>
+  <div class="limits-row">
+    <span><span>effective_gain:</span> <b id="effGain">—</b></span>
+    <span><span>limits:</span> <b id="limits">—</b></span>
+    <span><span>motion_limits 有効値 (max_gain / max_vel / max_acc / duty_max):</span> <b id="limEff" class="mono">—</b></span>
+    <span><span>上限:</span> <b id="limCeil" class="mono">—</b></span>
+  </div>
+  <!-- velocity_limited / acceleration_limited は planner が出す札なので WS の ack には乗らず（ack の limits は受け付け時の
+       pose_clamped / gain_limited だけ）、GET /v1/status の limits（200 ms）に出る。ここはそれを札で見せる -->
+  <div style="margin-top:10px">サーバーの制限 <span class="dim small">status の limits</span>: <span class="flag" id="flagVel">velocity_limited</span><span class="flag" id="flagAcc">acceleration_limited</span><span id="flagOther" class="dim small"></span></div>
+  <div class="stream-note">点いているあいだは、速さを決めているのはページでなくサーバー（planner の max_vel / max_acc）。速くしたいならオペレーター用試験ページの「動きの制限」（max_vel / max_acc）を上げる。このページの rate や gain を上げても速くならない。</div>
+</section>
+</div>
+
+<div class="setup">
+<!-- 機器の選択 -->
+<section class="panel">
+  <h2>ジョイスティック <span class="small">Gamepad API</span></h2>
   <div class="dim small">ブラウザは<b>ボタンを 1 回押すか大きく倒す</b>まで機器を出さない。自動で選ぶのは「軸 2 本以上で、id（T.16000M / joystick / stick / HOTAS / pad / joy / controller。Thrustmaster だけでは同社のハンドルも通るので入れない）か mapping = standard がスティックだと言っている」機器だけ（ペダル・ハンドル等には落ちない。該当が無ければ一覧から選ぶ）。選択は localStorage に保存。</div>
-  <div class="row" style="margin-top:6px">
+  <div class="row" style="margin-top:8px">
     <label>使用するスティック <select id="padSelect"><option value="">（未検出）</option></select></label>
     <button id="bPadDefault" title="スティックと判定できる機器（軸 2 本以上＋id / mapping）で最初に見つかるものを選ぶ">自動で選ぶ</button>
     <span id="padState" class="dim small">—</span>
   </div>
-  <div style="overflow-x:auto; margin-top:6px">
+  <div class="tbl" style="margin-top:8px">
   <table>
     <thead><tr><th>index</th><th>id</th><th>axes</th><th>buttons</th><th>判定</th><th>使用</th></tr></thead>
     <tbody id="pads"></tbody>
   </table>
   </div>
-  <div class="row small" style="margin-top:6px">
+  <div class="row small" style="margin-top:8px">
     <span>選択中の生の値:</span><span id="padAxes" class="mono dim">—</span>
   </div>
   <div class="btns" id="padButtons" style="margin-top:4px"></div>
 </section>
 
-<section>
-  <h2>軸の割当 <span class="dim small">roll ← 左右（axes[0]）、pitch ← 前後（axes[1]）。h3game と同じ符号（前へ倒す = pitch マイナス）</span></h2>
+<!-- 軸の割当 -->
+<section class="panel">
+  <h2>軸の割当 <span class="small">roll ← 左右（axes[0]）、pitch ← 前後（axes[1]）。h3game と同じ符号（前へ倒す = pitch マイナス）</span></h2>
   <div class="axis">
     <b>roll</b>
     <div class="ctl">
@@ -187,91 +477,21 @@
     <span class="dim small">norm</span><div class="bar" id="pitchBar"><i></i></div>
     <span></span><div class="row small"><span>raw <span id="pitchRaw" class="mono">—</span></span><span>norm <span id="pitchNorm" class="mono">—</span></span><span class="dim">(center <span id="pitchCenter" class="mono">0</span>)</span></div>
   </div>
-  <div class="row" style="margin-top:6px">
+  <div class="row" style="margin-top:8px">
     <label>不感帯 <input type="number" id="dead" min="0" max="0.9" step="0.01" value="0.05"></label>
     <button id="bCenter" title="いまの生の値を両軸の中央（0）にする">中央を取り直す</button>
     <button id="bResetMap" title="axes 0 / 1、反転なし、center 0、不感帯 0.05 に戻す">割当を初期化</button>
   </div>
-  <div class="row" style="margin-top:8px; align-items:flex-start">
-    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）。輪 = 倒し量、塗り = 指令姿勢（送る値）"><u></u><b></b></div>
-    <div>
-      <div class="row" style="gap:16px">
-        <div><div class="dim small">倒し量（不感帯の後、−1..1）</div>
-          <div>roll <span id="rollBig" class="big mono" style="color:var(--amber)">0.00</span></div>
-          <div>pitch <span id="pitchBig" class="big mono" style="color:var(--amber)">0.00</span></div></div>
-        <div><div class="dim small">指令姿勢（pose として送る値）</div>
-          <div>roll <span id="rollCmd" class="big mono" style="color:var(--blue)">—</span></div>
-          <div>pitch <span id="pitchCmd" class="big mono" style="color:var(--blue)">—</span></div></div>
-      </div>
-      <div class="dim small" id="cmdNote">速度モード: 倒し量 × rate × dt を積分したものが指令姿勢。位置モード: 倒し量 = 指令姿勢（yaw は 0）</div>
-    </div>
-  </div>
 </section>
 </div>
 
-<section>
-  <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
-  <!-- 入力モード（localStorage）。既定は「速度」: 倒し量 = 姿勢の変化の速さ。サーバーに送るものは pose + gain のまま -->
-  <div class="row">
-    <label>入力モード <select id="inMode">
-      <option value="rate">速度（倒し量 = 姿勢の変化の速さ）</option>
-      <option value="pos">位置（倒し量 = 姿勢）</option>
-    </select></label>
-    <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
-    <span class="dim small" id="modeNote"></span>
-  </div>
-  <div id="rateCtl">
-    <label class="sl w" title="倒し切ったときの姿勢の変化の速さ。1.0 = 中央から端まで 1 秒。サーバーの max_vel がそれより遅ければサーバーの制限で頭打ちになる（velocity_limited が点く）">rate <input type="range" id="rate" min="0.2" max="3" step="0.1" value="1.0"><span id="rateV">1.0 /s</span></label>
-    <div class="row small">
-      <label title="倒し量が 0（不感帯の内側）のあいだ、指令姿勢を中央へ戻す。切なら離した姿勢で止まる"><input type="checkbox" id="rtc"> 離すと中央へ戻る</label>
-      <label class="sl w" style="display:inline-grid; margin:0" title="中央へ戻る速さ（全ストローク/秒）">戻る速さ <input type="range" id="rtcSpeed" min="0.1" max="3" step="0.1" value="0.5"><span id="rtcSpeedV">0.5 /s</span></label>
-      <label title="実験的。倒し量の変化の速さ（d|倒し量|/dt を約 0.15 s で平滑）で rate を 1〜4 倍にする。弾くように倒すと速く、ゆっくり押すと普通の rate。離す動きでは増やさない"><input type="checkbox" id="momentum"> 勢い（実験的）</label>
-      <span id="momentumV" class="mono dim">×1.00</span>
-    </div>
-  </div>
-  <!-- 既定 1.0 = スティック全開でソフトリミット内の端まで。安全側の上限はサーバーの max_gain（setMaxGain でスライダーの最大に反映） -->
-  <label class="sl w">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
-  <div class="row">
-    <button id="bStream">送信開始</button>
-    <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
-    <span>WS: <b id="wsState">closed</b></span>
-    <span>seq: <b id="seq" class="mono">0</b></span>
-    <span>frame_seq: <b id="frameSeq" class="mono">0</b></span>
-    <span>max_gain: <b id="maxGain">—</b></span>
-    <span>session: <b id="sessionLabel" class="mono">なし</b></span>
-  </div>
-  <div style="margin-top:4px">送っている pose: <span id="sentPose" class="mono dim">—</span></div>
-  <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
-  <!-- velocity_limited / acceleration_limited は planner が出す札なので WS の ack には乗らず（ack の limits は受け付け時の
-       pose_clamped / gain_limited だけ）、GET /v1/status の limits（200 ms）に出る。ここはそれを札で見せる -->
-  <div style="margin-top:6px">サーバーの制限 <span class="dim small">status の limits</span>: <span class="flag" id="flagVel">velocity_limited</span><span class="flag" id="flagAcc">acceleration_limited</span><span id="flagOther" class="dim small"></span></div>
-  <div class="dim small">点いているあいだは、速さを決めているのはページでなくサーバー（planner の max_vel / max_acc）。速くしたいならオペレーター用試験ページの「動きの制限」（max_vel / max_acc）を上げる。このページの rate や gain を上げても速くならない。</div>
-  <div class="dim small" style="margin-top:4px">
-    「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
-    位置モード: スティックを離せば（不感帯の内側なら）0 を送る。速度モード: 離せばその姿勢で止まる（「離すと中央へ戻る」なら戻る速さで 0 へ）。「中央へ」で指令姿勢を 0 に。
-    スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（速度モードの積分も止まる。サーバーが鮮度切れで減速停止する）。
-    ack が stale_session（別のクライアントが session を発行した・サーバー再起動）なら送信を止める。再開は「送信開始」。
-  </div>
-</section>
-
-<section>
-  <h2>3 系統 <span class="dim small">actual = エンコーダーの値（count）</span></h2>
-  <div style="overflow-x:auto">
-  <table>
-    <thead><tr>
-      <th>軸</th><th>名前</th><th>接続</th><th>mcu_state</th><th>fault_code</th><th>flags</th>
-      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>decode_errors</th><th>校正</th>
-    </tr></thead>
-    <tbody id="axes"></tbody>
-  </table>
-  </div>
-  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral / sign）。</div>
-</section>
-
-<section>
-  <h2>HTTP ログ <span class="dim small">応答本文はすべて表示</span></h2>
+<div class="stack">
+<!-- 6. ログ -->
+<section class="panel">
+  <h2>HTTP ログ <span class="small">応答本文はすべて表示</span></h2>
   <div id="httpLog" class="log"></div>
 </section>
+</div>
 
 <script>
 // ---------------------------------------------------------------- H3Joy: 純粋な写像（試験から呼べるように window に置く）
