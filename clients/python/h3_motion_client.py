@@ -210,6 +210,9 @@ class MotionClient:
         # Everything below is guarded by self._cond. Never do I/O while holding it.
         self._pose: Optional[_Pending] = None
         self._gain: Optional[float] = None  # pending gain-only update
+        self._limits: Optional[Dict[str, float]] = None  # pending limits patch (merged until sent)
+        self._limits_seqs: set = set()  # seqs of limits messages awaiting their ack
+        self._last_limits_ack: Optional[dict] = None
         self._closing = False
         self._reconnect_req = False
         self._conn_failed = False  # set by the reader when its connection ends
@@ -297,6 +300,51 @@ class MotionClient:
             self._gain = None  # the pose carries the newer gain
             self._cond.notify_all()
         return True
+
+    def submit_limits(
+        self,
+        *,
+        max_gain: Optional[float] = None,
+        max_vel_count_s: Optional[float] = None,
+        max_acc_count_s2: Optional[float] = None,
+        duty_max_percent: Optional[float] = None,
+    ) -> bool:
+        """Change the server's shared motion limits (``{"type":"limits"}``).
+
+        Only the given fields change. Values above the ceilings (firmware
+        absolutes, ``overspeed / 1.5``, gain 1.0) are clamped by the server
+        and reported in the ack (``effective_limits``, ``limits`` has
+        ``ceiling_clamped``). Never extends freshness. Several calls before
+        the next send are merged (last value per field wins). Returns False
+        (and stores nothing) for a non-finite value or when no field is given.
+        The server resets the limits to its config on every new session, so
+        a client that wants its values must resend them after ``reconnect()``
+        (watch ``session_id``).
+        """
+        fields = {
+            "max_gain": max_gain,
+            "max_vel_count_s": max_vel_count_s,
+            "max_acc_count_s2": max_acc_count_s2,
+            "duty_max_percent": duty_max_percent,
+        }
+        patch = {k: v for k, v in fields.items() if v is not None}
+        if not patch:
+            return False
+        if not all(_finite(v) for v in patch.values()):
+            self.log.warning("submit_limits: invalid value dropped %r", patch)
+            return False
+        with self._cond:
+            merged = dict(self._limits or {})
+            merged.update({k: float(v) for k, v in patch.items()})
+            self._limits = merged
+            self._cond.notify_all()
+        return True
+
+    @property
+    def last_limits_ack(self) -> Optional[dict]:
+        """Last ack of a ``limits`` message (accepted or rejected); None before any."""
+        with self._cond:
+            return self._last_limits_ack
 
     def submit_gain(self, gain: float) -> bool:
         """Gain-only update (never extends pose freshness on the server)."""
@@ -480,19 +528,32 @@ class MotionClient:
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: (self._closing or self._reconnect_req or self._conn_failed
-                                             or self._pose is not None or self._gain is not None))
+                                             or self._pose is not None or self._gain is not None
+                                             or self._limits is not None))
                 if self._closing or self._reconnect_req or self._conn_failed:
                     return
                 if self._session_lost:
                     # Not our session any more: drop instead of sending into rejection.
                     self._pose = None
                     self._gain = None
+                    self._limits = None
                     continue
-                pose, gain = self._pose, self._gain
+                pose, gain, limits = self._pose, self._gain, self._limits
                 self._pose = None
                 self._gain = None
+                self._limits = None
                 msgs: List[str] = []
                 now = time.monotonic()
+                if limits is not None:
+                    # Before the pose: the new gain ceiling applies to it.
+                    self._seq += 1
+                    m_l: Dict[str, Any] = {"type": "limits", "protocol": PROTOCOL_VERSION,
+                                           "source_session": session, "seq": self._seq}
+                    m_l.update(limits)
+                    self._limits_seqs.add(self._seq)
+                    if len(self._limits_seqs) > 64:
+                        self._limits_seqs = set(sorted(self._limits_seqs)[-64:])
+                    msgs.append(json.dumps(m_l, allow_nan=False))
                 if pose is not None:
                     if pose.frame_seq is None and require_frame_seq and not self._warned_no_frame_seq:
                         self._warned_no_frame_seq = True
@@ -533,6 +594,14 @@ class MotionClient:
                     self._conn_failed = True
                     self._cond.notify_all()
 
+    def _limits_seq_pending(self, ack: dict) -> bool:
+        """True if this (rejected) ack answers a limits message we sent (guarded by _cond)."""
+        seq = ack.get("seq")
+        if seq in self._limits_seqs:
+            self._limits_seqs.discard(seq)
+            return True
+        return False
+
     def _handle_message(self, raw: Any) -> None:
         try:
             msg = json.loads(raw)
@@ -547,6 +616,11 @@ class MotionClient:
             rejected = msg.get("accepted") is False
             with self._cond:
                 self._last_ack = msg
+                if "effective_limits" in msg:
+                    self._limits_seqs.discard(msg.get("seq"))
+                    self._last_limits_ack = msg
+                elif rejected and self._limits_seq_pending(msg):
+                    self._last_limits_ack = msg
                 if rejected:
                     self._last_reject = msg
                 lost = rejected and reason == "stale_session" and not self._session_lost

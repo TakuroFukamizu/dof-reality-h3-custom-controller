@@ -46,11 +46,11 @@ def load_axes(config_path: str) -> List[Dict[str, Any]]:
         with open(config_path, "rb") as f:
             cfg = tomllib.load(f)
         axes = cfg["axis"]
-        timing, game = cfg["timing"], cfg["game"]
+        timing, game, limits = cfg["timing"], cfg["game"], cfg["limits"]
     except ImportError:
-        axes, timing, game = _parse_toml_subset(config_path)
+        axes, timing, game, limits = _parse_toml_subset(config_path)
     axes = sorted(axes, key=lambda a: a["axis_id"])
-    return [dict(a, _timing=timing, _game=game) for a in axes]
+    return [dict(a, _timing=timing, _game=game, _limits=limits) for a in axes]
 
 
 def _parse_toml_subset(path: str):
@@ -76,7 +76,7 @@ def _parse_toml_subset(path: str):
                     cur[k] = v
                 else:
                     cur[k] = float(v) if any(c in v for c in ".eE") else int(v)
-    return axes, tables["timing"], tables["game"]
+    return axes, tables["timing"], tables["game"], tables["limits"]
 
 
 def mix(pitch: float, roll: float, yaw: float, gain: float) -> List[float]:
@@ -315,7 +315,7 @@ class Scenario:
         self.tl = Timeline(os.path.join(args.out, "timeline.jsonl"), self.t0)
         self.axes = load_axes(args.config)
         self.timing = self.axes[0]["_timing"]
-        self.max_gain = float(self.axes[0]["_game"]["max_gain"])
+        self.max_gain = float(self.axes[0]["_limits"]["max_gain"])
         self.neutral = [int(a["count_at_virtual_512"]) for a in self.axes]
         self.checks: List[Dict[str, Any]] = []
         self.metrics: Dict[str, Any] = {}
@@ -612,7 +612,7 @@ class Scenario:
             ("neutral", (0.0, 0.0, 0.0)),
         ]:
             self.track(label, {"pitch": p[0], "roll": p[1], "yaw": p[2]}, g)
-        # Largest mix at max_gain: 512 + 0.35*511*2 = 869.7, so the legacy 0..1023
+        # Largest mix at max_gain 0.5: 512 + 0.5*511*2 = 1023, so the legacy 0..1023
         # range cannot saturate while max_gain <= 0.5 (checked: no virtual_saturated).
         self.track("full(1,1,0) gain 0.35", {"pitch": 1.0, "roll": 1.0, "yaw": 0.0}, 0.35)
         st = self.status()

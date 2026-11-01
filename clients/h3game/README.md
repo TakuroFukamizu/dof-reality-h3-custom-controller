@@ -148,7 +148,8 @@ bridge を二重に起動しても、2 つ目はポートが取れずに終わ�
 
 - `GET /v1/status` は制御ループが終わっている（落ちた）とき 503 を返す。サーバーの終了処理中は新しい接続を受け付けない（接続拒否。確定: sim で確認）。直前に受け付けた要求への 503 はありうる（推定）。どの場合も bridge の `/state` では `server_reachable=false`・`rig_state=null` になる。
 - 管理 API の 503 で「実行されたかもしれない」のは stop / disarm / fault だけ。arm / start などは 503 なら実行されない。状態は status で確かめる。
-- gain の上限はサーバー設定 `max_gain`（既定 0.35）。画面のスライダーは 0.6 まで動くが、超えた分は `effective_gain` が 0.35 になり、ack の `limits` に `gain_limited` が入る。画面の接続表示にも「揺れは 0.35 に制限」と出る（スライダーの数字は画面の設定値のまま）。
+- gain の上限はサーバー設定 `[limits].max_gain`（既定 0.5）。画面のスライダーは 0.6 まで動くが、超えた分は `effective_gain` が上限になり、ack の `limits` に `gain_limited` が入る。画面の接続表示にも「揺れは 0.5 に制限」と出る（スライダーの数字は画面の設定値のまま）。
+- 動きの制限（docs/control-server/limits.md §3.1）: ゲームの POST に `"limits": {"max_gain": 0.8, "max_vel_count_s": 3000, "max_acc_count_s2": 15000, "duty_max_percent": 40}`（どの項目も省略可）を付けると、backend がそのまま `limits` メッセージとして送る（姿勢と独立。`/state` の `stats.limits` に数える。数値でない値は `invalid`）。サーバーは上限で切って ack に `effective_limits` を返す。新しい session（再接続・再読み込み）で初期値に戻る。いまの index.html は送らない（必要なら画面側で付ける）。
 - 「● H3 接続中」は「サーバーに届いていて session を持っている」という意味で、座席が動いているとは限らない。横に出る `rig_state`（`ACTIVE` で走行中）を見る。
 
 ## frame_seq のない画面

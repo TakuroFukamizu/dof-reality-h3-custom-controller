@@ -117,15 +117,30 @@
   <label class="sl">pitch <input type="range" id="pitch" min="-1" max="1" step="0.01" value="0"><span id="pitchV">0.00</span></label>
   <label class="sl">roll <input type="range" id="roll" min="-1" max="1" step="0.01" value="0"><span id="rollV">0.00</span></label>
   <label class="sl">yaw <input type="range" id="yaw" min="-1" max="1" step="0.01" value="0"><span id="yawV">0.00</span></label>
-  <label class="sl">gain <input type="range" id="gain" min="0" max="0.35" step="0.01" value="0.2"><span id="gainV">0.20</span></label>
+  <label class="sl">gain <input type="range" id="gain" min="0" max="0.5" step="0.01" value="0.2"><span id="gainV">0.20</span></label>
   <div class="row">
     <button id="bStream">送信開始</button>
     <button id="bZero">スライダーを 0 に</button>
     <span>WS: <b id="wsState">closed</b></span>
     <span>seq: <b id="seq">0</b></span>
-    <span>max_gain: <b id="maxGain">0.35</b></span>
+    <span>max_gain: <b id="maxGain">0.5</b></span>
   </div>
   <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">動きの制限 <span class="dim small">WS の limits メッセージ（送信中だけ送れる）。上限はファームの申告値（status の motion_limits.ceiling）。POST /v1/session で設定ファイルの初期値に戻る</span></h2>
+  <label class="sl">max_gain <input type="range" id="limGain" min="0.05" max="1" step="0.05" value="0.5"><span id="limGainV">0.50</span></label>
+  <label class="sl">max_vel <input type="range" id="limVel" min="100" max="6000" step="100" value="3000"><span id="limVelV">3000</span></label>
+  <label class="sl">max_acc <input type="range" id="limAcc" min="500" max="40000" step="500" value="15000"><span id="limAccV">15000</span></label>
+  <label class="sl">duty_max <input type="range" id="limDuty" min="1" max="60" step="1" value="40"><span id="limDutyV">40</span></label>
+  <div class="row">
+    <button id="bLimits">制限を送る</button>
+    <button id="bLimitsReset">設定の初期値に戻す</button>
+    <span>有効値: <b id="limEff">—</b></span>
+    <span>上限: <b id="limCeil">—</b></span>
+  </div>
+  <div style="margin-top:4px">limits の ack: <span id="limAck" class="dim">—</span></div>
 </section>
 
 <section>
@@ -143,7 +158,7 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const TOKEN_KEY = 'h3cs_admin_token';
-  const state = { session: null, maxGain: 0.35, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0, pollBusy: false, eventsBusy: false };
+  const state = { session: null, maxGain: 0.5, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0, pollBusy: false, eventsBusy: false, limitsCeiling: null };
 
   $('hostLabel').textContent = location.host;
 
@@ -267,7 +282,29 @@
     return c;
   }
 
+  const LIMIT_FIELDS = ['max_gain', 'max_vel_count_s', 'max_acc_count_s2', 'duty_max_percent'];
+  function limitsText(o) {
+    return o ? LIMIT_FIELDS.map((k) => fmt(o[k])).join(' / ') : '—';
+  }
+  function renderLimits(ml) {
+    if (!ml) return;
+    $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '');
+    $('limCeil').textContent = limitsText(ml.ceiling);
+    if (ml.ceiling) {
+      state.limitsCeiling = ml.ceiling;
+      // The sliders' maxima follow the firmware's absolute ceilings.
+      $('limGain').max = String(ml.ceiling.max_gain);
+      $('limVel').max = String(ml.ceiling.max_vel_count_s);
+      $('limAcc').max = String(ml.ceiling.max_acc_count_s2);
+      $('limDuty').max = String(ml.ceiling.duty_max_percent);
+    }
+    if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) {
+      setMaxGain(ml.effective.max_gain);
+    }
+  }
+
   function renderStatus(s) {
+    renderLimits(s.motion_limits);
     if (s.admin_token_required === false) {
       tokenInput.placeholder = '不要（require_admin_token = false）';
       tokenInput.disabled = true;
@@ -419,6 +456,38 @@
     ['pitch', 'roll', 'yaw'].forEach((id) => { $(id).value = '0'; $(id + 'V').textContent = '0.00'; });
   });
 
+  // ---------------------------------------------------------------- motion limits
+  [['limGain', 2], ['limVel', 0], ['limAcc', 0], ['limDuty', 0]].forEach(([id, d]) => {
+    $(id).addEventListener('input', () => { $(id + 'V').textContent = parseFloat($(id).value).toFixed(d); });
+  });
+  function sendLimits(fields) {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { log('制限: 姿勢送信（WS）を開始してから送ってください', true); return; }
+    state.seq += 1;
+    const msg = Object.assign({ type: 'limits', protocol: 1, source_session: state.session, seq: state.seq }, fields);
+    state.lastLimitsSeq = state.seq;
+    ws.send(JSON.stringify(msg));
+    $('seq').textContent = String(state.seq);
+    log('limits → ' + JSON.stringify(fields));
+  }
+  $('bLimits').addEventListener('click', () => {
+    sendLimits({
+      max_gain: parseFloat($('limGain').value),
+      max_vel_count_s: parseInt($('limVel').value, 10),
+      max_acc_count_s2: parseInt($('limAcc').value, 10),
+      duty_max_percent: parseInt($('limDuty').value, 10),
+    });
+  });
+  $('bLimitsReset').addEventListener('click', () => {
+    const d = state.lastStatus && state.lastStatus.motion_limits && state.lastStatus.motion_limits.defaults;
+    if (!d) { log('制限: status の motion_limits.defaults がまだ無い', true); return; }
+    $('limGain').value = String(d.max_gain); $('limGainV').textContent = Number(d.max_gain).toFixed(2);
+    $('limVel').value = String(d.max_vel_count_s); $('limVelV').textContent = String(d.max_vel_count_s);
+    $('limAcc').value = String(d.max_acc_count_s2); $('limAccV').textContent = String(d.max_acc_count_s2);
+    $('limDuty').value = String(d.duty_max_percent); $('limDutyV').textContent = String(d.duty_max_percent);
+    sendLimits({ max_gain: d.max_gain, max_vel_count_s: d.max_vel_count_s, max_acc_count_s2: d.max_acc_count_s2, duty_max_percent: d.duty_max_percent });
+  });
+
   function setWsState(text, bad) {
     $('wsState').textContent = text;
     $('wsState').className = bad ? 'bad' : '';
@@ -461,6 +530,13 @@
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'ack' && (m.effective_limits || (m.accepted === false && m.seq === state.lastLimitsSeq))) {
+        const a = $('limAck');
+        a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted ' + limitsText(m.effective_limits) : 'REJECTED ' + fmt(m.reason)) +
+          ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし');
+        a.className = m.accepted ? 'ok' : 'bad';
+        return;
+      }
       if (m.type === 'ack') {
         const a = $('ack');
         a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +

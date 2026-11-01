@@ -24,6 +24,8 @@ client.close()                      # 座席は止めない（Pose が途絶え�
 | --- | --- |
 | `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)` | 最新 1 件スロットに置くだけ。通信を待たない。非有限値（float にできない巨大な整数を含む）・負の age・整数でない／0〜2⁶⁴−1 の外の frame_seq は保存せず `False`（例外は出さない） |
 | `submit_gain(gain)` | gain だけの更新（`{"type":"gain"}`）。未送信の Pose があればその gain を書き換える。鮮度は延長しない |
+| `submit_limits(max_gain=, max_vel_count_s=, max_acc_count_s2=, duty_max_percent=)` | サーバーの動きの制限値（`{"type":"limits"}`、docs/control-server/limits.md §3.1）。渡した項目だけ変わる。次の送信まで複数回の呼び出しは合成（項目ごとに最後の値）。Pose より先に送る（新しい gain の上限がその Pose に効く）。上限を超えた値はサーバーが切って ack の `effective_limits` と `limits`（`ceiling_clamped`）で返す。鮮度は延長しない。非有限値・項目なしは `False`。サーバーは新しい session で初期値に戻すので、`reconnect()` の後は送り直す |
+| `last_limits_ack` | 最後の `limits` メッセージの ack（受理・拒否とも。無ければ `None`） |
 | `status()` | WS で受けた最新 status（`GET /v1/status` と同じ形、`type` キーは除く） |
 | `last_ack` | 最新の ack（dict） |
 | `last_reject` | 最後に拒否された ack（`reason` が拒否理由。拒否が無ければ `None`。受理されても消えない） |
@@ -50,7 +52,7 @@ client.close()                      # 座席は止めない（Pose が途絶え�
 ## bridge 側が知っておくこと
 
 - **既定設定では `frame_seq` 必須**（`allow_missing_frame_seq = false`）。`frame_seq` なしの Pose は `missing_frame_seq` で拒否される。ゲーム更新が正常に終わるたびに増やす。同じ `frame_seq` の再送は受理されるが鮮度は延長されず、`source_freshness_ms`（既定 250 ms）後に `fresh=false` になる。
-- `max_gain` は 0.35。超えた gain は `effective_gain` が 0.35 に制限され、ack の `limits` に `"gain_limited"` が入る。
+- `max_gain` は既定 0.5（`[limits]`。`submit_limits(max_gain=...)` で 1.0 まで上げられる）。超えた gain は `effective_gain` が上限に制限され、ack の `limits` に `"gain_limited"` が入る。
 - **走行中（ACTIVE）に再接続すると座席は止まる。** 駆動権限は START 時の session に束縛されるので、`reconnect()` や通信断からの自動再接続（新しい session）で必ず STOPPING → BRAKED_DISARMED になる。再開はオペレーターが ARM ＋ START をやり直す。意図した動作（模擬軸で確認済み）。
 - 自分の session か確かめるには `status()["session"]["source_session_prefix"] == client.session_id[:8]`。status には完全な id は載らない。
 - `GET /v1/status` の 503 `control_loop_unavailable` は制御ループが終わっている（落ちた）とき。終了処理（SIGTERM など）が始まるとサーバーは新しい接続を受け付けないので、503 ではなく接続拒否になる（確定: sim で確認）。終了処理の直前に受け付けた要求に 503 が返ることはありうる（推定、未観測）。`stop()` の `False` は「停止を確認できなかった」であって「停止していない」ではない（503 の stop はループが追いつけば実行される）。

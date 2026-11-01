@@ -44,6 +44,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 DEFAULT_URL = "http://127.0.0.1:8892"
 AXES = ("pitch", "roll", "yaw")
+# Fields of the optional `limits` object in a POST (design 2026-11-01 §5.3).
+LIMIT_KEYS = ("max_gain", "max_vel_count_s", "max_acc_count_s2", "duty_max_percent")
 
 # Blocker codes (the text before ':' in StatusSnapshot.blockers[], DESIGN.md
 # §7.2 / §10.2) and WS ack reject reasons that the player should see in
@@ -97,6 +99,7 @@ def hud_note(blockers: Any, axis_conflict: Any = None, reject_reason: Any = None
 # Return values of submit() (also the keys of ServerBackend.stats).
 SENT = "sent"            # pose put in the client slot
 GAIN_ONLY = "gain_only"  # same frame_seq, gain changed → gain-only message
+LIMITS = "limits"        # a `limits` object was forwarded (counted in addition to the pose result)
 REPEAT = "repeat"        # same frame_seq, nothing new → not forwarded
 OLD_FRAME = "old_frame"  # frame_seq went backwards for the same owner → dropped
 INVALID = "invalid"      # non-numeric / non-finite / bad frame_seq or age → dropped
@@ -143,7 +146,7 @@ class ServerBackend:
         self._frame_seq: Optional[int] = None
         self._pose = {k: 0.0 for k in AXES}
         self._gain: Optional[float] = None
-        self.stats: Dict[str, int] = {k: 0 for k in (SENT, GAIN_ONLY, REPEAT, OLD_FRAME, INVALID)}
+        self.stats: Dict[str, int] = {k: 0 for k in (SENT, GAIN_ONLY, REPEAT, OLD_FRAME, INVALID, LIMITS)}
         self.stats["new_page"] = 0
 
     # ------------------------------------------------------------ lifecycle
@@ -181,6 +184,17 @@ class ServerBackend:
             return self._submit_locked(d, fallback)
 
     def _submit_locked(self, d: Dict[str, Any], fallback: Dict[str, Any]) -> str:
+        # Motion limits (design 2026-11-01 §5.3): an optional object the game
+        # may attach to any POST. Passed through as a `limits` message; the
+        # server clamps and reports in the ack. Independent of the pose below.
+        lim = d.get("limits")
+        if isinstance(lim, dict):
+            patch = {k: _num(lim[k]) for k in LIMIT_KEYS if k in lim}
+            if patch and all(v is not None for v in patch.values()):
+                if self.client.submit_limits(**patch):
+                    self.stats[LIMITS] += 1
+            else:
+                self.stats[INVALID] += 1
         has_pose = any(k in d for k in AXES)
         raw_gain = d["gain"] if "gain" in d else (self._gain if self._gain is not None else fallback.get("gain"))
         gain = _num(raw_gain)

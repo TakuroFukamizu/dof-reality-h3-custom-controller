@@ -154,7 +154,16 @@ class FakeServer:
                 msg = json.loads(raw)
                 with self.lock:
                     self.messages.append((time.monotonic(), qsession, msg))
-                if self.ack_reason is None:
+                if self.ack_reason is None and msg.get("type") == "limits":
+                    eff = {"max_gain": min(msg.get("max_gain", 0.35), 1.0),
+                           "max_vel_count_s": min(msg.get("max_vel_count_s", 3000), 6000),
+                           "max_acc_count_s2": min(msg.get("max_acc_count_s2", 15000), 40000),
+                           "duty_max_percent": min(msg.get("duty_max_percent", 40), 60)}
+                    clamped = any(eff[k] != msg[k] for k in eff if k in msg)
+                    ack = {"type": "ack", "seq": msg.get("seq"), "accepted": True, "reason": None,
+                           "effective_gain": eff["max_gain"], "limits": ["ceiling_clamped"] if clamped else [],
+                           "fresh": False, "effective_limits": eff}
+                elif self.ack_reason is None:
                     ack = {"type": "ack", "seq": msg.get("seq"), "accepted": True, "reason": None,
                            "effective_gain": min(msg.get("gain", 0.0), 0.35), "limits": [], "fresh": True}
                 else:
@@ -459,6 +468,36 @@ class FakeServerTests(unittest.TestCase):
         fake.send_status = False
         time.sleep(0.5)
         self.assertIsNone(client.status(), "status older than STATUS_MAX_AGE_S must read as unknown")
+
+    def test_submit_limits_is_sent_before_the_pose_and_acked(self):
+        fake = self.fake = FakeServer()
+        client = self.client = client_for(fake)
+        client.start()
+        self.connected()
+        self.assertFalse(client.submit_limits())  # nothing given
+        self.assertFalse(client.submit_limits(max_gain=float("nan")))
+        self.assertTrue(client.submit_limits(max_vel_count_s=7000, duty_max_percent=45))
+        self.assertTrue(client.submit_limits(max_gain=0.8))  # merged with the pending patch
+        self.assertTrue(client.submit_pose(0.1, 0.0, 0.0, 0.7, frame_seq=1))
+        ack = wait_until(lambda: client.last_limits_ack, msg="limits ack")
+        self.assertTrue(ack["accepted"], ack)
+        self.assertEqual(ack["effective_limits"]["max_vel_count_s"], 6000)
+        self.assertEqual(ack["effective_limits"]["duty_max_percent"], 45)
+        self.assertEqual(ack["effective_limits"]["max_gain"], 0.8)
+        self.assertIn("ceiling_clamped", ack["limits"])
+        msgs = wait_until(lambda: [m for _, _, m in fake.messages if m["type"] in ("limits", "pose")]
+                          if len([m for _, _, m in fake.messages]) >= 2 else None, msg="two messages")
+        self.assertEqual([m["type"] for m in msgs], ["limits", "pose"], "limits go out before the pose")
+        self.assertLess(msgs[0]["seq"], msgs[1]["seq"])
+        self.assertEqual(msgs[0]["max_vel_count_s"], 7000.0)
+        self.assertEqual(msgs[0]["max_gain"], 0.8)
+        self.assertNotIn("max_acc_count_s2", msgs[0], "absent fields are not sent")
+        # A rejected limits message is also the last limits ack.
+        fake.ack_reason = "out_of_range"
+        client.submit_limits(duty_max_percent=0)
+        ack = wait_until(lambda: client.last_limits_ack if client.last_limits_ack.get("accepted") is False else None,
+                         msg="rejected limits ack")
+        self.assertEqual(ack["reason"], "out_of_range")
 
     def test_status_unknown_before_connect(self):
         self.client = MotionClient("http://127.0.0.1:%d" % free_port())
