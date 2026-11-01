@@ -39,13 +39,12 @@ uint64_t g_device_id = 0;
 uint32_t g_boot_id = 0;
 v1::TxPump<V1TxFrame> g_pump;  // loop() だけが触る
 
-// Serial（HWCDC）を v1_tx_pump.h の Port にする
+// Serial（HWCDC）を v1_tx_pump.h の Port にする。空きが無ければ書かない（接続状態は見ない。v1_tx_pump.h の注意）
 struct SerialPort {
   size_t available_for_write() {
     const int n = Serial.availableForWrite();
     return n > 0 ? static_cast<size_t>(n) : 0;
   }
-  bool connected() { return static_cast<bool>(Serial); }  // isCDC_Connected()（未接続なら IN_EMPTY 割り込みを立て直す）
   size_t write(const uint8_t* data, size_t len) { return Serial.write(data, len); }
 };
 

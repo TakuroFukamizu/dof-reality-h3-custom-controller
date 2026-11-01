@@ -36,6 +36,7 @@ struct V1Tuning {
   int stall_duty_ratio_percent = V1_STALL_DUTY_RATIO_PERCENT;  // ENCODER_FAULT のしきい値 = max(stall_duty, duty_max × これ / 100)
   uint32_t stall_ms = STALL_MS;
   uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
+  uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
   bool floor_sign_gate = V1_FLOOR_SIGN_GATE != 0;      // Duty 下限を目標へ向かう向きだけに掛ける（Issue #15 M1）
   uint32_t overrun_ms = V1_OVERRUN_MS;
@@ -427,9 +428,11 @@ class V1Axis {
 
   // 停止ブースト（Issue #15 H4）
   int stall_boost_ = 0;              // duty_min への上乗せ %
+  bool boost_eligible_ = false;      // 前の tick で対象だった
   bool boost_window_running_ = false;
   int8_t boost_err_sign_ = 0;        // 直近に評価した誤差の符号（反転で 0 に戻す）
   uint64_t boost_window_start_us_ = 0;
+  uint64_t boost_active_since_us_ = 0;  // 対象になってから（動けば取り直す）。stall_boost_max_ms の起点
   int64_t boost_anchor_raw_ = 0;     // 窓の開始時のカウント
 
   // --- 校正（CALIBRATING） ---
@@ -1220,7 +1223,9 @@ class V1Axis {
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
-    // 停止ブースト（Issue #15 H4）: 前の tick までに積んだ上乗せを下限に足す（duty_max を超えない）
+    // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
+    //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
+    stall_boost_gate(err, now);
     V1Tuning t = tuning;
     if (stall_boost_ > 0) {
       t.duty_min = tuning.duty_min + stall_boost_;
@@ -1230,7 +1235,8 @@ class V1Axis {
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_ = -static_cast<int>(sign_) * cmd;
-    update_stall_boost(err, cmd, now);
+    update_stall_boost(now);
+    if (state_ == v1::state::FAULT) return;  // 上乗せの上限・時間切れで ENCODER_FAULT をラッチした（出力は落ちている）
 
     // ENCODER_FAULT: |duty| ≥ しきい値（max(stall_duty, duty_max × 75 %)。Issue #15 M2）が stall_ms 続いてカウントが
     // 変わらない（manual_guard.h の無パルス判定と同じ窓）。
@@ -1266,43 +1272,66 @@ class V1Axis {
 
   void reset_stall_boost() {
     stall_boost_ = 0;
+    boost_eligible_ = false;
     boost_window_running_ = false;
     boost_err_sign_ = 0;
   }
 
-  // 停止ブースト（Issue #15 H4）。対象は「軌道が止まっている（setpoint_vel = 0）」「誤差が不感帯の外（cmd ≠ 0）」
-  // 「ブレーキ解除指令中」のとき。この状態で stall_boost_ms の窓の間にカウントが stall_boost_min_move 未満しか動かなければ
-  // 上乗せを 1 % 増やす（duty_max − duty_min で頭打ち）。動けば窓を取り直す（上乗せは保つ）。不感帯に入る（cmd = 0）・
-  // 誤差の符号が反転する・軌道が動き出す・ブレーキ作動・位置制御の終了で 0 に戻す。
-  // ENCODER_FAULT の無パルス判定（軌道が動いている間だけ）とは排他で、誤差の上限は従来どおり FOLLOWING_ERROR が守る。
-  void update_stall_boost(int64_t err, int cmd, uint64_t now) {
+  // 停止ブースト（Issue #15 H4）の対象判定。Duty を計算する前に呼ぶ。
+  // 対象は「軌道が止まっている（setpoint_vel = 0）」「|誤差| > deadband_out（不感帯の外。in_band の履歴に依らず明示的に見る。
+  // 動いた後は in_band = false なので cmd ≠ 0 だけでは 10 < |誤差| ≤ 20 の静止誤差も対象になってしまう）」「ブレーキ解除指令中」。
+  // 対象外になった tick と誤差の符号が反転した tick は、ここで上乗せを 0 に戻す（この tick の Duty から効く）。
+  void stall_boost_gate(int64_t err, uint64_t now) {
     if (tuning.stall_boost_ms == 0) { reset_stall_boost(); return; }
-    const bool eligible = setpoint_vel_ == 0.0 && cmd != 0 && brake_release_cmd_;
-    const int8_t err_sign = err > 0 ? 1 : (err < 0 ? -1 : 0);
+    const int64_t err_abs = err < 0 ? -err : err;
+    const bool eligible = setpoint_vel_ == 0.0 && err_abs > tuning.deadband_out && brake_release_cmd_;
     if (!eligible) { reset_stall_boost(); return; }
-    if (err_sign != boost_err_sign_) {
+    const int8_t err_sign = err > 0 ? 1 : -1;
+    if (!boost_eligible_ || err_sign != boost_err_sign_) {
       reset_stall_boost();
+      boost_eligible_ = true;
       boost_err_sign_ = err_sign;
-    }
-    if (!boost_window_running_) {
-      boost_window_running_ = true;
+      boost_window_running_ = true;  // 窓の開始
       boost_window_start_us_ = now;
+      boost_active_since_us_ = now;
       boost_anchor_raw_ = raw_;
-      return;
     }
+  }
+
+  // 停止ブースト（Issue #15 H4）の窓。Duty を書いた後に呼ぶ。対象のまま stall_boost_ms の窓の間にカウントが
+  // stall_boost_min_move 未満しか動かなければ上乗せを 1 % 増やす（duty_max − duty_min で頭打ち）。動けば窓と時間の起点を
+  // 取り直す（上乗せは保つ）。
+  // 上限: 上乗せが頭打ち（Duty = duty_max）のまま次の窓も動かない、または対象になってから stall_boost_max_ms 動かない
+  //（既定 2 s）なら ENCODER_FAULT をラッチする（詰まった機構か死んだエンコーダかは区別できない。静止目標では無パルス判定が
+  // 回らないので、上乗せを duty_max で出し続ける経路をここで閉じる。FAULT_RESET で基準が消えるのは protocol.md §4 のとおり）。
+  // 誤差の上限は従来どおり FOLLOWING_ERROR が守る。
+  void update_stall_boost(uint64_t now) {
+    if (!boost_eligible_ || !boost_window_running_) return;
     const int64_t moved = raw_ - boost_anchor_raw_;
     if ((moved < 0 ? -moved : moved) >= tuning.stall_boost_min_move) {
-      boost_window_start_us_ = now;  // 動いている: 窓を取り直す
+      boost_window_start_us_ = now;  // 動いている: 窓と時間の起点を取り直す
+      boost_active_since_us_ = now;
       boost_anchor_raw_ = raw_;
       return;
     }
     const int max_boost = tuning.duty_max > tuning.duty_min ? tuning.duty_max - tuning.duty_min : 0;
     if (stall_boost_ > max_boost) stall_boost_ = max_boost;  // SET_LIMITS で上限が下がった
-    if (now - boost_window_start_us_ >= ms_to_us(tuning.stall_boost_ms)) {
-      if (stall_boost_ < max_boost) stall_boost_ += 1;
+    if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;
+    const bool at_cap = stall_boost_ >= max_boost;
+    const bool timed_out = tuning.stall_boost_max_ms != 0 &&
+                           now - boost_active_since_us_ >= ms_to_us(tuning.stall_boost_max_ms);
+    if (at_cap || timed_out) {
+      if (!encoder_fault_check_disabled()) {
+        latch_fault(v1::fault::ENCODER_FAULT, now);  // 出力 0・ブレーキ作動・主電源 OFF 指令。reset_stall_boost は次の update_duty で
+        return;
+      }
+      // duty_max < stall_duty で無パルス判定を無効にしている構成では FAULT にせず頭打ちのまま（画面に「無パルス検出なし」）
       boost_window_start_us_ = now;
-      boost_anchor_raw_ = raw_;
+      return;
     }
+    stall_boost_ += 1;
+    boost_window_start_us_ = now;
+    boost_anchor_raw_ = raw_;
   }
 
   // ------------------------------------------------------------------------

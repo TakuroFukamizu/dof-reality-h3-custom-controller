@@ -128,6 +128,9 @@ constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
 // 自重のかかった軸の動き出しは約 9 %、7〜8 % では動かない。
 constexpr uint32_t V1_STALL_BOOST_MS = 200;
 constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満しか動かなければ「動いていない」（停止中のエンコーダの ±1 のちらつきで窓を取り直さない）
+// 上乗せの上限: 対象になってからこれだけ動かなければ（または上乗せが duty_max で頭打ちのまま次の窓も動かなければ）ENCODER_FAULT を
+// ラッチする（詰まった機構を duty_max で押し続けない。静止目標では無パルス判定が回らないので、ここで閉じる）。0 で時間の上限なし。
+constexpr uint32_t V1_STALL_BOOST_MAX_MS = 2000;
 // Issue #15 M1: Duty 下限を「目標へ向かう向き」のときだけ掛ける（1）。FF（軌道速度）と P（誤差）の合成が下限未満で、かつ誤差と
 // 逆向きなら、下限まで持ち上げて目標から離れる向きに走らせるのではなく 0（惰行）にする。例: err +50（P +1 %）・vel −200
 // （FF −2 %）→ 合成 −1 % → 旧: −duty_min で目標から離れる / 新: 0。0 にすると旧動作（合成値に下限を掛ける）。実機 A/B 用に
@@ -137,7 +140,7 @@ constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満し�
 #endif
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
-constexpr uint32_t V1_TX_DEFER_MAX_MS = 200;     // STATUS 以外の保留がこれを超えたら捨てる（PC の ACK 期限 1000 ms より十分短い。ここまで詰まったリンクは PC 側でも途絶）
+constexpr uint32_t V1_TX_DEFER_MAX_MS = 200;     // STATUS 以外は積まれてからこれ以上経ったら送らない（空きがあっても。硬い期限）。PC の ACK 期限 1000 ms より十分短く、ここまで詰まったリンクは PC 側でも途絶
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで

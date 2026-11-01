@@ -1491,11 +1491,6 @@ inline void test_stall_boost_ramps_while_stuck_and_resets_in_band() {
   CHECK(h.ax.stall_boost() == 6);
   h.step();
   CHECK(h.ax.duty_percent() == -13);
-  // duty_max（20）で頭打ち: 上乗せは最大 13
-  h.drive(3000, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 13);
-  h.step();
-  CHECK(h.ax.duty_percent() == -V1_DUTY_MAX);
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
   // 動き出して不感帯に入れば 0 に戻り、Duty も 0
   h.stall = false;
@@ -1503,6 +1498,119 @@ inline void test_stall_boost_ramps_while_stuck_and_resets_in_band() {
   CHECK(h.ax.following_error_count() == 0);
   CHECK(h.ax.stall_boost() == 0);
   CHECK(h.ax.duty_percent() == 0);
+}
+
+// 上乗せの上限（Codex レビュー HIGH）: 詰まった機構を duty_max で押し続けない。対象になってから V1_STALL_BOOST_MAX_MS（2 s）
+// 動かなければ ENCODER_FAULT（出力 0・ブレーキ作動）。FAULT_RESET は通るが基準は消える（protocol.md §4）
+inline void test_stall_boost_times_out_to_encoder_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;  // 追従誤差では止めない（25 count の残り誤差は通常の FE 上限より小さい）
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();  // 対象になった（t0）
+  h.drive(1990, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost() == 9);  // 200 ms × 9 = 1.8 s。2 s の窓はまだ
+  h.drive(20, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.duty_percent() == 0 && !h.ax.brake_release_cmd() && !h.ax.power_on_cmd());
+  CHECK(h.ax.stall_boost() == 0);
+  const std::vector<v1::FaultEvent> ev = h.fault_events();
+  CHECK(ev.size() == 1 && ev[0].fault_code == fc::ENCODER_FAULT && ev[0].mcu_state_before == st::HOLDING);
+  Harness::accepted(h.fault_reset());
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.referenced());
+}
+
+// 頭打ち（duty_max）のまま次の窓も動かなければ、2 s を待たずに ENCODER_FAULT
+inline void test_stall_boost_at_cap_without_motion_is_encoder_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(10, 7, 2, 100, 10, 20));  // 上乗せは最大 3
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.drive(600, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost() == 3);
+  h.step();
+  CHECK(h.ax.duty_percent() == -10);  // duty_max
+  h.drive(200, h.ax.actual_count() + 25);  // 頭打ちのまま 1 窓
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.duty_percent() == 0);
+}
+
+// 動けば時間の起点も取り直す: ゆっくりでも 3 count 以上/窓 動いていれば 2 s を超えても FAULT にしない
+inline void test_stall_boost_timer_restarts_on_motion() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 200;
+  h.step();
+  for (int i = 0; i < 100; ++i) {  // 3 s。150 ms ごとに 3 count ずつ動く（誤差は 200 → 140）
+    h.set_position(h.ax.actual_count());
+    h.idle(30);
+    if (i % 5 == 4) h.raw += 3;
+  }
+  CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
+  CHECK(h.ax.stall_boost() == 0);  // 窓が完了する前に動くので上乗せも増えない
+}
+
+// duty_max < V1_STALL_DUTY で無パルス判定を無効にしている構成では、上乗せの上限でも FAULT にせず頭打ちのまま
+inline void test_stall_boost_cap_without_encoder_fault_when_check_disabled() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(8, 7, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_check_disabled());
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.drive(3000, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
+  CHECK(h.ax.stall_boost() == 1);
+  CHECK(h.ax.duty_percent() == -8);
+}
+
+// 対象は |誤差| > deadband_out を明示的に見る（Codex レビュー）: 動いた後（in_band = false）の 10 < |誤差| ≤ 20 の静止誤差は
+// 下限 Duty は出るが上乗せしない。不感帯に入ってから（in_band = true）出た 25 は上乗せする
+inline void test_stall_boost_requires_error_outside_outer_band() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;  // 不感帯の外 → in_band = false、下限 7 %、上乗せ開始
+  h.drive(420, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 2);
+  h.raw += 10;  // 10 count だけ動いて誤差 15: 入る側 10 より大きいので in_band = false のまま → 下限 7 % は出続ける
+  h.drive(1000, h.ax.actual_count() + 15);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
+  CHECK(h.ax.duty_percent() == -7);
+  CHECK(h.ax.stall_boost() == 0);  // 20 以下なので上乗せしない（cmd ≠ 0 だけを見ていると 2 s で ENCODER_FAULT になる）
+  // 25 に広がれば対象
+  h.raw -= 10;
+  h.drive(420, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 2);
+  // 不感帯に入ってから出た履歴（in_band = true → 25 で出る）でも同じ
+  Harness g;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();  // 誤差 0 で in_band = true
+  g.stall = true;
+  g.raw -= 15;
+  g.drive(600, g.ax.actual_count() + 15);
+  CHECK(g.ax.duty_percent() == 0 && g.ax.stall_boost() == 0);  // 出る側 20 以下: 不感帯の中
+  g.raw -= 10;
+  g.drive(420, g.ax.actual_count() + 25);
+  CHECK(g.ax.duty_percent() == -9 && g.ax.stall_boost() == 2);
 }
 
 // 窓の間に stall_boost_min_move（3）以上動けば窓を取り直す（上乗せは保つ）。それ未満のちらつき（±1）では取り直さない。
@@ -1543,11 +1651,27 @@ inline void test_stall_boost_resets_on_error_sign_flip() {
   h.drive(620, h.ax.actual_count() + 25);
   CHECK(h.ax.stall_boost() == 3);
   h.raw += 50;  // 誤差 +25 → −25
-  h.step();     // この tick の Duty は前の tick までの上乗せ（10 %）で反対向きに出て、評価で 0 に戻る
+  h.step();     // 反転した tick の Duty から上乗せ無し（反対向きに 10 % のパルスを出さない。Codex レビュー MEDIUM）
   CHECK(h.ax.stall_boost() == 0);
-  CHECK(h.ax.duty_percent() == 10);
-  h.step();
   CHECK(h.ax.duty_percent() == 7);
+  // 軌道が動き出す tick も同じ: 上乗せ付きの床を 1 tick 持ち越さない
+  Harness g;
+  v1::Config c2 = base_config();
+  c2.following_error_limit_count = 100000;
+  c2.max_vel_count_s = 200;
+  Harness::accepted(g.config_with(c2));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 25;
+  g.drive(620, g.ax.actual_count() + 25);
+  CHECK(g.ax.stall_boost() == 3);
+  g.set_position(g.ax.actual_count() + 25);
+  Harness::accepted(g.start());
+  g.set_position(g.ax.actual_count() + 2000);  // 軌道が動き出す
+  g.step();
+  CHECK(g.ax.state() == st::ACTIVE && g.ax.target_count() > g.ax.actual_count() + 25);
+  CHECK(g.ax.stall_boost() == 0);
+  CHECK(g.ax.duty_percent() == -7);  // P 0.5 + FF 0.01 → 下限 7（上乗せ 3 を持ち越せば −10）
 }
 
 // 軌道が動いている間（FF が効く）とブレーキ作動中（DISARMING）は上乗せしない。duty_max を下げれば上乗せもそこで止まる。
@@ -1570,15 +1694,17 @@ inline void test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_lim
   CHECK(h.ax.state() == st::HOLDING);
   h.drive(620, h.ax.target_count());
   CHECK(h.ax.stall_boost() >= 3);
-  // duty_max 10 / duty_min 7 なら上乗せは 3 まで
+  // duty_max 10 / duty_min 7 に下げれば上乗せはその場で 3 に切り詰め、Duty は duty_max
   Harness::accepted(h.set_limits(10, 7, 2, 100, 10, 20));
-  h.drive(1000, h.ax.target_count());
+  h.drive(50, h.ax.target_count());
   CHECK(h.ax.stall_boost() == 3);
   CHECK(h.ax.duty_percent() == 10 || h.ax.duty_percent() == -10);
-  // DISARM → ブレーキ作動指令で 0 に戻り、DISARMING 中に上がらない
+  // DISARM → ブレーキ作動指令で 0 に戻り（その tick の Duty から）、DISARMING 中に上がらない
   Harness::accepted(h.disarm());
   CHECK(h.ax.state() == st::DISARMING);
-  h.idle(250);
+  h.step();
+  CHECK(h.ax.stall_boost() == 0 && (h.ax.duty_percent() == 7 || h.ax.duty_percent() == -7));
+  h.idle(245);
   CHECK(h.ax.state() == st::DISARMING && h.ax.stall_boost() == 0);
   h.idle(60);
   CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
@@ -2758,6 +2884,11 @@ inline void run_all() {
   test_static_hold_error_at_min_duty_is_not_encoder_fault();
   test_active_settled_with_residual_error_is_not_encoder_fault();
   test_stall_boost_ramps_while_stuck_and_resets_in_band();
+  test_stall_boost_times_out_to_encoder_fault();
+  test_stall_boost_at_cap_without_motion_is_encoder_fault();
+  test_stall_boost_timer_restarts_on_motion();
+  test_stall_boost_cap_without_encoder_fault_when_check_disabled();
+  test_stall_boost_requires_error_outside_outer_band();
   test_stall_boost_window_restarts_on_motion_but_ignores_jitter();
   test_stall_boost_resets_on_error_sign_flip();
   test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits();
