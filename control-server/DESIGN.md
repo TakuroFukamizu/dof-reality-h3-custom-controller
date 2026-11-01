@@ -99,7 +99,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `CALIBRATION_REQUIRED` | 3 軸接続済みだが、どれかが: 設定の `calibration_valid = false` / `POSITION_REFERENCED` なし / 設定の `device_id` との不一致（`axis_device_mismatch`）/ 系統を変えた個体の再基準化待ち（`reference_stale`）/ この起動中に再校正された（`calibration_stale`、§11。export → 設定反映 → 再起動まで）/ 未知の装置のポートあり（`unknown_device`）/ CONFIG 未受理 / MCU が DISARMED 以外（FAULT 等）/ 実位置（STATUS.actual_count）がソフトリミット外（MCU も ARM_PREPARE を BAD_STATE で拒否する）/ CONFIG 受理後の STATUS `POWER_CONTROLLER` が設定（`power_controller_axis` の軸だけ 1）と違う（`power_role_mismatch`。主電源リレーを 2 軸が操作しないように。計画 §10）。`blockers` に理由を列挙 |
 | `READY_TO_ARM` | 上記がすべて解消。接続時は各軸へ CONFIG を送る（epoch は現行値）。CONFIG ACK を待って `configured` |
 | `ARMING` | `Arm` で epoch += 1 → 全軸へ CONFIG（新 epoch）→ 全 ACK ACCEPTED → 全軸へ ARM_PREPARE → 全軸が STATUS で HOLDING → planner を実測位置で初期化して `HOLDING`。`arm_timeout_ms` 超過 → FAULT_LATCHED(ArmTimeout)。ARMING 中から SET_POSITION（現在位置＝保持目標）を毎 tick 送る（lease） |
-| `HOLDING` | 毎 tick SET_POSITION（保持目標）。`Start`: 新鮮な Pose が無ければ拒否。あれば全軸へ START → 全軸 ACTIVE を確認して `ACTIVE(game)`。`Center`: 全軸へ START → `ACTIVE(center)`。MCU は期限内の SET_POSITION が無い START を BAD_STATE で拒否するので、START は SET_POSITION を送り続けている HOLDING からだけ出す |
+| `HOLDING` | 毎 tick SET_POSITION（保持目標）。`Start`: 新鮮な Pose が無ければ拒否（`no_fresh_pose`）。あっても、その Pose が追従と同じ経路（mix → saturate → 校正 → ソフトリミット）で作る目標が、どれかの軸で保持位置（planner の位置。未初期化なら実位置）から `game.start_max_offset_count`（既定 300 count）を超えて離れていれば拒否（`pose_not_near_hold`、blockers に軸ごとの距離 `pose_not_near_hold: axis1 target 2000 is +2000 counts from hold 0 (max 300)`。忘れたタブの極端な姿勢で START 直後に飛ばないため。Issue #15 M4）。通れば全軸へ START → 全軸 ACTIVE を確認して `ACTIVE(game)`。`Center`: 全軸へ START → `ACTIVE(center)`。MCU は期限内の SET_POSITION が無い START を BAD_STATE で拒否するので、START は SET_POSITION を送り続けている HOLDING からだけ出す |
 | `ACTIVE(game)` | 新鮮な Pose → compat → calibration（ソフトリミットでクリップ）→ planner.step_track。Pose が古い/無い → `STOPPING(source_stale)`。center 目標へは動かない |
 | `ACTIVE(center)` | 目標 = 各軸 neutral count、速度上限 × `center_speed_fraction`。到達 = planner と各 MCU の `target_count` が中立（|pos − neutral| ≤ 1 かつ vel = 0）**かつ全軸の実位置 `actual_count` が neutral ± `game.center_tolerance_count`** → `center_reached` → 全軸 CONTROLLED_STOP → `HOLDING`。目標が中立に着いてから `timing.center_reach_timeout_ms` 以内に実位置が入らない軸があれば FAULT（`StopTimeout`、detail `center: axisN …`）。Pose は使わない。CONTROLLED_STOP 後の `HOLDING(settling)` は全軸 HOLDING **かつ全軸が実測で静止**（STOPPING の行の定義）で終わり、それまで `Start` / `Center` は `busy`。`stop_settle_timeout_ms` 以内に静止しなければ FAULT（`center stop did not settle: axisN vel … fe …`） |
 | `STOPPING` | `Stop` / 鮮度切れ: 全軸へ CONTROLLED_STOP、planner.step_stop。**Decel → Hold**: planner が settled かつ全軸 HOLDING **かつ全軸が実測で静止**（下記）→ **Hold → Disarming**: `stop_hold_ms` 以上保持し、その時点でも全軸が静止していれば全軸 DISARM（保持中に動いた軸があれば静止に戻るまで待つ。`stop_hold_ms + stop_settle_timeout_ms` を超えたら FAULT）→ 全軸 DISARMED で `BRAKED_DISARMED`。Decel が `stop_settle_timeout_ms` 以内に静止しなければ FAULT_LATCHED(StopTimeout)。detail には静止していない軸の実測 `vel` / `fe` と閾値を入れる（`deceleration did not settle: axis2 vel +0 count/s fe +200 (rest: …)`）。**実測の静止**（Issue #15 H1）= その軸の STATUS が `|velocity_count_s| ≤ timing.rest_velocity_count_s` かつ `|following_error_count| ≤ timing.rest_error_count` を `timing.rest_dwell_ms` 連続で満たしている（`AxisTrack.rest_since`。STATUS ごとに判定し、外れたら振り出し。切断・再接続・再起動でも振り出し）。MCU の HOLDING は「軌道の速度が 0」でしかなく（protocol.md §5）、自重のかかった軸は HOLDING のまま数百 count 手前で動いていることがある（2026-11-01） |
@@ -116,6 +116,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 「後に受けた」は時刻ではなくイベント順（supervisor 内の受信通番）で判定する。同一ポートの受信は順序が保たれるので、ACK の後に来た STATUS は HOST_FAULT 処理後の状態を表す。
 - frame skew: 各軸の STATUS を取り込んだ時点の `group_frame_id` と、その STATUS の `last_applied_frame` の差（遅れ量 lag）を軸ごとに記録し、3 軸の lag の最大−最小を skew とする。STATUS が遅れた・途絶えた軸は lag が古いままで skew にはならない（途絶は `axis_status_timeout_ms` で `AxisDisconnected`）。同時に適用されていないフレーム（SET_POSITION を取りこぼす軸）は lag が増えて検出される。
 - 管理命令の拒否理由 `blockers` は `"<code>: <detail>"` 形式（例 `not_connected: axis2`、`rig_state: HOLDING`、`no_fresh_pose: …`）。状態名は JSON と同じ表記（`HOLDING` など）。クライアントは `:` より前の code だけで判定する。
+- 動きの制限値（limits.md）は 3 段で持つ: `requested`（API が書いた値）→ `target`（上限と停止時間の規則で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と SET_POSITION が使う値）。target の SET_LIMITS 内容（Duty 上限）が effective のものと同じなら target を即 effective にする（速度・加速度・gain だけの変更は待たない）。違えば、接続中で SET_LIMITS を知る全軸がその内容を ACK するまで effective は確定済みの組を保ち、target のうち**下がった**成分だけを先に取り込む（status `motion_limits.pending = true`）。速度と Duty を同時に上げても、旧 Duty 上限のままの軸に速い目標を送らない（Issue #15 M3）。成分ごとの最小は停止時間の規則を保つ（両組が `acc ≥ vel / 期限` を満たせば最小同士も満たす）。
 - 状態のスナップショット（`StatusSnapshot`、§7）を毎 tick 作る。
 
 ## 6. sim_axis（MCU 参照モデル）
@@ -138,7 +139,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
 | `GET /joystick`, `GET /joystick.html` | なし（loopback だけ） | ジョイスティック試験ページ（§7.5）。ヘッダーは `GET /` と同じ |
 | `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.5, "source_freshness_ms": 250, "require_frame_seq": true}`。動きの制限値を `[limits]` の初期値に戻す（`max_gain` はその値） |
-| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。limits.md §3.2） |
+| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...],"reasons":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。`effective` は clamp した要求値で、制御ループが適用済みかは status の `motion_limits.pending`。limits.md §3.2） |
 | `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
 | `GET /v1/motion[?session=<id>]`（WS） | なし | §7.1。`session` は省略可（各メッセージの `source_session` で判定）。指定した場合は別セッション名のメッセージも `stale_session` |
 | `GET /v1/status` | なし | StatusSnapshot（§7.2） |
@@ -166,7 +167,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | 500 | `no_config_path` / `config_read_failed` / `rewrite_failed` / `invalid_result` / `write_failed` | `/v1/calibration/export` だけ。`detail` 付き。設定ファイルから起動していない / 読めない / `[[axis]]` ブロックの書き換えに失敗 / 書き換えた結果が `Config::from_toml_str` を通らない（何も書かない）/ 書けない |
 | 503 | `control_loop_unavailable` | 制御ループが `ADMIN_TIMEOUT`（1 秒）内に答えない、または止まっている（`GET /v1/status` も 503） |
 
-- 409 の code: `not_ready` / `already_armed` / `not_holding` / `busy` / `no_fresh_pose` / `fault_latched` / `not_faulted` / `reset_in_progress` / `axis_disconnected` / `axis_not_settled` / `not_disarmed` / `axis_conflict`（§10、arm / start / center）/ `calibrating` / `mcu_not_disarmed` / `power_axis_required`（§11）/ `no_calibration_result` / `exists`（export）/ `shutting_down`。
+- 409 の code: `not_ready` / `already_armed` / `not_holding` / `busy` / `no_fresh_pose` / `pose_not_near_hold`（start。§5 HOLDING）/ `fault_latched` / `not_faulted` / `reset_in_progress` / `axis_disconnected` / `axis_not_settled` / `not_disarmed` / `axis_conflict`（§10、arm / start / center）/ `calibrating` / `mcu_not_disarmed` / `power_axis_required`（§11）/ `no_calibration_result` / `exists`（export）/ `shutting_down`。
 - 503 の意味: 制御ループがまだ取り出していなかった命令は**実行されない**（遅れて実行しない。ループは実行前に要求を claim し、API の打ち切りとどちらか一方だけが成立する）。ただし `Stop` / `Disarm` / `Fault` は安全側なので、ループが追いつけば実行する（呼び出し側から結果は分からない）。ループが claim 済みなら API は応答を待って 200/409 を返す。
 
 ### 7.1 WS /v1/motion
@@ -190,7 +191,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 ```
 
 - ack は受理・拒否どちらも返す。拒否理由: `stale_session` / `old_seq` / `old_frame` / `non_finite` / `out_of_range` / `invalid_age` / `missing_frame_seq` / `bad_protocol` / `bad_message` / `axis_conflict`（§10。pose・gain とも拒否し、鮮度も更新しない）。
-- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
+- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目。制御ループが適用済みかは status の `motion_limits.pending`）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`、停止時間の規則（limits.md §1.1: `max_acc ≥ max_vel / 停止期限`）で `max_acc` を上げた（または `max_vel` を下げた）ら `stop_time_limited`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
 - status は `status_period_ms` ごと。WS 自体は駆動権限を与えない。
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 
@@ -212,7 +213,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
   "requested_pose": null, "requested_gain": null, "effective_gain": null, "limits": [],
   "motion_limits": {"effective": {"max_gain": 0.5, "max_vel_count_s": 3000, "max_acc_count_s2": 15000, "duty_max_percent": 40},
                     "requested": {...}, "ceiling": {"max_gain": 1.0, "max_vel_count_s": 6000, "max_acc_count_s2": 40000, "duty_max_percent": 60},
-                    "defaults": {...}, "limited": []},
+                    "defaults": {...}, "limited": [], "reasons": [], "pending": false},
   "virtual_targets": [512.0, 512.0, 512.0],
   "target_counts": [0, 0, 0],
   "session_epoch": 3,

@@ -115,7 +115,7 @@ curl -s $URL/v1/status | python3 -m json.tool      # 状態（認証なし）
 curl -s "$URL/v1/events?n=50" | python3 -m json.tool   # 直近のイベント（障害前後の経過。認証なし・loopback だけ。?after=<id> で続きだけ）
 curl -sX POST $URL/v1/session                       # Game の session 発行。通常は bridge が行う。前の session は無効になり、走行中なら停止する
 curl -sX POST -H "$AUTH" $URL/v1/arm                # ARM: 全軸 HOLDING（その場で保持）まで
-curl -sX POST -H "$AUTH" $URL/v1/start              # START: 新鮮な Pose が無ければ 409 no_fresh_pose
+curl -sX POST -H "$AUTH" $URL/v1/start              # START: 新鮮な Pose が無ければ 409 no_fresh_pose、Pose が保持位置から離れ過ぎなら 409 pose_not_near_hold
 curl -sX POST $URL/v1/stop                          # 停止要求（トークン不要）→ 減速 → 保持 → ブレーキ
 curl -sX POST -H "$AUTH" $URL/v1/disarm             # DISARM: 減速停止してブレーキ
 curl -sX POST -H "$AUTH" -d '{"note":"手で止めた"}' $URL/v1/fault   # 管理者による FAULT ラッチ

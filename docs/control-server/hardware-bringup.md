@@ -287,7 +287,7 @@ curl -s $URL/v1/status | python3 -m json.tool
 curl -sX POST -H "$AUTH" $URL/v1/start
 ```
 
-- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。
+- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。その Pose が作る目標は保持位置から `[game].start_max_offset_count`（300 count）以内でなければならない（`409 pose_not_near_hold`。上の `0 0 0 0.05` なら中立で問題ない。§10 の表）。
 - 受理後 `rig_state = ACTIVE`、`active_source = "game"`、3 軸 `mcu_state = ACTIVE`。目標は `count_at_virtual_512` へ `[limits].max_vel_count_s` 以内で動く（limits.md §4 の低い値 600 count/s で始める）。
 - **ここで 3 通りに分かれる**（ファームの無パルス判定は「ブレーキ解除指令中に目標（軌道）が動いている間」だけ働く。設計 §3）:
   - `|actual_count − count_at_virtual_512| ≤ 5`（基準がぴったり）: 目標 = 実位置で Duty 0 のまま。ACTIVE が続く。送信停止 → `BRAKED_DISARMED` まで進むことを見る。
@@ -402,6 +402,7 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 | HTTP 401 / 403 | トークン無し・不一致（`require_admin_token = true` のときだけ） / Origin 違反 | `H3CS_ADMIN_TOKEN` が起動時と同じか。curl は Origin を付けないので 403 はブラウザー側 |
 | 3 台とも USB に見えるのに HELLO にも書き込み（esptool）にも答えない | USB-JTAG が固まっている。Base15 の DC を切っても USB ハブの VBUS で CoreS3 は動き続け、再起動しない（`ioreg -p IOUSB -l -w0 \| grep sessionID` が変わらない） | **ハブの上流 USB ケーブルを抜き差し**（または各 USB を抜き差し）して再列挙させる。2026-11-01 に 2 台同時に起きた（[runs/hw_20261101.md](runs/hw_20261101.md)） |
 | HTTP 409 `no_fresh_pose` | START に新鮮な Pose が無い | `bringup_pose.py` が動いているか、`session.fresh`。`frame_seq` の無い Pose は拒否（`allow_missing_frame_seq = false`） |
+| HTTP 409 `pose_not_near_hold` | START 時の Pose が作る目標が、保持位置から `[game].start_max_offset_count`（既定 300 count）を超えて離れた軸がある | `blockers` に軸ごとの距離。送っている Pose を中立（0, 0, 0）か gain 0 に戻してから START（忘れたタブが極端な姿勢を流していないか） |
 | HTTP 409 `not_holding` / `not_disarmed`（`blockers` に `rig_state: <状態>`） | その状態では受けない命令（例: READY_TO_ARM で start、ACTIVE で center、HOLDING 中に reference） | 順序: arm → start。center は HOLDING で、reference は全軸 DISARMED で |
 | HTTP 429 | 管理 API の rate limit（20 回/秒） | status のポーリングは `GET /v1/status`（認証なし・対象外）で |
 | HTTP 503 `control_loop_unavailable` | 制御ループが 1 s 以内に答えない | arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は **実行されたかもしれない**。status で確かめる。`GET /v1/status` 自体が 503 なら制御ループが落ちている → `GET /v1/events` は読めるので保存し、**24V を切ってから** サーバーを再起動（MCU は lease 切れで既に止まっているはず） |

@@ -294,10 +294,12 @@
   }
   function renderLimits(ml) {
     if (!ml) return;
-    // pending: 全軸の SET_LIMITS 確認待ち（別 PR で追加。無いサーバーでは出さない）
-    const pending = (ml.pending !== undefined && ml.pending !== null && ml.pending !== false && !(Array.isArray(ml.pending) && !ml.pending.length));
-    $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '') + (pending ? ' (pending: ' + fmt(ml.pending) + ')' : '');
-    $('limEff').className = pending ? 'bad' : '';
+    // `limited` = fields the clamp changed, `reasons` = why (ceiling_clamped / stop_time_limited),
+    // `pending` = waiting for every axis to ACK the new duty cap before the planner uses it.
+    const why = (ml.limited && ml.limited.length)
+      ? ' (clamped: ' + ml.limited.join(',') + ((ml.reasons && ml.reasons.length) ? ' — ' + ml.reasons.join(',') : '') + ')'
+      : '';
+    $('limEff').textContent = limitsText(ml.effective) + why + (ml.pending ? ' [pending: SET_LIMITS 未 ACK]' : '');
     $('limCeil').textContent = limitsText(ml.ceiling);
     if (ml.ceiling) {
       state.limitsCeiling = ml.ceiling;
