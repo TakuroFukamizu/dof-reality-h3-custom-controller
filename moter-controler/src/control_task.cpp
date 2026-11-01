@@ -112,7 +112,14 @@ void task_main(void*) {
     machine.tick(ai);
 
     // 手動速度は、自動移動中でなくても無パルス／遅すぎで 0 にラッチする（センサー断線のまま動かさない）。
+#if MC_NO_MANUAL_GUARD
+    // 試験専用（env:m5stack-cores3-noguard）: フィードバックセンサーを無視して手動速度をそのまま出す。
+    // センサー断線でも止まらないので、機構の切り分け以外では使わない。
+    const int manual_out = machine.active() ? 0 : in.manual_speed;
+    (void)manual_guard;
+#else
     const int manual_out = manual_guard.tick(now, raw, machine.active() ? 0 : in.manual_speed, in.relay_live);
+#endif
     const int out = machine.active() ? machine.duty_signed : manual_out;
     motor_output_write(out);
 
