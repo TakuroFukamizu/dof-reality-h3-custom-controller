@@ -189,28 +189,38 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
     let mut links = Vec::new();
     let mut sims = Vec::new();
     let mut port_tasks = Vec::new();
+    // One simulated unit for axis `a` on `port` (sim backend, or a serial
+    // backend's `sim_axes`).
+    let mut spawn_sim = |a: &crate::config::AxisConfig, sim: &crate::config::SimBackendConfig, port: String| {
+        let boot_id = rand::random::<u32>().max(1);
+        let selected_axis = if sim.report_selected_axis { a.axis_id.get() } else { 0 };
+        // A unit always has a device_id; without a configured one the
+        // simulator uses the documented placeholder pattern 5131…0N.
+        let device_id = if a.device_id.is_unassigned() {
+            DeviceId(0x5131_0000_0000_0000 + u64::from(a.axis_id.get()))
+        } else {
+            a.device_id
+        };
+        let (io, handle) = sim_pair(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
+        links.push(axis_link::spawn_link(io, port, cfg.clone(), events_tx.clone()));
+        sims.push((a.axis_id, handle));
+    };
     match &cfg.backend {
         BackendConfig::Sim(sim) => {
             for (k, n) in SIM_PORT_AXES.iter().enumerate() {
                 let Some(a) = AxisId::new(*n).and_then(|id| cfg.axis(id)) else { continue };
-                let boot_id = rand::random::<u32>().max(1);
-                let selected_axis = if sim.report_selected_axis { a.axis_id.get() } else { 0 };
-                // A unit always has a device_id; without a configured one the
-                // simulator uses the documented placeholder pattern 5131…0N.
-                let device_id = if a.device_id.is_unassigned() {
-                    DeviceId(0x5131_0000_0000_0000 + u64::from(a.axis_id.get()))
-                } else {
-                    a.device_id
-                };
-                let (io, handle) =
-                    sim_pair(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
-                let port = format!("sim:{}", k + 1);
-                links.push(axis_link::spawn_link(io, port, cfg.clone(), events_tx.clone()));
-                sims.push((a.axis_id, handle));
+                spawn_sim(a, sim, format!("sim:{}", k + 1));
             }
             sims.sort_by_key(|(a, _)| *a);
         }
         BackendConfig::Serial(serial) => {
+            // Simulated stand-ins first, so a real unit selecting the same
+            // axis shows up as a conflict rather than taking it over.
+            for id in &serial.sim_axes {
+                let Some(a) = cfg.axis(*id) else { continue };
+                spawn_sim(a, &serial.sim, format!("sim:{}", id.get()));
+            }
+            sims.sort_by_key(|(a, _)| *a);
             for port in &serial.ports {
                 port_tasks.push(tokio::spawn(serial_port_task(
                     port.clone(),

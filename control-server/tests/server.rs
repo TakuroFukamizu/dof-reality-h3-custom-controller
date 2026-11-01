@@ -723,3 +723,23 @@ async fn local_estop_from_an_axis_is_decoded_latched_and_named_in_status() {
     wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn serial_backend_sim_axes_stand_in_for_missing_units() {
+    // Bring-up with fewer real units: axes listed in `sim_axes` are served by
+    // in-process simulators (no serial port is opened for them).
+    let mut cfg = fast_cfg();
+    cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
+        ports: vec![],
+        baud: 115_200,
+        sim_axes: vec![AxisId::new(1).unwrap(), AxisId::new(2).unwrap(), AxisId::new(3).unwrap()],
+        sim: h3cs::config::SimBackendConfig::default(),
+    });
+    let srv = h3cs::server::start(cfg, h3cs::server::ServerOptions::default()).await.unwrap();
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let ports: Vec<_> = st.axes.iter().map(|a| a.port.clone().unwrap()).collect();
+    assert_eq!(ports, ["sim:1", "sim:2", "sim:3"]);
+    assert_eq!(srv.sims.len(), 3);
+    assert!(st.axes.iter().all(|a| a.assignment == Some("selected")));
+    srv.shutdown().await;
+}

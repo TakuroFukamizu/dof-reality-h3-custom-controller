@@ -203,6 +203,18 @@ pub struct SerialBackendConfig {
     pub ports: Vec<String>,
     #[serde(default = "default_baud")]
     pub baud: u32,
+    /// Axes served by an in-process simulated unit instead of a real one
+    /// (bring-up with fewer real units: the rig still needs three axes; a
+    /// simulated axis follows its target perfectly, so with a pose that keeps
+    /// it at its neutral it just sits there). Its `[[axis]]` must be a valid
+    /// calibration like in the sim backend. A real unit that selects a
+    /// simulated axis becomes an `axis_conflict` (the simulated unit is
+    /// identified first).
+    #[serde(default)]
+    pub sim_axes: Vec<AxisId>,
+    /// Parameters of those simulated units.
+    #[serde(default)]
+    pub sim: SimBackendConfig,
 }
 
 fn default_baud() -> u32 {
@@ -428,11 +440,22 @@ impl Config {
                 }
             }
             BackendConfig::Serial(b) => {
-                if b.ports.is_empty() {
-                    errs.push("backend.ports must list at least one port".into());
+                if b.ports.is_empty() && b.sim_axes.len() < AXIS_COUNT {
+                    errs.push("backend.ports must list at least one port (or sim_axes must cover every axis)".into());
                 }
                 if b.baud == 0 {
                     errs.push("backend.baud must be > 0".into());
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for a in &b.sim_axes {
+                    if !seen.insert(*a) {
+                        errs.push(format!("backend.sim_axes lists axis {} twice", a.get()));
+                    }
+                }
+                for (name, v) in [("backend.sim.status_period_ms", b.sim.status_period_ms), ("backend.sim.link_latency_ms", b.sim.link_latency_ms)] {
+                    if v > MAX_TIMING_MS {
+                        errs.push(format!("{name} must be <= {MAX_TIMING_MS}, got {v}"));
+                    }
                 }
             }
         }

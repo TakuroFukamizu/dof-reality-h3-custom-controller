@@ -62,7 +62,14 @@ fn check_config(path: &Path) -> ExitCode {
     };
     let backend = match &cfg.backend {
         BackendConfig::Sim(_) => "sim".to_string(),
-        BackendConfig::Serial(s) => format!("serial {:?}", s.ports),
+        BackendConfig::Serial(s) => {
+            let sims: Vec<u8> = s.sim_axes.iter().map(|a| a.get()).collect();
+            if sims.is_empty() {
+                format!("serial {:?}", s.ports)
+            } else {
+                format!("serial {:?} + simulated axes {:?}", s.ports, sims)
+            }
+        }
     };
     println!("{}: OK (rig_id {}, bind {}, backend {backend})", path.display(), cfg.rig_id, cfg.server.bind);
     let mut blockers = Vec::new();

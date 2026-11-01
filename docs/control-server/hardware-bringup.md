@@ -287,6 +287,10 @@ curl -sX POST -H "$AUTH" $URL/v1/start
 
 HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING`（ブレーキ給電 OFF → 300 ms → PWM 0 → 主電源 OFF 指令）→ `DISARMED`、`rig_state = BRAKED_DISARMED`。ブレーキが掛かってから `actual_count` が 8〜38 count 動くのは正常（2026-10-31 の実測: #2 +8、#3 +38。ブレーキの食い込み）。基準位置はブレーキ後の値で考える（§5.1 の「動いていなければ前回と同じ値」は ±40 の幅がある）。`curl -sX POST $URL/v1/stop`（トークン不要）はどの状態でも 200。
 
+### 6.5 実機が 3 台そろわないとき（模擬軸で代替）
+
+サーバーは 3 軸そろわないと ARM しない。1 台を別件で外しているときは `[backend]` に `sim_axes = [<軸>]` を足し、その軸のポートを `ports` から外す（`control-server/config/bringup.toml` のコメント）。その軸は模擬軸（`sim:<軸>`）として接続・基準済みで現れ、目標に完全に追従する。その軸の `calibration_valid = true` は模擬軸用（実機の宣言ではない）。残りの実機だけを Pose の選び方（§7）で動かして確認する。実機を戻したら `sim_axes` を消す。
+
 ## 7. 1 軸ずつ電源 ON で低ゲイン
 
 **24V を入れる前に**: 座席に人がいない、機構の可動範囲に物も人もない、物理非常停止に手が届く、§6 が通っている、`max_gain = 0.15`、印の位置が §5.1 の基準と合っている。

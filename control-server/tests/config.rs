@@ -337,3 +337,18 @@ fn all_zero_device_ids_mean_no_cross_check_and_validate() {
     }
     cfg.validate().unwrap();
 }
+
+#[test]
+fn serial_sim_axes_validation() {
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml")).unwrap();
+    let with = |extra: &str| base.replacen("baud = 115200", &format!("baud = 115200\n{extra}"), 1);
+    assert!(h3cs::config::Config::from_toml_str(&with("sim_axes = [3]")).is_ok());
+    let dup = h3cs::config::Config::from_toml_str(&with("sim_axes = [3, 3]"));
+    assert!(dup.is_err(), "duplicate sim axis must be rejected");
+    let bad = h3cs::config::Config::from_toml_str(&with("sim_axes = [4]"));
+    assert!(bad.is_err(), "axis 4 does not exist");
+    // No ports at all is fine only when every axis is simulated.
+    let no_ports = base.replacen("ports = [", "ports = [] # [", 1);
+    assert!(h3cs::config::Config::from_toml_str(&no_ports).is_err());
+    assert!(h3cs::config::Config::from_toml_str(&no_ports.replacen("baud = 115200", "baud = 115200\nsim_axes = [1, 2, 3]", 1)).is_ok());
+}
