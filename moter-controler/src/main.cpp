@@ -13,6 +13,106 @@
 #include "pmic_log.h"
 #include "profile_store.h"
 
+#if MC_PROTO_V1
+#include <esp_log.h>
+
+#include "v1_codec.h"
+#include "v1_link.h"
+#endif
+
+namespace {
+
+M5Canvas canvas(&M5.Display);
+bool sprite_ok = false;
+
+int relayOffLevel() { return RELAY_ON_LEVEL ? 0 : 1; }
+int brakeOffLevel() { return BRAKE_ON_LEVEL ? 0 : 1; }
+
+void driveOutput(gpio_num_t pin, int level) {
+  gpio_set_level(pin, level);
+  gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+  gpio_set_level(pin, level);
+}
+
+// KeyStream src/display.cpp と同じ警告色（RGB565）。
+constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+constexpr uint16_t kOrange = rgb565(255, 90, 0);
+constexpr uint16_t kAmber = rgb565(230, 70, 0);
+constexpr uint16_t kDarkRed = rgb565(50, 10, 10);
+constexpr uint16_t kDarkOrange = rgb565(35, 12, 0);
+constexpr uint16_t kGreen = rgb565(0, 255, 100);
+constexpr uint16_t kGray = rgb565(60, 60, 60);
+constexpr uint16_t kRed = rgb565(255, 0, 0);
+
+// ピンを安全側に固定してから M5 を初期化する。設定は従来 env と v1 env で同一。
+void boardBegin() {
+  driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
+  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), brakeOffLevel());
+  driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
+  driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
+
+  auto cfg = M5.config();
+  cfg.clear_display = true;
+#if MC_USB_POWER
+  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。Bottom の DC 入力は接続しない。
+  // （DIN Base 時代の Issue #1 回避用。Base15 の DC と USB の同時接続は未検証）
+  cfg.output_power = true;
+#else
+  cfg.output_power = false;  // Bottom（Base15 の DC ジャック → MP1584 → BUS 5V）から 5V を受ける設定
+#endif
+  cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
+  cfg.internal_mic = false;
+  cfg.internal_spk = false;
+  cfg.external_imu = false;
+  cfg.external_rtc = false;
+  // 外部機器の探索をさせない。理由は 2 つ。
+  //  - Port.A（G1 SCL / G2 SDA）の I2C 探索抑止。G2 は主電源リレー IN なので I2C の High で入れたくない
+  //    （G1 はブレーキを G13 に移して空いたが、I2C は両線が要るので緩めない）。
+  //  - Module Display / RCA の検出が走ると M5Unified が mbus_pin23 = G13 を I2S DOUT に取る。
+  //    G13 はブレーキ解除リレー IN なので external_speaker_value = 0 で止める。internal_spk = false も同じ理由で保つ。
+  cfg.external_display_value = 0;
+  cfg.external_speaker_value = 0;
+  M5.begin(cfg);
+#if MC_PMIC_LOG
+  pmic_log_boot();  // 前回の電源断要因（REG21）を、ほかの処理より先に読む
+#endif
+#if !MC_USB_POWER
+  M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
+#endif
+  Serial.begin(115200);
+  // USB CDC をホストが読んでいないと write / flush は既定 100 ms ずつ待つ。自動移動中は AUTO 行と ENC 行の
+  // flush が続くので、UI ループが 200 ms 止まると制御タスクの入力鮮度の守りが働いてしまう。20 ms に短縮する。
+  Serial.setTxTimeoutMs(20);
+
+  if (M5.Display.width() < M5.Display.height()) {
+    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
+  }
+
+  pinMode(PIN_POWER_RELAY, OUTPUT);
+  digitalWrite(PIN_POWER_RELAY, relayOffLevel());
+  pinMode(PIN_MOTOR_BRAKE, OUTPUT);
+  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
+  pinMode(PIN_MD13S_DIR, OUTPUT);
+  digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
+}
+
+bool spriteBegin() {
+  canvas.setColorDepth(16);
+  canvas.setPsram(true);
+  sprite_ok = canvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
+  if (!sprite_ok) {
+    canvas.setPsram(false);
+    sprite_ok = canvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
+  }
+  return sprite_ok;
+}
+
+}  // namespace
+
+#if !MC_PROTO_V1
+
 namespace {
 
 int requested_speed = 0;
@@ -22,7 +122,6 @@ bool brake_on = false;
 uint32_t relay_on_ms = 0;
 bool was_live = false;
 bool ui_dirty = true;
-bool sprite_ok = false;
 ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
 uint32_t next_enc_ms = 0;
@@ -40,19 +139,8 @@ char line_buf[64];
 size_t line_len = 0;
 uint32_t next_repeat_ms = 0;
 
-M5Canvas canvas(&M5.Display);
-
-int relayOffLevel() { return RELAY_ON_LEVEL ? 0 : 1; }
-int brakeOffLevel() { return BRAKE_ON_LEVEL ? 0 : 1; }
-
 bool outputLive() {
   return relay_on && (millis() - relay_on_ms >= RELAY_SETTLE_MS);
-}
-
-void driveOutput(gpio_num_t pin, int level) {
-  gpio_set_level(pin, level);
-  gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-  gpio_set_level(pin, level);
 }
 
 void publish(const char* prefix) {
@@ -348,18 +436,6 @@ void pollSerial() {
     }
   }
 }
-
-// KeyStream src/display.cpp と同じ警告色（RGB565）。
-constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-  return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-constexpr uint16_t kOrange = rgb565(255, 90, 0);
-constexpr uint16_t kAmber = rgb565(230, 70, 0);
-constexpr uint16_t kDarkRed = rgb565(50, 10, 10);
-constexpr uint16_t kDarkOrange = rgb565(35, 12, 0);
-constexpr uint16_t kGreen = rgb565(0, 255, 100);
-constexpr uint16_t kGray = rgb565(60, 60, 60);
-constexpr uint16_t kRed = rgb565(255, 0, 0);
 
 enum class Action : uint8_t { Power, Brake, Speed, Stop, Estop, Motor, HomeP, HomeN, Neutral, Cal };
 
@@ -784,54 +860,7 @@ void reportAuto(const ControlSnapshot& now) {
 }  // namespace
 
 void setup() {
-  driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
-  driveOutput(static_cast<gpio_num_t>(PIN_MOTOR_BRAKE), brakeOffLevel());
-  driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
-  driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
-
-  auto cfg = M5.config();
-  cfg.clear_display = true;
-#if MC_USB_POWER
-  // env:m5stack-cores3-usbpower。USB のみで動かし、CoreS3 が Grove 5V を供給する。Bottom の DC 入力は接続しない。
-  // （DIN Base 時代の Issue #1 回避用。Base15 の DC と USB の同時接続は未検証）
-  cfg.output_power = true;
-#else
-  cfg.output_power = false;  // Bottom（Base15 の DC ジャック → MP1584 → BUS 5V）から 5V を受ける設定
-#endif
-  cfg.internal_imu = false;  // CoreS3 SE に BMI270 は無い
-  cfg.internal_mic = false;
-  cfg.internal_spk = false;
-  cfg.external_imu = false;
-  cfg.external_rtc = false;
-  // 外部機器の探索をさせない。理由は 2 つ。
-  //  - Port.A（G1 SCL / G2 SDA）の I2C 探索抑止。G2 は主電源リレー IN なので I2C の High で入れたくない
-  //    （G1 はブレーキを G13 に移して空いたが、I2C は両線が要るので緩めない）。
-  //  - Module Display / RCA の検出が走ると M5Unified が mbus_pin23 = G13 を I2S DOUT に取る。
-  //    G13 はブレーキ解除リレー IN なので external_speaker_value = 0 で止める。internal_spk = false も同じ理由で保つ。
-  cfg.external_display_value = 0;
-  cfg.external_speaker_value = 0;
-  M5.begin(cfg);
-#if MC_PMIC_LOG
-  pmic_log_boot();  // 前回の電源断要因（REG21）を、ほかの処理より先に読む
-#endif
-#if !MC_USB_POWER
-  M5.Power.setUsbOutput(false);  // CoreS3からPC側へのUSB給電を無効化
-#endif
-  Serial.begin(115200);
-  // USB CDC をホストが読んでいないと write / flush は既定 100 ms ずつ待つ。自動移動中は AUTO 行と ENC 行の
-  // flush が続くので、UI ループが 200 ms 止まると制御タスクの入力鮮度の守りが働いてしまう。20 ms に短縮する。
-  Serial.setTxTimeoutMs(20);
-
-  if (M5.Display.width() < M5.Display.height()) {
-    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
-  }
-
-  pinMode(PIN_POWER_RELAY, OUTPUT);
-  digitalWrite(PIN_POWER_RELAY, relayOffLevel());
-  pinMode(PIN_MOTOR_BRAKE, OUTPUT);
-  digitalWrite(PIN_MOTOR_BRAKE, brakeOffLevel());
-  pinMode(PIN_MD13S_DIR, OUTPUT);
-  digitalWrite(PIN_MD13S_DIR, DIR_POSITIVE_LEVEL);
+  boardBegin();
   motor_output_begin();
   if (!encoder_begin()) {
     Serial.println("ERR pcnt");
@@ -841,14 +870,7 @@ void setup() {
   }
   control_begin(profile_store_load(profile_store_selected_motor()));
 
-  canvas.setColorDepth(16);
-  canvas.setPsram(true);
-  sprite_ok = canvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
-  if (!sprite_ok) {
-    canvas.setPsram(false);
-    sprite_ok = canvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
-  }
-  if (!sprite_ok) {
+  if (!spriteBegin()) {
     Serial.println("ERR sprite");
   }
   layoutButtons(M5.Display.width());
@@ -907,3 +929,332 @@ void loop() {
     ui_dirty = false;
   }
 }
+
+#else  // MC_PROTO_V1
+
+// ---------------------------------------------------------------------------------
+// USB プロトコル v1（h3-control-server 接続）。USB CDC はバイナリ専用でテキストを一切出さない。
+// 画面は状態の表示と、系統選択（DISARMED のときだけ）・非常停止（ラッチ / 解除）だけ。
+// 手動の電源・ブレーキ・速度・自動移動のボタンは出さない（校正・端当ては従来 env で行う）。
+// ---------------------------------------------------------------------------------
+
+namespace {
+
+V1Snapshot vsnap;
+uint8_t saved_motor = 1;          // NVS に保存済みの系統。スナップショットの selected_axis が変わったら保存する
+bool ui_dirty = true;
+uint32_t next_snap_ms = 0;
+uint32_t last_press_ms = 0;
+char notice[32];
+uint32_t notice_until_ms = 0;
+char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
+
+enum class V1Action : uint8_t { Motor, Estop };
+
+struct V1Button {
+  int x;
+  int y;
+  int w;
+  int h;
+  V1Action action;
+};
+
+constexpr int kMargin = 6;
+V1Button v1_buttons[2];
+
+void showNotice(const char* text) {
+  snprintf(notice, sizeof(notice), "%s", text);
+  notice_until_ms = millis() + 1500;
+  ui_dirty = true;
+}
+
+void layoutV1(int width, int height) {
+  v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
+  v1_buttons[1] = {kMargin, height - 62, width - kMargin * 2, 56, V1Action::Estop};
+}
+
+const V1Button* hitV1(int x, int y) {
+  for (const V1Button& b : v1_buttons) {
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return &b;
+  }
+  return nullptr;
+}
+
+const char* stateName(uint8_t s) {
+  switch (s) {
+    case v1::state::BOOT: return "BOOT";
+    case v1::state::DISARMED: return "DISARMED";
+    case v1::state::ARMING: return "ARMING";
+    case v1::state::HOLDING: return "HOLDING";
+    case v1::state::ACTIVE: return "ACTIVE";
+    case v1::state::STOPPING: return "STOPPING";
+    case v1::state::DISARMING: return "DISARMING";
+    case v1::state::FAULT: return "FAULT";
+  }
+  return "?";
+}
+
+const char* faultName(uint16_t f) {
+  switch (f) {
+    case v1::fault::NONE: return "NONE";
+    case v1::fault::COMMAND_TIMEOUT: return "COMMAND_TIMEOUT";
+    case v1::fault::FOLLOWING_ERROR: return "FOLLOWING_ERROR";
+    case v1::fault::OVERSPEED: return "OVERSPEED";
+    case v1::fault::SOFT_LIMIT: return "SOFT_LIMIT";
+    case v1::fault::ENCODER_FAULT: return "ENCODER_FAULT";
+    case v1::fault::CONTROL_OVERRUN: return "CONTROL_OVERRUN";
+    case v1::fault::CONFIG_INVALID: return "CONFIG_INVALID";
+    case v1::fault::STOP_TIMEOUT: return "STOP_TIMEOUT";
+    case v1::fault::POWER_FAULT: return "POWER_FAULT";
+    case v1::fault::HOST_FAULT: return "HOST_FAULT";
+    case v1::fault::NOT_REFERENCED: return "NOT_REFERENCED";
+    case v1::fault::LOCAL_ESTOP: return "LOCAL_ESTOP";
+  }
+  return "UNKNOWN";
+}
+
+uint16_t stateColor(uint8_t s) {
+  switch (s) {
+    case v1::state::HOLDING:
+    case v1::state::ACTIVE: return kGreen;
+    case v1::state::ARMING:
+    case v1::state::STOPPING:
+    case v1::state::DISARMING: return kAmber;
+    case v1::state::FAULT: return kRed;
+    default: return kGray;
+  }
+}
+
+void onV1Button(const V1Button& b) {
+  switch (b.action) {
+    case V1Action::Motor:
+      if (vsnap.state != v1::state::DISARMED) {
+        showNotice("DISARMEDで切替");
+        return;
+      }
+      control_v1_select_axis(static_cast<uint8_t>(vsnap.selected_axis % 3 + 1));
+      break;
+    case V1Action::Estop:
+      control_v1_set_estop(!vsnap.estop_latched);
+      showNotice(vsnap.estop_latched ? "非常停止を解除" : "非常停止");
+      break;
+  }
+}
+
+void pollTouchV1() {
+  const auto touch = M5.Touch.getDetail();
+  if (!touch.wasPressed()) return;
+  // 同じ押下で wasPressed が 2 回成立することがある（実機で確認）。250 ms 以内の再押下は無視する。
+  const uint32_t now = millis();
+  if (now - last_press_ms < 250) return;
+  last_press_ms = now;
+  if (const V1Button* b = hitV1(touch.x, touch.y)) onV1Button(*b);
+}
+
+void renderV1() {
+  if (!sprite_ok) return;
+  const int width = canvas.width();
+  const bool fault = vsnap.state == v1::state::FAULT;
+  const bool disarmed = vsnap.state == v1::state::DISARMED;
+
+  canvas.fillSprite(TFT_BLACK);
+  canvas.fillRect(0, 0, width, 28, kDarkRed);
+  canvas.drawLine(0, 28, width, 28, kOrange);
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
+
+  // 系統ボタン
+  {
+    const V1Button& b = v1_buttons[0];
+    const uint16_t edge = disarmed ? kOrange : kGray;
+    canvas.fillRect(b.x, b.y, b.w, b.h, disarmed ? kDarkOrange : TFT_BLACK);
+    canvas.drawRect(b.x, b.y, b.w, b.h, edge);
+    canvas.setTextColor(edge, disarmed ? kDarkOrange : TFT_BLACK);
+    canvas.setTextDatum(middle_center);
+    char motor_label[8];
+    snprintf(motor_label, sizeof(motor_label), "#%u", static_cast<unsigned>(vsnap.selected_axis));
+    canvas.drawString(motor_label, b.x + b.w / 2, b.y + b.h / 2);
+  }
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(kOrange, kDarkRed);
+  canvas.drawString("H3 v1", 62, 14);
+  canvas.setTextDatum(middle_right);
+  if (notice[0] != '\0') {
+    canvas.setTextColor(kRed, kDarkRed);
+    canvas.drawString(notice, width - 8, 14);
+  } else {
+    char id_text[24];
+    snprintf(id_text, sizeof(id_text), "dev %04X", static_cast<unsigned>(vsnap.device_id & 0xFFFF));
+    canvas.setTextColor(TFT_WHITE, kDarkRed);
+    canvas.drawString(id_text, width - 8, 14);
+  }
+
+  // 状態（FAULT は赤で異常コード名）
+  canvas.setFont(&fonts::Font4);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(stateColor(vsnap.state), TFT_BLACK);
+  char state_text[40];
+  if (fault) {
+    snprintf(state_text, sizeof(state_text), "FAULT %s", faultName(vsnap.fault_code));
+  } else if (vsnap.fault_code != v1::fault::NONE) {
+    snprintf(state_text, sizeof(state_text), "%s %s", stateName(vsnap.state), faultName(vsnap.fault_code));
+  } else {
+    snprintf(state_text, sizeof(state_text), "%s", stateName(vsnap.state));
+  }
+  canvas.drawString(state_text, 8, 46);
+
+  // 指令行
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
+  char cmd_text[64];
+  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %+d%%", vsnap.power_on_cmd ? "入" : "切",
+           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty);
+  canvas.setTextColor(vsnap.power_on_cmd || vsnap.brake_release_cmd ? kGreen : kOrange, TFT_BLACK);
+  canvas.drawString(cmd_text, 8, 70);
+
+  // カウント行
+  canvas.fillRect(kMargin, 84, width - kMargin * 2, 30, kDarkOrange);
+  canvas.drawRect(kMargin, 84, width - kMargin * 2, 30, kOrange);
+  canvas.setFont(&fonts::Font4);
+  canvas.setTextColor(vsnap.referenced ? TFT_WHITE : kAmber, kDarkOrange);
+  char pos_text[16];
+  snprintf(pos_text, sizeof(pos_text), "%ld", static_cast<long>(vsnap.actual));
+  canvas.drawString(pos_text, 12, 99);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  canvas.setTextDatum(middle_right);
+  char motion_text[64];
+  snprintf(motion_text, sizeof(motion_text), "目標 %ld  誤差 %ld  %ld c/s", static_cast<long>(vsnap.target),
+           static_cast<long>(vsnap.following_error), static_cast<long>(vsnap.velocity));
+  canvas.setTextColor(kOrange, kDarkOrange);
+  canvas.drawString(motion_text, width - 12, 99);
+
+  // フラグ行
+  canvas.setTextDatum(middle_left);
+  canvas.setFont(&fonts::lgfxJapanGothic_12);
+  char flag_text[64];
+  snprintf(flag_text, sizeof(flag_text), "%s  %s  %s", vsnap.configured ? "CONFIG 済" : "CONFIG 未",
+           vsnap.referenced ? "基準 済" : "基準 未",
+           (vsnap.flags & v1::flags::POWER_CONTROLLER) ? "電源担当" : "電源担当なし");
+  canvas.setTextColor(vsnap.configured && vsnap.referenced ? kGreen : kAmber, TFT_BLACK);
+  canvas.drawString(flag_text, 8, 124);
+
+  // リンク行
+  char link_text[80];
+  if (vsnap.has_rx) {
+    snprintf(link_text, sizeof(link_text), "PC %lu ms前  rx_err %u  stale %u  tx_drop %lu",
+             static_cast<unsigned long>(vsnap.last_rx_age_ms), vsnap.rx_error_count, vsnap.stale_drop_count,
+             static_cast<unsigned long>(vsnap.tx_dropped));
+    canvas.setTextColor(vsnap.last_rx_age_ms < 500 ? kGreen : kAmber, TFT_BLACK);
+  } else {
+    snprintf(link_text, sizeof(link_text), "PC 未受信  rx_err %u", vsnap.rx_error_count);
+    canvas.setTextColor(kGray, TFT_BLACK);
+  }
+  canvas.drawString(link_text, 8, 142);
+
+  // tick 行（周期の守りの確認用）
+  char tick_text[64];
+  snprintf(tick_text, sizeof(tick_text), "tick %lu  最大間隔 %lu us%s%s", static_cast<unsigned long>(vsnap.tick_count),
+           static_cast<unsigned long>(vsnap.max_tick_gap_us), boot_error[0] ? "  ERR " : "", boot_error);
+  canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
+  canvas.drawString(tick_text, 8, 160);
+
+  // 非常停止ボタン（ラッチ中は「解除」）
+  {
+    const V1Button& b = v1_buttons[1];
+    const uint16_t fill = vsnap.estop_latched ? kRed : kDarkRed;
+    canvas.fillRect(b.x, b.y, b.w, b.h, fill);
+    canvas.drawRect(b.x, b.y, b.w, b.h, kRed);
+    canvas.setFont(&fonts::lgfxJapanGothic_24);
+    canvas.setTextColor(TFT_WHITE, fill);
+    canvas.setTextDatum(middle_center);
+    canvas.drawString(vsnap.estop_latched ? "非常停止 解除" : "非常停止", b.x + b.w / 2, b.y + b.h / 2);
+  }
+
+  canvas.pushSprite(0, 0);
+}
+
+bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
+  return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
+         a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
+         a.brake_release_cmd != b.brake_release_cmd || a.duty != b.duty || a.actual != b.actual ||
+         a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
+         a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
+         a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
+         a.tx_dropped != b.tx_dropped || (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
+         (a.tick_count / 200) != (b.tick_count / 200);
+}
+
+void noteBootError(const char* what) {
+  if (boot_error[0] == '\0') {
+    snprintf(boot_error, sizeof(boot_error), "%s", what);
+  } else {
+    char merged[24];
+    snprintf(merged, sizeof(merged), "%s,%s", boot_error, what);
+    snprintf(boot_error, sizeof(boot_error), "%s", merged);
+  }
+}
+
+}  // namespace
+
+void setup() {
+  // SET_POSITION は 100 Hz × 44 byte。画面の pushSprite（数十 ms）の間に HWCDC の既定 256 byte が溢れないよう広げる。
+  // begin() より前でないと効かない。
+  Serial.setRxBufferSize(1024);
+  // USB CDC は v1 のバイナリ専用。IDF / M5Unified のログも出さない（COBS の区切り 0x00 と混ざる）。
+  // M5.begin() より前に止める。Arduino core の log_e() は CORE_DEBUG_LEVEL=0（platformio.ini）でコンパイル時に消す。
+  esp_log_level_set("*", ESP_LOG_NONE);
+  boardBegin();
+  motor_output_begin();
+  if (!encoder_begin()) {
+    noteBootError("pcnt");
+  }
+  if (!profile_store_begin()) {
+    noteBootError("nvs");
+  }
+  if (!v1_link_begin()) {
+    noteBootError("link");
+  }
+  saved_motor = profile_store_selected_motor();
+  int8_t signs[4] = {1, 1, 1, 1};
+  for (uint8_t m = 1; m <= 3; ++m) {
+    signs[m] = profile_store_load(m).sign;
+  }
+  control_v1_begin(signs, saved_motor);
+  vsnap.selected_axis = saved_motor;
+
+  if (!spriteBegin()) {
+    noteBootError("sprite");
+  }
+  layoutV1(M5.Display.width(), M5.Display.height());
+  ui_dirty = true;
+}
+
+void loop() {
+  M5.update();
+  v1_link_poll();
+  pollTouchV1();
+
+  if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {
+    notice[0] = '\0';
+    ui_dirty = true;
+  }
+
+  if (static_cast<int32_t>(millis() - next_snap_ms) >= 0) {
+    next_snap_ms = millis() + 50;
+    const V1Snapshot previous = vsnap;
+    vsnap = control_v1_snapshot();
+    // 系統の選択は制御タスク（V1Axis）が DISARMED のときだけ受け付ける。受け付けられた値だけ NVS に保存する。
+    if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis)) {
+      profile_store_select_motor(vsnap.selected_axis);
+      saved_motor = vsnap.selected_axis;
+    }
+    if (snapChanged(previous, vsnap)) {
+      ui_dirty = true;
+    }
+  }
+
+  if (ui_dirty) {
+    renderV1();
+    ui_dirty = false;
+  }
+}
+
+#endif  // MC_PROTO_V1

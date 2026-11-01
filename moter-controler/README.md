@@ -11,7 +11,8 @@ cd moter-controler
 /Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3            # Bottom（Base15）の DC ジャックから給電する本番設定
 /Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower   # USB のみ給電（開発用。Bottom の DC は接続しない。DIN Base 時代の Issue #1 回避用）
 /Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-usbpower -t upload --upload-port /dev/cu.usbmodem2101
-tests/run_tests.sh   # ホストテスト（状態機械とプロファイル）
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-v1            # USB プロトコル v1（h3-control-server 接続。下の節）
+tests/run_tests.sh   # ホストテスト（状態機械とプロファイル、v1 のコーデックと状態機械）
 ```
 
 ## 配線（Base15）
@@ -63,6 +64,37 @@ G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298）と共
 - NVS `h3`: `motor`、`m{n}_stroke`、`m{n}_neutral`、`m{n}_cal`、`m{n}_sign`。
 - 2026-10-25 時点: #3 校正済み（stroke 6160、neutral 3080、sign +1）。#1・#2 は未校正。
 - 2026-10-26 のレビュー修正（未書き込み・実機未確認）: 自動移動中の速度操作は中止（PWM 0）に統一、中立の再始動時に速度窓を取り直す、PCNT リミット跨ぎの読み直し、入力の鮮度監視、校正中は保存ストロークを信じない。
+
+## USB プロトコル v1（h3-control-server 接続）
+
+PC 側の [h3-control-server](../control-server/) と USB でつなぐためのファームウェア。仕様は [docs/control-server/protocol.md](../docs/control-server/protocol.md)、載せ方は [docs/superpowers/specs/2026-10-31-moter-controler-v1-protocol-design.md](../docs/superpowers/specs/2026-10-31-moter-controler-v1-protocol-design.md)。3 台とも同じファームで、担当する系統は画面で選ぶ（NVS の `motor`）。
+
+| env | 用途 |
+| --- | --- |
+| `m5stack-cores3-v1` | Base15 の DC ジャックから給電する本番設定 + v1（`-DMC_PROTO_V1=1`） |
+| `m5stack-cores3-v1-usbpower` | USB のみ給電 + v1（机上確認用。Bottom の DC は接続しない） |
+
+書き込みは手動で行う（下はコマンド例。実機が別の作業で使用中のときは実行しない）:
+
+```sh
+cd moter-controler
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-v1
+/Users/takuro/.platformio/penv/bin/pio run -e m5stack-cores3-v1 -t upload --upload-port /dev/cu.usbmodemXXXX   # 例。ポートは SER= で個体を確認してから
+```
+
+構成:
+
+- `include/v1_codec.h` — COBS、CRC-16/CCITT-FALSE、フレーム、protocol.md §4 の全メッセージの LE エンコード・デコード（純粋、ヘッダのみ）。
+- `include/v1_axis.h` — 1 軸の状態機械 `V1Axis`（DISARMED → ARMING → HOLDING ⇄ ACTIVE、STOPPING、DISARMING、FAULT）。`control-server/src/sim_axis.rs` と同じ入出力・同じ応答を目標にしている。位置制御は速度フィードフォワード＋比例（`v1_duty_command`: `V1_FF_COUNT_S_PER_PERCENT`・`V1_KP_PERCENT_PER_100`・不感帯 `V1_DEADBAND` / `V1_DEADBAND_OUT` のヒステリシス・`V1_DUTY_MIN`〜`V1_DUTY_MAX`。[docs/multi_axis_20261031.md](docs/multi_axis_20261031.md) の 3 系統運転の実測から置いた仮値）。無パルスの `ENCODER_FAULT` は、ブレーキ解除指令中に目標（軌道）が動いている間だけ判定する（目標が止まっているときの静止や DISARMING 中の残り誤差では出さない。代わりに、エンコーダが死んだまま目標が止まっている間は検出できず、目標が動いてから 200 ms で出る。FAULT_RESET を拒む「残る原因」は画面の非常停止のラッチだけ）。Duty の向きは系統プロファイルの `sign` から決める（`actual_count` には符号を掛けない）。
+- `src/v1_link.cpp` — `Serial` のバイト受信 → COBS 区切り → 受信キュー、送信キュー → `Serial.write`（loop() 側だけが書く）。`device_id` は `0x5131` + eFuse MAC を表記順に並べた 48 bit（`v1_device_id_from_mac`。例 `1C:DB:D4:BA:8D:58` → `51311cdbd4ba8d58`。画面の `dev XXXX` は MAC の末尾 2 オクテット）、`boot_id` は `esp_random()`。
+- `src/control_task.cpp` — `MC_PROTO_V1` では 5 ms タスクが `V1Axis` を回し、主電源 G2（電源担当軸のみ）・ブレーキ G13・PWM を直接書く。
+- 時間定数は `config.h` の `POWER_SETTLE_MS` / `BRAKE_RELEASE_WAIT_MS` / `BRAKE_APPLY_WAIT_MS`（各 300 ms、仮値）。
+
+画面（v1）: 系統 `#n`（タップで 1 → 2 → 3。**DISARMED のときだけ**。切り替えると CONFIG・位置基準が消え AXIS_SELECT を送る）/ 状態名（FAULT は赤で異常コード名）/ 電源・ブレーキの指令と Duty / `actual_count`・目標・追従誤差・速度 / CONFIG・基準・電源担当の有無 / リンク（PC から最後に受けてからの経過 ms、`rx_error`、`stale`、送信キュー満杯）/ tick 数と最大間隔 / **非常停止**（いつでも。押すと `FAULT(LOCAL_ESTOP = 12)`、ラッチ中はボタンが「非常停止 解除」になる。解除してから PC が FAULT_RESET を送る）。
+
+v1 で無効になるもの: テキストコマンド（`R` `S` `HOME` …）と `STAT` / `ENC` / `AUTO` 行、IDF のログ出力と Arduino core の `log_e()`（v1 env は `CORE_DEBUG_LEVEL=0`。COBS の区切り 0x00 と混ざるため）、手動の電源・ブレーキ・速度・自動移動のボタン。校正・端当ては従来 env で行う。
+
+ホストテスト `tests/run_tests.sh` は v1 のテスト（protocol.md §7 の全ベクタの encode / decode、状態機械の各規則）も走らせる。
 
 ## 安全
 

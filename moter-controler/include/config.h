@@ -94,3 +94,20 @@ constexpr int32_t RETREAT_COUNTS = 600;         // 端当てで開始直後に�
 
 // --- 手動速度の守り（無パルス／遅すぎで出力 0） ---
 constexpr int MANUAL_GUARD_MIN_DUTY = NEUTRAL_DUTY_MIN;  // これ未満は機構が動かないことがある（7 % で動くことを実測）ので監視しない
+
+// --- USB プロトコル v1（MC_PROTO_V1。docs/control-server/protocol.md、設計 docs/superpowers/specs/2026-10-31-moter-controler-v1-protocol-design.md §3） ---
+// いずれも実機で詰めるまでの仮値。
+// 2026-10-31 の 3 系統同時運転（docs/multi_axis_20261031.md）の実測: Duty 1 % あたりおよそ 100〜130 count/s、始動に 7〜9 %
+// （#2 の持ち上げ側は 8 % 台で 200 count/s 未満）。15 % で 1300〜1460 count/s。比例だけでは誤差を数百 count 抱えないと
+// 速度が出ないので、軌道の目標速度に応じたフィードフォワードを足し、比例は補正に使う。
+constexpr int V1_KP_PERCENT_PER_100 = 2;        // 位置制御の比例ゲイン。誤差 100 カウントあたり 2 %
+constexpr int V1_FF_COUNT_S_PER_PERCENT = 100;  // フィードフォワード: 軌道の目標速度 [count/s] ÷ この値 = Duty [%]（実測の下側を取った仮値）
+constexpr int32_t V1_DEADBAND = 10;             // 目標が止まっているとき、|誤差| がこれ以下になったら Duty 0（入る側）
+constexpr int32_t V1_DEADBAND_OUT = 20;         // Duty 0 のあと、|誤差| がこれを超えるまで再駆動しない（出る側。到達帯の縁での往復を防ぐ）
+constexpr int V1_DUTY_MIN = NEUTRAL_DUTY_MIN;   // Duty の下限（7 %。これ未満では機構が動かないことを実測）
+constexpr int V1_DUTY_MAX = 20;                 // Duty の上限（実測 20 % ≈ 1900 count/s 前後。overspeed_count_s より十分下の速度に収める）
+constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty|（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）
+constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
+constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
+constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
+constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで

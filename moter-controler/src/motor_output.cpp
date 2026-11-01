@@ -30,7 +30,11 @@ void motor_output_begin() {
   ledcAttachPin(PIN_MD13S_PWM, PWM_CHANNEL);
 #endif
   writePwm(0);
+#if MC_PROTO_V1
+  (void)actual_hz;  // v1 では USB CDC はバイナリ専用。テキストを出さない
+#else
   Serial.printf("pwm %u Hz requested, timer %u Hz, %u-bit\n", PWM_FREQ_HZ, actual_hz, PWM_BITS);
+#endif
 }
 
 // 反転するときだけ PWM を落としてから DIR を変える。同じ出力なら戻る。

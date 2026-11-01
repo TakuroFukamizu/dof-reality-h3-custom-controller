@@ -11,7 +11,19 @@
 #include "manual_guard.h"
 #include "motor_output.h"
 
+#if MC_PROTO_V1
+#include <esp_timer.h>
+
+#include "v1_axis.h"
+#include "v1_link.h"
+#endif
+
 namespace {
+
+constexpr uint32_t kPeriodMs = 5;
+portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#if !MC_PROTO_V1
 
 struct Inputs {
   bool relay_live = false;
@@ -28,11 +40,8 @@ struct Inputs {
 };
 
 constexpr uint32_t kInputStaleMs = 200;
-
-constexpr uint32_t kPeriodMs = 5;
 constexpr uint32_t kVelocityWindowMs = 100;
 
-portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 Inputs g_in;
 ControlSnapshot g_snap;
 MotorProfile g_initial;
@@ -145,7 +154,11 @@ void task_main(void*) {
   }
 }
 
+#endif  // !MC_PROTO_V1
+
 }  // namespace
+
+#if !MC_PROTO_V1
 
 void control_begin(const MotorProfile& initial) {
   g_initial = initial;
@@ -212,3 +225,161 @@ ControlSnapshot control_snapshot() {
   portEXIT_CRITICAL(&g_mux);
   return snap;
 }
+
+#else  // MC_PROTO_V1
+
+// ---------------------------------------------------------------------------------
+// USB プロトコル v1: 5 ms 周期で V1Axis を回し、GPIO（主電源 G2・ブレーキ G13）と PWM を制御タスクから直接書く。
+// 受信フレームは v1_link の受信キューから、出力メッセージは送信キューへ（ACK → STATUS の順を保つ）。
+// 手動速度・自動移動（AutoMachine・ManualGuard）は使わない。モーター出力は V1Axis だけが書く。
+// ---------------------------------------------------------------------------------
+
+namespace {
+
+struct V1Inputs {
+  bool select_pulse = false;
+  uint8_t select_axis = 0;
+  bool estop_pulse = false;
+  bool estop_value = false;
+};
+
+V1Axis g_axis;  // 大きいのでタスクのスタックではなく静的領域に置く
+V1Inputs g_v1_in;
+V1Snapshot g_v1_snap;
+int8_t g_signs[4] = {1, 1, 1, 1};
+uint8_t g_selected = 1;
+
+int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
+int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
+
+// 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
+void write_outputs(bool power_on, bool brake_release, int duty) {
+  digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
+  digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
+  motor_output_write(duty);
+}
+
+void v1_task_main(void*) {
+  V1Identity id;
+  id.device_id = v1_link_device_id();
+  id.boot_id = v1_link_boot_id();
+  g_axis.begin(id, g_selected, g_signs[g_selected], static_cast<uint64_t>(esp_timer_get_time()), encoder_count());
+
+  TickType_t last_wake = xTaskGetTickCount();
+  uint32_t ticks = 0;
+  uint32_t max_gap_us = 0;
+  uint64_t prev_now = static_cast<uint64_t>(esp_timer_get_time());
+
+  for (;;) {
+    V1Inputs in;
+    portENTER_CRITICAL(&g_mux);
+    in = g_v1_in;
+    g_v1_in.select_pulse = false;
+    g_v1_in.estop_pulse = false;
+    portEXIT_CRITICAL(&g_mux);
+
+    const uint64_t now = static_cast<uint64_t>(esp_timer_get_time());
+    const uint64_t gap = now - prev_now;
+    prev_now = now;
+    if (gap > max_gap_us) max_gap_us = static_cast<uint32_t>(gap);
+
+    // 画面の非常停止は受信フレームより先に（この周期の出力に必ず反映する）
+    if (in.estop_pulse) {
+      g_axis.set_local_estop(in.estop_value, now);
+    }
+    // メッセージ層より下で捨てた受信（300 byte 超・受信キュー満杯）
+    for (uint32_t d = v1_link_take_rx_dropped(); d > 0; --d) {
+      g_axis.record_rx_error();
+    }
+    V1RxFrame frame;
+    while (v1_link_rx_pop(&frame)) {
+      g_axis.handle_frame(frame.data, frame.len, now);
+    }
+    if (in.select_pulse) {
+      if (g_axis.select_axis(in.select_axis, now)) {
+        g_axis.set_sign(g_signs[in.select_axis]);
+      }
+    }
+
+    g_axis.tick(now, encoder_count());
+    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_percent());
+
+    // outbox → 送信キュー。順序を保つ: 満杯なら STATUS は捨て（次の周期で送る）、それ以外は保留して次の周期に再試行。
+    while (const v1::McuMsg* m = g_axis.peek()) {
+      if (v1_link_tx_push(*m)) {
+        g_axis.pop();
+      } else if (m->type == v1::msg::STATUS) {
+        g_axis.pop();
+      } else {
+        break;
+      }
+    }
+
+    V1Snapshot snap;
+    snap.state = g_axis.state();
+    snap.fault_code = g_axis.fault_code();
+    snap.flags = g_axis.flags();
+    snap.selected_axis = g_axis.selected_axis();
+    snap.power_on_cmd = g_axis.power_on_cmd();
+    snap.brake_release_cmd = g_axis.brake_release_cmd();
+    snap.duty = g_axis.duty_percent();
+    snap.actual = g_axis.actual_count();
+    snap.target = g_axis.target_count();
+    snap.velocity = g_axis.velocity_count_s();
+    snap.following_error = g_axis.following_error_count();
+    snap.configured = g_axis.configured();
+    snap.referenced = g_axis.referenced();
+    snap.estop_latched = g_axis.estop_latched();
+    snap.has_rx = g_axis.has_rx();
+    snap.last_rx_age_ms = g_axis.has_rx() ? static_cast<uint32_t>((now - g_axis.last_rx_us()) / 1000) : 0;
+    snap.rx_error_count = g_axis.rx_error_count();
+    snap.stale_drop_count = g_axis.stale_drop_count();
+    snap.tx_dropped = v1_link_tx_dropped();
+    ticks += 1;
+    snap.tick_count = ticks;
+    snap.max_tick_gap_us = max_gap_us;
+    snap.device_id = id.device_id;
+    snap.boot_id = id.boot_id;
+
+    portENTER_CRITICAL(&g_mux);
+    g_v1_snap = snap;
+    portEXIT_CRITICAL(&g_mux);
+
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(kPeriodMs));
+  }
+}
+
+}  // namespace
+
+void control_v1_begin(const int8_t signs[4], uint8_t selected_axis) {
+  for (int i = 0; i < 4; ++i) g_signs[i] = signs[i] < 0 ? -1 : 1;
+  g_selected = (selected_axis >= 1 && selected_axis <= 3) ? selected_axis : 1;
+  g_v1_snap.selected_axis = g_selected;
+  g_v1_snap.state = 0;  // BOOT（タスクが begin するまで）
+  xTaskCreatePinnedToCore(v1_task_main, "control_v1", 8192, nullptr, 5, nullptr, 1);
+}
+
+void control_v1_select_axis(uint8_t axis) {
+  if (axis < 1 || axis > 3) return;
+  portENTER_CRITICAL(&g_mux);
+  g_v1_in.select_axis = axis;
+  g_v1_in.select_pulse = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void control_v1_set_estop(bool latched) {
+  portENTER_CRITICAL(&g_mux);
+  g_v1_in.estop_value = latched;
+  g_v1_in.estop_pulse = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+V1Snapshot control_v1_snapshot() {
+  V1Snapshot snap;
+  portENTER_CRITICAL(&g_mux);
+  snap = g_v1_snap;
+  portEXIT_CRITICAL(&g_mux);
+  return snap;
+}
+
+#endif  // MC_PROTO_V1
