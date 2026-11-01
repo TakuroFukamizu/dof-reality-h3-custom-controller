@@ -15,10 +15,15 @@
     不感帯の既定だけ h3game の 0.12 ではなく 0.05（細かい動きを見るため）。ならし（smooth）はしない。
   - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当は localStorage。
   - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
-  - 姿勢は 50 Hz で送る。frame_seq はブラウザの描画フレーム（requestAnimationFrame）が進んだときだけ増える。
-    タブが隠れると rAF が止まり frame_seq が進まなくなるので、サーバーの鮮度判定（source_freshness_ms）が
-    減速停止させる。ページ側では隠れても送信を止めず、0（中央）も送らない。
+  - 姿勢は 50 Hz で送る。50 Hz の刻みは Web Worker で回す: 主スレッドの setInterval や requestAnimationFrame は、
+    タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に間引かれ、frame_seq が進まずサーバーの鮮度切れ
+    （source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。Worker のタイマーは間引かれないので、
+    刻みごとに主スレッドでスティックを読み（navigator.getGamepads は隠れていても読める）、姿勢を計算し、
+    スティックを読めたときだけ frame_seq を進めて送る。描画（棒・数値）だけ requestAnimationFrame で行い、
+    描画が止まっても frame_seq と送信は止まらない。隠れても 0（中央）は送らない: 止めたいときは STOP か「送信停止」。
   - 選んだスティックが見えなくなったら、最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+  - 操作ボタン（ARM / START / DISARM / FAULT RESET）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
+    （判定はサーバーが正。STOP は常に押せる）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
 -->
 <style>
@@ -87,7 +92,7 @@
     <button id="bStart">START</button>
     <button id="bDisarm">DISARM</button>
     <button id="bFaultReset">FAULT RESET</button>
-    <span class="dim small">順番: 送信開始 → ARM → START。送信を止めるかタブを隠すと鮮度切れで減速停止（その場で止まる。中央へは戻らない）</span>
+    <span class="dim small">順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</span>
   </div>
 </section>
 
@@ -178,7 +183,7 @@
 </div>
 
 <section>
-  <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz、seq 単調増加、frame_seq は描画フレームごと、source_age_ms 0、yaw 0</span></h2>
+  <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
   <label class="sl">gain <input type="range" id="gain" min="0" max="0.5" step="0.01" value="0.10"><span id="gainV">0.10</span></label>
   <div class="row">
     <button id="bStream">送信開始</button>
@@ -287,9 +292,9 @@ window.H3Joy = (function () {
   const MAP_KEY = 'h3cs_joystick';
   const DEFAULT_MAP = () => ({ roll: { axis: 0, invert: false, center: 0, min: null, max: null }, pitch: { axis: 1, invert: false, center: 0, min: null, max: null } });
   const state = {
-    session: null, maxGain: null, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0,
+    session: null, maxGain: null, lastStatus: null, ws: null, streaming: false, seq: 0, frameSeq: 0,
     pollBusy: false, lastPollError: null,
-    pads: [], sel: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null, padLost: false,
+    pads: [], sel: null, pad: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null, padLost: false,
   };
 
   $('hostLabel').textContent = location.host;
@@ -336,7 +341,8 @@ window.H3Joy = (function () {
       const b = $(id);
       b.disabled = true;
       try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
-      b.disabled = false;
+      // 戻すときはリグ状態の判定に任せる（次の status を待たずに、押せない状態を押せるに戻さない）
+      if (state.lastStatus) updateButtons(state.lastStatus); else b.disabled = false;
     });
   }
   $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
@@ -359,6 +365,29 @@ window.H3Joy = (function () {
     $('gainV').textContent = parseFloat(gain.value).toFixed(2);
   }
 
+  // 操作ボタンの押せる／押せない（STOP 以外）。リグ状態から決め、押せない理由を title に出す。
+  // サーバー側の判定が正。ここは「いま意味のある操作」を見せるためのもの（オペレーター用試験ページと同じ規則）。
+  // bCenter はこのページではスティックの「中央を取り直す」なので対象外。
+  function updateButtons(s) {
+    const st = s.rig_state || '';
+    const armedStates = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
+    const fresh = !!(s.session && s.session.fresh);
+    const rules = {
+      bArm: [st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED', '前提: READY_TO_ARM か BRAKED_DISARMED（いま ' + st + '）'],
+      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
+      bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
+      bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
+    };
+    for (const id in rules) {
+      const el = $(id);
+      if (!el) continue;
+      const [ok, why] = rules[id];
+      if (el.dataset.title0 === undefined) el.dataset.title0 = el.getAttribute('title') || '';
+      el.disabled = !ok;
+      el.title = ok ? el.dataset.title0 : why;
+    }
+  }
+
   function renderStatus(s) {
     if (s.admin_token_required === false) {
       tokenInput.placeholder = '不要（require_admin_token = false）';
@@ -368,6 +397,7 @@ window.H3Joy = (function () {
       tokenInput.disabled = false;
     }
     state.lastStatus = s;
+    updateButtons(s);
     const rig = $('rigState');
     rig.textContent = s.rig_state;
     rig.className = 'state ' + s.rig_state;
@@ -622,7 +652,49 @@ window.H3Joy = (function () {
   window.addEventListener('gamepadconnected', (e) => log('gamepadconnected: #' + e.gamepad.index + ' ' + e.gamepad.id));
   window.addEventListener('gamepaddisconnected', (e) => log('gamepaddisconnected: #' + e.gamepad.index + ' ' + e.gamepad.id, true));
 
-  // ---------------------------------------------------------------- joystick: 毎フレームの読み取り（frame_seq はここで進む）
+  // ---------------------------------------------------------------- joystick: 50 Hz の刻み（Worker）で読む。frame_seq はここで進む
+  // 刻みごとに: スティックを読む → 姿勢を計算 → 読めたときだけ frame_seq を進める → WS が開いていれば送る。
+  // 描画は別（rAF の frame()）。描画が止まっても（タブが隠れる・別ウィンドウに覆われる）ここは止まらない。
+  function tick() {
+    state.pads = J.readPads();
+    if (!state.sel && state.pads.length) {
+      const p = J.pickDefault(state.pads);
+      if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); log('スティック（自動）: #' + p.index + ' ' + p.id); }
+    }
+    const pad = J.findPad(state.pads, state.sel);
+    state.pad = pad;
+    if (pad) {
+      state.pose = J.poseFrom(pad, state.map, state.dead);
+      state.frameSeq += 1; // スティックを読めた刻みだけ進む
+      state.padLost = false;
+    } else {
+      // スティックが見えない: 最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+      state.padLost = !!(state.sel && state.streaming);
+    }
+    sendPose();
+  }
+
+  // 50 Hz のタイマーは Worker で回す（主スレッドの setInterval は裏に回ると 1 Hz 程度に間引かれる）
+  let tickWorker = null;
+  let tickTimer = null;
+  function startTicker(ms) {
+    stopTicker();
+    try {
+      const src = 'let t=null;onmessage=e=>{if(e.data&&e.data.start){clearInterval(t);t=setInterval(()=>postMessage(1),e.data.start)}else{clearInterval(t);t=null}}';
+      tickWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      tickWorker.onmessage = () => tick();
+      tickWorker.postMessage({ start: ms });
+    } catch (e) {
+      log('Worker が使えないので setInterval で刻む（裏に回ると間引かれる）: ' + e, true);
+      tickTimer = setInterval(tick, ms);
+    }
+  }
+  function stopTicker() {
+    if (tickWorker) { try { tickWorker.terminate(); } catch (e) { /* 無視 */ } tickWorker = null; }
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  }
+
+  // ---------------------------------------------------------------- joystick: 描画（rAF）。読み取りも frame_seq も触らない
   function setBar(id, v) {
     const i = $(id).firstElementChild;
     const w = Math.min(1, Math.abs(v)) * 50;
@@ -657,36 +729,27 @@ window.H3Joy = (function () {
   }
 
   function frame() {
-    state.pads = J.readPads();
-    if (!state.sel && state.pads.length) {
-      const p = J.pickDefault(state.pads);
-      if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); log('スティック（自動）: #' + p.index + ' ' + p.id); }
-    }
     renderPadList();
-    const pad = J.findPad(state.pads, state.sel);
-    const pose = J.poseFrom(pad, state.map, state.dead);
+    const pad = state.pad;
     const banner = $('padBanner');
     if (pad) {
-      state.pose = pose;
-      state.frameSeq += 1; // 描画フレームが進み、スティックを読めたときだけ進む
-      state.padLost = false;
       $('padState').textContent = '読み取り中: #' + pad.index + ' ' + pad.id;
       $('padState').className = 'ok small';
       if (banner.className.indexOf('show') >= 0) banner.className = 'banner warn';
     } else {
-      // スティックが見えない: 最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
-      state.padLost = !!(state.sel && state.timer);
       $('padState').textContent = state.sel ? '選んだスティックが見えない: #' + state.sel.index + ' ' + state.sel.id : '未選択（ボタンを 1 回押すと一覧に出る）';
       $('padState').className = 'bad small';
-      if (state.timer) {
+      if (state.streaming) {
         banner.textContent = 'スティックが見えない: 最後の姿勢のまま frame_seq を止めている（サーバーの鮮度切れで減速停止する）。STOP で止めてもよい';
         banner.className = 'banner warn show';
       }
     }
-    renderStick(pad, pose);
+    // 見えているあいだはいまの値、見えなくなったら棒も 0 に戻す（送っている最後の姿勢は sentPose に出る）
+    renderStick(pad, pad ? state.pose : null);
     $('frameSeq').textContent = String(state.frameSeq);
     requestAnimationFrame(frame);
   }
+  startTicker(20);
   requestAnimationFrame(frame);
 
   // ---------------------------------------------------------------- pose streamer
@@ -702,8 +765,10 @@ window.H3Joy = (function () {
     $('wsState').className = bad ? 'bad' : '';
   }
 
+  // 送信を止める。50 Hz の刻み（スティックの読み取り）は止めない: sendPose が WS の無いときは何もしない。
   function stopStream(reason) {
-    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    state.streaming = false;
+    state.padLost = false;
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
     $('padBanner').className = 'banner warn';
@@ -751,8 +816,7 @@ window.H3Joy = (function () {
     setWsState('connecting', false);
     ws.onopen = () => {
       setWsState('open', false);
-      if (state.timer) clearInterval(state.timer);
-      state.timer = setInterval(sendPose, 20);
+      state.streaming = true; // 以後は Worker の刻み（tick）が sendPose を呼ぶ
       b.textContent = '送信停止';
     };
     ws.onmessage = (ev) => {
@@ -769,7 +833,7 @@ window.H3Joy = (function () {
   }
 
   $('bStream').addEventListener('click', () => {
-    if (state.timer || state.ws) stopStream('operator'); else startStream();
+    if (state.streaming || state.ws) stopStream('operator'); else startStream();
   });
 
   window.addEventListener('pagehide', () => stopStream('pagehide'));

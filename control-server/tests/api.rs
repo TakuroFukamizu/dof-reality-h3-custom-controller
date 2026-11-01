@@ -172,7 +172,9 @@ async fn joystick_page_is_served_and_self_contained() {
     assert_ne!(api::JOYSTICK_PAGE, api::TEST_PAGE);
     // The pure stick mapping lives in a `H3Joy` module (exercised from the browser check) and
     // follows h3game: roll from the X axis, pitch from the Y axis, `getGamepads` for the pads.
-    for needle in ["window.H3Joy", "navigator.getGamepads", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
+    // The 50 Hz tick runs in a Web Worker (main-thread timers and rAF are throttled when the
+    // window is hidden or covered); rAF is kept for rendering only.
+    for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
         assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
     }
     // No external resources: the page must work offline.
