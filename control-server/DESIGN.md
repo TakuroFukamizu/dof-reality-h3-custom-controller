@@ -136,6 +136,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | API | 認証 | 内容 |
 | --- | --- | --- |
 | `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
+| `GET /joystick`, `GET /joystick.html` | なし（loopback だけ） | ジョイスティック試験ページ（§7.5）。ヘッダーは `GET /` と同じ |
 | `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.5, "source_freshness_ms": 250, "require_frame_seq": true}`。動きの制限値を `[limits]` の初期値に戻す（`max_gain` はその値） |
 | `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。limits.md §3.2） |
 | `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
@@ -272,6 +273,15 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答と status の `motion_limits.effective.max_gain` から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
 - Origin: ブラウザーは同一 origin でも POST と WS に `Origin` を付けるので、`check_origin` は `allowed_origins` に加えて「**自分自身の origin**」を通す: `Origin` が `http://<Host ヘッダー>` と一致（大文字小文字を無視、末尾のスラッシュなし）し、かつ Host のホスト名が `localhost` または loopback の IP リテラル（`127.0.0.1`、`[::1]`、`127.x.y.z`）であること（`api::same_origin_loopback`）。loopback の条件が DNS リバインディングを塞ぐ（`Host: evil.example:8892` に `Origin: http://evil.example:8892` を付けても 403。攻撃者のページは Host をサーバーの名前にしながら Origin を自分の origin にせざるを得ないので一致しない）。他の origin の扱い、`Origin` 無し（curl・Python クライアント）の扱い、`max_body_bytes`・rate limit は変わらない。
 - LAN: `GET /` は `lan_allowed` に入れない（ページは管理トークンを扱う。トークンは LAN を通らない）。`allow_non_loopback` のときも loopback 以外からは 403 `loopback_only`。
+
+### 7.5 ジョイスティック試験ページ `GET /joystick`
+
+`control-server/static/joystick_page.html` を `include_str!` で埋め込み、`GET /joystick` と `GET /joystick.html` で返す（ヘッダー・Origin・LAN の扱いは §7.4 と同じ。外部資源なし、日本語 UI）。ゲームの代わりに手元のスティック（Gamepad API）で roll / pitch を動かし、新しい設定（limits など）を確かめるためのもの。
+
+- スティックの扱いは h3game（`web/input.js`・`index.html`）に合わせる: 機器の判定 `isStick`（T.16000M / Thrustmaster / joystick / stick / HOTAS、または軸 3 以上＋ボタン 4 以上）、center / min / max による正規化（`norm`）、不感帯の再スケール、「動かして割り当て」（いちばん大きく動いた軸）。**roll ← 左右（`axes[0]`）、pitch ← 前後（`axes[1]`）、符号は変えない**（h3game の `target.pitch = inp.y; target.roll = inp.x`。前後は「奥へ倒す = マイナス」）。反転は軸ごとのチェックボックス。不感帯の既定は 0.05（h3game は 0.12）、ならしはしない。選んだ機器と割当は `localStorage`。純粋な写像は `window.H3Joy` にまとめ、ブラウザーの試験から呼べる。
+- 表示: §7.4 と同じ status のポーリング（200 ms）で `rig_state`・blockers・fault・`session.fresh`・`effective_gain`・`motion_limits`（有効値と上限）・`requested_pose`・`target_counts`、3 系統の表（接続 / mcu_state / fault_code / flags / actual（エンコーダー）/ target / velocity / f.err / pwm‰ / status_age / decode_errors / 校正）。機器の一覧（id / index / axes / buttons / 判定）、生の値と正規化後の値、棒グラフ。
+- 送信: 「送信開始」で `POST /v1/session`（新 session。走行中なら止まり、制限値は初期値に戻る）→ `WS /v1/motion?session=`、50 Hz で `pose`（yaw 0、gain はスライダー、`source_age_ms` 0）。`seq` は送信ごと、**`frame_seq` は描画フレーム（`requestAnimationFrame`）でスティックを読めたときだけ**進む。タブが隠れても送信を止めず 0 も送らない: rAF が止まれば `frame_seq` が進まず、サーバーの鮮度切れで減速停止する。選んだ機器が見えなくなったときも同じ（最後の姿勢のまま `frame_seq` を止める。中央へ戻さない）。「姿勢を 0 に固定」はスティックの代わりに 0 を送る（`frame_seq` が進むのはスティックが見えているときだけ、という規則は変わらない）。
+- 操作: ARM / START / STOP（トークン不要）/ DISARM / FAULT RESET（トークンの扱いは §7.4 と同じ）。`/` へのリンク。読み込んだだけでは何もしない。
 
 ## 8. Python クライアントと h3game アダプター
 

@@ -114,6 +114,12 @@ async fn foreign_origin_is_forbidden() {
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+    // The embedded pages too (a foreign page must not read them).
+    for p in ["/", "/joystick"] {
+        let (st, body) = call(&s.app, req("GET", p, &[("origin", "http://evil.example")], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
+        assert_eq!(body["error"], "forbidden_origin", "{p}");
+    }
     assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
 
     let (st, _) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://localhost:8891")], "")).await;
@@ -143,6 +149,38 @@ async fn test_page_is_served_at_root_and_index_html() {
     }
     // POST / is a known path with the wrong method.
     let (st, body) = call(&s.app, req("POST", "/", &[], "")).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"], "method_not_allowed");
+    assert!(s.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn joystick_page_is_served_and_self_contained() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/joystick", "/joystick.html"] {
+        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert_eq!(html, api::JOYSTICK_PAGE);
+        assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
+        assert!(html.contains("ジョイスティック") && html.contains("/v1/motion") && html.contains("/v1/session"), "{path}");
+    }
+    assert_ne!(api::JOYSTICK_PAGE, api::TEST_PAGE);
+    // The pure stick mapping lives in a `H3Joy` module (exercised from the browser check) and
+    // follows h3game: roll from the X axis, pitch from the Y axis, `getGamepads` for the pads.
+    for needle in ["window.H3Joy", "navigator.getGamepads", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
+        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    }
+    // No external resources: the page must work offline.
+    for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
+        assert!(!api::JOYSTICK_PAGE.contains(needle), "external resource in the page: {needle}");
+    }
+    // POST /joystick is a known path with the wrong method.
+    let (st, body) = call(&s.app, req("POST", "/joystick", &[], "")).await;
     assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"], "method_not_allowed");
     assert!(s.seen.lock().unwrap().is_empty());
@@ -699,8 +737,17 @@ async fn non_loopback_peers_get_only_status_and_stop() {
     let s = stub(cfg.clone(), Some(ok_reply));
     let app = s.app.clone().layer(MockConnectInfo(lan));
     let auth = bearer();
-    // The test page (it holds the admin token) is closed to the LAN too.
-    for (m, p) in [("POST", "/v1/session"), ("GET", "/v1/motion"), ("POST", "/v1/arm"), ("POST", "/v1/fault"), ("GET", "/"), ("GET", "/index.html")] {
+    // The test pages (they hold the admin token) are closed to the LAN too.
+    for (m, p) in [
+        ("POST", "/v1/session"),
+        ("GET", "/v1/motion"),
+        ("POST", "/v1/arm"),
+        ("POST", "/v1/fault"),
+        ("GET", "/"),
+        ("GET", "/index.html"),
+        ("GET", "/joystick"),
+        ("GET", "/joystick.html"),
+    ] {
         let (st, body) = call(&app, req(m, p, &[("authorization", &auth)], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{m} {p}");
         assert_eq!(body["error"], "loopback_only");

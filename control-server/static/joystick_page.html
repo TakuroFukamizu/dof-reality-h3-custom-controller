@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>h3-control-server ジョイスティック試験</title>
+<!--
+  h3-control-server のジョイスティック試験ページ（DESIGN.md §7.5）。
+  サーバーが GET /joystick で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
+  ゲームの代わりに、手元のスティックで roll / pitch を動かして新しい設定（limits など）を確かめるためのもの。
+  - スティックの扱いは h3game の web/input.js と index.html に合わせる:
+      roll  ← スティックの左右（axes[0]）、pitch ← スティックの前後（axes[1]）。符号は変えない
+      （h3game: target.pitch = inp.y, target.roll = inp.x。前後は「奥へ倒す = マイナス」）。
+      center / min / max による正規化（norm）、不感帯の再スケール、isStick の判定も同じ式。
+    不感帯の既定だけ h3game の 0.12 ではなく 0.05（細かい動きを見るため）。ならし（smooth）はしない。
+  - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当は localStorage。
+  - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
+  - 姿勢は 50 Hz で送る。frame_seq はブラウザの描画フレーム（requestAnimationFrame）が進んだときだけ増える。
+    タブが隠れると rAF が止まり frame_seq が進まなくなるので、サーバーの鮮度判定（source_freshness_ms）が
+    減速停止させる。ページ側では隠れても送信を止めず、0（中央）も送らない。
+  - 選んだスティックが見えなくなったら、最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+  - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
+-->
+<style>
+  :root { --red: #c0392b; --green: #1e8449; --amber: #b9770e; --blue: #1f618d; --gray: #666; --bg: #f6f6f6; }
+  body { font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 0; padding: 12px 16px; background: var(--bg); color: #222; font-size: 14px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  h2 { font-size: 15px; margin: 0 0 6px; border-bottom: 1px solid #ccc; padding-bottom: 2px; }
+  section { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  button { font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid #888; background: #eee; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.stop { background: var(--red); color: #fff; border-color: #922b21; font-size: 22px; font-weight: bold; padding: 14px 36px; }
+  button.on { background: #d5f5e3; border-color: var(--green); }
+  input[type=text], input[type=password], input[type=number], select { font: inherit; padding: 4px 6px; border: 1px solid #aaa; border-radius: 4px; }
+  input[type=number] { width: 5em; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { border: 1px solid #ddd; padding: 3px 5px; text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th { background: #f0f0f0; }
+  td.num { text-align: right; }
+  .state { font-size: 26px; font-weight: bold; padding: 4px 10px; border-radius: 4px; background: #eee; display: inline-block; }
+  .state.ACTIVE, .state.HOLDING, .state.ARMING, .state.STOPPING { background: #fde3c3; color: var(--amber); }
+  .state.FAULT_LATCHED { background: var(--red); color: #fff; }
+  .state.READY_TO_ARM { background: #d5f5e3; color: var(--green); }
+  .ok { color: var(--green); } .bad { color: var(--red); font-weight: bold; } .dim { color: var(--gray); }
+  td.bad { color: var(--red); font-weight: bold; }
+  .log { font-family: Menlo, Consolas, monospace; font-size: 12px; background: #fafafa; border: 1px solid #e5e5e5; padding: 6px; margin: 4px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+  .banner { padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; display: none; }
+  .banner.show { display: block; }
+  .banner.bad { background: #fadbd8; color: var(--red); }
+  .banner.warn { background: #fdebd0; color: var(--amber); }
+  .small { font-size: 12px; }
+  .mono { font-family: Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  /* 軸の表示: 値と棒（中央 0、右が + ） */
+  .axis { display: grid; grid-template-columns: 4em 1fr; gap: 6px 10px; align-items: center; margin: 6px 0; }
+  .axis .ctl { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+  .bar { position: relative; height: 14px; background: #eee; border: 1px solid #ccc; border-radius: 3px; overflow: hidden; }
+  .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #999; }
+  .bar i { position: absolute; top: 0; bottom: 0; background: var(--blue); }
+  .bar.raw i { background: #aab7c4; }
+  .big { font-size: 28px; font-weight: bold; }
+  .xy { position: relative; width: 140px; height: 140px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; }
+  .xy::before, .xy::after { content: ""; position: absolute; background: #ddd; }
+  .xy::before { left: 50%; top: 0; bottom: 0; width: 1px; }
+  .xy::after { top: 50%; left: 0; right: 0; height: 1px; }
+  .xy b { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--blue); left: 50%; top: 50%; }
+  label.sl { display: grid; grid-template-columns: 4em 1fr 4.5em; gap: 8px; align-items: center; margin: 4px 0; }
+  .btns span { display: inline-block; min-width: 1.4em; text-align: center; border: 1px solid #ccc; border-radius: 3px; margin: 1px; font-size: 11px; }
+  .btns span.on { background: var(--amber); color: #fff; border-color: var(--amber); }
+</style>
+</head>
+<body>
+<h1>h3-control-server ジョイスティック試験 <span class="dim small" id="hostLabel"></span> <a href="/" class="small" style="margin-left:12px">オペレーター用試験ページ（/）へ</a></h1>
+<div id="pollBanner" class="banner bad"></div>
+<div id="padBanner" class="banner warn"></div>
+
+<section>
+  <div class="row">
+    <button id="bStop" class="stop" title="POST /v1/stop（トークン不要）。物理非常停止ではない">STOP</button>
+    <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
+    <span class="dim small">sessionStorage に保存（このタブだけ）</span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="bArm">ARM</button>
+    <button id="bStart">START</button>
+    <button id="bDisarm">DISARM</button>
+    <button id="bFaultReset">FAULT RESET</button>
+    <span class="dim small">順番: 送信開始 → ARM → START。送信を止めるかタブを隠すと鮮度切れで減速停止（その場で止まる。中央へは戻らない）</span>
+  </div>
+</section>
+
+<section>
+  <h2>リグ状態 <span class="dim small">GET /v1/status（200 ms）</span> <span id="statusAge" class="dim small"></span></h2>
+  <div class="row">
+    <span id="rigState" class="state">—</span>
+    <span>armed: <b id="armed">—</b></span>
+    <span>active_source: <b id="activeSource">—</b></span>
+    <span>session: <b id="statusSession">—</b></span>
+    <span>fresh: <b id="fresh">—</b></span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span>effective_gain: <b id="effGain">—</b></span>
+    <span>limits: <b id="limits">—</b></span>
+    <span>requested_pose: <b id="reqPose" class="mono">—</b></span>
+    <span>target_counts: <b id="targets" class="mono">—</b></span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span>motion_limits 有効値 (max_gain / max_vel / max_acc / duty_max): <b id="limEff" class="mono">—</b></span>
+    <span>上限: <b id="limCeil" class="mono">—</b></span>
+  </div>
+  <div style="margin-top:6px">blockers: <span id="blockers" class="dim">—</span></div>
+  <div style="margin-top:4px">fault: <span id="fault">—</span> <span style="margin-left:12px">axis_conflict: <b id="axisConflict">—</b></span></div>
+</section>
+
+<div class="cols">
+<section>
+  <h2>ジョイスティック <span class="dim small">Gamepad API</span></h2>
+  <div class="dim small">ブラウザは<b>ボタンを 1 回押すか大きく倒す</b>まで機器を出さない。既定は h3game と同じ判定（T.16000M / Thrustmaster / joystick / stick / HOTAS、または軸 3 以上＋ボタン 4 以上）で最初に見つかったもの。選択は localStorage に保存。</div>
+  <div class="row" style="margin-top:6px">
+    <label>使用するスティック <select id="padSelect"><option value="">（未検出）</option></select></label>
+    <button id="bPadDefault" title="h3game の isStick で最初に見つかるものを選ぶ">自動で選ぶ</button>
+    <span id="padState" class="dim small">—</span>
+  </div>
+  <div style="overflow-x:auto; margin-top:6px">
+  <table>
+    <thead><tr><th>index</th><th>id</th><th>axes</th><th>buttons</th><th>判定</th><th>使用</th></tr></thead>
+    <tbody id="pads"></tbody>
+  </table>
+  </div>
+  <div class="row small" style="margin-top:6px">
+    <span>選択中の生の値:</span><span id="padAxes" class="mono dim">—</span>
+  </div>
+  <div class="btns" id="padButtons" style="margin-top:4px"></div>
+</section>
+
+<section>
+  <h2>軸の割当 <span class="dim small">roll ← 左右（axes[0]）、pitch ← 前後（axes[1]）。h3game と同じ符号（前へ倒す = pitch マイナス）</span></h2>
+  <div class="axis">
+    <b>roll</b>
+    <div class="ctl">
+      <label>axis <input type="number" id="rollAxis" min="0" step="1" value="0"></label>
+      <label><input type="checkbox" id="rollInvert"> 反転</label>
+      <button id="bAssignRoll" title="4 秒のあいだにいちばん大きく動いた軸を roll に割り当てる">動かして割り当て</button>
+      <span id="assignRoll" class="dim small"></span>
+    </div>
+    <span class="dim small">raw</span><div class="bar raw" id="rollRawBar"><i></i></div>
+    <span class="dim small">norm</span><div class="bar" id="rollBar"><i></i></div>
+    <span></span><div class="row small"><span>raw <span id="rollRaw" class="mono">—</span></span><span>norm <span id="rollNorm" class="mono">—</span></span><span class="dim">(center <span id="rollCenter" class="mono">0</span>)</span></div>
+  </div>
+  <div class="axis">
+    <b>pitch</b>
+    <div class="ctl">
+      <label>axis <input type="number" id="pitchAxis" min="0" step="1" value="1"></label>
+      <label><input type="checkbox" id="pitchInvert"> 反転</label>
+      <button id="bAssignPitch" title="4 秒のあいだにいちばん大きく動いた軸を pitch に割り当てる">動かして割り当て</button>
+      <span id="assignPitch" class="dim small"></span>
+    </div>
+    <span class="dim small">raw</span><div class="bar raw" id="pitchRawBar"><i></i></div>
+    <span class="dim small">norm</span><div class="bar" id="pitchBar"><i></i></div>
+    <span></span><div class="row small"><span>raw <span id="pitchRaw" class="mono">—</span></span><span>norm <span id="pitchNorm" class="mono">—</span></span><span class="dim">(center <span id="pitchCenter" class="mono">0</span>)</span></div>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <label>不感帯 <input type="number" id="dead" min="0" max="0.9" step="0.01" value="0.05"></label>
+    <button id="bCenter" title="いまの生の値を両軸の中央（0）にする">中央を取り直す</button>
+    <button id="bResetMap" title="axes 0 / 1、反転なし、center 0、不感帯 0.05 に戻す">割当を初期化</button>
+  </div>
+  <div class="row" style="margin-top:8px; align-items:flex-start">
+    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）"><b></b></div>
+    <div>
+      <div>roll <span id="rollBig" class="big mono">0.00</span></div>
+      <div>pitch <span id="pitchBig" class="big mono">0.00</span></div>
+      <div class="dim small">不感帯の後の値（−1..1）。これをそのまま pose の roll / pitch として送る（yaw は 0）</div>
+    </div>
+  </div>
+</section>
+</div>
+
+<section>
+  <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz、seq 単調増加、frame_seq は描画フレームごと、source_age_ms 0、yaw 0</span></h2>
+  <label class="sl">gain <input type="range" id="gain" min="0" max="0.5" step="0.01" value="0.10"><span id="gainV">0.10</span></label>
+  <div class="row">
+    <button id="bStream">送信開始</button>
+    <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
+    <span>WS: <b id="wsState">closed</b></span>
+    <span>seq: <b id="seq" class="mono">0</b></span>
+    <span>frame_seq: <b id="frameSeq" class="mono">0</b></span>
+    <span>max_gain: <b id="maxGain">—</b></span>
+    <span>session: <b id="sessionLabel" class="mono">なし</b></span>
+  </div>
+  <div style="margin-top:4px">送っている pose: <span id="sentPose" class="mono dim">—</span></div>
+  <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
+  <div class="dim small" style="margin-top:4px">
+    「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
+    スティックを離せば（不感帯の内側なら）0 を送る。スティックが見えなくなったら最後の値のまま frame_seq を止める（サーバーが鮮度切れで減速停止する）。
+  </div>
+</section>
+
+<section>
+  <h2>3 系統 <span class="dim small">actual = エンコーダーの値（count）</span></h2>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th>軸</th><th>名前</th><th>接続</th><th>mcu_state</th><th>fault_code</th><th>flags</th>
+      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>decode_errors</th><th>校正</th>
+    </tr></thead>
+    <tbody id="axes"></tbody>
+  </table>
+  </div>
+  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral / sign）。</div>
+</section>
+
+<section>
+  <h2>HTTP ログ <span class="dim small">応答本文はすべて表示</span></h2>
+  <div id="httpLog" class="log"></div>
+</section>
+
+<script>
+// ---------------------------------------------------------------- H3Joy: 純粋な写像（試験から呼べるように window に置く）
+// h3game の web/input.js と同じ式。DOM もネットワークも触らない。
+window.H3Joy = (function () {
+  'use strict';
+  // input.js: isStick / isPedal（id の正規表現、または軸・ボタンの数）
+  const isStick = (p) => /t\.16000|thrustmaster|joystick|stick|hotas/i.test(p.id) || (p.axes.length >= 3 && p.buttons.length >= 4);
+  const isPedal = (p) => /pedal|rudder|saitek|crosswind|logitech g/i.test(p.id) || (p.axes.length <= 3 && p.buttons.length <= 1);
+  // 既定のスティック: isStick かつ isPedal でない最初のもの（index 順）。無ければ最初の機器。
+  function pickDefault(pads) {
+    const sorted = pads.slice().sort((a, b) => a.index - b.index);
+    return sorted.find((p) => isStick(p) && !isPedal(p)) || sorted[0] || null;
+  }
+  // 選んだ機器を探す: 同じ index と id → 同じ id（index が変わった）→ null
+  function findPad(pads, sel) {
+    if (!sel) return null;
+    return pads.find((q) => q.index === sel.index && q.id === sel.id) || pads.find((q) => q.id === sel.id) || null;
+  }
+  // input.js の norm(): center を 0 とし、記録した min / max（無ければ ±1）で片側ずつ伸ばす。反転、±1 で切る。
+  function norm(m, raw) {
+    if (m == null || raw == null || !Number.isFinite(raw)) return 0;
+    const c = m.center || 0;
+    const up = (m.max != null && m.max > c + 0.05) ? m.max - c : 1 - c;
+    const dn = (m.min != null && m.min < c - 0.05) ? c - m.min : 1 + c;
+    let v = raw >= c ? (raw - c) / Math.max(0.05, up) : (raw - c) / Math.max(0.05, dn);
+    if (m.invert) v = -v;
+    return Math.max(-1, Math.min(1, v));
+  }
+  // input.js の get(): 不感帯の内側は 0、外側は 0..1 に伸ばし直す
+  function deadzone(v, dead) {
+    const d = Math.max(0, Math.min(0.9, Number(dead) || 0));
+    if (Math.abs(v) < d) return 0;
+    return Math.sign(v) * (Math.abs(v) - d) / (1 - d);
+  }
+  // 姿勢: roll ← 左右の軸、pitch ← 前後の軸（index.html: target.pitch = inp.y, target.roll = inp.x。符号は変えない）
+  function poseFrom(pad, map, dead) {
+    if (!pad) return null;
+    const rawR = pad.axes[map.roll.axis];
+    const rawP = pad.axes[map.pitch.axis];
+    if (rawR == null || rawP == null) return null;
+    const roll = deadzone(norm(map.roll, rawR), dead);
+    const pitch = deadzone(norm(map.pitch, rawP), dead);
+    return { roll, pitch, rawRoll: rawR, rawPitch: rawP, normRoll: norm(map.roll, rawR), normPitch: norm(map.pitch, rawP) };
+  }
+  // 割当: seen[axis] = {min, max} のうち、いちばん大きく動いた軸（threshold より大きい動きだけ）
+  function mostMoved(seen, threshold) {
+    let best = -1, span = threshold == null ? 0.45 : threshold;
+    seen.forEach((s, a) => { const sc = s.max - s.min; if (sc > span) { span = sc; best = a; } });
+    return best < 0 ? null : { axis: best, span };
+  }
+  // ブラウザの Gamepad API を素の配列に写す（試験では navigator.getGamepads を差し替える）
+  function readPads() {
+    let gp = [];
+    try { gp = navigator.getGamepads ? Array.from(navigator.getGamepads()) : []; } catch (e) { gp = []; }
+    return gp.filter((g) => g).map((g) => ({
+      id: String(g.id), index: g.index, axes: Array.from(g.axes, Number),
+      buttons: Array.from(g.buttons, (b) => !!(b && b.pressed)),
+    }));
+  }
+  return { isStick, isPedal, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, readPads };
+})();
+</script>
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const J = window.H3Joy;
+  const TOKEN_KEY = 'h3cs_admin_token';
+  const MAP_KEY = 'h3cs_joystick';
+  const DEFAULT_MAP = () => ({ roll: { axis: 0, invert: false, center: 0, min: null, max: null }, pitch: { axis: 1, invert: false, center: 0, min: null, max: null } });
+  const state = {
+    session: null, maxGain: null, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0,
+    pollBusy: false, lastPollError: null,
+    pads: [], sel: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null, padLost: false,
+  };
+
+  $('hostLabel').textContent = location.host;
+
+  // ---------------------------------------------------------------- token
+  const tokenInput = $('token');
+  tokenInput.value = sessionStorage.getItem(TOKEN_KEY) || '';
+  tokenInput.addEventListener('input', () => sessionStorage.setItem(TOKEN_KEY, tokenInput.value));
+  const token = () => tokenInput.value.trim();
+
+  // ---------------------------------------------------------------- http log
+  const httpLog = $('httpLog');
+  function log(line, bad) {
+    const d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString() + ' ' + line;
+    if (bad) d.className = 'bad';
+    httpLog.prepend(d);
+    while (httpLog.childElementCount > 60) httpLog.removeChild(httpLog.lastChild);
+  }
+
+  // Every request goes through here so every error body is shown.
+  async function call(method, path, opts) {
+    opts = opts || {};
+    const headers = {};
+    if (opts.auth && token()) headers['Authorization'] = 'Bearer ' + token();
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    let resp, text;
+    try {
+      resp = await fetch(path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body), cache: 'no-store' });
+      text = await resp.text();
+    } catch (e) {
+      if (!opts.silent) log(method + ' ' + path + ' -> ネットワークエラー: ' + e, true);
+      throw e;
+    }
+    if (!opts.silent) log(method + ' ' + path + ' -> ' + resp.status + ' ' + text, !resp.ok);
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { /* 本文は JSON とは限らない */ }
+    return { ok: resp.ok, status: resp.status, text, json };
+  }
+
+  // ---------------------------------------------------------------- admin buttons
+  function adminButton(id, path, opts) {
+    $(id).addEventListener('click', async () => {
+      const b = $(id);
+      b.disabled = true;
+      try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
+      b.disabled = false;
+    });
+  }
+  $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
+  adminButton('bArm', '/v1/arm', { auth: true });
+  adminButton('bStart', '/v1/start', { auth: true });
+  adminButton('bDisarm', '/v1/disarm', { auth: true });
+  adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+
+  // ---------------------------------------------------------------- status
+  const fmt = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  const LIMIT_FIELDS = ['max_gain', 'max_vel_count_s', 'max_acc_count_s2', 'duty_max_percent'];
+  const limitsText = (o) => o ? LIMIT_FIELDS.map((k) => fmt(o[k])).join(' / ') : '—';
+
+  function setMaxGain(g) {
+    state.maxGain = g;
+    const gain = $('gain');
+    gain.max = String(g);
+    if (parseFloat(gain.value) > g) gain.value = String(g);
+    $('maxGain').textContent = String(g);
+    $('gainV').textContent = parseFloat(gain.value).toFixed(2);
+  }
+
+  function renderStatus(s) {
+    if (s.admin_token_required === false) {
+      tokenInput.placeholder = '不要（require_admin_token = false）';
+      tokenInput.disabled = true;
+    } else if (s.admin_token_required === true) {
+      tokenInput.placeholder = 'H3CS_ADMIN_TOKEN';
+      tokenInput.disabled = false;
+    }
+    state.lastStatus = s;
+    const rig = $('rigState');
+    rig.textContent = s.rig_state;
+    rig.className = 'state ' + s.rig_state;
+    $('armed').textContent = fmt(s.armed);
+    $('activeSource').textContent = fmt(s.active_source);
+    $('statusSession').textContent = s.session ? (fmt(s.session.source_session_prefix) + ' last_seq=' + fmt(s.session.last_seq) + ' last_frame_seq=' + fmt(s.session.last_frame_seq)) : 'なし';
+    const fresh = $('fresh');
+    fresh.textContent = s.session ? String(s.session.fresh) : '—';
+    fresh.className = s.session && s.session.fresh ? 'ok' : '';
+    $('effGain').textContent = fmt(s.effective_gain);
+    $('limits').textContent = (s.limits && s.limits.length) ? s.limits.join(', ') : 'なし';
+    const p = s.requested_pose;
+    $('reqPose').textContent = p ? ('pitch ' + Number(p.pitch).toFixed(2) + ' roll ' + Number(p.roll).toFixed(2) + ' yaw ' + Number(p.yaw).toFixed(2)) : '—';
+    $('targets').textContent = Array.isArray(s.target_counts) ? s.target_counts.join(', ') : '—';
+    const ml = s.motion_limits;
+    if (ml) {
+      $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '');
+      $('limCeil').textContent = limitsText(ml.ceiling);
+      if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) setMaxGain(ml.effective.max_gain);
+    }
+    const conflict = s.axis_conflict || [];
+    $('axisConflict').textContent = conflict.length ? conflict.join(', ') + '（競合: 入力拒否）' : 'なし';
+    $('axisConflict').className = conflict.length ? 'bad' : 'ok';
+    const bl = $('blockers');
+    bl.textContent = (s.blockers && s.blockers.length) ? s.blockers.join(' / ') : 'なし';
+    bl.className = (s.blockers && s.blockers.length) ? 'bad' : 'ok';
+    const f = $('fault');
+    f.textContent = s.fault ? JSON.stringify(s.fault) : 'なし';
+    f.className = s.fault ? 'bad' : 'ok';
+    (s.axes || []).forEach((a, i) => updateAxisRow(axisRow(i), a));
+  }
+
+  // 軸の行は 1 回だけ作り、以後は td の中身だけ更新する。
+  const axisRows = [];
+  const COLS = 14;
+  function axisRow(i) {
+    if (axisRows[i]) return axisRows[i];
+    const tr = document.createElement('tr');
+    const cells = [];
+    for (let c = 0; c < COLS; c++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); }
+    $('axes').appendChild(tr);
+    axisRows[i] = { tr, cells };
+    return axisRows[i];
+  }
+  function set(cell, text, cls) {
+    if (cell.textContent !== text) cell.textContent = text;
+    const c = cls || '';
+    if (cell.className !== c) cell.className = c;
+  }
+  function updateAxisRow(row, a) {
+    const c = row.cells;
+    set(c[0], String(a.axis_id));
+    set(c[1], a.name || '');
+    set(c[2], a.connected ? '接続' : '未接続', a.connected ? 'ok' : 'bad');
+    set(c[3], fmt(a.mcu_state), a.mcu_state === 'FAULT' ? 'bad' : '');
+    set(c[4], fmt(a.fault_code), (a.fault_code && a.fault_code !== 'NONE') ? 'bad' : '');
+    set(c[5], [a.power_on_cmd ? 'P' : '-', a.brake_release_cmd ? 'B' : '-', a.configured ? 'C' : '-', a.referenced ? 'R' : '-', a.power_controller ? 'PC' : '--'].join(' '));
+    set(c[6], fmt(a.actual_count), 'num');
+    set(c[7], fmt(a.target_count), 'num');
+    set(c[8], fmt(a.velocity_count_s), 'num');
+    set(c[9], fmt(a.following_error_count), 'num');
+    set(c[10], fmt(a.pwm_permille), 'num');
+    set(c[11], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : Number(a.status_age_ms).toFixed(0) + ' ms', 'num');
+    set(c[12], fmt(a.decode_errors), (a.decode_errors ? 'num bad' : 'num'));
+    set(c[13], calText(a), calClass(a));
+  }
+  function calText(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'CALIBRATING';
+    const c = a.calibration;
+    if (!c) return '—';
+    return c.result + ' (' + c.reason + ') n_end ' + fmt(c.n_end_count) + ' neutral ' + fmt(c.neutral_count) + ' sign ' + fmt(c.sign);
+  }
+  function calClass(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'bad';
+    const c = a.calibration;
+    if (!c) return '';
+    return c.result === 'OK' ? 'ok' : 'bad';
+  }
+
+  // 同じエラーが続いても HTTP ログには 1 回だけ出す（バナーには常に出す）。
+  function pollError(text) {
+    const banner = $('pollBanner');
+    banner.textContent = text;
+    banner.className = 'banner bad show';
+    if (state.lastPollError !== text) { state.lastPollError = text; log(text, true); }
+  }
+  async function pollStatus() {
+    if (state.pollBusy) return;
+    state.pollBusy = true;
+    const t0 = performance.now();
+    try {
+      const r = await call('GET', '/v1/status', { silent: true });
+      if (r.ok && r.json) {
+        renderStatus(r.json);
+        $('pollBanner').className = 'banner bad';
+        state.lastPollError = null;
+        $('statusAge').textContent = '(' + (performance.now() - t0).toFixed(0) + ' ms)';
+      } else {
+        pollError('GET /v1/status -> ' + r.status + ' ' + r.text);
+      }
+    } catch (e) {
+      pollError('GET /v1/status に届かない: ' + e);
+    }
+    state.pollBusy = false;
+  }
+  setInterval(pollStatus, 200);
+  pollStatus();
+
+  // ---------------------------------------------------------------- joystick: 選択と割当（localStorage）
+  function loadMap() {
+    try {
+      const s = JSON.parse(localStorage.getItem(MAP_KEY));
+      if (s && typeof s === 'object') {
+        if (s.sel && typeof s.sel.id === 'string' && Number.isInteger(s.sel.index)) state.sel = { id: s.sel.id, index: s.sel.index };
+        for (const k of ['roll', 'pitch']) {
+          const m = s.map && s.map[k];
+          if (m && Number.isInteger(m.axis) && m.axis >= 0) {
+            state.map[k] = { axis: m.axis, invert: !!m.invert, center: Number(m.center) || 0, min: Number.isFinite(m.min) ? m.min : null, max: Number.isFinite(m.max) ? m.max : null };
+          }
+        }
+        if (Number.isFinite(s.dead)) state.dead = Math.max(0, Math.min(0.9, s.dead));
+      }
+    } catch (e) { /* 壊れた保存値は無視 */ }
+  }
+  function saveMap() {
+    try { localStorage.setItem(MAP_KEY, JSON.stringify({ sel: state.sel, map: state.map, dead: state.dead })); } catch (e) { /* 無視 */ }
+  }
+  function renderMapControls() {
+    for (const k of ['roll', 'pitch']) {
+      $(k + 'Axis').value = String(state.map[k].axis);
+      $(k + 'Invert').checked = state.map[k].invert;
+      $(k + 'Center').textContent = Number(state.map[k].center).toFixed(3);
+    }
+    $('dead').value = String(state.dead);
+  }
+  loadMap();
+  renderMapControls();
+
+  for (const k of ['roll', 'pitch']) {
+    $(k + 'Axis').addEventListener('change', () => {
+      const v = parseInt($(k + 'Axis').value, 10);
+      if (Number.isInteger(v) && v >= 0) { state.map[k] = { axis: v, invert: state.map[k].invert, center: 0, min: null, max: null }; saveMap(); renderMapControls(); }
+    });
+    $(k + 'Invert').addEventListener('change', () => { state.map[k].invert = $(k + 'Invert').checked; saveMap(); });
+  }
+  $('dead').addEventListener('change', () => {
+    const v = parseFloat($('dead').value);
+    if (Number.isFinite(v)) { state.dead = Math.max(0, Math.min(0.9, v)); saveMap(); renderMapControls(); }
+  });
+  // 中央を取り直す: いまの生の値を両軸の center にする（input.js の centerAll と同じ。min / max は残す）
+  $('bCenter').addEventListener('click', () => {
+    const pad = J.findPad(state.pads, state.sel);
+    if (!pad) { log('中央: スティックが見えていない', true); return; }
+    for (const k of ['roll', 'pitch']) {
+      const raw = pad.axes[state.map[k].axis];
+      if (raw != null) state.map[k].center = +raw.toFixed(3);
+    }
+    saveMap(); renderMapControls();
+    log('中央を取り直した: roll ' + state.map.roll.center + ' pitch ' + state.map.pitch.center);
+  });
+  $('bResetMap').addEventListener('click', () => {
+    state.map = DEFAULT_MAP(); state.dead = 0.05; saveMap(); renderMapControls();
+    log('割当を初期化した（axes 0 / 1、反転なし、center 0、不感帯 0.05）');
+  });
+
+  // 割当: 4 秒のあいだ、選択中のスティックでいちばん大きく動いた軸を役割に結びつける（input.js の assign と同じ規則）
+  function assign(key) {
+    if (state.assigning) return;
+    const pad0 = J.findPad(state.pads, state.sel);
+    if (!pad0) { log('割当: スティックが見えていない', true); return; }
+    const SECONDS = 4;
+    const t0 = performance.now();
+    const base = pad0.axes.slice();
+    const seen = base.map((v) => ({ min: v, max: v }));
+    const out = $(key === 'roll' ? 'assignRoll' : 'assignPitch');
+    state.assigning = key;
+    $('bAssignRoll').disabled = $('bAssignPitch').disabled = true;
+    const iv = setInterval(() => {
+      const pad = J.findPad(state.pads, state.sel);
+      const el = (performance.now() - t0) / 1000;
+      if (pad) {
+        for (let a = 0; a < seen.length && a < pad.axes.length; a++) {
+          seen[a].min = Math.min(seen[a].min, pad.axes[a]);
+          seen[a].max = Math.max(seen[a].max, pad.axes[a]);
+        }
+      }
+      const best = J.mostMoved(seen);
+      out.textContent = (SECONDS - el).toFixed(1) + ' s: ' + key + ' にしたい軸を大きく倒して戻す' + (best ? '（候補 axis ' + best.axis + '）' : '');
+      // 大きく動いて戻ったら早めに確定
+      const returned = best && pad && el >= 1.5 && Math.abs(pad.axes[best.axis] - base[best.axis]) < 0.08 && best.span > 0.6;
+      if (el >= SECONDS || returned) {
+        clearInterval(iv);
+        state.assigning = null;
+        $('bAssignRoll').disabled = $('bAssignPitch').disabled = false;
+        if (best) {
+          const c = base[best.axis];
+          state.map[key] = { axis: best.axis, invert: state.map[key].invert, center: +c.toFixed(3), min: +seen[best.axis].min.toFixed(3), max: +seen[best.axis].max.toFixed(3) };
+          saveMap(); renderMapControls();
+          out.textContent = 'axis ' + best.axis + ' を割り当てた（center ' + state.map[key].center + ', min ' + state.map[key].min + ', max ' + state.map[key].max + '）';
+          log('割当: ' + key + ' ← axis ' + best.axis);
+        } else {
+          out.textContent = '動いた軸が無かった（割当は変えない）';
+        }
+      }
+    }, 50);
+  }
+  $('bAssignRoll').addEventListener('click', () => assign('roll'));
+  $('bAssignPitch').addEventListener('click', () => assign('pitch'));
+
+  // ---------------------------------------------------------------- joystick: 機器の一覧と選択
+  const padSelect = $('padSelect');
+  let padsKey = '';
+  const padKey = (p) => p.index + '|' + p.id;
+  function renderPadList() {
+    const key = state.pads.map(padKey).join('\n') + '\n' + (state.sel ? padKey(state.sel) : '');
+    if (key === padsKey) return;
+    padsKey = key;
+    const cur = J.findPad(state.pads, state.sel);
+    // select
+    while (padSelect.firstChild) padSelect.removeChild(padSelect.firstChild);
+    if (!state.pads.length) {
+      const o = document.createElement('option'); o.value = ''; o.textContent = '（未検出: ボタンを 1 回押すか大きく倒す）'; padSelect.appendChild(o);
+    }
+    for (const p of state.pads) {
+      const o = document.createElement('option');
+      o.value = padKey(p);
+      o.textContent = '#' + p.index + ' ' + p.id + ' (axes ' + p.axes.length + ', buttons ' + p.buttons.length + ')';
+      if (cur && padKey(cur) === padKey(p)) o.selected = true;
+      padSelect.appendChild(o);
+    }
+    // table
+    const tb = $('pads');
+    while (tb.firstChild) tb.removeChild(tb.firstChild);
+    for (const p of state.pads) {
+      const tr = document.createElement('tr');
+      const cells = [String(p.index), p.id, String(p.axes.length), String(p.buttons.length),
+        (J.isStick(p) ? 'stick' : '') + (J.isPedal(p) ? ' pedal' : ''), (cur && padKey(cur) === padKey(p)) ? '使用中' : ''];
+      cells.forEach((t, i) => { const td = document.createElement('td'); td.textContent = t; if (i === 5 && t) td.className = 'ok'; tr.appendChild(td); });
+      tb.appendChild(tr);
+    }
+  }
+  padSelect.addEventListener('change', () => {
+    const p = state.pads.find((q) => padKey(q) === padSelect.value);
+    if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); padsKey = ''; log('スティック: #' + p.index + ' ' + p.id); }
+  });
+  $('bPadDefault').addEventListener('click', () => {
+    const p = J.pickDefault(state.pads);
+    if (!p) { log('スティック: 機器が見えていない（ボタンを 1 回押す）', true); return; }
+    state.sel = { id: p.id, index: p.index }; saveMap(); padsKey = '';
+    log('スティック（自動）: #' + p.index + ' ' + p.id);
+  });
+  window.addEventListener('gamepadconnected', (e) => log('gamepadconnected: #' + e.gamepad.index + ' ' + e.gamepad.id));
+  window.addEventListener('gamepaddisconnected', (e) => log('gamepaddisconnected: #' + e.gamepad.index + ' ' + e.gamepad.id, true));
+
+  // ---------------------------------------------------------------- joystick: 毎フレームの読み取り（frame_seq はここで進む）
+  function setBar(id, v) {
+    const i = $(id).firstElementChild;
+    const w = Math.min(1, Math.abs(v)) * 50;
+    i.style.left = (v < 0 ? 50 - w : 50) + '%';
+    i.style.width = w + '%';
+  }
+  function renderStick(pad, pose) {
+    if (pad) {
+      $('padAxes').textContent = pad.axes.map((v) => (v >= 0 ? '+' : '') + v.toFixed(3)).join('  ');
+      const bb = $('padButtons');
+      if (bb.childElementCount !== pad.buttons.length) {
+        while (bb.firstChild) bb.removeChild(bb.firstChild);
+        pad.buttons.forEach((_, i) => { const s = document.createElement('span'); s.textContent = String(i + 1); bb.appendChild(s); });
+      }
+      pad.buttons.forEach((on, i) => { const s = bb.children[i]; const c = on ? 'on' : ''; if (s.className !== c) s.className = c; });
+    } else {
+      $('padAxes').textContent = '—';
+    }
+    const vals = pose || { roll: 0, pitch: 0, rawRoll: null, rawPitch: null, normRoll: 0, normPitch: 0 };
+    for (const k of ['roll', 'pitch']) {
+      const raw = vals[k === 'roll' ? 'rawRoll' : 'rawPitch'];
+      const n = vals[k === 'roll' ? 'normRoll' : 'normPitch'];
+      $(k + 'Raw').textContent = raw == null ? '—' : raw.toFixed(3);
+      $(k + 'Norm').textContent = n.toFixed(3);
+      $(k + 'Big').textContent = vals[k].toFixed(2);
+      setBar(k + 'RawBar', raw == null ? 0 : raw);
+      setBar(k + 'Bar', vals[k]);
+    }
+    const dot = $('xy').firstElementChild;
+    dot.style.left = (50 + vals.roll * 45) + '%';
+    dot.style.top = (50 + vals.pitch * 45) + '%';
+  }
+
+  function frame() {
+    state.pads = J.readPads();
+    if (!state.sel && state.pads.length) {
+      const p = J.pickDefault(state.pads);
+      if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); log('スティック（自動）: #' + p.index + ' ' + p.id); }
+    }
+    renderPadList();
+    const pad = J.findPad(state.pads, state.sel);
+    const pose = J.poseFrom(pad, state.map, state.dead);
+    const banner = $('padBanner');
+    if (pad) {
+      state.pose = pose;
+      state.frameSeq += 1; // 描画フレームが進み、スティックを読めたときだけ進む
+      state.padLost = false;
+      $('padState').textContent = '読み取り中: #' + pad.index + ' ' + pad.id;
+      $('padState').className = 'ok small';
+      if (banner.className.indexOf('show') >= 0) banner.className = 'banner warn';
+    } else {
+      // スティックが見えない: 最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+      state.padLost = !!(state.sel && state.timer);
+      $('padState').textContent = state.sel ? '選んだスティックが見えない: #' + state.sel.index + ' ' + state.sel.id : '未選択（ボタンを 1 回押すと一覧に出る）';
+      $('padState').className = 'bad small';
+      if (state.timer) {
+        banner.textContent = 'スティックが見えない: 最後の姿勢のまま frame_seq を止めている（サーバーの鮮度切れで減速停止する）。STOP で止めてもよい';
+        banner.className = 'banner warn show';
+      }
+    }
+    renderStick(pad, pose);
+    $('frameSeq').textContent = String(state.frameSeq);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------------------------------------------------------------- pose streamer
+  $('gain').addEventListener('input', () => { $('gainV').textContent = parseFloat($('gain').value).toFixed(2); });
+  $('bZero').addEventListener('click', () => {
+    state.zero = !state.zero;
+    $('bZero').textContent = '姿勢を 0 に固定: ' + (state.zero ? '入' : '切');
+    $('bZero').className = state.zero ? 'on' : '';
+  });
+
+  function setWsState(text, bad) {
+    $('wsState').textContent = text;
+    $('wsState').className = bad ? 'bad' : '';
+  }
+
+  function stopStream(reason) {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
+    $('bStream').textContent = '送信開始';
+    $('padBanner').className = 'banner warn';
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
+  }
+
+  // 送る姿勢: 0 固定なら 0、そうでなければ最後に読んだスティックの値（yaw は常に 0）
+  function currentPose() {
+    if (state.zero) return { pitch: 0, roll: 0 };
+    const p = state.pose;
+    return p ? { pitch: p.pitch, roll: p.roll } : { pitch: 0, roll: 0 };
+  }
+
+  function sendPose() {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const p = currentPose();
+    state.seq += 1;
+    const msg = {
+      type: 'pose', protocol: 1, source_session: state.session,
+      seq: state.seq, frame_seq: state.frameSeq, source_age_ms: 0,
+      pitch: p.pitch, roll: p.roll, yaw: 0,
+      gain: parseFloat($('gain').value),
+    };
+    ws.send(JSON.stringify(msg));
+    $('seq').textContent = String(state.seq);
+    $('sentPose').textContent = 'pitch ' + p.pitch.toFixed(3) + ' roll ' + p.roll.toFixed(3) + ' yaw 0 gain ' + msg.gain.toFixed(2) + (state.zero ? '（0 固定）' : '') + (state.padLost ? '（スティック喪失: frame_seq 停止）' : '');
+    $('sentPose').className = 'mono' + (state.padLost ? ' bad' : '');
+  }
+
+  async function startStream() {
+    const b = $('bStream');
+    b.disabled = true;
+    try {
+      const r = await call('POST', '/v1/session');
+      if (!(r.ok && r.json && typeof r.json.source_session === 'string')) { b.disabled = false; return; }
+      state.session = r.json.source_session;
+      if (typeof r.json.max_gain === 'number') setMaxGain(r.json.max_gain);
+      $('sessionLabel').textContent = state.session.slice(0, 8) + '…';
+    } catch (e) { b.disabled = false; return; }
+    b.disabled = false;
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/v1/motion?session=' + encodeURIComponent(state.session));
+    state.ws = ws;
+    setWsState('connecting', false);
+    ws.onopen = () => {
+      setWsState('open', false);
+      if (state.timer) clearInterval(state.timer);
+      state.timer = setInterval(sendPose, 20);
+      b.textContent = '送信停止';
+    };
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type !== 'ack') return;
+      const a = $('ack');
+      a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +
+        ' effective_gain=' + fmt(m.effective_gain) + ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし') + ' fresh=' + fmt(m.fresh);
+      a.className = m.accepted ? 'ok' : 'bad';
+    };
+    ws.onerror = () => { setWsState('error', true); };
+    ws.onclose = (ev) => { if (state.ws === ws) stopStream('close ' + ev.code); };
+  }
+
+  $('bStream').addEventListener('click', () => {
+    if (state.timer || state.ws) stopStream('operator'); else startStream();
+  });
+
+  window.addEventListener('pagehide', () => stopStream('pagehide'));
+})();
+</script>
+</body>
+</html>

@@ -17,6 +17,8 @@
 cd control-server && cargo build && ./target/debug/h3-control-server --config config/sim.toml
 # 2) 運転用テストページ（状態・ARM/START/STOP・姿勢スライダー）
 open http://127.0.0.1:8892/
+#    ジョイスティックで roll / pitch を動かして確かめるページ（h3game と同じ符号。DESIGN.md §7.5）
+open http://127.0.0.1:8892/joystick
 # 3) h3game（パッチ適用後）を server モードで
 H3_BACKEND=server python3 bridge.py        # Chrome で http://localhost:8891
 ```

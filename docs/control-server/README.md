@@ -68,6 +68,8 @@ H3CS_ADMIN_TOKEN=secret ./target/debug/h3-control-server --config config/sim.tom
 
 試験ページ（オペレーター用、DESIGN.md §7.4）: サーバーを起動して、同じ PC のブラウザーで **<http://127.0.0.1:8892/>**（`--bind` を変えたらそのアドレス。`localhost` でもよい）を開く。管理トークン欄に `H3CS_ADMIN_TOKEN` の値を入れると、状態（`rig_state`・blockers・fault・3 系統の表）、イベントの末尾、ARM / START / STOP / DISARM / CENTER / FAULT / FAULT RESET / 軸ごとの REFERENCE、スライダーによる姿勢送信（50 Hz、タブが隠れると止まる）が使える。読み込んだだけでは何もしない。ページは LAN からは開けない（loopback だけ）。ブラウザーが同一 origin の POST / WS に付ける `Origin`（`http://127.0.0.1:8892` など、Host が loopback で一致するもの）は `allowed_origins` に無くても通る。他の origin の扱い（403）と `Origin` 無しのクライアントの扱いは変わらない（DESIGN.md §7.4）。
 
+- ジョイスティック試験ページ（DESIGN.md §7.5）: 同じサーバーの **<http://127.0.0.1:8892/joystick>**。USB のスティック（T.16000M など。ボタンを 1 回押すとブラウザーが機器を出す）で roll ← 左右、pitch ← 前後（h3game と同じ符号、yaw は 0）を 50 Hz で送り、使用する機器・生の値と正規化後の値・リグ状態・3 系統（エンコーダーの `actual_count` を含む）を表示する。ARM / START / STOP / DISARM / FAULT RESET も同じ。`frame_seq` は描画フレームが進んだときだけ増えるので、タブを隠す・スティックを抜くと鮮度切れで減速停止する（0 は送らない）。loopback だけ。
+
 Python の試験（リポジトリ直下で。結合試験は `cargo build` 済みのバイナリを使い、なければ skip）:
 
 ```sh
