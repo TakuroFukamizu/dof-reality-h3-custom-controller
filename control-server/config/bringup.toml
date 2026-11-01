@@ -62,7 +62,7 @@ kind = "serial"
 #   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
 # （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
 # 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
-ports = ["/dev/cu.usbmodemXXXX1", "/dev/cu.usbmodemXXXX2", "/dev/cu.usbmodemXXXX3"]
+ports = ["/dev/cu.usbmodem214101", "/dev/cu.usbmodem214501", "/dev/cu.usbmodem214301"]  # 2026-11-01 のハブ: 1C:DB / 68:EE / 30:ED（差し込み口で変わる。list-ports と SER= で確認）
 baud = 115200
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ baud = 115200
 axis_id = 1
 # 照合用の個体 ID（16 桁 hex、0 = 照合しない）。§4 で status の axes[].device_id を見てから転記する。
 # 書くと、別の個体が系統 1 を選んだとき ARM しない（axis_device_mismatch）。
-device_id = "0000000000000000"
+device_id = "51311cdbd4ba8d58"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
 name = "右手前リフト (motor #1)"
 # !!! true にする前に確認すること（hardware-bringup.md §5 の終わり）。true は「この軸でこの値を測った」という
 # !!! 操作者の宣言で、有人運転の可否ではない。bring-up 中は無人・物理非常停止あり・max_gain 0.15 が前提。
@@ -100,7 +100,7 @@ overspeed_count_s = 2000        # 15 % で 1300〜1460 count/s、Duty 上限 20 
 # ---------------------------------------------------------------------------
 [[axis]]
 axis_id = 2
-device_id = "0000000000000000"   # 照合用（0 = 照合しない）。§4 で転記
+device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
 name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = false
@@ -124,7 +124,7 @@ overspeed_count_s = 2000
 # ---------------------------------------------------------------------------
 [[axis]]
 axis_id = 3
-device_id = "0000000000000000"   # 照合用（0 = 照合しない）。§4 で転記
+device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
 name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = false
