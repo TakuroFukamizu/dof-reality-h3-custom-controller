@@ -48,6 +48,11 @@ struct V1Tuning {
   // 整定判定（Issue #25 手順 10「S」。config.h V1_SETTLED_MEASURED）。settled_ms = 0 で従来どおり |誤差| ≤ deadband で即入る
   uint32_t settled_ms = V1_SETTLED_MEASURED ? V1_SETTLED_MS : 0;
   int32_t settled_meas_vel = V1_SETTLED_MEAS_VEL_COUNT_S;  // 整定とみなす |実測速度| の上限 [count/s]
+  // 追従中の動き出し補助（Issue #25 手順 9「T」。config.h V1_TRACK_ASSIST）。assist_ms = 0 で無効
+  uint32_t assist_ms = V1_TRACK_ASSIST ? V1_ASSIST_MS : 0;
+  int32_t assist_vel = V1_ASSIST_VEL_COUNT_S;            // 対象になる |軌道速度| の下限（これより速い）
+  int32_t assist_meas_vel = V1_ASSIST_MEAS_VEL_COUNT_S;  // 「動いていない」とみなす |実測速度|（これ未満）
+  int32_t assist_release_move = V1_ASSIST_RELEASE_MOVE;  // 補助 ON の後、これ以上動けば解除（窓の間に動けば窓を取り直す）
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
@@ -67,6 +72,7 @@ struct V1DutyTerms {
   bool in_band = false;        // 静止の不感帯の中（Duty 0）
   int16_t boost_permille = 0;  // 停止ブースト（Issue #15 H4）の上乗せ。V1Axis が埋める
   int16_t i_permille = 0;      // 積分項（Issue #25 手順 9「F」）。この tick の出力に入った値（四捨五入）
+  bool assist_on = false;      // 追従中の動き出し補助（Issue #25 手順 9「T」）が床を掛けている
   int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
 };
 
@@ -107,8 +113,12 @@ struct V1DutyState {
 // settle_ok = 不感帯に**入って**よい（Issue #25 手順 10「S」: V1Axis が「軌道速度 0・|誤差| ≤ deadband・|実測速度| ≤ 10 が
 // settled_ms 続いた」で立てる）。false の間は |誤差| ≤ deadband でも入らず、生の P + I（床は |誤差| ≤ 15 で OFF）を出す。
 // すでに中なら出る側の判定だけ（settle_ok は見ない）。
+// assist = 追従中の動き出し補助（Issue #25 手順 9「T」。V1Axis の update_track_assist が立てる）: この tick だけ、床の適用状態
+// （st.floor_on）に依らず床（duty_min ＋ boost）を掛ける。st.floor_on には書かない（E のヒステリシスに残さない）。合成が軌道速度と
+// 同じ向きのときだけ（軌道と逆向きに押し当てない）。合成 0 なら何もしない。
 inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
-                           V1DutyTerms* terms = nullptr, double dt_s = 0.0, bool settle_ok = true) {
+                           V1DutyTerms* terms = nullptr, double dt_s = 0.0, bool settle_ok = true,
+                           bool assist = false) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
   o = V1DutyTerms{};
@@ -158,7 +168,9 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
   o.floor_on = st.floor_on;
   long mag = cmd < 0 ? -cmd : cmd;
   bool floor_lifted = false;
-  if (cmd != 0 && st.floor_on) {
+  const bool assist_now = assist && cmd != 0 && vel != 0.0 && ((cmd < 0) == (vel < 0.0));
+  o.assist_on = assist_now;
+  if (cmd != 0 && (st.floor_on || assist_now)) {
     long floor_pm = v1_permille(t.duty_min) + boost_permille;
     if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
     if (mag < floor_pm) { mag = floor_pm; floor_lifted = true; }
@@ -539,6 +551,13 @@ class V1Axis {
   bool stall_running_ = false;
   V1DutyState duty_state_{};  // 不感帯と床のヒステリシス（位置制御が止まれば戻す）
   uint64_t settle_dwell_us_ = 0;  // 整定判定（Issue #25 手順 10「S」）: 条件が続いている時間
+
+  // 追従中の動き出し補助（Issue #25 手順 9「T」）
+  bool assist_active_ = false;          // 床を掛けている
+  bool assist_window_running_ = false;  // 対象になってから assist_ms を数えている
+  uint64_t assist_window_start_us_ = 0;
+  int64_t assist_anchor_raw_ = 0;       // 窓の開始時（ON の後は ON 時）のカウント
+  int64_t assist_err_anchor_abs_ = 0;   // 窓の開始時の |誤差|（増え続けていることの基準）
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
@@ -1339,6 +1358,7 @@ class V1Axis {
       stall_running_ = false;
       duty_state_ = V1DutyState{};
       settle_dwell_us_ = 0;
+      reset_track_assist();
       reset_stall_boost();
       terms_ = V1DutyTerms{};
       return;
@@ -1350,8 +1370,9 @@ class V1Axis {
     const uint64_t dt_cap_us = ms_to_us(tuning.overrun_ms);
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
     const bool settle_ok = update_settle_dwell(err, dt_us);
-    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s,
-                                    settle_ok);  // カウント増の向きが正 [permille]
+    const bool assist = update_track_assist(err, now);
+    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
+                                    assist);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
@@ -1402,6 +1423,49 @@ class V1Axis {
     if (!cond) { settle_dwell_us_ = 0; return false; }
     settle_dwell_us_ += dt_us;
     return settle_dwell_us_ >= ms_to_us(tuning.settled_ms);
+  }
+
+  void reset_track_assist() {
+    assist_active_ = false;
+    assist_window_running_ = false;
+  }
+
+  // 追従中の動き出し補助（Issue #25 手順 9「T」）。Duty を計算する前に呼ぶ。true ならこの tick は床を掛ける。
+  // 対象: |軌道速度| > assist_vel（100）・|実測速度| < assist_meas_vel（20。100 ms 窓なので実質 0 か ±10）・ブレーキ解除指令中。
+  // 対象のまま assist_ms（150 ms）の間カウントが assist_release_move（3）未満しか動かず、|誤差| が窓の開始時より増えていれば ON。
+  // 窓の間に動く・|誤差| が減る・対象外になれば窓を取り直す。ON の後はカウントが 3 以上動く・軌道が止まる（≤ assist_vel）・
+  // ブレーキ作動で解除。停止ブースト（H4）は軌道速度 0 だけが対象なので排他。実測速度は 100 ms 窓なので、動き出しの検出は
+  // 最長 100 ms 遅れる（対象になるのが遅れる方向。ON になった後の解除はカウントで見るので即）。
+  // 保護との関係: 掛けるのは床（duty_min ＋ ブースト。ブーストは静止だけなので実質 duty_min）までで、ENCODER_FAULT の
+  // しきい値 max(10 %, duty_max × 75 %) には届かない（FF + P がそこまで出ていれば従来どおり無パルス判定が回る）。
+  // FOLLOWING_ERROR の判定（check_motion_faults）は触らない。
+  bool update_track_assist(int64_t err, uint64_t now) {
+    if (tuning.assist_ms == 0) { reset_track_assist(); return false; }
+    const double sv_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+    const bool traj_moving = sv_abs > static_cast<double>(tuning.assist_vel) && brake_release_cmd_;
+    const int64_t moved = raw_ - assist_anchor_raw_;
+    const int64_t moved_abs = moved < 0 ? -moved : moved;
+    if (assist_active_) {
+      if (!traj_moving || moved_abs >= tuning.assist_release_move) { reset_track_assist(); return false; }
+      return true;
+    }
+    const int32_t v_abs = velocity_ < 0 ? -velocity_ : velocity_;
+    const bool eligible = traj_moving && v_abs < tuning.assist_meas_vel;
+    if (!eligible) { reset_track_assist(); return false; }
+    const int64_t err_abs = err < 0 ? -err : err;
+    if (!assist_window_running_ || moved_abs >= tuning.assist_release_move || err_abs < assist_err_anchor_abs_) {
+      assist_window_running_ = true;  // 窓の開始（取り直し）
+      assist_window_start_us_ = now;
+      assist_anchor_raw_ = raw_;
+      assist_err_anchor_abs_ = err_abs;
+      return false;
+    }
+    if (now - assist_window_start_us_ >= ms_to_us(tuning.assist_ms) && err_abs > assist_err_anchor_abs_) {
+      assist_active_ = true;
+      assist_anchor_raw_ = raw_;
+      return true;
+    }
+    return false;
   }
 
   void reset_stall_boost() {

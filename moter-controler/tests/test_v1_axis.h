@@ -46,6 +46,7 @@ struct Harness {
   uint32_t frame = 0;
   int64_t raw = 0;
   bool stall = false;             // プラントが動かない
+  uint32_t pos_max_vel = 4000;    // set_position の max_vel_count_s（T のテストで遅い軌道にする）
   double plant_vel = 4000.0;      // count/s
   // 校正（CALIBRATING）の模擬機構: Duty（MD13S の符号付き %）に比例した速度で raw が動き、端 [end_lo, end_hi] で止まる
   // （止まる＝無パルス。AutoMachine の端検出がこれを拾う）。plant_sign = +1 は「Duty + でカウント減」（#1 の実測。
@@ -180,7 +181,7 @@ struct Harness {
     m.set_position.seq = ++seq;
     m.set_position.group_frame_id = ++frame;
     m.set_position.target_count = target;
-    m.set_position.max_vel_count_s = 4000;
+    m.set_position.max_vel_count_s = pos_max_vel;
     m.set_position.max_acc_count_s2 = 20000;
     m.set_position.valid_for_ms = valid_for_ms;
     m.set_position.apply_at_us = 0;
@@ -1796,6 +1797,7 @@ inline void test_duty_command_floor_requires_p_and_respects_small_deadband_out()
   // 軸を通して: SET_LIMITS kp 0・deadband_out 12 を受理し、追従中の FF だけ（max_vel 300 → 30 permille）に床が掛からない
   Harness h;
   h.ax.tuning.ki_permille_per_count_s = 0.0;  // kp 0 で FF だけが出ることを見る試験。積分（F）は切る
+  h.ax.tuning.assist_ms = 0;  // 模擬プラントは 100 count/s（0.5 count/tick）では動けない＝止まったままなので動き出し補助（T）も切る
   v1::Config c = base_config();
   c.max_vel_count_s = 300;
   c.following_error_limit_count = 100000;
@@ -3331,6 +3333,111 @@ inline void test_settled_on_keeps_stationary_stall_fault() {
   CHECK(h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
 }
 
+
+// ---- Issue #25 手順 9「T」: 追従中の動き出し補助 ----------------------------------------------------------------
+
+// 軌道 110 count/s で動いているのにカウントが動かず |誤差| が増え続けて 150 ms → |誤差| ≈ 17（床の 20 未満）でも床 7 % を掛ける。
+// カウントが 3 以上動けば即解除。
+inline void test_track_assist_triggers_after_150ms_and_releases_on_motion() {
+  Harness h;
+  CHECK(h.ax.tuning.assist_ms == V1_ASSIST_MS && h.ax.tuning.assist_ms == 150);  // 既定 ON（config.h V1_TRACK_ASSIST）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 110;
+  const int32_t start = h.ax.actual_count();
+  h.drive(140, start + 5000);
+  // 140 ms: |誤差| ≈ 15、FF 11 + P 3 → 生の 14（床 OFF、補助もまだ）
+  CHECK(!h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on);
+  CHECK(h.ax.duty_permille() < 0 && h.ax.duty_permille() > -30);
+  h.drive(30, start + 5000);
+  // 170 ms: 補助 ON → 床 70（|誤差| ≈ 18 < 20 なので E の床ではない）
+  const int32_t fe = -h.ax.following_error_count();
+  CHECK(fe > 10 && fe < 20);
+  CHECK(h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on && h.ax.duty_permille() == -70);
+  CHECK(h.ax.state() == st::ACTIVE);
+  // 動き出す（3 count 以上）→ 次の tick で解除、生の FF + P に戻る
+  h.stall = false;
+  h.plant_vel = 2000.0;
+  h.drive(10, start + 5000);
+  CHECK(!h.ax.duty_terms().assist_on);
+  CHECK(h.ax.duty_permille() > -70 && h.ax.duty_permille() < 0);
+}
+
+// 軌道が 100 count/s 以下なら対象外（80 count/s: 150 ms 後も生の出力。誤差が 20 を超えれば E の床）。assist_ms = 0
+// （-DV1_TRACK_ASSIST=0）なら 110 count/s でも掛けない。
+inline void test_track_assist_requires_trajectory_speed_and_can_be_disabled() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 80;
+  const int32_t start = h.ax.actual_count();
+  h.drive(200, start + 5000);  // |誤差| ≈ 16
+  CHECK(!h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on && h.ax.duty_permille() > -30);
+  h.drive(100, start + 5000);  // |誤差| ≈ 24 → E の床
+  CHECK(!h.ax.duty_terms().assist_on && h.ax.duty_terms().floor_on && h.ax.duty_permille() == -70);
+  Harness g;
+  g.ax.tuning.assist_ms = 0;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 110;
+  g.drive(170, g.ax.actual_count() + 5000);
+  CHECK(!g.ax.duty_terms().assist_on && !g.ax.duty_terms().floor_on && g.ax.duty_permille() > -30);
+}
+
+// 補助は保護を妨げない: 軌道 600 count/s で止まったままなら FOLLOWING_ERROR（400）は従来どおり約 0.7 s で出る。
+// kp 6 で FF + P が 15 %（duty_max 20 の 75 %）に届けば 200 ms の無パルスで ENCODER_FAULT。
+inline void test_track_assist_does_not_block_following_error_or_moving_stall_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 400;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 600;
+  const int32_t start = h.ax.actual_count();
+  const uint64_t t0 = h.now;
+  h.drive(200, start + 5000);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.duty_terms().assist_on);  // 補助は対象（|誤差| > 20 なので E の床も ON）
+  CHECK(h.ax.duty_permille() <= -70 && h.ax.duty_permille() > -150);  // FF 60 + P（誤差 ≈ 110 → 22）。15 % 未満: 無パルス判定は回らない
+  for (int i = 0; i < 80 && h.ax.state() != st::FAULT; ++i) h.drive(10, start + 5000);  // SET_POSITION を送り続ける（lease を切らさない）
+  CHECK(h.ax.state() == st::FAULT && h.now - t0 <= 1000 * MS);  // 400 / 600 ≈ 0.67 s ＋ 加速ぶん
+  CHECK(h.ax.fault_code() == fc::FOLLOWING_ERROR);
+  CHECK(h.ax.duty_permille() == 0 && !h.ax.duty_terms().assist_on && h.ax.integral_permille() == 0);
+  // 移動中の無パルス（ENCODER_FAULT）: kp 6・duty_min 9・duty_max 20 → 誤差 150 で FF 60 + P 90 = 150 ≥ 150 → 200 ms で FAULT
+  Harness g;
+  v1::Config c2 = base_config();
+  c2.following_error_limit_count = 100000;
+  Harness::accepted(g.config_with(c2));
+  Harness::accepted(g.set_limits(20, 9, 6, 100, 10, 20));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 600;
+  const int32_t gstart = g.ax.actual_count();
+  const uint64_t gt0 = g.now;
+  g.drive(160, gstart + 5000);
+  CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().assist_on && g.ax.duty_permille() <= -90);
+  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= 900 * MS);  // 誤差 150 まで ≈ 0.25 s ＋ 無パルス 200 ms
+  CHECK(g.ax.fault_code() == fc::ENCODER_FAULT);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -3408,6 +3515,9 @@ inline void run_all() {
   test_settled_entry_requires_dwell_with_measured_rest();
   test_settled_blocked_by_measured_motion_and_legacy_immediate();
   test_settled_on_keeps_stationary_stall_fault();
+  test_track_assist_triggers_after_150ms_and_releases_on_motion();
+  test_track_assist_requires_trajectory_speed_and_can_be_disabled();
+  test_track_assist_does_not_block_following_error_or_moving_stall_fault();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();
