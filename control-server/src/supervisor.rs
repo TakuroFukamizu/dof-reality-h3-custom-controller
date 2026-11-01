@@ -53,6 +53,11 @@
 //!   CONFIG outside ARMING → not a fault (blocker `not_configured`, retried);
 //!   FAULT_RESET → stays latched, blocker `fault_reset_rejected`;
 //!   SET_REFERENCE → event only. `DUPLICATE` is treated as `ACCEPTED`.
+//! - START not confirmed → `StartTimeout { axis }` (Issue #15): at
+//!   [`ACK_TIMEOUT`] when the axis's START ACK never came (detail
+//!   `ack_timeout: … (MCU reports ACTIVE)` — the MCU usually did start), or
+//!   at `arm_timeout_ms` when an axis is still not ACTIVE (detail names its
+//!   state). Never an `AxisStateMismatch { expected: ACTIVE, actual: ACTIVE }`.
 //! - FaultReset is refused synchronously when an axis is disconnected, has no
 //!   STATUS, has no STATUS processed after its HOST_FAULT ACK (event order, not
 //!   time), is still powered / decelerating with a fault, or a reset is in
@@ -138,7 +143,8 @@ use crate::calibration::{self, AxisCalibration};
 use crate::compat;
 use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
 use crate::limits::{
-    self as motion_limits, Ceilings, FwAbsolute, FwTuning, LimitedField, MotionLimits, MotionLimitsSnapshot,
+    self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest, MotionLimits,
+    MotionLimitsSnapshot, OperatorCap,
 };
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
@@ -676,6 +682,9 @@ pub struct Supervisor {
     limits_cfg: LimitsConfig,
     /// What the API asked for (shared set, before the ceilings).
     requested_limits: MotionLimits,
+    /// Fields of `requested_limits` the game channel wrote last: held to the
+    /// operator's `[limits]` values by the clamp (Issue #15).
+    game_fields: FieldSet,
     /// `requested_limits` clamped (ceilings + stop-time rule): what we want
     /// in force and what SET_LIMITS carries.
     target_limits: MotionLimits,
@@ -777,6 +786,7 @@ impl Supervisor {
         let clamped = motion_limits::clamp(
             &requested_limits,
             &Ceilings::fallback(cfg.limits.overspeed_count_s),
+            &OperatorCap::none(requested_limits),
             motion_limits::stop_deadline(&cfg.timing),
         );
         Self {
@@ -784,6 +794,7 @@ impl Supervisor {
             game: cfg.game.clone(),
             limits_cfg: cfg.limits.clone(),
             requested_limits,
+            game_fields: FieldSet::NONE,
             target_limits: clamped.effective,
             effective_limits: clamped.effective,
             limited: clamped.limited,
@@ -1394,10 +1405,24 @@ impl Supervisor {
 
     // ------------------------------------------------------------ motion limits
 
-    /// Replace the requested shared set (the control loop forwards the
-    /// API's value every tick). Takes effect at the next `tick`.
+    /// Replace the requested shared set as the operator / config would
+    /// (no field under the game-channel cap). Takes effect at the next `tick`.
     pub fn set_requested_limits(&mut self, requested: MotionLimits) {
-        self.requested_limits = requested;
+        self.set_limits_request(LimitsRequest::new(requested));
+    }
+
+    /// Replace the requested shared set with its provenance (the control loop
+    /// forwards the API's value every tick): the game-written fields are held
+    /// to the operator's `[limits]` values (Issue #15). Takes effect at the
+    /// next `tick`.
+    pub fn set_limits_request(&mut self, req: LimitsRequest) {
+        self.requested_limits = req.requested;
+        self.game_fields = req.game_fields;
+    }
+
+    /// The cap the clamp applies to the game-written fields.
+    fn operator_cap(&self) -> OperatorCap {
+        OperatorCap { max: MotionLimits::from_config(&self.limits_cfg), fields: self.game_fields }
     }
 
     /// The set in effect: what the planner and SET_POSITION use (the clamped
@@ -1446,6 +1471,8 @@ impl Supervisor {
             requested: self.requested_limits,
             ceiling: self.ceilings(),
             defaults: MotionLimits::from_config(&self.limits_cfg),
+            operator_max: MotionLimits::from_config(&self.limits_cfg),
+            game_fields: self.game_fields,
             limited: self.limited.clone(),
             reasons: self.limit_reasons.clone(),
             pending: self.limits_pending,
@@ -1464,7 +1491,8 @@ impl Supervisor {
     ///   describes). The stop-time rule survives the component-wise minimum:
     ///   both sets satisfy `acc ≥ vel / deadline`, so their minima do too.
     fn recompute_limits(&mut self) {
-        let c = motion_limits::clamp(&self.requested_limits, &self.ceilings(), self.stop_deadline());
+        let c =
+            motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
         self.target_limits = c.effective;
         self.limited = c.limited;
         self.limit_reasons = c.reasons;
@@ -2633,16 +2661,28 @@ impl Supervisor {
                         entered: now,
                     };
                 } else if elapsed(now, since) > ms(self.timing.arm_timeout_ms) {
-                    let (axis, actual) = self.first_axis_not_in(McuState::Active);
-                    self.latch(
-                        RigFault::AxisStateMismatch {
-                            axis,
-                            expected: McuState::Active,
-                            actual,
-                        },
-                        Some("START not confirmed in time".into()),
-                        now,
-                    );
+                    // Name the real cause: an axis not ACTIVE, else one whose
+                    // START ACK never came (normally caught earlier by
+                    // `expire_pending`; this is the backstop).
+                    let (axis, detail) = match self.axes.iter().position(|t| t.mcu_state() != Some(McuState::Active)) {
+                        Some(i) => (
+                            AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                            format!(
+                                "axis{} not ACTIVE within {} ms (reports {:?})",
+                                i + 1,
+                                self.timing.arm_timeout_ms,
+                                self.axes[i].mcu_state().unwrap_or(McuState::Boot)
+                            ),
+                        ),
+                        None => {
+                            let i = self.axes.iter().position(|t| !t.group_ok).unwrap_or(0);
+                            (
+                                AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                                format!("ack_timeout: START on axis{} not ACKed (MCU reports ACTIVE)", i + 1),
+                            )
+                        }
+                    };
+                    self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
                 }
             }
             Phase::Holding {
@@ -3230,6 +3270,23 @@ impl Supervisor {
                         t.limits_retry_at = Some(now + LIMITS_RETRY);
                     }
                 }
+                // A START whose ACK never came while we wait for it: the axis
+                // cannot be confirmed (the MCU may well be ACTIVE already —
+                // say so, instead of a state mismatch that names no mismatch).
+                if p.purpose == Purpose::Start
+                    && self.group == Some((Purpose::Start, p.gen))
+                    && matches!(self.phase, Phase::Holding { start: Some(_), .. })
+                {
+                    if let Some(axis) = AxisId::from_index(p.axis) {
+                        let reports = self.axes[p.axis].mcu_state().map_or("no STATUS".to_string(), |s| format!("{s:?}"));
+                        let detail = format!(
+                            "ack_timeout: START on axis{} not ACKed within {} ms (MCU reports {reports})",
+                            axis.get(),
+                            ACK_TIMEOUT.as_millis()
+                        );
+                        self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
+                    }
+                }
                 // An unanswered CALIBRATE(1) must not leave the axis "pending"
                 // forever (no calibrate, no CONFIG retry, cancels on every Stop).
                 // Treated like a rejection: the power axis unanswered cancels
@@ -3301,19 +3358,6 @@ impl Supervisor {
             self.timing.rest_error_count,
             self.timing.rest_dwell_ms
         )
-    }
-
-    fn first_axis_not_in(&self, s: McuState) -> (AxisId, McuState) {
-        for (i, t) in self.axes.iter().enumerate() {
-            let st = t.mcu_state();
-            if st != Some(s) {
-                return (
-                    AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
-                    st.unwrap_or(McuState::Boot),
-                );
-            }
-        }
-        (AxisId::ALL[0], s)
     }
 
     fn axis_calibration_valid(&self, i: usize) -> bool {

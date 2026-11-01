@@ -72,7 +72,7 @@ start_max_offset_count = 300     # START 時の姿勢が保持位置からこの
 # !!! gain は 0.5 まで（example.toml / sim.toml の値が上げ切った先の目標）。実行時は試験ページか POST /v1/limits、
 # !!! 決めた値はここに書く。上限はファームの絶対上限（Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0。
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）
-max_gain = 0.5                  # 0.15 → 0.5（向きの確認が済んだので。gain 1.0 でソフトリミットいっぱい）
+max_gain = 1.0                  # 11-02: 向き（swap_pitch_roll）確認済み。gain 1.0 = 全開でソフトリミット内の端まで（count_at_virtual_0/1023 の余裕 150 count で行き過ぎを吸収）。試験ページ側の gain 既定も 1.0
 max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）より遅い
 max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）

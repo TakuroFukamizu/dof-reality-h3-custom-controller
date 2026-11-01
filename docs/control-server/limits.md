@@ -8,6 +8,7 @@
 ゲーム / 管理者 ─(要求)─▶ PC の現在値（3 軸共通。初期値は [limits]）─▶ clamp(上限) ─▶ 有効値
                                                                   │
    上限 = ファームの絶対上限（LIMITS で申告）と overspeed_count_s / 1.5 と gain 1.0
+          ＋ ゲームが書いた項目には操作者の [limits] の値（ゲームは下げるだけ）
                                                                   │
    有効値 → 毎フレームの SET_POSITION（速度・加速度）、SET_LIMITS（Duty 上限など。変わったときだけ）
                                                                   │
@@ -19,9 +20,10 @@
 | 段 | どこにあるか | 変え方 | 内容 |
 | --- | --- | --- | --- |
 | 1. 絶対上限 | ファーム `moter-controler/include/config.h` の定数 `V1_ABS_*`。PC へは HELLO の後の LIMITS で申告される（status の `axes[].fw_limits.abs_*`） | 焼き直し | Duty 60 %、速度 6000 count/s、加速度 40000 count/s² |
-| 2. 現在値 | PC の設定ファイル `[limits]`（初期値）。起動後は 3 軸共通の 1 組（status の `motion_limits`） | 設定ファイル、`WS /v1/motion` の `limits`、`POST /v1/limits` | §2 の表 |
+| 2. 現在値 | PC の設定ファイル `[limits]`（初期値）。起動後は 3 軸共通の 1 組（status の `motion_limits`） | 設定ファイル、`WS /v1/motion` の `limits`（操作者の初期値まで。下げるだけ）、`POST /v1/limits`（段 1 まで） | §2 の表 |
 
 - 段 2 で段 1 を超える要求を受けても拒否はしない。段 1 でクランプして、有効値と理由（`ceiling_clamped`）を返す。gain の `gain_limited` と同じ流儀。
+- **ゲーム経路は操作者の値を下げるだけ**（Issue #15）。WS `/v1/motion` の `limits`（トークン不要）で書いた項目は、`[limits]` の初期値（＝操作者が許した上限。status の `motion_limits.operator_max`）を超えない。超える要求は操作者の値でクランプして理由 `operator_limited` を返す（ファームの上限のほうが低い個体では `ceiling_clamped`）。操作者の `POST /v1/limits`（Bearer）だけがそれを超えて段 1 まで上げられる。項目ごとに「最後に書いたのがゲームか」を覚えていて（status の `motion_limits.game_fields`）、管理者が書いた項目はこの上限から外れ、ゲームが書き直せばまた入る。`POST /v1/session` で値とともに消える。
 - クランプにはもう 1 つ、**停止時間の規則**（§1.1）がある。上限とは逆向き（下限）で、`max_acc_count_s2` を上げる（場合により `max_vel_count_s` を下げる）。理由は `stop_time_limited`。
 - クランプした要求（target）がすぐ有効値になるとは限らない。Duty 上限が変わる要求は、全軸が新しい SET_LIMITS を ACK するまで planner に効かない（§1.2、status の `pending`）。
 - CONFIG（ARM 時に MCU へ送る）の速度・加速度には段 1 の値を入れる。実際の上限は毎フレームの SET_POSITION が運ぶ有効値で決まる。CONFIG は「もう 1 つの上限」ではない。
@@ -53,6 +55,8 @@ PC は制限値を 3 段で持つ: `requested`（API が書いた値）→ `targ
 `control-server/config/*.toml` の `[limits]`（`schema_version = 2`）。3 軸共通。下の初期値は `example.toml` / `sim.toml` のもの（上げ切った先の目標）。`bringup.toml` は §4 の低い値で置いてある。
 
 ### 2.1 実行時に変えられる 4 つ
+
+表の「上限」は管理者（`POST /v1/limits`）が上げられる限界。**ゲーム（WS `limits`）はどの項目も初期値まで**で、超える要求は初期値で切られて `operator_limited` になる（§1）。
 
 | 項目 | 初期値 | 上限 | 根拠 / 注意 |
 | --- | ---: | --- | --- |
@@ -97,7 +101,7 @@ PC は LIMITS を受けるまで同じ値（`protocol::fw_absolute`）を仮の�
 ```
 
 - 4 項目はどれも省略可。書いた項目だけ変わる。`seq` と `source_session` の規則は pose と同じ（`seq` は受理したときだけ消費する）。**鮮度は延長しない**。
-- ack: `{"type":"ack","seq":1252,"accepted":true,"effective_gain":0.5,"effective_limits":{...4 項目...},"limits":["ceiling_clamped"],"fresh":false}`。`effective_gain` は新しい gain の上限。`ceiling_clamped` はどれかが上限で切られたとき、`stop_time_limited` は停止時間の規則（§1.1）で `max_acc` が上がった（または `max_vel` が下がった）とき。`effective_limits` は clamp した要求値（target）で、Duty 上限が変わる要求が planner に効くのは全軸の ACK 後（§1.2、status の `motion_limits.pending`）。
+- ack: `{"type":"ack","seq":1252,"accepted":true,"effective_gain":0.5,"effective_limits":{...4 項目...},"limits":["operator_limited"],"fresh":false}`。`effective_gain` は新しい gain の上限。`operator_limited` はゲームが書いた項目が操作者の `[limits]` の値で切られたとき（§1。ゲームは下げるだけ。4 項目とも）、`ceiling_clamped` はファームの上限で切られたとき、`stop_time_limited` は停止時間の規則（§1.1）で `max_acc` が上がった（または `max_vel` が下がった）とき。`limits` は要求全体のクランプ結果で、前に送って切られたままの項目も毎回入る。`effective_limits` は clamp した要求値（target）で、Duty 上限が変わる要求が planner に効くのは全軸の ACK 後（§1.2、status の `motion_limits.pending`）。
 - 拒否: 非有限は `non_finite`、`max_gain < 0`・速度と加速度の 0 以下・`duty_max_percent` の 1〜100 の外は `out_of_range`。競合中（`axis_conflict`）は pose と同じく拒否。
 - 新しい gain の上限は、いま追従中の姿勢にもその場で効く（`effective_gain` が下がり `gain_limited` が付く。鮮度は変えない）。Python クライアントは `submit_limits(...)` を pose より先に送る。
 - bridge（`H3_BACKEND=server`）はゲームの POST に `"limits": {...}` があればそのまま渡す（`clients/h3game/README.md`）。
@@ -109,18 +113,18 @@ curl -s $URL/v1/limits | python3 -m json.tool                          # 現在�
 curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書いた項目だけ変える（Bearer、rate limit あり）
 ```
 
-応答（GET / POST 共通）: `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...],"reasons":[...]}`。`requested` が要求値、`ceiling` がいまの上限、`effective` がその結果（clamp した要求値。適用済みかは status の `pending`）、`defaults` が `[limits]` の初期値、`limited` は clamp が動かした項目名、`reasons` はその理由（`ceiling_clamped` / `stop_time_limited`）。不正な値は 400（`non_finite` / `out_of_range`）。
+応答（GET / POST 共通）: `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"operator_max":{...},"game_fields":[...],"limited":[...],"reasons":[...]}`。`requested` が要求値、`ceiling` がいまの上限、`effective` がその結果（clamp した要求値。適用済みかは status の `pending`）、`defaults` が `[limits]` の初期値、`operator_max` がゲーム経路の上限（＝ `defaults` の値。役割を名前にしたもの）、`game_fields` がいまゲームが書いた項目（この上限がかかる）、`limited` は clamp が動かした項目名、`reasons` はその理由（`ceiling_clamped` / `operator_limited` / `stop_time_limited`）。不正な値は 400（`non_finite` / `out_of_range`）。POST で書いた項目は `game_fields` から外れ、ファームの上限まで上がる。
 
 ### 3.3 status で見る
 
-- `motion_limits`: 上の GET と同じ 6 つ（`effective` / `requested` / `ceiling` / `defaults` / `limited` / `reasons`）に `pending`（bool。Duty 上限が変わる要求の SET_LIMITS を全軸が ACK するまで true。その間 `effective` は確定済みの組＋下がった成分、§1.2）。
+- `motion_limits`: 上の GET と同じ 8 つ（`effective` / `requested` / `ceiling` / `defaults` / `operator_max` / `game_fields` / `limited` / `reasons`）に `pending`（bool。Duty 上限が変わる要求の SET_LIMITS を全軸が ACK するまで true。その間 `effective` は確定済みの組＋下がった成分、§1.2）。
 - `axes[].fw_limits`: その個体が LIMITS で返した有効値（`duty_max_percent` …）と絶対上限（`abs_duty_max_percent`、`abs_max_vel_count_s`、`abs_max_acc_count_s2`）。SET_LIMITS を受ける前は `null`。
 - blockers: `firmware_limits_unsupported: axisN`（SET_LIMITS を知らない旧ファーム。焼き直すまで ARM しない）、`limits_rejected: axisN`（SET_LIMITS が拒否された。1 秒後に再送）、`limits_unconfirmed: axisN`（いまの調整値の SET_LIMITS が ACK され、かつ LIMITS が届くまで。ファーム既定の 7〜20 % や前の接続の値で ARM しないための阻害。ACK が来なければ 1 秒の期限切れの後に、ACK は来たが LIMITS が落ちたなら 1 秒後に、新しい request_id で送り直す）。
 - events: `limits`（LIMITS の受信）、`ack_rejected`（SET_LIMITS の拒否）。
 
 ### 3.4 試験ページ（`GET /`）
 
-「動きの制限」の 4 本のスライダー（上限は status の `motion_limits.ceiling` に追従）→「制限を送る」。WS の `limits` で送るので、姿勢送信（WS）を開始してから使う。「設定の初期値に戻す」は `defaults` を送る。limits の ack は姿勢の ack とは別に表示する。有効値の行には `limited` / `reasons` と、全軸の ACK 待ちなら `[pending]` を出す。
+「動きの制限」の 4 本のスライダー（WS で送るので、上限は status の `motion_limits.operator_max` と `ceiling` の小さいほうに追従）→「制限を送る」。WS の `limits` で送るので、姿勢送信（WS）を開始してから使う。「設定の初期値に戻す」は `defaults` を送る。limits の ack は姿勢の ack とは別に表示する。有効値の行には `limited` / `reasons` と、全軸の ACK 待ちなら `[pending]` を出す。
 
 ## 4. 実機で上げる手順
 
@@ -146,6 +150,7 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ## 6. 変更履歴
 
+- 2026-11-02（Issue #15 追加分）: ゲーム経路の上限（§1）。WS `limits` で書いた項目は操作者の `[limits]` の値を超えない（`operator_limited`）。`POST /v1/limits` だけがファームの上限まで上げる。`GET/POST /v1/limits` と status の `motion_limits` に `operator_max` / `game_fields`。試験ページのスライダーの上限もそれに追従。
 - 2026-11-02（Issue #15 H2 / M3）: 停止時間の規則（§1.1。設定の検査と実行時 clamp の下限、`stop_time_limited`、`GET/POST /v1/limits` と status に `reasons`）、要求と適用の分離（§1.2。Duty 上限が変わる要求は全軸の SET_LIMITS ACK まで planner に効かない、status `motion_limits.pending`）。同じ PR で START の姿勢関門 `[game].start_max_offset_count`（M4、DESIGN.md §5）。
 
 - 2026-11-01: `[game].max_gain` と `[[axis]]` の `max_vel_count_s` / `max_acc_count_s2` / `following_error_limit_count` / `overspeed_count_s` を `[limits]` へ（`schema_version` 1 → 2。旧ファイルは読み込みで失敗する）。SET_LIMITS（0x0D）/ LIMITS（0x88）、capabilities bit3、WS `limits`、`GET/POST /v1/limits`、status の `motion_limits` / `axes[].fw_limits`。`calibration_hash` は幾何だけに。

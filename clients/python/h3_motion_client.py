@@ -321,10 +321,13 @@ class MotionClient:
     ) -> bool:
         """Change the server's shared motion limits (``{"type":"limits"}``).
 
-        Only the given fields change. Values above the ceilings (firmware
-        absolutes, ``overspeed / 1.5``, gain 1.0) are clamped by the server
-        and reported in the ack (``effective_limits``, ``limits`` has
-        ``ceiling_clamped``). Never extends freshness. Several calls before
+        Only the given fields change. The game channel may only *lower* the
+        operator's ``[limits]`` values: a field above them is held to them
+        by the server and reported in the ack (``effective_limits``,
+        ``limits`` has ``operator_limited``); the firmware ceilings
+        (``ceiling_clamped``) and the stop-time rule (``stop_time_limited``)
+        apply too. Raising above the operator's values is the admin's
+        ``POST /v1/limits``. Never extends freshness. Several calls before
         the next send are merged (last value per field wins). Returns False
         (and stores nothing) for a non-finite value or when no field is given.
         The server resets the limits to its config on every new session, so
