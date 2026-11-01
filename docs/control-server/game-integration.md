@@ -5,6 +5,7 @@
 | 知りたいこと | 読む場所 |
 | --- | --- |
 | サーバーの起動・設定・管理操作（curl） | [README.md](README.md) |
+| 思いどおりに動かす Tips（gain で全域、速さ・加速度の決まり方、揺れの周波数の上限、START は中立から、鮮度、症状 → 原因） | [game-tips.md](game-tips.md) |
 | Game API の契約（WS `/v1/motion` の JSON、ack の拒否理由、`GET /v1/status` の形） | [../../control-server/DESIGN.md](../../control-server/DESIGN.md) §7 |
 | h3game に当てるパッチと bridge の動かし方 | [../../clients/h3game/README.md](../../clients/h3game/README.md) |
 | Python クライアント（bridge が使う。他のゲームからも使える） | [../../clients/python/README.md](../../clients/python/README.md) |
