@@ -1324,11 +1324,20 @@ void renderV1() {
   {
     const V1DutyTerms& tm = vsnap.terms;
     char terms_text[64];
-    snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d F%d A%d B %d O %+d", static_cast<int>(tm.ff_permille),
-             static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s),
-             tm.floor_on ? 1 : 0, tm.assist_on ? 1 : 0, static_cast<int>(tm.boost_permille),
-             static_cast<int>(vsnap.pwm_permille));
-    canvas.setTextColor(tm.in_band ? kGray : ((tm.floor_on || tm.assist_on) ? kAmber : kGreen), TFT_BLACK);
+    // Issue #25 r6（V1_FF_DIRECTIONAL）: 床・補助・ブーストが無いので代わりに状態 M（MOVE / HOLD / BRK = 動き出しパルス）を出す
+    const char* mode = tm.mode == V1DutyMode::HOLD ? "HOLD" : (tm.mode == V1DutyMode::BRK ? "BRK" : "MOVE");
+    if (V1_FF_DIRECTIONAL) {
+      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d %s O %+d", static_cast<int>(tm.ff_permille),
+               static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s), mode,
+               static_cast<int>(vsnap.pwm_permille));
+    } else {
+      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d F%d A%d B %d O %+d", static_cast<int>(tm.ff_permille),
+               static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s),
+               tm.floor_on ? 1 : 0, tm.assist_on ? 1 : 0, static_cast<int>(tm.boost_permille),
+               static_cast<int>(vsnap.pwm_permille));
+    }
+    canvas.setTextColor(tm.in_band ? kGray : ((tm.floor_on || tm.assist_on || tm.mode == V1DutyMode::BRK) ? kAmber : kGreen),
+                        TFT_BLACK);
     canvas.drawString(terms_text, 8, 192);
   }
 
@@ -1356,7 +1365,7 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.terms.ff_permille / 10) != (b.terms.ff_permille / 10) || (a.terms.p_permille / 10) != (b.terms.p_permille / 10) ||
          (a.terms.i_permille / 10) != (b.terms.i_permille / 10) || a.terms.assist_on != b.terms.assist_on ||
          (a.terms.vel_count_s / 50) != (b.terms.vel_count_s / 50) || a.terms.floor_on != b.terms.floor_on ||
-         a.terms.in_band != b.terms.in_band || a.terms.boost_permille != b.terms.boost_permille ||
+         a.terms.in_band != b.terms.in_band || a.terms.boost_permille != b.terms.boost_permille || a.terms.mode != b.terms.mode ||
          (a.pwm_permille / 10) != (b.pwm_permille / 10) ||
          a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
