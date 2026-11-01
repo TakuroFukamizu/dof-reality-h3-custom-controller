@@ -12,6 +12,7 @@
 | [hardware-bringup.md](hardware-bringup.md) | 実機 bring-up 手順（CoreS3 ×3 を初めてつないで 3 軸を動かすまで。設定は `control-server/config/bringup.toml`） |
 | [limits.md](limits.md) | 動きの制限値。ファームの絶対上限と PC の共有現在値の 2 段、`[limits]` の各値と根拠（実機未検証）、実行時に変える IF（WS `limits`、`/v1/limits`）、実機で上げる手順 |
 | [game-integration.md](game-integration.md) | ゲーム（h3game）実装者向けの入口。実機なしで動かす手順、ゲームがやること・やらないこと、画面に出す状態、変えてはいけないこと |
+| [game-tips.md](game-tips.md) | ゲーム開発者向け Tips。全域を使う（gain）、速さ・加速度を思いどおりにする（補間か `limits` か）、揺れの周波数の上限、START の中立関門、鮮度と停止、ゲーム側に置かないこと、症状 → 原因の表 |
 | [`control-server/DESIGN.md`](../../control-server/DESIGN.md) | 実装設計（API・状態機械・JSON の形） |
 | [`clients/python/README.md`](../../clients/python/README.md) | Game API の Python クライアント |
 | [`clients/h3game/README.md`](../../clients/h3game/README.md) | h3game へのパッチと bridge 用バックエンド層 |
