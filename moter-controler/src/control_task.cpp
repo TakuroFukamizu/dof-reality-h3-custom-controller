@@ -241,7 +241,13 @@ struct V1Inputs {
   uint8_t select_axis = 0;
   bool estop_pulse = false;
   bool estop_value = false;
+  bool clear_dirty_pulse = false;
 };
+
+void copy_text(char* dest, size_t size, const char* text) {
+  strncpy(dest, text, size - 1);
+  dest[size - 1] = '\0';
+}
 
 V1Axis g_axis;  // 大きいのでタスクのスタックではなく静的領域に置く
 V1Inputs g_v1_in;
@@ -276,7 +282,12 @@ void v1_task_main(void*) {
     in = g_v1_in;
     g_v1_in.select_pulse = false;
     g_v1_in.estop_pulse = false;
+    g_v1_in.clear_dirty_pulse = false;
     portEXIT_CRITICAL(&g_mux);
+
+    if (in.clear_dirty_pulse) {
+      g_axis.clear_profile_dirty();
+    }
 
     const uint64_t now = static_cast<uint64_t>(esp_timer_get_time());
     const uint64_t gap = now - prev_now;
@@ -303,6 +314,13 @@ void v1_task_main(void*) {
 
     g_axis.tick(now, encoder_count());
     write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_percent());
+
+    // 校正に成功した系統の符号を、次の系統切り替え（set_sign）に反映する。NVS への保存は loop() が行う
+    //（Preferences の書き込みは数十 ms 止まることがあり、5 ms の制御タスクでは CONTROL_OVERRUN になる）。
+    if (g_axis.profile_dirty()) {
+      const MotorProfile& p = g_axis.dirty_profile();
+      if (profile_motor_ok(p.motor)) g_signs[p.motor] = p.sign < 0 ? -1 : 1;
+    }
 
     // outbox → 送信キュー。順序を保つ: 満杯なら STATUS は捨て（次の周期で送る）、それ以外は保留して次の周期に再試行。
     while (const v1::McuMsg* m = g_axis.peek()) {
@@ -340,6 +358,21 @@ void v1_task_main(void*) {
     snap.max_tick_gap_us = max_gap_us;
     snap.device_id = id.device_id;
     snap.boot_id = id.boot_id;
+    snap.cal_live_step = g_axis.cal_live_step();
+    copy_text(snap.cal_live_reason, sizeof(snap.cal_live_reason), g_axis.cal_live_reason());
+    snap.cal_result_valid = g_axis.has_cal_result();
+    if (snap.cal_result_valid) {
+      const v1::CalResult& r = g_axis.last_cal_result();
+      snap.cal_result = r.result;
+      snap.cal_step = r.step;
+      snap.cal_n_end = r.n_end_count;
+      snap.cal_neutral = r.neutral_count;
+      snap.cal_sign = r.sign;
+      memcpy(snap.cal_reason, r.reason, v1::CAL_REASON_LEN);
+      snap.cal_reason[v1::CAL_REASON_LEN] = '\0';
+    }
+    snap.profile_dirty = g_axis.profile_dirty();
+    snap.profile = g_axis.dirty_profile();
 
     portENTER_CRITICAL(&g_mux);
     g_v1_snap = snap;
@@ -371,6 +404,12 @@ void control_v1_set_estop(bool latched) {
   portENTER_CRITICAL(&g_mux);
   g_v1_in.estop_value = latched;
   g_v1_in.estop_pulse = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void control_v1_clear_profile_dirty() {
+  portENTER_CRITICAL(&g_mux);
+  g_v1_in.clear_dirty_pulse = true;
   portEXIT_CRITICAL(&g_mux);
 }
 

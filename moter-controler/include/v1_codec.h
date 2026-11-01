@@ -36,6 +36,7 @@ constexpr uint8_t FAULT_RESET = 0x08;
 constexpr uint8_t CLOCK_SYNC = 0x09;
 constexpr uint8_t HOST_FAULT = 0x0A;
 constexpr uint8_t SET_REFERENCE = 0x0B;
+constexpr uint8_t CALIBRATE = 0x0C;
 
 constexpr uint8_t HELLO = 0x81;
 constexpr uint8_t ACK = 0x82;
@@ -43,6 +44,7 @@ constexpr uint8_t STATUS = 0x83;
 constexpr uint8_t FAULT_EVENT = 0x84;
 constexpr uint8_t CLOCK_SYNC_REPLY = 0x85;
 constexpr uint8_t AXIS_SELECT = 0x86;
+constexpr uint8_t CAL_RESULT = 0x87;
 }  // namespace msg
 
 // --- 共通の値（protocol.md §3） ---
@@ -55,6 +57,7 @@ constexpr uint8_t ACTIVE = 4;
 constexpr uint8_t STOPPING = 5;
 constexpr uint8_t DISARMING = 6;
 constexpr uint8_t FAULT = 7;
+constexpr uint8_t CALIBRATING = 8;  // CALIBRATE 受理後、端当て校正の間（protocol.md §1.2）。終了で DISARMED
 }  // namespace state
 
 namespace fault {
@@ -111,6 +114,28 @@ constexpr uint32_t APPLY_AT = 1u << 1;
 constexpr uint32_t CURRENT_SENSE = 1u << 2;
 }  // namespace capabilities
 
+// CALIBRATE の mode（protocol.md §4）
+namespace cal_mode {
+constexpr uint8_t CANCEL = 0;
+constexpr uint8_t START = 1;
+}  // namespace cal_mode
+
+// CAL_RESULT の result / step（protocol.md §4）
+namespace cal_result {
+constexpr uint8_t OK = 0;
+constexpr uint8_t FAILED = 1;
+constexpr uint8_t CANCELLED = 2;
+}  // namespace cal_result
+
+namespace cal_step {
+constexpr uint8_t NONE = 0;
+constexpr uint8_t TO_P = 1;
+constexpr uint8_t TO_N = 2;
+constexpr uint8_t TO_NEUTRAL = 3;
+}  // namespace cal_step
+
+constexpr size_t CAL_REASON_LEN = 8;  // CAL_RESULT の reason（ASCII、NUL 埋め。8 文字ちょうどなら終端なし）
+
 // --- 種別ごとの payload 長。未知の種別は -1 ---
 inline int host_payload_len(uint8_t type) {
   switch (type) {
@@ -125,6 +150,7 @@ inline int host_payload_len(uint8_t type) {
     case msg::CLOCK_SYNC: return 12;
     case msg::HOST_FAULT: return 8;
     case msg::SET_REFERENCE: return 8;
+    case msg::CALIBRATE: return 8;
     default: return -1;
   }
 }
@@ -137,6 +163,7 @@ inline int mcu_payload_len(uint8_t type) {
     case msg::FAULT_EVENT: return 20;
     case msg::CLOCK_SYNC_REPLY: return 28;
     case msg::AXIS_SELECT: return 8;
+    case msg::CAL_RESULT: return 28;
     default: return -1;
   }
 }
@@ -327,6 +354,10 @@ struct SetReference {
   uint32_t request_id;
   int32_t reference_count;
 };
+struct Calibrate {
+  uint32_t request_id;
+  uint8_t mode;  // cal_mode::START / CANCEL
+};
 
 struct Hello {
   uint32_t request_id;
@@ -385,6 +416,15 @@ struct AxisSelect {
   uint8_t prev_selected_axis;
   uint8_t mcu_state;
 };
+struct CalResult {
+  uint32_t boot_id;
+  uint8_t result;              // cal_result::*
+  uint8_t step;                // cal_step::*（終了時の段階）
+  int32_t n_end_count;         // N 端の count（P 端 = 0 の座標。符号は掛けない）
+  int32_t neutral_count;       // 中立の count（同上）
+  int8_t sign;                 // 系統プロファイルの符号 ±1
+  char reason[CAL_REASON_LEN]; // ASCII、NUL 埋め
+};
 
 // PC → MCU の 1 メッセージ。type で union の有効な要素が決まる。
 struct HostMsg {
@@ -401,6 +441,7 @@ struct HostMsg {
     ClockSync clock_sync;
     HostFault host_fault;
     SetReference set_reference;
+    Calibrate calibrate;
   };
 };
 
@@ -414,6 +455,7 @@ struct McuMsg {
     FaultEvent fault_event;
     ClockSyncReply clock_sync_reply;
     AxisSelect axis_select;
+    CalResult cal_result;
   };
 };
 
@@ -484,6 +526,10 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
     case msg::SET_REFERENCE:
       put_u32(out + 0, m.set_reference.request_id);
       put_i32(out + 4, m.set_reference.reference_count);
+      break;
+    case msg::CALIBRATE:
+      put_u32(out + 0, m.calibrate.request_id);
+      put_u8(out + 4, m.calibrate.mode);
       break;
     default:
       return 0;
@@ -561,6 +607,17 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       put_u8(out + 5, m.axis_select.prev_selected_axis);
       put_u8(out + 6, m.axis_select.mcu_state);
       break;
+    case msg::CAL_RESULT: {
+      const CalResult& c = m.cal_result;
+      put_u32(out + 0, c.boot_id);
+      put_u8(out + 4, c.result);
+      put_u8(out + 5, c.step);
+      put_i32(out + 8, c.n_end_count);
+      put_i32(out + 12, c.neutral_count);
+      put_u8(out + 16, static_cast<uint8_t>(c.sign));
+      memcpy(out + 20, c.reason, CAL_REASON_LEN);
+      break;
+    }
     default:
       return 0;
   }
@@ -635,6 +692,10 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
     case msg::SET_REFERENCE:
       out->set_reference.request_id = get_u32(p + 0);
       out->set_reference.reference_count = get_i32(p + 4);
+      break;
+    case msg::CALIBRATE:
+      out->calibrate.request_id = get_u32(p + 0);
+      out->calibrate.mode = get_u8(p + 4);
       break;
     default:
       return false;
@@ -713,6 +774,17 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       out->axis_select.prev_selected_axis = get_u8(p + 5);
       out->axis_select.mcu_state = get_u8(p + 6);
       break;
+    case msg::CAL_RESULT: {
+      CalResult& c = out->cal_result;
+      c.boot_id = get_u32(p + 0);
+      c.result = get_u8(p + 4);
+      c.step = get_u8(p + 5);
+      c.n_end_count = get_i32(p + 8);
+      c.neutral_count = get_i32(p + 12);
+      c.sign = static_cast<int8_t>(get_u8(p + 16));
+      memcpy(c.reason, p + 20, CAL_REASON_LEN);
+      break;
+    }
     default:
       return false;
   }

@@ -993,6 +993,25 @@ const char* stateName(uint8_t s) {
     case v1::state::STOPPING: return "STOPPING";
     case v1::state::DISARMING: return "DISARMING";
     case v1::state::FAULT: return "FAULT";
+    case v1::state::CALIBRATING: return "CALIBRATING";
+  }
+  return "?";
+}
+
+const char* calStepName(uint8_t s) {
+  switch (s) {
+    case v1::cal_step::TO_P: return "P端へ";
+    case v1::cal_step::TO_N: return "N端へ";
+    case v1::cal_step::TO_NEUTRAL: return "中立へ";
+  }
+  return "";
+}
+
+const char* calResultName(uint8_t r) {
+  switch (r) {
+    case v1::cal_result::OK: return "OK";
+    case v1::cal_result::FAILED: return "FAILED";
+    case v1::cal_result::CANCELLED: return "CANCELLED";
   }
   return "?";
 }
@@ -1022,7 +1041,8 @@ uint16_t stateColor(uint8_t s) {
     case v1::state::ACTIVE: return kGreen;
     case v1::state::ARMING:
     case v1::state::STOPPING:
-    case v1::state::DISARMING: return kAmber;
+    case v1::state::DISARMING:
+    case v1::state::CALIBRATING: return kAmber;
     case v1::state::FAULT: return kRed;
     default: return kGray;
   }
@@ -1098,6 +1118,8 @@ void renderV1() {
   char state_text[40];
   if (fault) {
     snprintf(state_text, sizeof(state_text), "FAULT %s", faultName(vsnap.fault_code));
+  } else if (vsnap.state == v1::state::CALIBRATING) {
+    snprintf(state_text, sizeof(state_text), "CALIBRATING %s", calStepName(vsnap.cal_live_step));
   } else if (vsnap.fault_code != v1::fault::NONE) {
     snprintf(state_text, sizeof(state_text), "%s %s", stateName(vsnap.state), faultName(vsnap.fault_code));
   } else {
@@ -1150,14 +1172,30 @@ void renderV1() {
     snprintf(link_text, sizeof(link_text), "PC 未受信  rx_err %u", vsnap.rx_error_count);
     canvas.setTextColor(kGray, TFT_BLACK);
   }
-  canvas.drawString(link_text, 8, 142);
+  canvas.drawString(link_text, 8, 140);
+
+  // 校正行: 校正中は段階と AutoMachine の理由、終わっていれば最後の CAL_RESULT（結果 / 理由 / N 端 / 中立）
+  char cal_text[80];
+  if (vsnap.state == v1::state::CALIBRATING) {
+    snprintf(cal_text, sizeof(cal_text), "校正中 %s %s", calStepName(vsnap.cal_live_step), vsnap.cal_live_reason);
+    canvas.setTextColor(kAmber, TFT_BLACK);
+  } else if (vsnap.cal_result_valid) {
+    snprintf(cal_text, sizeof(cal_text), "校正 %s %s  N端 %ld  中立 %ld  sign %+d%s", calResultName(vsnap.cal_result),
+             vsnap.cal_reason, static_cast<long>(vsnap.cal_n_end), static_cast<long>(vsnap.cal_neutral),
+             static_cast<int>(vsnap.cal_sign), vsnap.profile_dirty ? "  保存待ち" : "");
+    canvas.setTextColor(vsnap.cal_result == v1::cal_result::OK ? kGreen : kAmber, TFT_BLACK);
+  } else {
+    snprintf(cal_text, sizeof(cal_text), "校正 この起動では未実施");
+    canvas.setTextColor(kGray, TFT_BLACK);
+  }
+  canvas.drawString(cal_text, 8, 155);
 
   // tick 行（周期の守りの確認用）
   char tick_text[64];
   snprintf(tick_text, sizeof(tick_text), "tick %lu  最大間隔 %lu us%s%s", static_cast<unsigned long>(vsnap.tick_count),
            static_cast<unsigned long>(vsnap.max_tick_gap_us), boot_error[0] ? "  ERR " : "", boot_error);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
-  canvas.drawString(tick_text, 8, 160);
+  canvas.drawString(tick_text, 8, 170);
 
   // 非常停止ボタン（ラッチ中は「解除」）
   {
@@ -1182,7 +1220,10 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
          a.tx_dropped != b.tx_dropped || (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
-         (a.tick_count / 200) != (b.tick_count / 200);
+         (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
+         strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||
+         a.cal_result != b.cal_result || a.cal_n_end != b.cal_n_end || a.cal_neutral != b.cal_neutral ||
+         a.profile_dirty != b.profile_dirty;
 }
 
 void noteBootError(const char* what) {
@@ -1248,6 +1289,16 @@ void loop() {
     if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis)) {
       profile_store_select_motor(vsnap.selected_axis);
       saved_motor = vsnap.selected_axis;
+    }
+    // 校正に成功した系統プロファイル（行程・中立・符号）を NVS に保存する。従来 env と同じく loop() 側で書く
+    //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。保存の成否に関わらず flag は下ろす（同じ結果で再試行しない）。
+    if (vsnap.profile_dirty) {
+      if (!profile_store_save(vsnap.profile)) {
+        showNotice("NVS 保存失敗");
+      } else {
+        showNotice("校正を保存");
+      }
+      control_v1_clear_profile_dirty();
     }
     if (snapChanged(previous, vsnap)) {
       ui_dirty = true;

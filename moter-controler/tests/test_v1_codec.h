@@ -127,6 +127,9 @@ inline bool eq_set_reference(const v1::HostMsg& a, const v1::HostMsg& b) {
   return a.set_reference.request_id == b.set_reference.request_id &&
          a.set_reference.reference_count == b.set_reference.reference_count;
 }
+inline bool eq_calibrate(const v1::HostMsg& a, const v1::HostMsg& b) {
+  return a.calibrate.request_id == b.calibrate.request_id && a.calibrate.mode == b.calibrate.mode;
+}
 
 inline bool eq_hello(const v1::McuMsg& a, const v1::McuMsg& b) {
   const v1::Hello& x = a.hello;
@@ -169,6 +172,13 @@ inline bool eq_axis_select(const v1::McuMsg& a, const v1::McuMsg& b) {
   const v1::AxisSelect& y = b.axis_select;
   return x.boot_id == y.boot_id && x.selected_axis == y.selected_axis &&
          x.prev_selected_axis == y.prev_selected_axis && x.mcu_state == y.mcu_state;
+}
+inline bool eq_cal_result(const v1::McuMsg& a, const v1::McuMsg& b) {
+  const v1::CalResult& x = a.cal_result;
+  const v1::CalResult& y = b.cal_result;
+  return x.boot_id == y.boot_id && x.result == y.result && x.step == y.step && x.n_end_count == y.n_end_count &&
+         x.neutral_count == y.neutral_count && x.sign == y.sign &&
+         std::memcmp(x.reason, y.reason, v1::CAL_REASON_LEN) == 0;
 }
 
 // ---- protocol.md §7 のベクタ -------------------------------------------------
@@ -256,6 +266,20 @@ inline void test_vectors_host() {
     check_host_vector("01 0B 08 00 0B 00 00 00 2E F5 FF FF A5 41",
                       "04 01 0B 08 02 0B 01 01 07 2E F5 FF FF A5 41 00", m, eq_set_reference);
   }
+  {  // 7.19 CALIBRATE（request_id 7、mode 1 = 開始）。CRC は独立した実装（Python）でも確認した値
+    v1::HostMsg m{};
+    m.type = v1::msg::CALIBRATE;
+    m.calibrate = {7, 1};
+    check_host_vector("01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F",
+                      "04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00", m, eq_calibrate);
+    CHECK(v1::host_payload_len(v1::msg::CALIBRATE) == 8);
+    // mode 0（中止）も同じ長さ
+    m.calibrate = {12, 0};
+    uint8_t f[v1::MAX_FRAME_LEN];
+    CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 4 + 8 + 2);
+    v1::HostMsg d{};
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 12 && d.calibrate.mode == 0);
+  }
 }
 
 inline void test_vectors_mcu() {
@@ -320,6 +344,41 @@ inline void test_vectors_mcu() {
     m.axis_select = {2309737967u, 2, 1, 1};
     check_mcu_vector("01 86 08 00 EF CD AB 89 02 01 01 00 32 C1",
                      "04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00", m, eq_axis_select);
+  }
+  {  // 7.20 CAL_RESULT（boot_id 0x89ABCDEF、OK、step 3、n_end 5551、neutral 2775、sign +1、reason "ok"）
+    v1::McuMsg m{};
+    m.type = v1::msg::CAL_RESULT;
+    m.cal_result.boot_id = 2309737967u;
+    m.cal_result.result = v1::cal_result::OK;
+    m.cal_result.step = v1::cal_step::TO_NEUTRAL;
+    m.cal_result.n_end_count = 5551;
+    m.cal_result.neutral_count = 2775;
+    m.cal_result.sign = 1;
+    std::memcpy(m.cal_result.reason, "ok\0\0\0\0\0\0", v1::CAL_REASON_LEN);
+    check_mcu_vector(
+        "01 87 1C 00 EF CD AB 89 00 03 00 00 AF 15 00 00 D7 0A 00 00 01 00 00 00 6F 6B 00 00 00 00 00 00 7A C9",
+        "04 01 87 1C 05 EF CD AB 89 02 03 01 03 AF 15 01 03 D7 0A 01 02 01 01 01 03 6F 6B 01 01 01 01 01 03 7A C9 00",
+        m, eq_cal_result);
+    CHECK(v1::mcu_payload_len(v1::msg::CAL_RESULT) == 28);
+    // 負の値と sign −1、8 文字ちょうどの reason（終端なし）も往復する
+    m.cal_result.result = v1::cal_result::FAILED;
+    m.cal_result.step = v1::cal_step::TO_N;
+    m.cal_result.n_end_count = -5551;
+    m.cal_result.neutral_count = -2775;
+    m.cal_result.sign = -1;
+    std::memcpy(m.cal_result.reason, "abcdefgh", v1::CAL_REASON_LEN);
+    uint8_t w[v1::MAX_WIRE_LEN];
+    const size_t n = v1::encode_mcu_wire(m, w, sizeof(w));
+    CHECK(n > 0);
+    v1::McuMsg d{};
+    CHECK(v1::decode_mcu_encoded(w, n - 1, &d) && eq_cal_result(d, m) && d.cal_result.sign == -1);
+    // 長さ違い（27 byte）は捨てる
+    uint8_t p[28] = {0};
+    CHECK(!v1::decode_mcu_payload(v1::msg::CAL_RESULT, p, 27, &d));
+    v1::HostMsg h{};
+    CHECK(!v1::decode_host_payload(v1::msg::CALIBRATE, p, 9, &h));
+    CHECK(!v1::decode_host_payload(v1::msg::CALIBRATE, p, 7, &h));
+    CHECK(v1::decode_host_payload(v1::msg::CALIBRATE, p, 8, &h) && h.calibrate.mode == 0);
   }
 }
 

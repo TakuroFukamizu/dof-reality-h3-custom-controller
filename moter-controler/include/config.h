@@ -112,3 +112,5 @@ constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこ�
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
+constexpr uint32_t CAL_POWER_SETTLE_MS = 5000;  // CALIBRATING: 主電源 ON 指令からブレーキ解除指令まで（protocol.md §1.2）。2026-10-31 に電源投入 4 s 後は動かず
+                                                // 12 s 後に動いた記録があるため ARMING の POWER_SETTLE_MS より長い。仮値。電源担当でない軸も同じ時間待つ

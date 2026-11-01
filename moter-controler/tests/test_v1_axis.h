@@ -46,6 +46,13 @@ struct Harness {
   int64_t raw = 0;
   bool stall = false;             // プラントが動かない
   double plant_vel = 4000.0;      // count/s
+  // 校正（CALIBRATING）の模擬機構: Duty（MD13S の符号付き %）に比例した速度で raw が動き、端 [end_lo, end_hi] で止まる
+  // （止まる＝無パルス。AutoMachine の端検出がこれを拾う）。plant_sign = +1 は「Duty + でカウント減」（#1 の実測。
+  // P 端 = raw の下限側）。既定の端は stroke 5551 / neutral 2775（CAL_RESULT のテストベクタと同じ値）。
+  int8_t plant_sign = 1;
+  int64_t end_lo = -1000;
+  int64_t end_hi = 4551;
+  double cal_count_s_per_percent = 100.0;  // 実測の 1 % ≈ 100〜130 count/s の下側
   std::vector<v1::McuMsg> out;    // これまでの全出力
   std::vector<uint8_t> seen_states;
 
@@ -180,18 +187,56 @@ struct Harness {
   }
   void set_position(int32_t target, uint16_t valid_for_ms = 50) { send(set_position_msg(target, valid_for_ms)); }
 
-  // 1 tick（既定 5 ms）。プラントは位置制御中だけ setpoint に追従する。
+  // 1 tick（既定 5 ms）。プラントは位置制御中だけ setpoint に追従する。校正中は Duty に応じて端まで動く。
   void step(uint32_t dt_ms = 5) {
     now += dt_ms * MS;
     if (!stall && ax.brake_release_cmd()) {
-      const double max_step = plant_vel * static_cast<double>(dt_ms) / 1000.0;
-      double delta = static_cast<double>(ax.target_count()) - static_cast<double>(ax.actual_count());
-      if (delta > max_step) delta = max_step;
-      if (delta < -max_step) delta = -max_step;
-      raw += static_cast<int64_t>(delta);
+      if (ax.state() == st::CALIBRATING) {
+        const double v = -static_cast<double>(plant_sign) * ax.duty_percent() * cal_count_s_per_percent;  // count/s
+        raw += llround(v * static_cast<double>(dt_ms) / 1000.0);
+        if (raw < end_lo) raw = end_lo;
+        if (raw > end_hi) raw = end_hi;
+      } else {
+        const double max_step = plant_vel * static_cast<double>(dt_ms) / 1000.0;
+        double delta = static_cast<double>(ax.target_count()) - static_cast<double>(ax.actual_count());
+        if (delta > max_step) delta = max_step;
+        if (delta < -max_step) delta = -max_step;
+        raw += static_cast<int64_t>(delta);
+      }
     }
     ax.tick(now, raw);
     drain();
+  }
+  // 条件が成り立つまで 5 ms ずつ進める（上限 max_ms）。成り立てば true。
+  template <typename Pred>
+  bool run_until(Pred pred, uint32_t max_ms) {
+    for (uint32_t t = 0; t < max_ms; t += 5) {
+      if (pred()) return true;
+      step(5);
+    }
+    return pred();
+  }
+  v1::HostMsg calibrate_msg(uint8_t mode, uint32_t request_id) {
+    v1::HostMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::CALIBRATE;
+    m.calibrate.request_id = request_id;
+    m.calibrate.mode = mode;
+    return m;
+  }
+  v1::Ack calibrate(uint8_t mode = 1) { return cmd(calibrate_msg(mode, next_rid())); }
+  std::vector<v1::CalResult> cal_results() const {
+    std::vector<v1::CalResult> r;
+    for (const v1::McuMsg& m : out) {
+      if (m.type == v1::msg::CAL_RESULT) r.push_back(m.cal_result);
+    }
+    return r;
+  }
+  // CALIBRATE(1) を受理させ、AutoMachine が動き出す（settle + brake wait の後）まで進める。
+  void start_calibration_and_reach_running() {
+    accepted(calibrate(1));
+    CHECK(ax.state() == st::CALIBRATING);
+    CHECK(run_until([&] { return ax.duty_percent() != 0; }, 6000));
   }
   void idle(uint32_t ms) {
     while (ms >= 5) {
@@ -1561,6 +1606,461 @@ inline void test_outbox_overflow_drops_status_first() {
   CHECK(ax.pending() >= 1 && ax.peek()->type == v1::msg::STATUS);
 }
 
+// ---- 校正（CALIBRATE / CALIBRATING / CAL_RESULT。protocol.md §1.2） ------------------
+
+inline bool reason_is(const v1::CalResult& r, const char* text) {
+  char buf[v1::CAL_REASON_LEN + 1];
+  memcpy(buf, r.reason, v1::CAL_REASON_LEN);
+  buf[v1::CAL_REASON_LEN] = '\0';
+  return strcmp(buf, text) == 0;
+}
+
+// out の中で CAL_RESULT が、DISARMED を示す最初の STATUS より前に 1 回だけ出ている（その前に DISARMED の STATUS が無い）。
+inline void cal_result_precedes_disarmed_status(const std::vector<v1::McuMsg>& out, size_t from) {
+  int results = 0;
+  bool seen_result = false;
+  bool disarmed_before_result = false;
+  bool disarmed_after_result = false;
+  for (size_t i = from; i < out.size(); ++i) {
+    const v1::McuMsg& m = out[i];
+    if (m.type == v1::msg::CAL_RESULT) {
+      results += 1;
+      seen_result = true;
+    } else if (m.type == v1::msg::STATUS && m.status.mcu_state == st::DISARMED) {
+      if (seen_result) disarmed_after_result = true;
+      else disarmed_before_result = true;
+    }
+  }
+  CHECK(results == 1);
+  CHECK(!disarmed_before_result);
+  CHECK(disarmed_after_result);
+}
+
+inline void test_calibrate_rejections_and_noop_cancel() {
+  Harness h;
+  // mode が 0・1 以外
+  Harness::rejected(h.calibrate(2), rs::INVALID_PARAM);
+  Harness::rejected(h.calibrate(255), rs::INVALID_PARAM);
+  // request_id 0
+  Harness::rejected(h.cmd(h.calibrate_msg(1, 0)), rs::INVALID_PARAM);
+  CHECK(h.ax.state() == st::DISARMED);
+  // DISARMED で mode 0 は何もせず ACCEPTED（CAL_RESULT も出ない）
+  Harness::accepted(h.calibrate(0));
+  CHECK(h.ax.state() == st::DISARMED && h.cal_results().empty());
+  // DISARMED 以外は BAD_STATE
+  Harness::accepted(h.config());
+  Harness::accepted(h.arm());
+  Harness::rejected(h.calibrate(1), rs::BAD_STATE);
+  Harness::accepted(h.calibrate(0));  // ARMING でも mode 0 は no-op ACCEPTED
+  CHECK(h.ax.state() == st::ARMING);
+  h.drive(620, 0);
+  CHECK(h.ax.state() == st::HOLDING);
+  Harness::rejected(h.calibrate(1), rs::BAD_STATE);
+  Harness::accepted(h.disarm());
+  Harness::rejected(h.calibrate(1), rs::BAD_STATE);  // DISARMING
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED);
+  // FAULT 中は FAULT_ACTIVE
+  Harness::accepted(h.host_fault());
+  Harness::rejected(h.calibrate(1), rs::FAULT_ACTIVE);
+  Harness::rejected(h.calibrate(0), rs::FAULT_ACTIVE);
+  Harness::accepted(h.fault_reset());
+  // 受理した CALIBRATE の再送は DUPLICATE（実行しない）
+  const uint32_t r = h.next_rid();
+  Harness::accepted(h.cmd(h.calibrate_msg(1, r)));
+  CHECK(h.ax.state() == st::CALIBRATING);
+  Harness::duplicate(h.cmd(h.calibrate_msg(1, r)));
+  // 校正中の mode 1 は BAD_STATE
+  Harness::rejected(h.calibrate(1), rs::BAD_STATE);
+  CHECK(h.ax.state() == st::CALIBRATING);
+}
+
+// 成功: 電源担当軸。主電源 ON 指令 → CAL_POWER_SETTLE_MS → ブレーキ解除指令 → BRAKE_RELEASE_WAIT_MS → 端当て → 終了手順
+// → CAL_RESULT → STATUS(DISARMED)。P 端 = 0 の基準が立ち、プロファイルが profile_dirty に出る。
+inline void test_calibration_success_on_power_axis() {
+  Harness h(1, 1, 0, false);  // 基準なし・CONFIG あり（電源担当）
+  Harness::accepted(h.config());
+  CHECK(!h.ax.referenced());
+  const size_t from = h.out.size();
+  const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(1, h.next_rid()));
+  // ACK → STATUS(CALIBRATING、主電源 ON 指令、ブレーキ作動、PWM 0、fault NONE、基準なし)
+  CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED &&
+        r[0].ack.acked_type == v1::msg::CALIBRATE);
+  CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::CALIBRATING);
+  CHECK((r[1].status.flags & fl::POWER_ON_CMD) != 0 && (r[1].status.flags & fl::BRAKE_RELEASE_CMD) == 0 &&
+        (r[1].status.flags & fl::POSITION_REFERENCED) == 0 && r[1].status.pwm_permille == 0 &&
+        r[1].status.fault_code == fc::NONE);
+  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  // HELLO も CALIBRATING
+  for (const v1::McuMsg& m : h.hello(5)) {
+    if (m.type == v1::msg::HELLO) CHECK(m.hello.mcu_state == st::CALIBRATING);
+  }
+  // CAL_POWER_SETTLE_MS（5000）の直前はまだブレーキ作動
+  h.idle(4995);
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  h.idle(10);
+  CHECK(h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  // BRAKE_RELEASE_WAIT_MS（300）の後に端当てが始まる: P 端向き = Duty +HOME_DUTY
+  h.idle(290);
+  CHECK(h.ax.duty_percent() == 0);
+  h.idle(10);
+  CHECK(h.ax.duty_percent() == HOME_DUTY);
+  CHECK(h.ax.cal_live_step() == v1::cal_step::TO_P);
+  const v1::Status running = h.status();
+  CHECK(running.mcu_state == st::CALIBRATING && (running.flags & fl::BRAKE_RELEASE_CMD) != 0 &&
+        (running.flags & fl::POWER_ON_CMD) != 0 && running.fault_code == fc::NONE);
+  CHECK(running.pwm_permille == -HOME_DUTY * 10);  // sign +1: Duty + はカウント減
+  // 端当て → N 端 → 中立 → 終了手順 → DISARMED
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.fault_code() == fc::NONE && h.fault_events().empty());
+  // CAL_RESULT は 1 回、DISARMED の STATUS より前
+  cal_result_precedes_disarmed_status(h.out, from);
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1);
+  CHECK(res[0].boot_id == 2309737967u);
+  CHECK(res[0].result == v1::cal_result::OK && res[0].step == v1::cal_step::TO_NEUTRAL);
+  CHECK(res[0].n_end_count == 5551 && res[0].neutral_count == 2775 && res[0].sign == 1);
+  CHECK(reason_is(res[0], "ok"));
+  CHECK(h.ax.has_cal_result() && h.ax.last_cal_result().n_end_count == 5551);
+  // 基準: P 端（raw = end_lo）が 0。いまは中立付近に居る
+  CHECK(h.ax.referenced());
+  CHECK(h.ax.actual_count() == h.raw - h.end_lo);
+  CHECK(h.ax.actual_count() >= 2775 - NEUTRAL_BAND && h.ax.actual_count() <= 2775 + NEUTRAL_BAND);
+  CHECK(h.ax.target_count() == h.ax.actual_count());  // DISARMED の保持目標は現在位置
+  CHECK((h.status().flags & fl::POSITION_REFERENCED) != 0);
+  // プロファイル（制御タスクが NVS に保存する）
+  CHECK(h.ax.profile_dirty());
+  const MotorProfile& p = h.ax.dirty_profile();
+  CHECK(p.motor == 1 && p.stroke == 5551 && p.neutral == 2775 && p.sign == 1 && p.calibrated);
+  h.ax.clear_profile_dirty();
+  CHECK(!h.ax.profile_dirty());
+  CHECK(h.ax.sign() == 1);
+  // CONFIG は残っている。基準を取り直さずに ARM できる（PC は SET_REFERENCE を送らない）が、
+  // ソフトリミットは P 端 = 0 の座標で作り直す（PC は CAL_RESULT から mechanical ∓ decel_zone を作って CONFIG し直す）
+  CHECK(h.ax.configured());
+  Harness::rejected(h.arm(), rs::BAD_STATE);  // 古い ±2700 の窓では中立 2775 が範囲外
+  v1::Config c = base_config();
+  c.soft_min_count = 100;
+  c.soft_max_count = 5451;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.state() == st::HOLDING);
+}
+
+// 符号が逆の機構（Duty + でカウント増）: NVS の sign が既定 +1 のままでも、P 端で向きが決まり −1 で保存される。
+// CAL_RESULT の座標は符号を掛けない（n_end_count = raw_N − raw_P < 0）。
+inline void test_calibration_negative_sign_plant_reports_negative_n_end() {
+  Harness h(2, 1, 300, false);
+  h.plant_sign = -1;
+  h.start_calibration_and_reach_running();
+  CHECK(h.ax.duty_percent() == HOME_DUTY);  // 端当ての Duty は機構の符号に依らず +（P 端向き）
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1 && res[0].result == v1::cal_result::OK);
+  CHECK(res[0].n_end_count == -5551 && res[0].neutral_count == -2775 && res[0].sign == -1);
+  CHECK(h.ax.sign() == -1);
+  CHECK(h.ax.referenced());
+  CHECK(h.ax.actual_count() == h.raw - h.end_hi);  // P 端 = raw の上限側 = 0
+  CHECK(h.ax.actual_count() <= -2775 + NEUTRAL_BAND && h.ax.actual_count() >= -2775 - NEUTRAL_BAND);
+  CHECK(h.ax.profile_dirty());
+  CHECK(h.ax.dirty_profile().motor == 2 && h.ax.dirty_profile().sign == -1 && h.ax.dirty_profile().stroke == 5551);
+  // 以後の Duty の向きは新しい符号（カウントを増やしたい → Duty +）。窓は N 端側が負
+  v1::Config c = base_config();
+  c.soft_min_count = -5451;
+  c.soft_max_count = -100;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 100;
+  h.set_position(h.ax.actual_count());
+  h.step();
+  CHECK(h.ax.duty_percent() > 0 && h.ax.pwm_permille() > 0);
+}
+
+// 電源担当でない軸（CONFIG なしでも受理する）: 主電源 ON 指令は出さず、同じ settle 時間を待ってからブレーキを解除する。
+inline void test_calibration_on_non_power_axis_without_config() {
+  Harness h(3, 1, 0, false);
+  CHECK(!h.ax.configured());
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1));
+  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.power_on_cmd());
+  h.idle(4995);
+  CHECK(!h.ax.brake_release_cmd());
+  h.idle(10);
+  CHECK(h.ax.brake_release_cmd());
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  for (size_t i = from; i < h.out.size(); ++i) {
+    if (h.out[i].type == v1::msg::STATUS) CHECK((h.out[i].status.flags & (fl::POWER_ON_CMD | fl::POWER_CONTROLLER)) == 0);
+  }
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1 && res[0].result == v1::cal_result::OK && res[0].n_end_count == 5551);
+  CHECK(h.ax.referenced() && h.ax.profile_dirty() && h.ax.dirty_profile().motor == 3);
+  CHECK(!h.ax.configured());  // CONFIG は要らないし増えもしない
+}
+
+// 失敗: 機構が動かない。ARRIVAL_MIN_TRAVEL 未満で止まる → 退避 → また止まる → FAILED "stall"（step 1）。
+// 基準は立たず、FAULT にはならず、プロファイルも出ない。
+inline void test_calibration_fails_on_stall_before_min_travel() {
+  Harness h(1, 1, 0, true);  // 基準ありで始めても、校正の開始で消える
+  Harness::accepted(h.config());
+  CHECK(h.ax.referenced());
+  h.stall = true;
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1));
+  CHECK(!h.ax.referenced());
+  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  // 開始猶予 300 + 無パルス 200 → 退避（反対向き）→ 猶予 300 + 無パルス 200 → 失敗
+  CHECK(h.run_until([&] { return h.ax.duty_percent() == -HOME_DUTY; }, 1000));
+  CHECK(h.ax.state() == st::CALIBRATING && strcmp(h.ax.cal_live_reason(), "retreat") == 0);
+  CHECK(h.run_until([&] { return !h.ax.brake_release_cmd(); }, 1000));
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() == 0);  // 終了手順: ブレーキ給電 OFF、PWM 0、主電源はまだ ON
+  CHECK(h.ax.power_on_cmd());
+  h.idle(295);
+  CHECK(h.ax.state() == st::CALIBRATING);
+  h.idle(10);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd());
+  cal_result_precedes_disarmed_status(h.out, from);
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1);
+  CHECK(res[0].result == v1::cal_result::FAILED && res[0].step == v1::cal_step::TO_P);
+  CHECK(reason_is(res[0], "stall"));
+  CHECK(res[0].n_end_count == 0 && res[0].neutral_count == 0 && res[0].sign == 1);
+  CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
+  CHECK(h.ax.fault_code() == fc::NONE && h.fault_events().empty());
+  CHECK(h.ax.sign() == 1);
+  Harness::rejected(h.arm(), rs::NOT_REFERENCED);  // 原点が信用できないので ARM できない
+}
+
+// 中立への移動で失敗（step 3）: N 端まで測れた値は CAL_RESULT に載るが、保存も基準の確立もしない。
+inline void test_calibration_failure_at_neutral_reports_values_but_keeps_nothing() {
+  Harness h(1, 1, 0, false);
+  h.start_calibration_and_reach_running();
+  CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL; }, 30000));
+  h.stall = true;  // 中立へ動けない → 下限 Duty を HOME_DUTY まで上げても動かず FAILED
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 30000));
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1);
+  CHECK(res[0].result == v1::cal_result::FAILED && res[0].step == v1::cal_step::TO_NEUTRAL);
+  CHECK(reason_is(res[0], "stall"));
+  CHECK(res[0].n_end_count == 5551 && res[0].neutral_count == 2775);
+  CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
+  CHECK(h.fault_events().empty());
+}
+
+// 中止: CALIBRATE(0)。settle 中（AutoMachine 開始前）と端当て中の両方。終了手順を経て DISARMED、CANCELLED "stop"。
+inline void test_calibrate_cancel_before_and_during_motion() {
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    const size_t from = h.out.size();
+    Harness::accepted(h.calibrate(1));
+    h.idle(1000);  // settle 中
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && !h.ax.brake_release_cmd());
+    const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(0, h.next_rid()));
+    CHECK(r.size() >= 1 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED);
+    CHECK(h.ax.state() == st::CALIBRATING);  // 終了手順の間は CALIBRATING のまま
+    h.idle(295);
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd());
+    h.idle(10);
+    CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd());
+    cal_result_precedes_disarmed_status(h.out, from);
+    const std::vector<v1::CalResult> res = h.cal_results();
+    CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && res[0].step == v1::cal_step::NONE);
+    CHECK(reason_is(res[0], "stop"));
+    CHECK(!h.ax.referenced() && !h.ax.profile_dirty() && h.fault_events().empty());
+    CHECK(h.raw == 0);  // 動いていない
+  }
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());  // 電源担当（終了手順の間は主電源 ON 指令のまま）
+    const size_t from = h.out.size();
+    h.start_calibration_and_reach_running();
+    h.idle(500);  // P 端へ動いている途中
+    CHECK(h.ax.duty_percent() == HOME_DUTY && h.raw < 0 && h.raw > h.end_lo);
+    const int64_t at_cancel = h.raw;
+    const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(0, h.next_rid()));
+    // ACK の時点でブレーキ給電 OFF・PWM 0（ACK の後の STATUS がそれを示す）
+    CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED);
+    CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::CALIBRATING &&
+          (r[1].status.flags & fl::BRAKE_RELEASE_CMD) == 0 && r[1].status.pwm_permille == 0);
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_percent() == 0 && h.ax.power_on_cmd());
+    // 終了手順中の 2 回目の中止は何もせず ACCEPTED
+    Harness::accepted(h.calibrate(0));
+    h.idle(400);
+    CHECK(h.ax.state() == st::DISARMED);
+    CHECK(h.raw == at_cancel);  // ブレーキ作動後は動かない
+    cal_result_precedes_disarmed_status(h.out, from);
+    const std::vector<v1::CalResult> res = h.cal_results();
+    CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && res[0].step == v1::cal_step::TO_P);
+    CHECK(reason_is(res[0], "stop"));
+    CHECK(!h.ax.referenced() && !h.ax.profile_dirty() && h.fault_events().empty());
+    // 改めて校正できる
+    h.start_calibration_and_reach_running();
+    CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+    CHECK(h.cal_results().size() == 2 && h.cal_results()[1].result == v1::cal_result::OK);
+    CHECK(h.ax.referenced());
+  }
+}
+
+// DISARM も中止（ACCEPTED）。N 端へ向かっている途中なら step 2。
+inline void test_disarm_cancels_calibration() {
+  Harness h(1, 1, 0, false);
+  const size_t from = h.out.size();
+  h.start_calibration_and_reach_running();
+  CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_N; }, 10000));
+  h.idle(300);
+  CHECK(h.ax.duty_percent() == -HOME_DUTY);  // N 端向き（校正中は保存ストロークを信じず低速）
+  Harness::accepted(h.disarm());
+  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED);
+  cal_result_precedes_disarmed_status(h.out, from);
+  const std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && res[0].step == v1::cal_step::TO_N);
+  CHECK(reason_is(res[0], "stop"));
+  CHECK(!h.ax.referenced());
+  Harness::accepted(h.disarm());  // DISARMED では no-op
+}
+
+// 校正中の他の命令: ARM_PREPARE / START / CONFIG / SET_REFERENCE / FAULT_RESET → BAD_STATE、CONTROLLED_STOP → no-op ACCEPTED、
+// SET_POSITION は捨てる（数えない）、系統の切り替えは無視。
+inline void test_calibrating_rejects_or_drops_other_commands() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  h.set_position(0);  // last_rx_seq = 1
+  CHECK(h.ax.last_rx_seq() == 1);
+  h.start_calibration_and_reach_running();
+  Harness::rejected(h.arm(), rs::BAD_STATE);
+  Harness::rejected(h.start(), rs::BAD_STATE);
+  Harness::rejected(h.config(), rs::BAD_STATE);
+  Harness::rejected(h.set_reference(0), rs::BAD_STATE);
+  Harness::rejected(h.fault_reset(), rs::BAD_STATE);
+  Harness::accepted(h.stop());
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() != 0);  // 止まらない
+  // SET_POSITION（有効・古い・apply_at ≠ 0）はどれも数えない
+  const uint16_t stale = h.ax.stale_drop_count();
+  const uint16_t rxerr = h.ax.rx_error_count();
+  h.set_position(100);
+  v1::HostMsg m = h.set_position_msg(100);
+  m.set_position.seq = 1;
+  h.send(m);
+  m = h.set_position_msg(100);
+  m.set_position.apply_at_us = 5;
+  h.send(m);
+  CHECK(h.ax.last_rx_seq() == 1 && h.ax.stale_drop_count() == stale && h.ax.rx_error_count() == rxerr);
+  CHECK(h.ax.last_applied_seq() == 0);
+  // 系統の切り替えは無視（AXIS_SELECT も出ない）
+  CHECK(!h.ax.select_axis(2, h.now));
+  CHECK(h.ax.selected_axis() == 1 && h.axis_selects().empty());
+  // lease は見ない（SET_POSITION 無しで COMMAND_TIMEOUT にならない）
+  h.idle(500);
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.fault_code() == fc::NONE);
+  // 校正が終われば SET_POSITION はまた数える
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  h.set_position(0);
+  CHECK(h.ax.last_rx_seq() == h.seq);
+}
+
+// HOST_FAULT 中の校正: 即 FAULT（出力はすべて OFF）。CAL_RESULT(CANCELLED "fault") を FAULT_EVENT より前に 1 回。
+// FAULT_RESET 後は DISARMED で基準なし。改めて校正できる。
+inline void test_host_fault_during_calibration() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  h.start_calibration_and_reach_running();
+  h.idle(200);
+  CHECK(h.ax.power_on_cmd() && h.ax.brake_release_cmd() && h.ax.duty_percent() != 0);
+  const std::vector<v1::McuMsg> r = h.send(h.host_fault_msg(h.next_rid()));
+  CHECK(r.size() == 4 && r[0].type == v1::msg::CAL_RESULT && r[1].type == v1::msg::FAULT_EVENT &&
+        r[2].type == v1::msg::ACK && r[3].type == v1::msg::STATUS);
+  CHECK(r[0].cal_result.result == v1::cal_result::CANCELLED && r[0].cal_result.step == v1::cal_step::TO_P);
+  CHECK(reason_is(r[0].cal_result, "fault"));
+  CHECK(r[1].fault_event.fault_code == fc::HOST_FAULT && r[1].fault_event.mcu_state_before == st::CALIBRATING);
+  CHECK(r[3].status.mcu_state == st::FAULT && r[3].status.fault_code == fc::HOST_FAULT &&
+        (r[3].status.flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0 && r[3].status.pwm_permille == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
+  h.idle(1000);
+  CHECK(h.ax.state() == st::FAULT && h.cal_results().size() == 1);  // 終了手順は踏まない（CAL_RESULT は増えない）
+  Harness::accepted(h.fault_reset());
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.referenced() && h.ax.configured());
+  // 改めて校正（前回の残りが無い）
+  h.start_calibration_and_reach_running();
+  CHECK(h.ax.cal_live_step() == v1::cal_step::TO_P);
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  CHECK(h.cal_results().size() == 2 && h.cal_results()[1].result == v1::cal_result::OK && h.ax.referenced());
+}
+
+// 画面の非常停止中の校正: FAULT(LOCAL_ESTOP)、CAL_RESULT(CANCELLED "estop")。制御周期の逸脱も FAULT。
+inline void test_local_estop_and_overrun_during_calibration() {
+  {
+    Harness h(1, 1, 0, false);
+    h.start_calibration_and_reach_running();
+    h.ax.set_local_estop(true, h.now);
+    h.drain();
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+    const std::vector<v1::CalResult> res = h.cal_results();
+    CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && reason_is(res[0], "estop"));
+    const std::vector<v1::FaultEvent> ev = h.fault_events();
+    CHECK(ev.size() == 1 && ev[0].mcu_state_before == st::CALIBRATING);
+    Harness::rejected(h.fault_reset(), rs::FAULT_CAUSE_PRESENT);
+    h.ax.set_local_estop(false, h.now);
+    Harness::accepted(h.fault_reset());
+    CHECK(h.ax.state() == st::DISARMED && !h.ax.referenced());
+  }
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.calibrate(1));
+    h.idle(100);
+    h.step(16);  // CALIBRATING は parked ではない: 周期の逸脱は異常
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::CONTROL_OVERRUN);
+    CHECK(h.cal_results().size() == 1 && reason_is(h.cal_results()[0], "fault"));
+  }
+}
+
+// 終了手順（ブレーキ作動待ち）の間の FAULT: 結果は確定済みなのでそのまま送る。成功なら基準・プロファイルも保つ。
+// 中止 "stop" の結果も "fault" に書き換えない。
+inline void test_fault_during_calibration_shutdown_keeps_final_result() {
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    h.start_calibration_and_reach_running();
+    // 中立に着いて終了手順に入る（ブレーキ給電 OFF、まだ CALIBRATING）
+    CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL && !h.ax.brake_release_cmd(); },
+                      40000));
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.referenced() && h.ax.profile_dirty());
+    CHECK(h.cal_results().empty());  // CAL_RESULT はまだ
+    h.idle(100);
+    const std::vector<v1::McuMsg> r = h.send(h.host_fault_msg(h.next_rid()));
+    CHECK(r.size() == 4 && r[0].type == v1::msg::CAL_RESULT && r[1].type == v1::msg::FAULT_EVENT &&
+          r[2].type == v1::msg::ACK && r[3].type == v1::msg::STATUS && r[3].status.mcu_state == st::FAULT);
+    CHECK(r[0].cal_result.result == v1::cal_result::OK && r[0].cal_result.n_end_count == 5551 &&
+          r[0].cal_result.neutral_count == 2775 && reason_is(r[0].cal_result, "ok"));
+    CHECK(h.ax.referenced() && h.ax.profile_dirty() && h.ax.dirty_profile().stroke == 5551);
+    CHECK((r[3].status.flags & fl::POSITION_REFERENCED) != 0);
+    h.idle(1000);
+    CHECK(h.ax.state() == st::FAULT && h.cal_results().size() == 1);
+    Harness::accepted(h.fault_reset());
+    CHECK(h.ax.state() == st::DISARMED && h.ax.referenced());
+    CHECK(h.ax.actual_count() == h.raw - h.end_lo);
+  }
+  {
+    Harness h(1, 1, 0, false);
+    h.start_calibration_and_reach_running();
+    h.idle(300);
+    Harness::accepted(h.calibrate(0));  // 中止 → 終了手順
+    CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd());
+    h.idle(100);
+    h.ax.set_local_estop(true, h.now);
+    h.drain();
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
+    const std::vector<v1::CalResult> res = h.cal_results();
+    CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && reason_is(res[0], "stop"));
+    CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
+  }
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -1632,6 +2132,18 @@ inline void run_all() {
   test_local_estop_in_disarmed_and_during_other_fault();
   test_bad_frames_counted_and_unanswered();
   test_outbox_overflow_drops_status_first();
+  test_calibrate_rejections_and_noop_cancel();
+  test_calibration_success_on_power_axis();
+  test_calibration_negative_sign_plant_reports_negative_n_end();
+  test_calibration_on_non_power_axis_without_config();
+  test_calibration_fails_on_stall_before_min_travel();
+  test_calibration_failure_at_neutral_reports_values_but_keeps_nothing();
+  test_calibrate_cancel_before_and_during_motion();
+  test_disarm_cancels_calibration();
+  test_calibrating_rejects_or_drops_other_commands();
+  test_host_fault_during_calibration();
+  test_local_estop_and_overrun_during_calibration();
+  test_fault_during_calibration_shutdown_keeps_final_result();
 }
 
 }  // namespace v1axis_test
