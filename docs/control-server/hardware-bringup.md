@@ -209,7 +209,7 @@ P 端                                                          N 端
 - `mechanical_min/max` = 従来 env の HOME / UPPER で当てた端（10 % Duty で止まる位置。到達位置は 0〜16 / 6155〜6171 の幅でばらつく。過去の記録）。目標には使わない。
 - `soft_min/max` = 機械端から `decel_zone_count`（300）だけ内側。サーバーは `soft_min − mechanical_min ≥ decel_zone_count`（かつ `soft_min > mechanical_min`）、`mechanical_max − soft_max ≥ decel_zone_count`（かつ `soft_max < mechanical_max`）を `check-config` で検査し（bringup.toml はちょうど等号で通る）、PC も MCU も目標をここでクリップし、実位置がここを外れると `SOFT_LIMIT`。
 - `count_at_virtual_512` = stroke / 2（従来 env の `neutral` と同じ値）。仮想位置 512（Pose 0）がここ。
-- `count_at_virtual_0` / `count_at_virtual_1023` = `soft_min` / `soft_max`。仮想 0〜1023 を運用範囲いっぱいに割り当てる。実際に動く量はゲームの gain で決まる: `g = gain × 511`、`m1 = 512 + g (roll + pitch)`、`m2 = 512 + g (roll − pitch)`、`m3 = 512 + g × yaw`（architecture.md §2.2）。`max_gain = 0.15` では仮想 512 ± 77（入力 1 つのとき）→ 軸 1 で約 ±370 count（モーター約 0.9 回転、座席の角で 10 mm 前後。過去の記録 0.03 mm/count から推定）。
+- `count_at_virtual_0` / `count_at_virtual_1023` = `soft_min` / `soft_max`。仮想 0〜1023 を運用範囲いっぱいに割り当てる。実際に動く量はゲームの gain で決まる: `g = gain × 511`、`m1 = 512 + g (roll + pitch)`、`m2 = 512 + g (roll − pitch)`、`m3 = 512 + g × yaw`（architecture.md §2.2）。gain 0.15 では仮想 512 ± 77（入力 1 つのとき）→ 軸 1 で約 ±370 count（モーター約 0.9 回転、座席の角で 10 mm 前後。過去の記録 0.03 mm/count から推定）。gain の上限は `[limits].max_gain`（既定 0.5）で、向きの確認中は 0.15 に下げておく（[limits.md](limits.md) §4）。
 - **向き**: 仮想 0 → 1023 で座席が上がるか下がるか（ヨーは右か左か）は新しい機構で **未確認**（architecture.md §6）。bringup.toml は全軸「count 増 = 仮想位置 増」。過去の記録では #1 / #2 の N 端 = 上（P 端 = 沈み切り）、#3 の P 端 = 右端なので、この仮定のもとでは `pitch +` で #1 が上がり #2 が下がる、`roll +` で両方上がる、`yaw +` で #3 が左へ動く。ゲームの意図と逆な軸は、**その軸の `count_at_virtual_0` と `count_at_virtual_1023` の値を入れ替える**（`count_at_virtual_512` はそのまま。単調減少は許される。3 点がソフトリミット内で単調なら `check-config` が通る）。入れ替えたらサーバー再起動 → §5.1 からやり直し。
 - ストロークが記録と違った（§1.2 の `<S>` が ±30 を超える）: `mechanical_max_count = <S>`、`soft_max_count = <S> − 300`、`count_at_virtual_1023 = <S> − 300`、`count_at_virtual_512 = <S>/2` に書き直し、`check-config`。
 
@@ -221,7 +221,7 @@ P 端                                                          N 端
 
 §5.1 が 3 軸とも通り、各軸の `actual_count` が `count_at_virtual_512` ± 30、§1.2 の stroke が bringup.toml と一致、座席に人がおらず、物理非常停止を押せる人がいる。この 4 点を確認したら bringup.toml の 3 軸を `calibration_valid = true` にしてサーバーを再起動し、§5.1 をやり直す（再起動で CoreS3 がリセットされた場合に備える。`referenced` が `true` のままなら不要）。status: `rig_state = READY_TO_ARM`、`blockers = []`。
 
-`true` は「この軸でこの値を測った」という操作者の宣言で、有人運転の可否ではない。向きの確認（§7）が終わるまで `max_gain` は 0.15 のまま。
+`true` は「この軸でこの値を測った」という操作者の宣言で、有人運転の可否ではない。向きの確認（§7）が終わるまで `[limits].max_gain` は 0.15 に下げておく（limits.md §4 の手順 2）。
 
 ## 6. 無負荷・モーター電源 OFF で ARM / START の流れ
 
@@ -288,10 +288,10 @@ curl -sX POST -H "$AUTH" $URL/v1/start
 ```
 
 - START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。
-- 受理後 `rig_state = ACTIVE`、`active_source = "game"`、3 軸 `mcu_state = ACTIVE`。目標は `count_at_virtual_512` へ `max_vel`（600 count/s）以内で動く。
+- 受理後 `rig_state = ACTIVE`、`active_source = "game"`、3 軸 `mcu_state = ACTIVE`。目標は `count_at_virtual_512` へ `[limits].max_vel_count_s` 以内で動く（limits.md §4 の低い値 600 count/s で始める）。
 - **ここで 3 通りに分かれる**（ファームの無パルス判定は「ブレーキ解除指令中に目標（軌道）が動いている間」だけ働く。設計 §3）:
   - `|actual_count − count_at_virtual_512| ≤ 5`（基準がぴったり）: 目標 = 実位置で Duty 0 のまま。ACTIVE が続く。送信停止 → `BRAKED_DISARMED` まで進むことを見る。
-  - ずれが小さい（目安: 数十 count 未満。`max_acc` 2000 count/s² では目標が 200 ms で動く距離が約 40 count）: 目標は 200 ms 以内に `count_at_virtual_512` に着いて止まり、無パルスの窓が閉じる。位置ループは Duty 7 %（`V1_DUTY_MIN`）を出し続けるが 24V が無いので動かず、**ACTIVE のまま `following_error_count` がそのずれで一定**（`pwm_permille` ≈ ±70）。FAULT にはならない。送信停止 → STOPPING → HOLDING → `BRAKED_DISARMED` まで進むことを見る（DISARMING でもこの残り誤差で FAULT にならない）。
+  - ずれが小さい（目安: 数十 count 未満。`max_acc` 2000 count/s² では目標が 200 ms で動く距離が約 40 count）: 目標は 200 ms 以内に `count_at_virtual_512` に着いて止まり、無パルスの窓が閉じる。位置ループは Duty 下限（`[limits].duty_min_percent`。SET_LIMITS を受ける前のファーム既定は 7 %）を出し続けるが 24V が無いので動かず、**ACTIVE のまま `following_error_count` がそのずれで一定**（`pwm_permille` ≈ ±70）。FAULT にはならない。送信停止 → STOPPING → HOLDING → `BRAKED_DISARMED` まで進むことを見る（DISARMING でもこの残り誤差で FAULT にならない）。
   - ずれが大きい（数十 count 以上）: 目標が動いている間に Duty ≥ 7 % でカウントが変わらないので、`STALL_MS`（200 ms）で **`ENCODER_FAULT`**。サーバーは FAULT_EVENT / STATUS でラッチし、他の軸へ HOST_FAULT。status: `rig_state = FAULT_LATCHED`、`fault = {"kind":"axis_fault","axis":N,"code":"ENCODER_FAULT"}`、3 軸とも `power_on_cmd = false`・`brake_release_cmd = false`、FAULT の軸 `fault_code = ENCODER_FAULT`、他は `HOST_FAULT`。**これは異常検出が働いた正常な結果**。`GET /v1/events` に `fault` と `rig_state` の遷移が並ぶ（§9）。
 - FAULT からの戻し: 送信を止める → `curl -sX POST -H "$AUTH" $URL/v1/fault/reset`。`fault/reset` は 200（`{"ok":true,"rig_state":"FAULT_LATCHED"}`）を返すが、解除の成否はこの応答では分からない（MCU の ACK は後から届く）。数百 ms 後に status を読み、`rig_state` が `READY_TO_ARM`（または `CALIBRATION_REQUIRED`）になっていれば解除済み。`FAULT_LATCHED` のままで `blockers` に `fault_reset_rejected: axisN FaultCausePresent` が出ていれば MCU が「原因が残っている」と判断している（v1 ファームでこれになるのは画面の非常停止がラッチ中のときだけ。ENCODER_FAULT は常に解除できる。`GET /v1/events` に `ack_rejected` が並ぶ）。原因を除いてからもう一度 `fault/reset` を送る。ENCODER_FAULT を解除した軸は `POSITION_REFERENCED` が消える（protocol.md §4）ので `not_referenced` に戻る。機構は動いていないので §5.1 と同じ `count` で `/v1/reference` をやり直す。
 - ここまでで確認できたこと: ACK → STATUS の順序、ARMING の電源 → ブレーキの順、`POWER_CONTROLLER` の担当分け、FAULT 時の全軸停止指令、FAULT_RESET と再基準化。24V を入れる前にこの流れを一度通す。
@@ -306,7 +306,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 
 ## 7. 1 軸ずつ電源 ON で低ゲイン
 
-**24V を入れる前に**: 座席に人がいない、機構の可動範囲に物も人もない、物理非常停止に手が届く、§6 が通っている、`max_gain = 0.15`、印の位置が §5.1 の基準と合っている。
+**24V を入れる前に**: 座席に人がいない、機構の可動範囲に物も人もない、物理非常停止に手が届く、§6 が通っている、`[limits]` を低い値（`max_gain 0.15`、`max_vel 600`、`max_acc 2000`、`duty_max 20`、`duty_min 7`。limits.md §4）にしてある、印の位置が §5.1 の基準と合っている。
 
 制約: 主電源は軸 1 の G2 が共通に入れるので、**24V を入れると 3 軸とも通電する**（safety.md「主電源リレーのインターロック」）。また、サーバーは 3 軸そろわないと ARM せず、24V の無い軸は目標が動く（中立まで数十 count 以上離れている）と `ENCODER_FAULT` になる（§6.3）ので、「2 軸を電気的に切り離して 1 軸だけ動かす」は ARM / HOLDING の確認にしか使えない。動かす確認は **3 軸とも通電したまま、Pose の選び方で 1 軸ずつ動かす**:
 
@@ -333,19 +333,20 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 4. 送信停止。`0 0 -1 0.05` で反対へ。
 5. 同様に `1 1 0 0.05`（#1 だけ、roll + pitch = 2 なので約 +250 count）、`-1 1 0 0.05`（#2 だけ）。それぞれ **上がったか下がったか** を記録。
 6. ゲームの意図（`pitch +` で前が上がるのか、`roll +` で右が上がるのか、`yaw +` で右へ向くのか）と比べ、逆な軸は §5.3 の方法で `count_at_virtual_0 / 1023` を入れ替える → サーバー再起動 → §5.1 → この節をやり直す。
-7. 1 軸ずつ通ったら gain 0.10、0.15 で同じ Pose。`max_gain` 0.15 を超える値は `effective_gain` が 0.15 に制限される（`limits` に `gain_limited`）。
-8. 各回、status の `following_error_count`（動作中に 300 を超えると FAULT）、`velocity_count_s`（600 以下）、`telemetry.tick_dt_ms.p99`（10 ms 前後）を控える。
+7. 1 軸ずつ通ったら gain 0.10、0.15 で同じ Pose。`max_gain`（0.15 にしてある）を超える値は `effective_gain` が 0.15 に制限される（`limits` に `gain_limited`）。
+8. 各回、status の `following_error_count`（`following_error_limit_count` に近づくと FAULT）、`velocity_count_s`（`max_vel_count_s` 以下）、`telemetry.tick_dt_ms.p99`（10 ms 前後）を控える。
+9. 向きが 3 軸とも合ったら、limits.md §4 の手順で `duty_min` → 速度・加速度 → Duty 上限の順に上げる（試験ページの「動きの制限」か `POST /v1/limits`。サーバーを再起動せずに変えられる）。
 
 ### 7.3 `/v1/center`
 
-HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center` → `active_source = "center"`、3 軸が `count_at_virtual_512` へ `max_vel × 0.25` = 150 count/s で動き、到達で CONTROLLED_STOP → HOLDING。1 軸ずつ動かした後に中立へ戻す手段として使う。
+HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center` → `active_source = "center"`、3 軸が `count_at_virtual_512` へ `max_vel × center_speed_fraction`（0.25。`max_vel` 600 なら 150 count/s）で動き、到達で CONTROLLED_STOP → HOLDING。1 軸ずつ動かした後に中立へ戻す手段として使う。
 
 ## 8. 3 軸
 
 1. §7 の向きが 3 軸とも確定していること。`bringup_pose.py` で複合の Pose（`1 0 0`、`0 1 0`、`1 1 1`、gain 0.10）を 1 つずつ、ARM → START → 送信停止。3 軸が同時に動き始め・同時に止まること（`telemetry.frame_skew` が 5 未満。超えると `frame_skew` で FAULT）。
 2. ゲームをつなぐ（`clients/h3game/README.md`「server モードでの運転の流れ」）: サーバーはそのまま、`H3_BACKEND=server python3 bridge.py`、Chrome で `http://localhost:8891`。接続しただけでは動かない。ゲームの Pose が届いていることを status の `session.fresh = true` で見てから `/v1/arm` → `/v1/start`。画面のスライダーの gain は `max_gain` で頭打ち。
 3. 止める: `curl -sX POST $URL/v1/stop`（トークン不要）か画面を閉じる・隠す（`frame_seq` が止まり 250 ms で STOPPING）。どちらもその場で保持 → ブレーキ。
-4. 停止距離・揺れ・保持の様子を見て、`timing` と `max_vel / max_acc` を決める材料にする。ここで決めた値は模擬軸の結果に基づかない実測として §9 に残す。
+4. 停止距離・揺れ・保持の様子を見て、`timing` と `[limits]`（limits.md §4）を決める材料にする。ここで決めた値は模擬軸の結果に基づかない実測として §9 に残す。
 5. 有人運転の可否はここでは判断しない（README「安全上の注意」）。
 
 ## 9. 記録
@@ -388,7 +389,7 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 | `fault.kind = "arm_timeout"`（ArmTimeout） | ARM 開始から 5 s 以内に全軸 HOLDING にならなかった | `GET /v1/events` で、どの軸がどこで止まったか（`ack_rejected`、`ack_timeout`、`ARMING` のまま）。ARM_PREPARE の `REJECTED` 理由: `NOT_CONFIGURED` / `NOT_REFERENCED` / `EPOCH_MISMATCH` / `BAD_STATE`（範囲外）。ACK はあるが HOLDING にならない → ファームの ARMING シーケンス（電源 300 ms + ブレーキ 300 ms で 1 s 以内のはず） |
 | `fault_code = COMMAND_TIMEOUT` | 100 ms 以上 SET_POSITION が届かなかった。動いていれば減速してから FAULT | PC 側の停止（スリープ、サーバー停止、USB 抜け）。`telemetry.tick_dt_ms.max` が 100 を超えていないか。ノート PC のスリープ設定（§0）。系統を駆動中に切り替えた個体もこれで止まる（protocol.md §1.1） |
 | `fault_code = FOLLOWING_ERROR` が **動き始めた直後・向きが逆** | 位置ループの向きが逆で、目標から離れる方向に駆動している（誤差が急増して 300 を超える） | **24V を切る。** NVS の `sign` と実際の向きが食い違っている（`sign` は従来 env の CAL が判定して保存。校正したスロットと `motor=` が違うと起きうる、§1.2 の `OK motor=`）。従来 env で `?` の `sign=` を確かめ、必要なら `UNCAL` → `CAL`。bringup.toml の `count_at_virtual_*` の入れ替えでは直らない（それは PC 側の仮想→count の向きで、MCU の駆動の向きではない） |
-| `fault_code = FOLLOWING_ERROR` が **移動中・徐々に** | 位置ループが目標に追いつけない（速度フィードフォワード 100 count/s あたり 1 %、KP 2 %/100 count、Duty 上限 20 % は仮値） | `following_error_limit_count`（400）を上げる前に `max_vel_count_s` を下げる（600 → 300）。重力軸（#1 / #2）の上昇で出やすい（2026-10-31 の実測: #2 の持ち上げは 8 % 台で 200 count/s 未満に落ちる。9 % 以上なら沈む側と同程度）。恒常的に出るなら `V1_FF_COUNT_S_PER_PERCENT` を 100 → 80 に（1 % あたりの速度を小さく見積もる＝同じ速度に多めの Duty） |
+| `fault_code = FOLLOWING_ERROR` が **移動中・徐々に** | 位置ループが目標に追いつけない（速度フィードフォワード 100 count/s あたり 1 %、KP 2 %/100 count、Duty 上限はすべて仮値。`[limits]`） | `following_error_limit_count` を上げる前に `max_vel_count_s` を下げる（`POST /v1/limits` で再起動なしに変えられる）。重力軸（#1 / #2）の上昇で出やすい（2026-10-31 の実測: #2 の持ち上げは 8 % 台で 200 count/s 未満に落ちる。9 % 以上なら沈む側と同程度）。恒常的に出るなら `[limits].ff_count_s_per_percent` を 100 → 80 に（1 % あたりの速度を小さく見積もる＝同じ速度に多めの Duty）。limits.md §5 |
 | `fault_code = OVERSPEED` | 100 ms 窓の速度が 2000 count/s 超（Duty 上限 20 % ≈ 1900 count/s、15 % で 1300〜1460 の実測） | 重力で落ちた（ブレーキ解除で保持できていない）か、カウントのノイズ。24V を切って機構を支持、§5.4 |
 | `fault_code = SOFT_LIMIT` | 位置制御中に実位置がソフトリミットを外れた（ARMING 中はブレーキを解除せず FAULT） | 基準の誤り（§5.1）か、追従できずに流れた。FAULT_RESET は範囲外でも通るが、ARM は `position_outside_soft_limits` で止まる → §5.4 |
 | `fault_code = ENCODER_FAULT` | ブレーキ解除指令中に目標（軌道）が動いている間、Duty ≥ 10 % が 200 ms 続いてカウントが変わらない（目標が止まっているときの静止・DISARMING 中・下限 7 % の押し当てでは判定しない） | 24V が来ていない（§6.3 では期待どおり）、エンコーダのケーブル・GND 共通、レベル変換。`fault/reset` は通る（v1 ファームはこれを「残る原因」にしない）が、解除で `POSITION_REFERENCED` が消えるので §5.1 をやり直す |

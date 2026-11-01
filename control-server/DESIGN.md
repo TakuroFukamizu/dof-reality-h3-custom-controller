@@ -26,7 +26,8 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `protocol` (`cobs`, `frame`, `mod`) | 純粋 | USB v1 のエンコード・デコード、ストリーム再同期 |
 | `config` | 純粋 | TOML スキーマ（済）と `validate()` |
 | `compat` | 純粋 | h3game-v1 の Pose 検査・gain 制限・混合式・飽和、旧 `H3` の送信値モデル（参照用） |
-| `calibration` | 純粋 | 3 点区分線形の virtual→count、ソフトリミット、検証、ハッシュ |
+| `calibration` | 純粋 | 3 点区分線形の virtual→count、ソフトリミット、検証、ハッシュ（幾何だけ） |
+| `limits` | 純粋 | 動きの制限値の 2 段（docs/control-server/limits.md）: 実行時に変わる 4 つ（gain・速度・加速度・Duty 上限）、ファーム申告の絶対上限と `overspeed / 1.5` から作る上限、`clamp`（WS の ack と supervisor が同じ関数を使う）、SET_LIMITS の中身、API と制御ループが共有する要求値 |
 | `sim_axis` | 純粋＋非同期 | **MCU 側の参照モデル**。protocol §5 の状態機械・期限・epoch/seq 検査・ACK・STATUS を実装し、簡単な位置追従プラントを持つ。異常注入可。CoreS3 ファームはこの挙動に合わせる |
 | `planner` | 純粋 | 100Hz の 3 軸目標生成。速度制限は 3 軸一様スケール、加速度制限、停止（減速）モード |
 | `session` | 純粋 | 駆動クライアントのセッション（単一所有）、Pose 受理判定と鮮度 |
@@ -135,7 +136,9 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | API | 認証 | 内容 |
 | --- | --- | --- |
 | `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
-| `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.35, "source_freshness_ms": 250, "require_frame_seq": true}` |
+| `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.5, "source_freshness_ms": 250, "require_frame_seq": true}`。動きの制限値を `[limits]` の初期値に戻す（`max_gain` はその値） |
+| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"limited":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。limits.md §3.2） |
+| `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
 | `GET /v1/motion[?session=<id>]`（WS） | なし | §7.1。`session` は省略可（各メッセージの `source_session` で判定）。指定した場合は別セッション名のメッセージも `stale_session` |
 | `GET /v1/status` | なし | StatusSnapshot（§7.2） |
 | `GET /v1/events[?n=&after=]` | なし（loopback だけ） | 制御ループのイベントリング（障害前後の経過）。§7.3 |
@@ -173,16 +176,20 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 {"type":"pose","protocol":1,"source_session":"...","seq":1250,"frame_seq":2408,"source_age_ms":3.0,
  "pitch":0.3,"roll":-0.2,"yaw":0.0,"gain":0.35}
 {"type":"gain","protocol":1,"source_session":"...","seq":1251,"gain":0.3}
+{"type":"limits","protocol":1,"source_session":"...","seq":1252,"max_gain":0.8,"max_vel_count_s":7000}
 ```
 
 サーバー → クライアント:
 
 ```json
 {"type":"ack","seq":1250,"accepted":true,"reason":null,"effective_gain":0.35,"limits":["pose_clamped"],"fresh":true}
+{"type":"ack","seq":1252,"accepted":true,"reason":null,"effective_gain":0.8,"limits":["ceiling_clamped"],"fresh":true,
+ "effective_limits":{"max_gain":0.8,"max_vel_count_s":6000,"max_acc_count_s2":15000,"duty_max_percent":40}}
 {"type":"status", ...StatusSnapshot}
 ```
 
 - ack は受理・拒否どちらも返す。拒否理由: `stale_session` / `old_seq` / `old_frame` / `non_finite` / `out_of_range` / `invalid_age` / `missing_frame_seq` / `bad_protocol` / `bad_message` / `axis_conflict`（§10。pose・gain とも拒否し、鮮度も更新しない）。
+- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
 - status は `status_period_ms` ごと。WS 自体は駆動権限を与えない。
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 
@@ -202,6 +209,9 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
   "blockers": [],
   "session": {"source_session_prefix": "8b69173f", "fresh": false, "freshness_mode": "frame_seq", "source_age_ms": null, "last_seq": 0, "last_frame_seq": null},
   "requested_pose": null, "requested_gain": null, "effective_gain": null, "limits": [],
+  "motion_limits": {"effective": {"max_gain": 0.5, "max_vel_count_s": 3000, "max_acc_count_s2": 15000, "duty_max_percent": 40},
+                    "requested": {...}, "ceiling": {"max_gain": 1.0, "max_vel_count_s": 6000, "max_acc_count_s2": 40000, "duty_max_percent": 60},
+                    "defaults": {...}, "limited": []},
   "virtual_targets": [512.0, 512.0, 512.0],
   "target_counts": [0, 0, 0],
   "session_epoch": 3,
@@ -258,13 +268,14 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 - 表示: `GET /v1/status` を 200 ms ごとに読み、`rig_state`・`blockers`・`fault`・`axis_conflict`・3 系統の表（接続 / port / device_id / expected / assignment / claimants / mcu_state / fault_code / flags（P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller）/ actual / target / velocity / following_error / pwm / status_age / reference_stale）。`GET /v1/events?n=50` を 1 秒ごとに読んで末尾を出す。HTTP の応答本文（エラーを含む）はすべてログ欄に出す。
 - 操作: 管理トークン欄（`sessionStorage` にだけ置く。タブを閉じると消える）、session 発行、ARM、START、**STOP（大きい赤、トークン不要）**、DISARM、CENTER、FAULT、FAULT RESET、軸ごとの REFERENCE（count 入力、既定 0、確認ダイアログ）、校正（3 軸）（確認ダイアログ: **機構が両端まで動く**）、校正を中止、校正結果を設定に書き出す（応答の path と各軸の値を表示）。3 系統の表に校正列（CALIBRATING か最後の CAL_RESULT）。読み込んだだけでは何もしない（自動で session を発行・ARM・送信しない）。
-- 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
+- 動きの制限（limits.md §3.4）: `max_gain` / `max_vel` / `max_acc` / `duty_max` のスライダー（上限は status の `motion_limits.ceiling`）と「制限を送る」「設定の初期値に戻す」。WS の `limits` で送る（姿勢送信中だけ）。limits の ack は姿勢の ack と別に表示。
+- 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答と status の `motion_limits.effective.max_gain` から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
 - Origin: ブラウザーは同一 origin でも POST と WS に `Origin` を付けるので、`check_origin` は `allowed_origins` に加えて「**自分自身の origin**」を通す: `Origin` が `http://<Host ヘッダー>` と一致（大文字小文字を無視、末尾のスラッシュなし）し、かつ Host のホスト名が `localhost` または loopback の IP リテラル（`127.0.0.1`、`[::1]`、`127.x.y.z`）であること（`api::same_origin_loopback`）。loopback の条件が DNS リバインディングを塞ぐ（`Host: evil.example:8892` に `Origin: http://evil.example:8892` を付けても 403。攻撃者のページは Host をサーバーの名前にしながら Origin を自分の origin にせざるを得ないので一致しない）。他の origin の扱い、`Origin` 無し（curl・Python クライアント）の扱い、`max_body_bytes`・rate limit は変わらない。
 - LAN: `GET /` は `lan_allowed` に入れない（ページは管理トークンを扱う。トークンは LAN を通らない）。`allow_non_loopback` のときも loopback 以外からは 403 `loopback_only`。
 
 ## 8. Python クライアントと h3game アダプター
 
-- `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。
+- `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `submit_limits(max_gain=, max_vel_count_s=, max_acc_count_s2=, duty_max_percent=)`（省略可、pose より先に送る、`last_limits_ack`）, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。
 - `clients/h3game/`: h3game リポジトリ（`TakuroFukamizu/20261004_shi3z_hackathon`）への小さいパッチと、bridge 用のバックエンド層 `h3_server_backend.py`。`H3_BACKEND=legacy|server|dry`（既定 legacy＝現状どおり）。server では旧 USB を開かず、60Hz 再送・1 秒で中央へ戻す処理・auto_sway を無効にし、POST の Pose をクライアントへ渡すだけ。`/state` の既存キーを残し、`backend`, `rig_state`, `armed`, `calibration_valid`, `fault` を追加。`index.html` は frame_seq と frame 経過時間を POST に追加する数行の変更。シーン（scene*.js）は変更しない。
 - パッチは h3game リポジトリへは push しない。`clients/h3game/patches/` に置き、適用手順を README に書く。
 

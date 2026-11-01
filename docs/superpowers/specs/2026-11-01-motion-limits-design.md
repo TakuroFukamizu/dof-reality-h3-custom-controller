@@ -107,7 +107,7 @@ SET_LIMITS / LIMITS に対応するファーム。PC は立っていない軸を
 | オフセット | 型 | 名前 | 内容 |
 | ---: | --- | --- | --- |
 | 0 | u32 | request_id | |
-| 4 | u8 | duty_max_percent | 1〜100。絶対上限を超える値はクランプ |
+| 4 | u8 | duty_max_percent | 0 は INVALID_PARAM。それ以外は絶対上限でクランプ（100 超も拒否せずクランプ。PC の API 側で 1〜100 に検査する） |
 | 5 | u8 | duty_min_percent | 0〜duty_max |
 | 6 | u8 | kp_percent_per_100 | |
 | 7 | u8 | reserved | 0 |
@@ -189,7 +189,7 @@ WS `/v1/motion`（ゲーム用。トークン不要）:
 ```
 
 - 4 項目はどれも省略可（書いた項目だけ変える）。`seq` と `source_session` の規則は pose と同じ。鮮度は延長しない。
-- ack: `{"type":"ack","seq":1252,"accepted":true,"effective_limits":{...4 項目...},"limits":["ceiling_clamped"],"fresh":...}`。非有限・負・0（gain 以外）は `out_of_range`（gain の負は 0 に丸めて `gain_negative`、既存と同じ）。
+- ack: `{"type":"ack","seq":1252,"accepted":true,"effective_gain":<新しい gain の上限>,"effective_limits":{...4 項目...},"limits":["ceiling_clamped"],"fresh":...}`。非有限は `non_finite`、`max_gain < 0`・速度と加速度の 0 以下・`duty_max_percent` の 1〜100 の外は `out_of_range`（実装で決めた: 制限値の要求に「負の gain を 0 に丸める」互換は要らない）。`seq` は受理したときだけ消費する。
 - 競合中（`axis_conflict`）は pose / gain と同じく拒否。
 
 REST:
