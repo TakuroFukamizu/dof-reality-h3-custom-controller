@@ -10,6 +10,7 @@
 | [protocol.md](protocol.md) | PC ⇄ CoreS3 の USB プロトコル v1（規範。CoreS3 ファームはこれに合わせる） |
 | [testing.md](testing.md) | 試験の一覧・未試験の範囲・最新の結果 |
 | [hardware-bringup.md](hardware-bringup.md) | 実機 bring-up 手順（CoreS3 ×3 を初めてつないで 3 軸を動かすまで。設定は `control-server/config/bringup.toml`） |
+| [game-integration.md](game-integration.md) | ゲーム（h3game）実装者向けの入口。実機なしで動かす手順、ゲームがやること・やらないこと、画面に出す状態、変えてはいけないこと |
 | [`control-server/DESIGN.md`](../../control-server/DESIGN.md) | 実装設計（API・状態機械・JSON の形） |
 | [`clients/python/README.md`](../../clients/python/README.md) | Game API の Python クライアント |
 | [`clients/h3game/README.md`](../../clients/h3game/README.md) | h3game へのパッチと bridge 用バックエンド層 |
