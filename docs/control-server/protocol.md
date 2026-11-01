@@ -33,6 +33,16 @@ PC 側の規則（詳細は `control-server/DESIGN.md` §10）:
 - ARMING〜STOPPING の間に担当軸の `selected_axis` が変わったら PC はリグを FAULT にし、接続中の他の軸へ HOST_FAULT を送る（切り替え先の系統を担当していた個体にも、競合で外す前に HOST_FAULT を届けて ACK を待つ）。**切り替えた個体自身には届かない**（競合中・未割当のポートには PC は何も送らない）ので、その個体は lease 切れ（COMMAND_TIMEOUT）で止まる。MCU 側の「DISARMED のときだけ切り替える」規則が最後の砦。駆動中に同じ系統を選んだ 2 台目が現れたら、減速停止 → DISARM してから競合扱いにする。
 - 同じ boot のまま系統が変わった個体には、PC 自身が SET_REFERENCE を送り直すまで ARM しない（`reference_stale`。ファームが `POSITION_REFERENCED` を消し忘れても古い基準で動かさない）。
 
+### 1.2 校正（端当てで行程を測る。MCU 主導、PC が開始する）
+
+行程（P 端・N 端）と中立の実測は、従来 env で実機確認済みの端当て（`moter-controler/include/auto_move.h`: P 端当て → 退避 → N 端当て → 保存 → 中立。無パルス・遅すぎ・移動量・時間の守り付き）を **v1 でも MCU が自分で行う**。PC は CALIBRATE（`0x0C`、§4）で開始・中止を指示し、結果を CAL_RESULT（`0x87`）で受ける。
+
+- 受理は **DISARMED のときだけ**（CONFIGURED・REFERENCED は不要）。受理で `mcu_state = CALIBRATING`（8、§3.1）。校正中に ARM_PREPARE / START / CONFIG / SET_REFERENCE は `BAD_STATE`、SET_POSITION は捨てる（数えない）。DISARM は校正の中止（下の終了手順で DISARMED へ。ACCEPTED）。HOST_FAULT は常に FAULT。
+- 手順: 主電源 ON 指令（`role_flags` bit0 の軸だけ）→ `CAL_POWER_SETTLE_MS`（5000。2026-10-31 に電源投入 4 s 後は動かず 12 s 後に動いた記録があるため長め。仮値）→ ブレーキ解除給電 → `BRAKE_RELEASE_WAIT_MS` → 端当て校正 → 終了手順。終了手順は DISARMING と同じ（ブレーキ給電 OFF → `BRAKE_APPLY_WAIT_MS` → PWM 0 → 主電源 OFF 指令）→ CAL_RESULT を 1 回 → STATUS（DISARMED）。
+- 成功したら MCU は **P 端を 0 とする基準を自分で確立**し（`reference_offset = raw_at_P_end`、以後 `actual_count = raw − reference_offset`）、`POSITION_REFERENCED` を立てる。行程・中立・符号を NVS の系統プロファイルに保存する。失敗・中止では `POSITION_REFERENCED` を消す（原点が信用できない）。FAULT にはしない（結果は CAL_RESULT の `result` / `reason`）。
+- CAL_RESULT の座標は `actual_count` と同じ（P 端 = 0。符号は掛けない）。`n_end_count` は N 端の count（系統の符号が +1 なら正、−1 なら負）、`neutral_count` は中立の count（既定は `n_end_count / 2`）。PC はこれから `mechanical_min/max = min/max(0, n_end_count)`、`soft = mechanical ∓ decel_zone`、`count_at_virtual_0 / 512 / 1023 = soft の P 端側 / neutral / soft の N 端側`（仮想位置は P 端 → N 端へ増える約束。向きが逆なら PC の設定で 0 と 1023 を入れ替える）を作る。
+- 主電源を持たない軸は、電源担当軸が同時に校正中（または ARM 中）でなければ 24V が無く、端当ては無パルスで失敗する。PC は校正を **電源担当軸を含む複数軸へ同時に** 指示する（§DESIGN.md §11）。
+
 ## 2. フレーミング
 
 ```text
@@ -68,6 +78,7 @@ frame:         header(4) payload(N) crc(2)
 | 5 | `STOPPING` | CONTROLLED_STOP / 期限切れ等で、速度・加速度制限内で減速して停止中。停止後 `HOLDING`。DISARM による減速なら停止後 `DISARMING`、COMMAND_TIMEOUT による減速なら停止後 `FAULT`（この間 `fault_code ≠ NONE`、§3.2） |
 | 6 | `DISARMING` | ブレーキ給電 OFF → `BRAKE_APPLY_WAIT_MS` → PWM 0 → 主電源 OFF（電源担当軸のみ）→ `DISARMED` |
 | 7 | `FAULT` | 異常ラッチ。PWM 0・ブレーキ作動・主電源 OFF 指令。FAULT_RESET まで解除しない |
+| 8 | `CALIBRATING` | CALIBRATE 受理後、端当て校正の間（§1.2）。MCU 主導。終了で DISARMED |
 
 PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支えている状態。
 
@@ -137,6 +148,7 @@ MCU は PC サーバーの再起動を知らない（USB の再オープンで�
 | `0x09` | CLOCK_SYNC | 0: u32 request_id / 4: u64 pc_time_us | 12 | CLOCK_SYNC_REPLY |
 | `0x0A` | HOST_FAULT | 0: u32 request_id / 4: u16 fault_code / 6: u16 reserved=0 | 8 | ACK（常に ACCEPTED）。どの状態でも即 FAULT ラッチ（PWM 0・ブレーキ作動）。ラッチされるコードは `HOST_FAULT`（既にラッチ済み・減速中の異常コードがあればそれを保つ）。payload の `fault_code` は記録のみ。ACK の後に送る最初の STATUS から `mcu_state = FAULT`、`fault_code ≠ NONE`（PC はこれを確認してから FAULT_RESET の送り先を決める） |
 | `0x0B` | SET_REFERENCE | 0: u32 request_id / 4: i32 reference_count | 8 | ACK。DISARMED のときだけ。現在の計数値を `reference_count` と定義し `POSITION_REFERENCED` を立てる |
+| `0x0C` | CALIBRATE | 0: u32 request_id / 4: u8 mode（1 = 開始、0 = 中止） / 5: u8 reserved=0 / 6: u16 reserved=0 | 8 | ACK。`mode = 1`: DISARMED のときだけ（それ以外 `REJECTED/BAD_STATE`）。受理で CALIBRATING（§1.2）。`mode = 0`: CALIBRATING なら中止して終了手順 → DISARMED、それ以外は何もせず ACCEPTED。`mode` が 0・1 以外は `REJECTED/INVALID_PARAM` |
 
 管理命令の共通規則（ACK を返す命令。MCU はこの順に処理する）:
 
@@ -171,6 +183,7 @@ SET_POSITION の規則:
 | `0x84` | FAULT_EVENT | 0: u32 boot_id / 4: u64 mcu_time_us / 12: u16 fault_code / 14: u8 mcu_state_before / 15: u8 reserved=0 / 16: i32 actual_count | 20 |
 | `0x85` | CLOCK_SYNC_REPLY | 0: u32 request_id / 4: u64 pc_time_us（エコー） / 12: u64 mcu_rx_us / 20: u64 mcu_tx_us | 28 |
 | `0x86` | AXIS_SELECT | 0: u32 boot_id / 4: u8 selected_axis（新しい値 1〜3、0 = 未選択） / 5: u8 prev_selected_axis / 6: u8 mcu_state / 7: u8 reserved=0 | 8 |
+| `0x87` | CAL_RESULT | 0: u32 boot_id / 4: u8 result（0 = OK、1 = FAILED、2 = CANCELLED） / 5: u8 step（終了時の段階。0 = なし、1 = P 端へ、2 = N 端へ、3 = 中立へ） / 6: u16 reserved=0 / 8: i32 n_end_count / 12: i32 neutral_count / 16: i8 sign（系統プロファイルの符号 ±1） / 17: u8 reserved=0 / 18: u16 reserved=0 / 20: u8[8] reason（ASCII、NUL 埋め。`ok` / `stall` / `slow` / `travel` / `timeout` / `stop` / `estop` など auto_move の理由） | 28 |
 
 - STATUS は MCU が自発的に 50Hz（20ms）で送る。状態遷移・FAULT 発生時は即時にも送ってよい。ACK との順序は §1（ACK より後の STATUS は遷移後の状態）。
 - STATUS の `target_count` = 位置ループがいま追従している目標（速度・加速度制限を適用済みの軌道上の点）。SET_POSITION で受けた `target_count` そのものではない。HOLDING / STOPPING / DISARMING では保持・減速中の目標。PC は中立への移動（`/v1/center`）の完了を全軸の STATUS `target_count` が中立に達したことで判断し、その後に CONTROLLED_STOP を送る。受けた目標を返すと移動の途中で止められる。
@@ -178,6 +191,7 @@ SET_POSITION の規則:
 - FAULT_EVENT は FAULT へ遷移するたびに 1 回送る（原因を問わない。HOST_FAULT・ARMING 中の SOFT_LIMIT も含む）。既に FAULT のときは送らない。`mcu_state_before` は遷移直前の状態。PC は FAULT_EVENT と STATUS のどちらでも異常をラッチする。
 - `actual_count` / `target_count` は `SET_REFERENCE` 適用後の座標。基準未確立なら起動時 0 からの相対値で、`POSITION_REFERENCED` = 0。
 - `boot_id` が変わったら PC はその軸の校正状態を無効化し、再 ARM を要求する。
+- CAL_RESULT は校正が終わる（成功・失敗・中止）たびに 1 回、終了手順の後・DISARMED を示す STATUS の前に送る（§1.2）。
 - AXIS_SELECT は系統を切り替えたとき（DISARMED のときだけ、§1.1）に 1 回送る。ACK はない。`prev_selected_axis` は切り替え前の値。PC は AXIS_SELECT、または STATUS / HELLO の `selected_axis` の変化のどれでも割当を変える。ただし STATUS の 0 では割当を変えない（旧ファームの reserved=0 と区別できない。§1.1）。
 
 ## 5. 状態遷移（MCU）
@@ -190,6 +204,7 @@ ACTIVE --CONTROLLED_STOP / 期限切れ(valid_for_ms)--> STOPPING --(停止確�
 ARMING / HOLDING --DISARM--> DISARMING → DISARMED
 ACTIVE / STOPPING --DISARM--> (減速停止) → DISARMING → DISARMED
 任意 --異常 / HOST_FAULT / command_timeout--> FAULT --FAULT_RESET(原因なし)--> DISARMED
+DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中止、DISARM)--> DISARMED   （§1.2）
 ```
 
 - 停止確認 = 軌道（STATUS の `target_count`）の速度が 0 になったこと。

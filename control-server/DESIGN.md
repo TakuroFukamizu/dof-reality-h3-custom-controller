@@ -304,3 +304,13 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `SimParams.selected_axis`。`SimMcu::select_axis(new, now_us) -> Vec<McuMsg>`: DISARMED 以外では何もしない（`select_axis_unchecked` はテスト用に規則違反を起こす）。切り替えで CONFIGURED / POSITION_REFERENCED / calibration_hash を消し、AXIS_SELECT を返し、以後の STATUS / HELLO に新しい値を載せる。`SimHandle::select_axis` / `select_axis_unchecked`。規則違反（DISARMED 以外）の切り替えでは制限値と lease を保つ（POSITION_REFERENCED だけ消す）ので、PC が書かなくなった個体は COMMAND_TIMEOUT で FAULT になる（protocol.md §1.1 の要求。`tests/server.rs` で確認）。
 - `[backend] kind = "sim"` に `report_selected_axis = true`（既定 true）。true なら各模擬軸の `selected_axis` = その軸番号（割当は選択で決まり、`device_id` は照合に使われる）。false なら 0（設定の `device_id` だけで決まる旧経路の試験用）。模擬軸の device_id は設定値、設定が 0（照合なし）なら `5131000000000000 + 軸番号`（個体は必ず device_id を持つ）。
 - server.rs の「primary でないポートの Status / Ack / FaultEvent を捨てる」判定は `Supervisor::axis_port` のままでよい（競合中は `None` なので全部落ちる）。`Disconnected` が primary 以外から来たら `PortClosed` に変換する既存処理で claimants から外す。
+
+## 11. 校正（protocol.md §1.2）
+
+- `AdminCmd::Calibrate{axes}`（`POST /v1/calibrate {"axes":[1,2,3]}`、省略 = 全軸）: 駆動していない（Idle / Fault 以外は `not_disarmed`）、対象の軸がすべて接続・DISARMED、**電源担当軸（`power_controller_axis`）を含む**（含まなければ `power_axis_required`）。各軸へ CALIBRATE(mode 1) を送り ACK を待つ。`AdminCmd::CalibrateCancel`（`POST /v1/calibrate/cancel`）: CALIBRATING の軸へ CALIBRATE(mode 0)。`Stop` は校正中も受理し、CALIBRATE(0) を送る。
+- 校正中（どれかの軸が `CALIBRATING`）: RigState は `CALIBRATION_REQUIRED` のまま、blockers に `calibrating: axisN`。`Arm` / `Start` / `Center` / `Reference` は `calibrating`。
+- `McuState::Calibrating = 8` を追加。CALIBRATING の軸へは SET_POSITION を送らない。STATUS 途絶・切断の扱いは DISARMED と同じ（FAULT にしない）。
+- CAL_RESULT: `AxisSnapshot.calibration = {result, step, n_end_count, neutral_count, sign, reason, boot_id, received_at}`（この boot の最新）。イベント `cal_result`。成功した軸は MCU が自分で基準を確立するので `referenced = true` になる（PC は SET_REFERENCE を送らない）。
+- `POST /v1/calibration/export`（token）: 結果のある軸の値から設定を作り、サーバーの設定ファイルと同じディレクトリに `<rig_id>.calibration-<YYYYmmdd-HHMMSS>.toml` を書く（現在の設定の複製に `mechanical_* / soft_* / count_at_virtual_*` を結果から置き換え、`device_id` を接続中の個体で埋め、`calibration_valid` は **false のまま**、先頭に測定日時と元の値をコメントで残す）。応答に path と各軸の値。結果が無い軸はそのまま。上書きしない（同名があれば 409）。
+- sim: `SimParams.end_min_count / end_max_count`（模擬機構の端、既定 −3000 / 3000）。CALIBRATE で端まで動かして CAL_RESULT を返し、P 端 = 0 に基準を取る。`select_axis` と同じく DISARMED だけ。
+- テストページ: 「校正（3 軸）」（確認ダイアログ。**機構が端まで動く**）、軸ごとの進行（CALIBRATING / 結果）、「中止」、「設定に書き出す」（path を表示）。
