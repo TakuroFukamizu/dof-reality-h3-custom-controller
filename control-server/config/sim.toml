@@ -31,6 +31,7 @@ arm_timeout_ms = 5000
 stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 5
+center_reach_timeout_ms = 5000
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 
@@ -40,6 +41,7 @@ clamp_out_of_range = true
 virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25
+center_tolerance_count = 50
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証の見積もり
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）。

@@ -72,9 +72,13 @@
 //! - `stop_settle_timeout_ms` bounds the deceleration, the post-center settle
 //!   and the wait for DISARMED; `arm_timeout_ms` bounds ARMING and START
 //!   confirmation.
-//! - Center is complete when the planner is at neutral with zero velocity and
+//! - Center is complete when the planner is at neutral with zero velocity,
 //!   every axis's STATUS.target_count (MCU setpoint) is within
-//!   [`CENTER_TOLERANCE_COUNT`] of neutral.
+//!   [`CENTER_TOLERANCE_COUNT`] of neutral, AND every axis's measured
+//!   STATUS.actual_count is within `game.center_tolerance_count` of neutral.
+//!   If the measured positions have not caught up `timing.center_reach_timeout_ms`
+//!   after the setpoints did, the rig latches `StopTimeout` ("center: axisN …")
+//!   rather than reporting `center_reached` with an axis still short.
 //!
 //! # End-stop calibration (DESIGN.md §11, protocol §1.2)
 //!
@@ -669,6 +673,11 @@ pub struct Supervisor {
     phase: Phase,
     planner: Planner,
     planner_settled: bool,
+    /// Center: when the planner (and every MCU setpoint) first reached neutral.
+    /// `center_reached` additionally needs every MEASURED position within
+    /// `game.center_tolerance_count`; past `timing.center_reach_timeout_ms` the
+    /// rig faults instead (2026-11-01: an axis was 280 counts short).
+    center_commanded_at: Option<Instant>,
 
     epoch: u32,
     next_request_id: u32,
@@ -745,6 +754,7 @@ impl Supervisor {
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             planner_settled: false,
+            center_commanded_at: None,
             epoch: nonzero(session_epoch),
             next_request_id: nonzero(request_id),
             seq: [0; AXIS_COUNT],
@@ -1153,20 +1163,52 @@ impl Supervisor {
                 drive_limits = out.limits.clone();
                 // Planner at neutral and every MCU setpoint (STATUS.target_count)
                 // caught up, so CONTROLLED_STOP does not cut the move short.
-                let reached = (0..AXIS_COUNT).all(|i| {
+                let commanded = (0..AXIS_COUNT).all(|i| {
                     (out.positions[i] - targets[i]).abs() <= CENTER_TOLERANCE_COUNT
                         && out.velocities[i] == 0.0
                         && self.axes[i].status.is_some_and(|s| {
                             (f64::from(s.target_count) - targets[i]).abs() <= CENTER_TOLERANCE_COUNT
                         })
                 });
-                if reached {
-                    self.event(now, "center_reached", serde_json::json!({}));
-                    self.send_group_stop(stop_reason::CENTER_REACHED, now);
-                    self.phase = Phase::Holding {
-                        start: None,
-                        settling: Some(now),
-                    };
+                if !commanded {
+                    self.center_commanded_at = None;
+                } else {
+                    let since = *self.center_commanded_at.get_or_insert(now);
+                    // The setpoint being at neutral says nothing about the load:
+                    // a gravity-loaded axis can sit hundreds of counts short with
+                    // the position loop saturated at duty_min. Judge on the
+                    // MEASURED position, and fault rather than wait forever.
+                    let tol = f64::from(self.game.center_tolerance_count);
+                    let lagging = (0..AXIS_COUNT).find_map(|i| {
+                        let s = self.axes[i].status?;
+                        let err = f64::from(s.actual_count) - targets[i];
+                        (err.abs() > tol).then_some((i, s.actual_count, err))
+                    });
+                    match lagging {
+                        None => {
+                            self.center_commanded_at = None;
+                            self.event(now, "center_reached", serde_json::json!({}));
+                            self.send_group_stop(stop_reason::CENTER_REACHED, now);
+                            self.phase = Phase::Holding {
+                                start: None,
+                                settling: Some(now),
+                            };
+                        }
+                        Some((i, actual, err)) => {
+                            if elapsed(now, since) > ms(self.timing.center_reach_timeout_ms) {
+                                let note = format!(
+                                    "center: axis{} actual {} is {:+.0} counts from neutral {:.0} (tolerance {}) after {} ms",
+                                    i + 1,
+                                    actual,
+                                    err,
+                                    targets[i],
+                                    self.game.center_tolerance_count,
+                                    self.timing.center_reach_timeout_ms
+                                );
+                                self.latch(RigFault::StopTimeout, Some(note), now);
+                            }
+                        }
+                    }
                 }
             }
             Phase::Holding { .. } => self.planner.hold(),
@@ -2146,6 +2188,7 @@ impl Supervisor {
         self.seq = [0; AXIS_COUNT];
         self.planner.clear();
         self.planner_settled = false;
+        self.center_commanded_at = None;
         self.begin_group(Purpose::ArmConfig, [true; AXIS_COUNT]);
         for i in 0..AXIS_COUNT {
             self.send_config(i, Purpose::ArmConfig, now);
@@ -2578,6 +2621,7 @@ impl Supervisor {
         self.event(now, "stopping", serde_json::json!({"reason": reason}));
         self.send_group_stop(reason, now);
         self.planner_settled = false;
+        self.center_commanded_at = None;
         self.phase = Phase::Stopping {
             sub: StopSub::Decel,
             started: now,
@@ -2654,6 +2698,7 @@ impl Supervisor {
         self.group = None;
         self.planner.clear();
         self.planner_settled = false;
+        self.center_commanded_at = None;
         for i in 0..AXIS_COUNT {
             self.axes[i].host_fault_req = None;
             self.axes[i].host_fault_ack_ev = None;
