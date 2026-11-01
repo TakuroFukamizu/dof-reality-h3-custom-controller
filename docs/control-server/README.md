@@ -93,7 +93,7 @@ control-server/scripts/e2e_sim.sh --out /tmp/e2e  # 記録先を変える
 | `control-server/config/sim.toml` | 模擬軸用。`calibration_valid = true` は模擬軸だから許される。実機の設定にコピーしない |
 
 - 校正・符号・ソフトリミットの変更は DISARMED のときだけ（サーバー再起動で反映）。軸 2・3 の値は未測定の仮値。軸 1 の値をコピーしない（architecture.md §6）。
-- 動きの制限値（gain・速度・加速度・Duty・位置ループの調整値・保護の判定値）は `[limits]` に 3 軸共通で 1 組（`schema_version = 2`。旧ファイルの `[game].max_gain` と `[[axis]]` の `max_vel_count_s` などは読み込みで失敗する）。最初の 4 つは初期値で、実行時にゲーム（WS `limits`）と管理者（`POST /v1/limits`）が変えられ、ファームの絶対上限で頭打ちになる。`POST /v1/session` で初期値に戻る。[limits.md](limits.md)。
+- 動きの制限値（gain・速度・加速度・Duty・位置ループの調整値・保護の判定値）は `[limits]` に 3 軸共通で 1 組（`schema_version = 2`。旧ファイルの `[game].max_gain` と `[[axis]]` の `max_vel_count_s` などは読み込みで失敗する）。最初の 4 つは初期値で、実行時にゲーム（WS `limits`。初期値まで、下げるだけ）と管理者（`POST /v1/limits`。ファームの絶対上限まで）が変えられる。`POST /v1/session` で初期値に戻る。[limits.md](limits.md)。
 - 実機で使う前に: 各 CoreS3 で担当する系統（軸 1〜3）を選択する（電源ボタン操作、NVS に保存。protocol.md §1.1）。未選択のまま PC に挿した個体（設定の `device_id` にも無いもの）は `unknown_device` でポートを閉じられるので、選択してから **USB を抜き差しする**（PC は装置が消えるまでそのポートを開き直さない）→ 必要なら status の `axes[].device_id` を見て `[[axis]].device_id` に記入する（「この軸はこの個体のはず」という照合。0 なら照合しない。違う個体が選ばれていれば `axis_device_mismatch` で ARM しない）→ 校正値を実測 → `calibration_valid = true` は人が確認してから。
 - 軸の割当は MCU 側の選択で決まる。同じ系統を 2 台が選んでいると `axis_conflict`（その軸は OFFLINE、ARM・START・ゲーム入力を拒否）。片方を別の系統にするか抜けば解消する。同じ boot のまま系統を変えた個体は `reference_stale`（`/v1/reference` をやり直すまで ARM しない）。
 - bind は既定で loopback だけ。`server.allow_non_loopback = true` でも LAN の相手に開くのは `GET /v1/status` と `POST /v1/stop` だけ。
@@ -124,7 +124,7 @@ curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 
 curl -sX POST -H "$AUTH" $URL/v1/calibrate          # 端当て校正（機構が両端まで動く！）。全軸 DISARMED・電源担当軸を含む 3 軸。{"axes":[1,2]} で一部（1 を含むこと）
 curl -sX POST -H "$AUTH" $URL/v1/calibrate/cancel   # 校正の中止（CALIBRATE(0)）。/v1/stop でも止まる
 curl -sX POST -H "$AUTH" $URL/v1/calibration/export # OK の結果を設定ファイルの複製に書き出す（下記）
-curl -s $URL/v1/limits | python3 -m json.tool       # 動きの制限値（effective / requested / ceiling / defaults / limited。認証なし・loopback だけ）
+curl -s $URL/v1/limits | python3 -m json.tool       # 動きの制限値（effective / requested / ceiling / defaults / operator_max / game_fields / limited / reasons。認証なし・loopback だけ）
 curl -sX POST -H "$AUTH" -d '{"max_vel_count_s":1500,"duty_max_percent":30}' $URL/v1/limits   # 書いた項目だけ変える。上限で切られた項目は limited に出る（limits.md）
 ```
 

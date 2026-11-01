@@ -35,6 +35,9 @@
 //!   on port order. With `report_selected_axis` (default) it reports
 //!   `selected_axis = N` and the assignment comes from that; with it off it
 //!   reports 0 and only the configured `device_id` maps it (DESIGN.md §10.3).
+//!   Like a serial port, a sim port is reopened [`SERIAL_RETRY`] after its
+//!   link closed (e.g. `status_timeout` after a host sleep), on the same
+//!   simulated unit (state kept); `RunningServer::sims` holds views of them.
 //! - Serial backend: one task per configured port opens it (retry every
 //!   [`SERIAL_RETRY`], never fatal) and forwards the link's events. After an
 //!   unknown device the port is reopened only once it has disappeared from
@@ -54,7 +57,7 @@ use crate::config::{BackendConfig, Config, ConfigError, SerialBackendConfig};
 use crate::protocol::HostMsg;
 use crate::limits::{self as motion_limits, MotionLimits, SharedLimits};
 use crate::session::{AcceptedPose, PoseIntake};
-use crate::sim_axis::{sim_pair, SimHandle, SimParams};
+use crate::sim_axis::{sim_detached, SimHandle, SimParams};
 use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput};
 use crate::telemetry::{lock_events, shared_event_log, Telemetry, TelemetrySummary};
 use crate::types::{AxisId, DeviceId, RigState};
@@ -102,7 +105,8 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 pub struct RunningServer {
     pub local_addr: SocketAddr,
     pub admin_token: String,
-    /// Sim backend only, sorted by axis id (fault injection in tests).
+    /// Sim backend only, sorted by axis id (fault injection in tests): views
+    /// of the simulated units, which the sim port tasks run.
     pub sims: Vec<(AxisId, SimHandle)>,
     status_rx: watch::Receiver<Arc<StatusSnapshot>>,
     shutdown_tx: watch::Sender<bool>,
@@ -190,12 +194,14 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
     let event_log = shared_event_log(Instant::now());
     let (status_tx, status_rx) = watch::channel(Arc::new(sup.snapshot(Instant::now())));
 
-    // Backend.
-    let mut links = Vec::new();
+    // Backend. Every link (sim or serial) reaches the control loop through
+    // `links_tx` from a port task that reopens it when it closes.
+    let links = Vec::new();
     let mut sims = Vec::new();
     let mut port_tasks = Vec::new();
     // One simulated unit for axis `a` on `port` (sim backend, or a serial
-    // backend's `sim_axes`).
+    // backend's `sim_axes`). The model lives in the port task; `sims` keeps
+    // a view of it for inspection / fault injection.
     let mut spawn_sim = |a: &crate::config::AxisConfig, sim: &crate::config::SimBackendConfig, port: String| {
         let boot_id = rand::random::<u32>().max(1);
         let selected_axis = if sim.report_selected_axis { a.axis_id.get() } else { 0 };
@@ -206,9 +212,16 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
         } else {
             a.device_id
         };
-        let (io, handle) = sim_pair(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
-        links.push(axis_link::spawn_link(io, port, cfg.clone(), events_tx.clone()));
-        sims.push((a.axis_id, handle));
+        let handle = sim_detached(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
+        sims.push((a.axis_id, handle.view()));
+        port_tasks.push(tokio::spawn(sim_port_task(
+            port,
+            handle,
+            cfg.clone(),
+            events_tx.clone(),
+            links_tx.clone(),
+            shutdown_rx.clone(),
+        )));
     };
     match &cfg.backend {
         BackendConfig::Sim(sim) => {
@@ -446,7 +459,7 @@ impl ControlLoop {
         }
 
         let dt_s = dt.map_or(self.period, |d| d.min(2 * self.period)).as_secs_f64();
-        self.sup.set_requested_limits(motion_limits::read(&self.limits));
+        self.sup.set_limits_request(motion_limits::read(&self.limits));
         let out = self.sup.tick(now, dt_s, pose.as_ref());
         self.dispatch(out, now);
         self.record_telemetry(now, dt);
@@ -612,6 +625,52 @@ fn route_event(sup: &Supervisor, port: String, ev: LinkEvent) -> Option<LinkEven
         | LinkEvent::CalResult { axis, .. } => is_primary(axis).then_some(ev),
         LinkEvent::Disconnected { axis, .. } if !is_primary(axis) => Some(LinkEvent::PortClosed { port }),
         ev => Some(ev),
+    }
+}
+
+// ------------------------------------------------------------------ sim
+
+/// Run one simulated unit on `port` until shutdown, reopening its link after
+/// it closes — the sim counterpart of [`serial_port_task`] (Issue #15: after a
+/// host sleep every link ends with `status_timeout`; the real ports were
+/// reopened, `sim:N` stayed OFFLINE). The [`SimMcu`](crate::sim_axis::SimMcu)
+/// is kept: same boot_id, reference, position and clock, so the reopened link
+/// identifies the same unit, as a real one would. A unit the server cannot
+/// map (`UnknownDevice`) is not reopened: its identity never changes.
+async fn sim_port_task(
+    port: String,
+    mut sim: SimHandle,
+    cfg: Arc<Config>,
+    events: mpsc::Sender<(String, LinkEvent)>,
+    links: mpsc::Sender<LinkHandle>,
+    shutdown: watch::Receiver<bool>,
+) {
+    let mut reopened = false;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let host = sim.attach();
+        if reopened {
+            tracing::info!(%port, "sim port reopened");
+        }
+        reopened = true;
+        let (tx, mut rx) = mpsc::channel(256);
+        let handle = axis_link::spawn_link(host, port.clone(), cfg.clone(), tx);
+        if links.send(handle).await.is_err() {
+            return;
+        }
+        // Forward until the link task ends (it drops its sender).
+        let mut unknown = false;
+        while let Some((p, ev)) = rx.recv().await {
+            unknown |= matches!(ev, LinkEvent::UnknownDevice { .. });
+            if events.send((p, ev)).await.is_err() {
+                return;
+            }
+        }
+        if unknown || sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
+            return;
+        }
     }
 }
 

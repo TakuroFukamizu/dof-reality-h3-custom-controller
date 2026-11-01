@@ -10,7 +10,7 @@ use std::time::Duration;
 use h3cs::calibration;
 use h3cs::compat;
 use h3cs::config::Config;
-use h3cs::limits::{LimitedField, MotionLimits};
+use h3cs::limits::{LimitedField, LimitsPatch, LimitsRequest, MotionLimits, Source};
 use h3cs::protocol::{capabilities, msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
 use h3cs::session::{AcceptedPose, PoseIntake, PoseMsg};
 use h3cs::sim_axis::{SimMcu, SimParams};
@@ -60,6 +60,9 @@ struct Rig {
     /// slow to answer); `release_held` delivers it later.
     hold_set_limits: [bool; 3],
     held: Vec<(usize, HostMsg)>,
+    /// The ACK of START from sim i is lost on the way back (the MCU still
+    /// applies the command).
+    drop_start_ack: [bool; 3],
 }
 
 impl Rig {
@@ -117,6 +120,7 @@ impl Rig {
             pre_tick: Vec::new(),
             hold_set_limits: [false; 3],
             held: Vec::new(),
+            drop_start_ack: [false; 3],
         }
     }
 
@@ -214,6 +218,7 @@ impl Rig {
                     }
                 }
                 McuMsg::Ack(ack) => match self.axis_of[i] {
+                    Some(_) if self.drop_start_ack[i] && ack.acked_type == msg_type::START => continue,
                     Some(axis) => LinkEvent::Ack { axis, ack },
                     None => continue,
                 },
@@ -1462,6 +1467,39 @@ fn axis_dropping_out_of_active_is_a_mismatch_fault() {
         "{:?}",
         r.sup.fault()
     );
+}
+
+/// Issue #15: a START whose ACK is lost (the MCU did start) is a
+/// `StartTimeout` naming the axis and the lost ACK, at ACK_TIMEOUT — not an
+/// `AxisStateMismatch { expected: ACTIVE, actual: ACTIVE }` 5 s later.
+#[test]
+fn start_whose_ack_is_lost_is_a_start_timeout_naming_the_axis() {
+    let mut r = Rig::new(sim_cfg());
+    r.holding();
+    r.set_game(Some((POSE_A, 0.3)));
+    r.run_ms(30);
+    r.drop_start_ack[1] = true;
+    r.admin(AdminCmd::Start).unwrap();
+    r.run_ms(100);
+    // Every MCU applied START; the rig still waits for axis 2's ACK.
+    assert_eq!(r.mcu_states(), vec![McuState::Active; 3]);
+    assert_eq!(r.sup.state(), RigState::Holding);
+    let t0 = r.now;
+    r.wait_state(RigState::FaultLatched, ACK_TIMEOUT.as_millis() as u64 + 500);
+    assert!(r.now - t0 < ACK_TIMEOUT + Duration::from_millis(300), "latched at the ACK timeout, not arm_timeout_ms");
+    assert_eq!(r.sup.fault(), Some(&RigFault::StartTimeout { axis: ax(2) }), "{:?}", r.sup.fault());
+    let snap = r.sup.snapshot(r.now);
+    let rec = snap.fault_history.last().unwrap();
+    let detail = rec.detail.as_deref().unwrap_or("");
+    assert!(detail.starts_with("ack_timeout: START on axis2"), "{detail}");
+    assert!(detail.contains("Active"), "{detail}");
+    assert!(
+        !snap.fault_history.iter().any(|f| matches!(f.fault, RigFault::AxisStateMismatch { .. })),
+        "{:?}",
+        snap.fault_history
+    );
+    // The fault stops the axes that did start.
+    assert!(r.run_until(1000, |r| r.mcu_states().iter().all(|s| *s == McuState::Fault)));
 }
 
 // ------------------------------------------------------------------ center / reference
@@ -3219,6 +3257,49 @@ fn runtime_limits_that_cannot_stop_in_time_are_raised_to_the_bound() {
     r.admin(AdminCmd::Stop).unwrap();
     r.wait_state(RigState::BrakedDisarmed, 6000);
     assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+}
+
+/// Issue #15: fields the game channel wrote are held to the operator's
+/// `[limits]` values (reported `operator_limited`, with `operator_max` and
+/// `game_fields` in status); fields the admin wrote go up to the firmware
+/// ceilings; a plain `set_requested_limits` (config / admin) caps nothing.
+#[test]
+fn game_written_limits_are_held_to_the_operator_values() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    let defaults = r.sup.effective_limits();
+    assert_eq!((defaults.max_gain, defaults.max_vel_count_s), (0.5, 3000));
+    let mut req = LimitsRequest::new(defaults);
+    req.apply(&LimitsPatch { max_gain: Some(0.9), max_vel_count_s: Some(5000.0), ..Default::default() }, Source::Game)
+        .unwrap();
+    r.sup.set_limits_request(req);
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    let ml = &snap.motion_limits;
+    assert_eq!((ml.requested.max_gain, ml.requested.max_vel_count_s), (0.9, 5000));
+    assert_eq!((ml.effective.max_gain, ml.effective.max_vel_count_s), (0.5, 3000));
+    assert_eq!(ml.operator_max, defaults);
+    assert_eq!(ml.game_fields.to_vec(), vec![LimitedField::MaxGain, LimitedField::MaxVelCountS]);
+    assert_eq!(ml.limited, vec![LimitedField::MaxGain, LimitedField::MaxVelCountS]);
+    assert_eq!(ml.reasons, vec![LimitReason::OperatorLimited]);
+    assert!(!ml.pending, "no duty change: nothing to confirm");
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!(sp[0].max_vel_count_s, 3000, "SET_POSITION carries the operator's velocity");
+    // The admin writes the velocity: released from the cap, up to the firmware
+    // ceiling (and the stop-time rule raises max_acc for it).
+    req.apply(&LimitsPatch { max_vel_count_s: Some(7000.0), ..Default::default() }, Source::Admin).unwrap();
+    r.sup.set_limits_request(req);
+    r.run_ms(50);
+    let ml = r.sup.snapshot(r.now).motion_limits;
+    assert_eq!((ml.effective.max_gain, ml.effective.max_vel_count_s, ml.effective.max_acc_count_s2), (0.5, 6000, 15000));
+    assert_eq!(ml.game_fields.to_vec(), vec![LimitedField::MaxGain]);
+    assert_eq!(ml.reasons, vec![LimitReason::CeilingClamped, LimitReason::OperatorLimited]);
+    // Config / admin semantics of the plain setter: no field is capped.
+    r.sup.set_requested_limits(MotionLimits { max_gain: 0.9, max_vel_count_s: 5000, ..defaults });
+    r.run_ms(50);
+    let ml = r.sup.snapshot(r.now).motion_limits;
+    assert_eq!((ml.effective.max_gain, ml.effective.max_vel_count_s), (0.9, 5000));
+    assert!(ml.game_fields.is_empty() && ml.reasons.is_empty(), "{ml:?}");
 }
 
 /// M3: raising velocity together with the duty cap waits until every axis has

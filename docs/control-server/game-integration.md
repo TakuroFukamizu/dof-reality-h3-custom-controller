@@ -31,7 +31,7 @@ H3_BACKEND=server python3 bridge.py        # Chrome で http://localhost:8891
 - **やること**: `POST /v1/session` で session を取り、`WS /v1/motion?session=...` に **`frame_seq` が進む姿勢**を送り続ける（DESIGN.md §7.1）。各フィールド:
   - `pitch` / `roll` / `yaw`: −1..1（範囲外は互換モードでクリップされ `limits` に出る）
   - `gain`: 0..1 の要求値。サーバーの `max_gain`（`[limits]`。example / sim は 0.5、bringup.toml は 0.15）で頭打ちになり、ack の `effective_gain` で分かる
-- **動きの制限を変えたいとき**（[limits.md](limits.md) §3.1）: 同じ WS に `{"type":"limits","protocol":1,"source_session":"...","seq":N,"max_gain":0.8,"max_vel_count_s":3000,"max_acc_count_s2":15000,"duty_max_percent":40}`（どの項目も省略可）。サーバーはファームの絶対上限で頭打ちにし、ack の `effective_limits` と `limits`（`ceiling_clamped`）で返す。鮮度は延びない。`POST /v1/session` のたびに設定ファイルの初期値に戻るので、接続のたびに送り直す。bridge は POST の `"limits": {...}` をそのまま渡す
+- **動きの制限を変えたいとき**（[limits.md](limits.md) §3.1）: 同じ WS に `{"type":"limits","protocol":1,"source_session":"...","seq":N,"max_gain":0.8,"max_vel_count_s":3000,"max_acc_count_s2":15000,"duty_max_percent":40}`（どの項目も省略可）。**ゲームからは操作者の `[limits]` の値を下げることしかできない**: それより上の要求は操作者の値で頭打ちにし、ack の `effective_limits` と `limits`（`operator_limited`。ファームの絶対上限なら `ceiling_clamped`）で返す。上げるのは操作者の `POST /v1/limits`（トークン付き）だけ。鮮度は延びない。`POST /v1/session` のたびに設定ファイルの初期値に戻るので、接続のたびに送り直す。bridge は POST の `"limits": {...}` をそのまま渡す
   - `seq`: 単調増加（接続ごと）。`frame_seq`: **ゲームのフレームが進んだときだけ増やす**。同じ値の再送では鮮度が延びない
   - `source_age_ms`: 入力の古さ（0 でよい）
 - **やらないこと**: ARM / START / STOP / 校正は**操作者**（テストページまたは curl）。ゲームは駆動権限を持たない。ゲームがつながっただけでは座席は動かない。

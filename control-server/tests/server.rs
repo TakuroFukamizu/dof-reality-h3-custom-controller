@@ -168,6 +168,39 @@ async fn happy_path_follows_game_then_stops_and_brakes_without_centering() {
     srv.shutdown().await;
 }
 
+/// Issue #15: a simulated axis whose link closed with `status_timeout` (the
+/// 2026-11-02 00:58 host sleep: the real ports were reopened, `sim:3` stayed
+/// OFFLINE) is reopened like a serial port, on the same simulated unit.
+#[tokio::test]
+async fn sim_axis_link_is_reopened_after_a_status_timeout() {
+    let srv = start_sim(sim_cfg()).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:3"));
+    sim(&srv, 2).nudge_actual(123);
+    let before = sim(&srv, 2).snapshot();
+    // STATUS stops (as if the host slept past the watchdog): the link closes.
+    sim(&srv, 2).set_freeze_status(true);
+    let st = wait_status(&srv, 2 * S, "axis 2 disconnected", |s| !s.axes[1].connected).await;
+    assert_eq!(st.rig_state, RigState::Offline, "{:?}", st.blockers);
+    assert!(st.fault.is_none(), "not armed: a disconnect is no fault");
+    sim(&srv, 2).set_freeze_status(false);
+    // Reopened after SERIAL_RETRY on the same unit (boot_id, position kept),
+    // re-identified and usable again.
+    let st = wait_status(&srv, server::SERIAL_RETRY + 3 * S, "axis 2 reconnected", |s| {
+        s.axes[1].connected && s.axes[1].mcu_state == Some(McuState::Disarmed)
+    })
+    .await;
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:3"));
+    assert_eq!(st.axes[1].boot_id, Some(before.boot_id), "same unit, not a reboot");
+    let after = sim(&srv, 2).snapshot();
+    assert_eq!((after.boot_id, after.actual_count, after.referenced), (before.boot_id, before.actual_count, before.referenced));
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    // The model ticks on the new link: STATUS keeps arriving and reflects a move.
+    sim(&srv, 2).nudge_actual(50);
+    wait_status(&srv, S, "moved position reported", |s| s.axes[1].actual_count == Some(before.actual_count + 50)).await;
+    srv.shutdown().await;
+}
+
 #[tokio::test]
 async fn frozen_status_on_one_axis_faults_the_whole_rig() {
     let (srv, streamer) = active_rig(fast_cfg()).await;

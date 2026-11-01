@@ -516,11 +516,12 @@ fn check_status_shape(v: &Value) {
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
     assert_keys(
         &v["motion_limits"],
-        &["effective", "requested", "ceiling", "defaults", "limited", "reasons", "pending"],
+        &["effective", "requested", "ceiling", "defaults", "operator_max", "game_fields", "limited", "reasons", "pending"],
         "motion_limits",
     );
     assert!(v["motion_limits"]["pending"].is_boolean());
-    for k in ["effective", "requested", "ceiling", "defaults"] {
+    assert!(v["motion_limits"]["game_fields"].is_array());
+    for k in ["effective", "requested", "ceiling", "defaults", "operator_max"] {
         assert_keys(
             &v["motion_limits"][k],
             &["max_gain", "max_vel_count_s", "max_acc_count_s2", "duty_max_percent"],
@@ -1127,33 +1128,40 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(v["ceiling"]["duty_max_percent"], 60);
     assert_eq!(v["ceiling"]["max_vel_count_s"], 6000);
     assert_eq!(v["defaults"]["max_acc_count_s2"], 15000);
+    assert_eq!(v["operator_max"], v["defaults"], "the game channel's cap is the operator's [limits]");
+    assert_eq!(v["game_fields"], serde_json::json!([]));
     assert_eq!(v["limited"], serde_json::json!([]));
 
-    // WS: raise the gain ceiling, ask for more velocity than the firmware allows.
+    // WS (the game): asks for more gain and velocity than the operator's
+    // [limits] allow → held to them, not to the firmware ceilings (Issue #15).
     let id = new_session(addr).await;
     let mut ws = ws_connect(addr, &id).await;
     ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_gain": 0.8, "max_vel_count_s": 7000}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["seq"], 1);
-    assert_eq!(ack["effective_gain"], 0.8);
-    assert_eq!(ack["effective_limits"]["max_gain"], 0.8);
-    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 6000);
+    assert_eq!(ack["effective_gain"], 0.5);
+    assert_eq!(ack["effective_limits"]["max_gain"], 0.5);
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
     assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 15000);
-    assert_eq!(ack["limits"], serde_json::json!(["ceiling_clamped"]));
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited"]));
     assert_eq!(ack["fresh"], false, "a limits message never extends freshness");
-    // The next pose is clamped to the new ceiling, not the old 0.5.
+    // The pose is still held to the operator's 0.5.
     ws_send(&mut ws, pose_json(&id, 2, 1, 0.1, 0.0, 0.0, 0.7)).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
-    assert_eq!(ack["effective_gain"], 0.7);
-    assert_eq!(ack["limits"], serde_json::json!([]));
+    assert_eq!(ack["effective_gain"], 0.5);
+    assert_eq!(ack["limits"], serde_json::json!(["gain_limited"]));
     assert_eq!(ack["fresh"], true);
-    // Lowering the ceiling re-clamps the pose being tracked (no new pose needed).
+    // Lowering is the game's to do, and re-clamps the pose being tracked
+    // (no new pose needed).
     ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_gain": 0.3}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_gain"], 0.3);
+    // The ack reports the whole request: the 7000 is still held.
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited"]));
     let mut st = next_status(&mut ws).await;
     for _ in 0..30 {
         if st["effective_gain"] == 0.3 {
@@ -1165,35 +1173,41 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(st["effective_gain"], 0.3, "{st}");
     assert_eq!(st["limits"], serde_json::json!(["gain_limited"]));
     ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_gain": 0.8}))).await;
-    assert_eq!(next_ack(&mut ws).await["accepted"], true);
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["effective_gain"].as_f64()), (Some(true), Some(0.5)));
     // Invalid value: rejected, seq not consumed.
     ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 0}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("out_of_range")));
-    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 50}))).await;
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 30}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
-    assert_eq!(ack["effective_limits"]["duty_max_percent"], 50);
+    assert_eq!(ack["effective_limits"]["duty_max_percent"], 30);
     ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({}))).await;
     assert_eq!(next_ack(&mut ws).await["reason"], "old_seq");
     // Status (WS push and GET) shows the change once the control loop took it.
     let mut st = next_status(&mut ws).await;
     for _ in 0..20 {
-        if st["motion_limits"]["effective"]["duty_max_percent"] == 50 {
+        if st["motion_limits"]["effective"]["duty_max_percent"] == 30 {
             break;
         }
         st = next_status(&mut ws).await;
     }
-    assert_eq!(st["motion_limits"]["effective"]["max_gain"], 0.8);
-    assert_eq!(st["motion_limits"]["effective"]["max_vel_count_s"], 6000);
-    assert_eq!(st["motion_limits"]["requested"]["max_vel_count_s"], 7000);
-    assert_eq!(st["motion_limits"]["limited"], serde_json::json!(["max_vel_count_s"]));
+    let ml = &st["motion_limits"];
+    assert_eq!(ml["effective"]["max_gain"], 0.5);
+    assert_eq!(ml["effective"]["max_vel_count_s"], 3000);
+    assert_eq!(ml["requested"]["max_vel_count_s"], 7000);
+    assert_eq!(ml["requested"]["max_gain"], 0.8);
+    assert_eq!(ml["operator_max"]["max_vel_count_s"], 3000);
+    assert_eq!(ml["game_fields"], serde_json::json!(["max_gain", "max_vel_count_s", "duty_max_percent"]));
+    assert_eq!(ml["limited"], serde_json::json!(["max_gain", "max_vel_count_s"]));
+    assert_eq!(ml["reasons"], serde_json::json!(["operator_limited"]), "{ml}");
     // The simulated axes received the new duty cap.
     let mut ok = false;
     for _ in 0..30 {
         let r = http(addr, "GET", "/v1/status", &[], None).await;
         let v = r.json();
-        if v["axes"].as_array().unwrap().iter().all(|a| a["fw_limits"]["duty_max_percent"] == 50) {
+        if v["axes"].as_array().unwrap().iter().all(|a| a["fw_limits"]["duty_max_percent"] == 30) {
             ok = true;
             break;
         }
@@ -1201,7 +1215,7 @@ async fn limits_over_ws_and_rest() {
     }
     assert!(ok, "fw_limits did not follow SET_LIMITS");
 
-    // REST: token required; applies the same patch rules.
+    // REST (the admin): token required; applies the same patch rules.
     let bearer = format!("Bearer {TOKEN}");
     let r = http(addr, "POST", "/v1/limits", &[], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
     assert_eq!(r.status, 401);
@@ -1213,19 +1227,52 @@ async fn limits_over_ws_and_rest() {
     let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
-    // 6000 count/s at 1000 count/s² would take 6 s to stop (deadline 0.8 x 1500 ms):
-    // raised to 5000 and reported (Issue #15 H2).
+    // The game's 7000 is still held to 3000; 3000 count/s at 1000 count/s²
+    // would take 3 s to stop (deadline 0.8 x 1500 ms): raised to 2500 and
+    // reported (Issue #15 H2).
     assert_eq!(v["requested"]["max_acc_count_s2"], 1000);
-    assert_eq!(v["effective"]["max_acc_count_s2"], 5000);
+    assert_eq!(v["effective"]["max_acc_count_s2"], 2500);
+    assert_eq!(v["limited"], serde_json::json!(["max_gain", "max_vel_count_s", "max_acc_count_s2"]));
+    assert_eq!(v["reasons"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    assert_eq!(v["effective"]["duty_max_percent"], 30, "other fields kept");
+    // The admin may raise above the operator's values, up to the firmware
+    // ceilings; the fields it writes leave the game's cap.
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[("Authorization", &bearer)],
+        Some(r#"{"max_gain": 0.8, "max_vel_count_s": 7000}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["effective"]["max_gain"], 0.8);
+    assert_eq!(v["effective"]["max_vel_count_s"], 6000, "firmware ceiling");
+    assert_eq!(v["effective"]["max_acc_count_s2"], 5000, "6000 count/s needs 5000 count/s² to stop in time");
+    assert_eq!(v["game_fields"], serde_json::json!(["duty_max_percent"]));
     assert_eq!(v["limited"], serde_json::json!(["max_vel_count_s", "max_acc_count_s2"]));
     assert_eq!(v["reasons"], serde_json::json!(["ceiling_clamped", "stop_time_limited"]));
-    assert_eq!(v["effective"]["max_gain"], 0.8, "other fields kept");
+    // The game writing the field again puts it back under the cap.
+    ws_send(&mut ws, limits_json(&id, 6, serde_json::json!({"max_vel_count_s": 6500}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
+    assert_eq!(ack["effective_gain"], 0.8, "the admin's gain stays");
+    // (the admin's max_acc 1000 is again raised for the capped 3000 count/s)
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 2500);
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["game_fields"], serde_json::json!(["max_vel_count_s", "duty_max_percent"]));
 
-    // A new session resets everything to the configured defaults.
+    // A new session resets everything to the configured defaults (and
+    // releases every field).
     let _id2 = new_session(addr).await;
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["effective"], v["defaults"]);
     assert_eq!(v["requested"]["max_vel_count_s"], 3000);
+    assert_eq!(v["game_fields"], serde_json::json!([]));
+    assert_eq!(v["reasons"], serde_json::json!([]));
     let _ = ws.close(None).await;
     srv.shutdown().await;
 }
