@@ -59,7 +59,7 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 | `tests/test_host.cpp`（従来 env の純粋部分） | 236 | プロファイル・端ラベル・自動移動（`auto_move.h`）・手動速度の守り（`manual_guard.h`）など | 1 |
 | `tests/test_v1_codec.h` | — | COBS・CRC・フレーム、protocol.md §7 の全ベクタの encode / decode、CRC 不一致・長さ違い・版違い・未知種別・256 byte 超の破棄 | 1 |
 | `tests/test_v1_axis.h` | — | `V1Axis` の規則（設計 §6 の各項目）。レビュー修正の回帰試験: DISARM 後の残り誤差で `ENCODER_FAULT` にならず DISARMED に着く（`test_disarm_with_residual_error_reaches_disarmed_not_encoder_fault`）、HOLDING で目標が止まっているときの最小 Duty の静止は `ENCODER_FAULT` にせず、軌道が動けば従来どおり出る（`test_static_hold_error_at_min_duty_is_not_encoder_fault`）、ACTIVE で到達後の残り誤差も出ない（`test_active_settled_with_residual_error_is_not_encoder_fault`）、`device_id` は MAC を表記順に詰める（`test_device_id_packs_mac_in_printed_order`） | 1 |
-| 合計 | 1676 | 件数は CHECK の数（スイートごとの内訳は出さない）。v1 追加前は 236。2026-11-01 に速度フィードフォワードと不感帯のヒステリシス（`v1_duty_command`）の試験を追加 | 1 |
+| 合計 | 2720 | 件数は CHECK の数（スイートごとの内訳は出さない）。v1 追加前は 236。2026-11-01 に速度フィードフォワードと不感帯のヒステリシス（`v1_duty_command`）の試験を追加（1676）、同日に校正（CALIBRATE / CALIBRATING / CAL_RESULT。模擬機構での成功・失敗・中止・FAULT とベクタ）の試験を追加（2720） | 1 |
 
 ### e2e（`control-server/scripts/e2e_sim.sh`）
 
@@ -95,7 +95,7 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 | `clients/h3game/tests` | Ran 50、OK（skip なし。`test_browser.py` もヘッドレス Chromium で実行） |
 | `e2e_sim.sh` | PASS、チェック 120 / 120（[runs/e2e_sim_20261101-112206/summary.md](runs/e2e_sim_20261101-112206/summary.md)。主な値: ARM → HOLDING 90 ms、ゲーム停止 → STOPPING 255 ms、STOPPING → BRAKED_DISARMED 1064 ms、管理者 FAULT → 全軸 FAULT 20 ms） |
 | `h3-control-server check-config config/bringup.toml` | OK。静的な阻害要因は `calibration_invalid` ×3 だけ（意図どおり。`device_id` は 0 = 照合なし） |
-| `moter-controler/tests/run_tests.sh` | 1676 passed、0 failed（CHECK の数。従来 266（main 95e0069 の中立・手動速度の修正を含む）＋ v1。前回 1646） |
+| `moter-controler/tests/run_tests.sh` | 2720 passed、0 failed（CHECK の数。従来 266（main 95e0069 の中立・手動速度の修正を含む）＋ v1。前回 1676。校正の追加分 1044） |
 | `pio run`（6 env、書き込みなし） | 全 SUCCESS、警告 0。`m5stack-cores3` RAM 24080 / Flash 786833 byte、`-usbpower` 24080 / 786777、`-pmiclog` 24128 / 788021、`-pmiclog-nobatt` 24128 / 788441、`-v1` 27800 / 1059725、`-v1-usbpower` 27800 / 1059649（RAM 327680、Flash 6553600 byte 中） |
 
 この回の修正（レビュー指摘。ファーム設計 §3 を先に直した）:

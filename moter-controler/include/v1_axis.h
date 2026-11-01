@@ -11,13 +11,17 @@
 // Duty の向き: NVS プロファイルの sign（+1 なら速度 − でカウント増）から決める。
 //   カウントを増やしたいなら duty_signed = −sign × duty。
 // 時刻はマイクロ秒で注入する（MCU では esp_timer_get_time()）。
+// 校正（protocol.md §1.2）: CALIBRATE で従来 env と同じ端当て状態機械 AutoMachine（auto_move.h）を内蔵のまま回し、
+//   成功で P 端 = 0 の基準を自分で確立する。Duty は AutoMachine の duty_signed（MD13S の符号付き %）をそのまま出す。
 
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "auto_move.h"
 #include "config.h"
+#include "motor_profile.h"
 #include "v1_codec.h"
 
 // 調整値。既定は config.h（実機で詰めるまでの仮値）。テストで差し替えられるよう構造体にしている。
@@ -34,6 +38,7 @@ struct V1Tuning {
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
   uint32_t brake_apply_wait_ms = BRAKE_APPLY_WAIT_MS;
+  uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
   uint32_t status_period_ms = 20;
   uint32_t velocity_window_ms = 100;
 };
@@ -86,10 +91,11 @@ inline uint64_t v1_device_id_from_mac(const uint8_t mac[6]) {
 
 class V1Axis {
  public:
-  static constexpr size_t kOutboxCap = 40;   // 1 周期の最大: 受信 16 件分の ACK + STATUS + FAULT_EVENT + AXIS_SELECT
+  static constexpr size_t kOutboxCap = 40;   // 1 周期の最大: 受信 16 件分の ACK + STATUS + FAULT_EVENT + AXIS_SELECT + CAL_RESULT
   static constexpr size_t kDedupeDepth = 16;
 
   V1Tuning tuning;
+  AutoConfig cal_config;  // 端当て校正の調整値（既定は config.h。テストで差し替えられる）
 
   // BOOT → DISARMED。selected_axis は NVS の motor、sign はその系統のプロファイルの符号。
   void begin(const V1Identity& id, uint8_t selected_axis, int8_t sign, uint64_t now_us, int64_t raw) {
@@ -104,12 +110,27 @@ class V1Axis {
     vel_anchor_raw_ = raw;
     vel_anchor_us_ = now_us;
     state_ = v1::state::DISARMED;
+    cal_phase_ = CalPhase::Idle;
+    cal_.cfg = cal_config;
+    cal_.set_profile(MotorProfile{});
     hold_here();
     began_ = true;
   }
 
   bool began() const { return began_; }
   void set_sign(int8_t sign) { sign_ = sign < 0 ? -1 : 1; }
+
+  // --- 校正の出力（制御タスク・画面向け） ------------------------------------------
+  // 成功した校正のプロファイル（motor = 校正時の系統）。profile_dirty() の間は NVS に未保存。保存したら clear_profile_dirty()。
+  bool profile_dirty() const { return profile_dirty_; }
+  const MotorProfile& dirty_profile() const { return dirty_profile_; }
+  void clear_profile_dirty() { profile_dirty_ = false; }
+  // この boot で最後に送った CAL_RESULT（画面の表示用）
+  bool has_cal_result() const { return has_cal_result_; }
+  const v1::CalResult& last_cal_result() const { return last_cal_result_; }
+  // 校正中の段階（CALIBRATING 以外では NONE）と AutoMachine の直近の理由（"retreat" など）
+  uint8_t cal_live_step() const { return state_ == v1::state::CALIBRATING ? cal_step_code() : v1::cal_step::NONE; }
+  const char* cal_live_reason() const { return cal_.reason; }
 
   // --- 入力 ---------------------------------------------------------------
 
@@ -153,6 +174,7 @@ class V1Axis {
       finish_stop(now_us);
     }
     update_duty(now_us);
+    tick_calibration(now_us);  // CALIBRATING のときだけ Duty を書く（update_duty の後）
     emit_status_if_changed();
     emit_periodic_status(now_us);
   }
@@ -221,7 +243,7 @@ class V1Axis {
   bool brake_release_cmd() const { return brake_release_cmd_; }
   int duty_percent() const { return duty_; }               // 符号付き %（MD13S へそのまま）
   int16_t pwm_permille() const {                            // 正が count の増える向き
-    return static_cast<int16_t>(-static_cast<int>(sign_) * duty_ * 10);
+    return static_cast<int16_t>(-static_cast<int>(effective_sign()) * duty_ * 10);
   }
 
   // --- 参照 -----------------------------------------------------------------
@@ -297,6 +319,9 @@ class V1Axis {
 
  private:
   enum class StopKind : uint8_t { Hold, Disarm, Fault };
+  // 校正の段階（protocol.md §1.2 の手順）: 主電源 ON 指令 → cal_power_settle → ブレーキ解除指令 → brake_release_wait →
+  // AutoMachine（Cal）→ 終了手順（ブレーキ給電 OFF → brake_apply_wait → CAL_RESULT → DISARMED）
+  enum class CalPhase : uint8_t { Idle, PowerSettle, BrakeRelease, Running, Shutdown };
 
   struct Accepted {
     uint8_t type;
@@ -366,6 +391,16 @@ class V1Axis {
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
 
+  // --- 校正（CALIBRATING） ---
+  AutoMachine cal_{};
+  CalPhase cal_phase_ = CalPhase::Idle;
+  uint64_t cal_phase_started_us_ = 0;  // いまの段階に入った時刻
+  v1::CalResult pending_cal_result_{};  // 終了手順の後に送る結果
+  bool has_cal_result_ = false;
+  v1::CalResult last_cal_result_{};
+  MotorProfile dirty_profile_{};
+  bool profile_dirty_ = false;
+
   // --- DUPLICATE 判定（受理した命令、古い順） ---
   Accepted accepted_[kDedupeDepth]{};
   size_t accepted_count_ = 0;
@@ -401,7 +436,20 @@ class V1Axis {
   }
   bool powered_state() const {
     return state_ == v1::state::ARMING || state_ == v1::state::HOLDING || state_ == v1::state::ACTIVE ||
-           state_ == v1::state::STOPPING || state_ == v1::state::DISARMING;
+           state_ == v1::state::STOPPING || state_ == v1::state::DISARMING || state_ == v1::state::CALIBRATING;
+  }
+  // pwm_permille の向きに使う符号。校正で P 端に当たって向きが分かった後はその値（NVS の sign は未校正だと既定値のまま）。
+  int8_t effective_sign() const {
+    if (state_ == v1::state::CALIBRATING && cal_.origin_valid) return cal_.working_sign;
+    return sign_;
+  }
+  uint8_t cal_step_code() const {
+    switch (cal_.cal_step) {
+      case CalStep::ToP: return v1::cal_step::TO_P;
+      case CalStep::ToN: return v1::cal_step::TO_N;
+      case CalStep::ToNeutral: return v1::cal_step::TO_NEUTRAL;
+      default: return v1::cal_step::NONE;
+    }
   }
   bool power_controller() const {
     return has_config_ && (config_.role_flags & v1::role_flags::POWER_CONTROLLER) != 0;
@@ -452,6 +500,7 @@ class V1Axis {
       case v1::msg::DISARM: command(m, m.disarm.request_id, now); break;
       case v1::msg::FAULT_RESET: command(m, m.fault_reset.request_id, now); break;
       case v1::msg::SET_REFERENCE: command(m, m.set_reference.request_id, now); break;
+      case v1::msg::CALIBRATE: command(m, m.calibrate.request_id, now); break;
       default: break;  // decode 済みなので来ない
     }
   }
@@ -466,6 +515,7 @@ class V1Axis {
       case v1::msg::DISARM: return on_disarm(now);
       case v1::msg::FAULT_RESET: return on_fault_reset();
       case v1::msg::SET_REFERENCE: return on_set_reference(m.set_reference.reference_count);
+      case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, now);
       default: return v1::ack_reason::BAD_STATE;
     }
   }
@@ -604,7 +654,9 @@ class V1Axis {
   }
 
   // SET_POSITION: ACK なし。古い → stale_drop、apply_at ≠ 0 → rx_error、有効 → lease。ACTIVE でだけ目標に反映。
+  // 校正中は捨てる（数えない。protocol.md §1.2）。
   void on_set_position(const v1::SetPosition& m, uint64_t now) {
+    if (state_ == v1::state::CALIBRATING) return;
     if (!has_config_ || m.session_epoch != config_.session_epoch || m.seq <= last_rx_seq_) {
       if (stale_drop_count_ < 0xFFFF) stale_drop_count_ += 1;
       return;
@@ -648,6 +700,7 @@ class V1Axis {
       case v1::state::HOLDING: enter_disarming(now); break;
       case v1::state::ACTIVE: begin_stop(StopKind::Disarm, now); break;
       case v1::state::STOPPING: stop_kind_ = StopKind::Disarm; break;
+      case v1::state::CALIBRATING: cal_cancel(now); break;  // 校正の中止（終了手順を経て DISARMED）
       case v1::state::FAULT: return v1::ack_reason::FAULT_ACTIVE;  // 異常ゲートで先に弾かれる
       default: break;
     }
@@ -681,6 +734,32 @@ class V1Axis {
     reference_offset_ = raw_ - static_cast<int64_t>(reference_count);
     hold_here();
     referenced_ = true;
+    return v1::ack_reason::NONE;
+  }
+
+  // CALIBRATE（protocol.md §4、§1.2）: mode 1 は DISARMED のときだけ（CONFIG・基準は不要）。受理で CALIBRATING。
+  // mode 0 は CALIBRATING なら中止、それ以外は何もせず受理。0・1 以外は INVALID_PARAM。
+  uint16_t on_calibrate(uint8_t mode, uint64_t now) {
+    if (mode != v1::cal_mode::START && mode != v1::cal_mode::CANCEL) return v1::ack_reason::INVALID_PARAM;
+    if (mode == v1::cal_mode::CANCEL) {
+      if (state_ == v1::state::CALIBRATING) cal_cancel(now);
+      return v1::ack_reason::NONE;
+    }
+    if (state_ != v1::state::DISARMED) return v1::ack_reason::BAD_STATE;
+    if (estop_latched_) return v1::ack_reason::BAD_STATE;  // ローカル操作中（通常は FAULT 側で弾かれる）
+    state_ = v1::state::CALIBRATING;
+    cal_phase_ = CalPhase::PowerSettle;  // 主電源 ON 指令（電源担当軸のみ。powered_state で立つ）
+    cal_phase_started_us_ = now;
+    brake_release_cmd_ = false;
+    duty_ = 0;
+    referenced_ = false;  // 端当てで原点を取り直す。成功したときだけ P 端 = 0 で立て直す
+    cal_.cfg = cal_config;
+    MotorProfile p;
+    p.motor = selected_axis_;
+    p.sign = sign_;
+    cal_.set_profile(p);  // origin_valid = false・Idle に戻る
+    cal_.profile_dirty = false;
+    memset(&pending_cal_result_, 0, sizeof(pending_cal_result_));
     return v1::ack_reason::NONE;
   }
 
@@ -727,9 +806,13 @@ class V1Axis {
   }
 
   // FAULT ラッチ: PWM 0・ブレーキ作動・主電源 OFF 指令。最初のコードが残る。FAULT_EVENT を 1 回。
+  // 校正中なら校正も終わる: CAL_RESULT(CANCELLED) を FAULT_EVENT より前に 1 回（基準は立てない。終了手順は踏まず即停止）。
   void latch_fault(uint16_t code, uint64_t now) {
     if (state_ == v1::state::FAULT) return;
     const uint8_t before = state_;
+    if (state_ == v1::state::CALIBRATING) {
+      cal_abort_for_fault(code == v1::fault::LOCAL_ESTOP ? "estop" : "fault", now);
+    }
     state_ = v1::state::FAULT;
     fault_code_ = code;
     stop_kind_ = StopKind::Hold;
@@ -876,10 +959,155 @@ class V1Axis {
     }
   }
 
+  // ------------------------------------------------------------------------
+  // 校正（CALIBRATING）
+  // ------------------------------------------------------------------------
+
+  AutoInputs cal_inputs(uint64_t now) const {
+    AutoInputs in;
+    in.now_ms = static_cast<uint32_t>(now / 1000);
+    in.raw_count = raw_;
+    in.relay_live = true;  // 電源 settle 済み（電源担当でない軸も同じ時間を待った）
+    in.brake_released = brake_release_cmd_;
+    in.manual_speed_nonzero = false;
+    in.stop = false;
+    in.estop = false;
+    return in;
+  }
+
+  // 校正の各段階を進める。tick の update_duty の後に呼び、CALIBRATING の間だけ duty_ を書く。
+  void tick_calibration(uint64_t now) {
+    if (state_ != v1::state::CALIBRATING) return;
+    const uint64_t elapsed = now - cal_phase_started_us_;
+    switch (cal_phase_) {
+      case CalPhase::PowerSettle:
+        duty_ = 0;
+        if (elapsed >= ms_to_us(tuning.cal_power_settle_ms)) {
+          brake_release_cmd_ = true;
+          cal_phase_ = CalPhase::BrakeRelease;
+          cal_phase_started_us_ = now;
+        }
+        break;
+      case CalPhase::BrakeRelease:
+        duty_ = 0;
+        if (elapsed >= ms_to_us(tuning.brake_release_wait_ms)) {
+          const char* err = "";
+          const AutoInputs in = cal_inputs(now);
+          if (cal_.request(AutoKind::Cal, in, &err)) {
+            cal_phase_ = CalPhase::Running;
+            cal_phase_started_us_ = now;
+            duty_ = cal_.duty_signed;
+          } else {
+            cal_finish(v1::cal_result::FAILED, err, now);  // 起こらないはず（busy / not_live / brake は満たしている）
+          }
+        }
+        break;
+      case CalPhase::Running: {
+        const AutoInputs in = cal_inputs(now);
+        cal_.tick(in);
+        duty_ = cal_.duty_signed;
+        if (!cal_.active()) {
+          uint8_t result = v1::cal_result::FAILED;
+          if (cal_.phase == AutoPhase::Done) result = v1::cal_result::OK;
+          if (cal_.phase == AutoPhase::Cancelled) result = v1::cal_result::CANCELLED;
+          cal_finish(result, cal_.reason, now);
+        }
+        break;
+      }
+      case CalPhase::Shutdown:
+        duty_ = 0;  // AutoMachine の finish で既に 0。ブレーキ作動待ちの間も 0
+        if (elapsed >= ms_to_us(tuning.brake_apply_wait_ms)) {
+          push_cal_result();
+          cal_phase_ = CalPhase::Idle;
+          state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
+          hold_here();
+        }
+        break;
+      case CalPhase::Idle: break;
+    }
+  }
+
+  // 校正の終わり（成功・失敗・中止）: 結果を組み、成功なら基準・符号・プロファイルを確定し、終了手順へ。
+  void cal_finish(uint8_t result, const char* reason, uint64_t now) {
+    v1::CalResult& r = pending_cal_result_;
+    memset(&r, 0, sizeof(r));
+    r.boot_id = id_.boot_id;
+    r.result = result;
+    r.step = cal_step_code();
+    for (size_t i = 0; i < v1::CAL_REASON_LEN && reason[i] != '\0'; ++i) r.reason[i] = reason[i];  // NUL 埋め（8 文字ちょうどなら終端なし）
+    if (result == v1::cal_result::OK) {
+      const MotorProfile& p = cal_.profile;
+      reference_offset_ = cal_.origin_raw;  // P 端 = 0
+      referenced_ = true;
+      sign_ = p.sign < 0 ? -1 : 1;
+      dirty_profile_ = p;
+      dirty_profile_.motor = selected_axis_;
+      profile_dirty_ = true;
+    } else {
+      referenced_ = false;
+    }
+    // 座標は actual_count と同じ（P 端 = 0。符号は掛けない）: n_end = raw_N − raw_P = stroke × sign、neutral も同様。
+    // N 端まで測れていれば（中立への移動で失敗したときも）値を載せる。保存するのは成功だけ。
+    if (cal_.profile.calibrated) {
+      const int32_t s = cal_.profile.sign < 0 ? -1 : 1;
+      r.n_end_count = cal_.profile.stroke * s;
+      r.neutral_count = cal_.profile.neutral * s;
+    }
+    r.sign = sign_;
+    brake_release_cmd_ = false;  // 終了手順: ブレーキ給電 OFF → brake_apply_wait → PWM 0 のまま主電源 OFF → DISARMED
+    duty_ = 0;
+    cal_phase_ = CalPhase::Shutdown;
+    cal_phase_started_us_ = now;
+  }
+
+  // CALIBRATE(0) / DISARM による中止。AutoMachine が動いていれば stop を渡して "stop" で止め、まだなら直接終了手順へ。
+  void cal_cancel(uint64_t now) {
+    if (cal_phase_ == CalPhase::Shutdown || cal_phase_ == CalPhase::Idle) return;  // 既に終わりかけ
+    if (cal_phase_ == CalPhase::Running) {
+      AutoInputs in = cal_inputs(now);
+      in.stop = true;
+      cal_.tick(in);
+      cal_finish(v1::cal_result::CANCELLED, cal_.reason, now);
+    } else {
+      cal_finish(v1::cal_result::CANCELLED, "stop", now);
+    }
+  }
+
+  // FAULT による打ち切り（latch_fault から）。終了手順は踏まない（FAULT が出力を落とす）。CAL_RESULT だけ即送る。
+  // 終了手順（ブレーキ作動待ち）の間なら結果は確定済み: そのまま送る（成功なら基準・プロファイルも保つ。
+  // FAULT は ENCODER_FAULT 以外では基準を消さない）。
+  void cal_abort_for_fault(const char* reason, uint64_t now) {
+    if (cal_phase_ == CalPhase::Shutdown) {
+      push_cal_result();
+      cal_phase_ = CalPhase::Idle;
+      return;
+    }
+    if (cal_phase_ == CalPhase::Running) {
+      AutoInputs in = cal_inputs(now);
+      in.estop = true;
+      cal_.tick(in);  // Cancelled "estop"・原点無効
+    }
+    if (cal_phase_ != CalPhase::Idle) {
+      cal_finish(v1::cal_result::CANCELLED, reason, now);
+      push_cal_result();
+    }
+    cal_phase_ = CalPhase::Idle;
+  }
+
+  void push_cal_result() {
+    v1::McuMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::CAL_RESULT;
+    m.cal_result = pending_cal_result_;
+    last_cal_result_ = pending_cal_result_;
+    has_cal_result_ = true;
+    push(m);
+  }
+
   // 位置制御の Duty と無パルス判定
   void update_duty(uint64_t now) {
     if (!position_control_on()) {
-      duty_ = 0;
+      duty_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
       in_band_ = false;
       return;
