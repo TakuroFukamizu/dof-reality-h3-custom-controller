@@ -2387,6 +2387,7 @@ inline void test_motor_output_permille_mapping() {
 
 inline void test_duty_deadband_and_clamp() {
   Harness h;
+  h.ax.tuning.settled_ms = 0;  // 不感帯のヒステリシスそのものを見る試験。整定判定（S）の 200 ms は test_settled_* で
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3194,6 +3195,7 @@ inline void test_integral_holding_bias_retained_in_band() {
 // 軸を通して: 止まったまま誤差 15（床 OFF・P 3）で I が積まれ、出力に足される。DISARM（DISARMED）/ FAULT / SET_REFERENCE で 0。
 inline void test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference() {
   Harness h;
+  h.ax.tuning.settled_ms = 0;  // ここは F だけを見る（S は test_settled_* で）
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3222,6 +3224,7 @@ inline void test_integral_in_axis_accumulates_and_resets_on_disarm_fault_referen
   CHECK(h.ax.integral_permille() == 0);
   // FAULT: 積んだ I は latch_fault で即 0
   Harness g;
+  g.ax.tuning.settled_ms = 0;
   Harness::accepted(g.config_with(c));
   g.reach_holding_from_configured();
   g.stall = true;
@@ -3234,6 +3237,98 @@ inline void test_integral_in_axis_accumulates_and_resets_on_disarm_fault_referen
   CHECK(g.ax.state() == st::FAULT && g.ax.integral_permille() == 0 && g.ax.duty_permille() == 0);
   g.idle(50);
   CHECK(g.ax.integral_permille() == 0);
+}
+
+
+// ---- Issue #25 手順 10「S」: 整定判定 ----------------------------------------------------------------------
+
+// 不感帯に入るのは「軌道速度 0・|誤差| ≤ 10・|実測速度| ≤ 10」が 200 ms 続いたとき。実測速度は 100 ms 窓なので、
+// 25 count 飛んで戻った直後は窓が 250 count/s を示す間（≤ 100 ms）は数えず、その後 200 ms で入る。
+inline void test_settled_entry_requires_dwell_with_measured_rest() {
+  Harness h;
+  CHECK(h.ax.tuning.settled_ms == V1_SETTLED_MS && h.ax.tuning.settled_ms == 200);  // 既定 ON（config.h V1_SETTLED_MEASURED）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.duty_terms().in_band);  // ARMING のブレーキ解除から HOLDING まで 300 ms 静止 → 入っている
+  h.stall = true;
+  h.raw -= 25;  // 出る側を超えて抜ける
+  h.step();
+  CHECK(!h.ax.duty_terms().in_band && h.ax.duty_permille() == -70);
+  h.raw += 25;  // 誤差 0 に戻る。実測速度の窓（100 ms）が更新されるまで 250 count/s を示し、その後 200 ms 待つ
+  h.step();
+  CHECK(!h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);  // 入っていないが P = 0 なので出力 0
+  h.drive(150, h.ax.actual_count());
+  CHECK(!h.ax.duty_terms().in_band);  // 150 ms ではまだ
+  h.drive(200, h.ax.actual_count());
+  CHECK(h.ax.duty_terms().in_band);  // 遅くとも 100 + 200 = 300 ms で入る
+  // 中では誤差 15 でも出力は I（0）のまま（出る側 20 まで）
+  h.raw -= 15;
+  h.step();
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);
+  // 軌道が動けば即抜ける
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = false;
+  h.drive(50, h.ax.actual_count() + 500);
+  CHECK(!h.ax.duty_terms().in_band);
+}
+
+// 実測速度が 10 count/s を超えている間（1 count / 25 ms = 40 count/s）は |誤差| ≤ 10 でも入らず、生の P を出す。止まれば
+// （窓が 0 を示してから）200 ms で入る。settled_ms = 0（-DV1_SETTLED_MEASURED=0）なら従来どおり即入る。
+inline void test_settled_blocked_by_measured_motion_and_legacy_immediate() {
+  Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // 生の P を見やすく
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.raw += 25;
+  h.step();
+  // 25 ms ごとに 1 count ずつずれる（誤差 −1 … −8、|誤差| ≤ 10）: 実測 40 count/s → 入らない → 生の P（誤差 −8 → −1.6 → −2 permille → MD13S +2）
+  for (int i = 0; i < 8; ++i) {
+    h.raw += 1;
+    h.drive(25, h.ax.actual_count() - (i + 1));  // 目標は元の位置（actual が +1 ずつ増えているので −(i+1)）
+  }
+  CHECK(!h.ax.duty_terms().in_band);
+  CHECK(h.ax.following_error_count() == 8 && h.ax.duty_permille() == 2);
+  // 止まる: 窓が 0 になってから 200 ms 以内に入る（上限 300 ms）
+  h.drive(300, h.ax.target_count());
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);
+  // settled_ms = 0: 即入る
+  Harness g;
+  g.ax.tuning.settled_ms = 0;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 25;
+  g.step();
+  CHECK(!g.ax.duty_terms().in_band);
+  g.raw += 25;
+  g.step();
+  CHECK(g.ax.duty_terms().in_band);
+}
+
+// S が ON でも停止ブースト（H4）の 2 s の上限 → ENCODER_FAULT はそのまま（|誤差| > 20 で止まったまま）。
+inline void test_settled_on_keeps_stationary_stall_fault() {
+  Harness h;
+  CHECK(h.ax.tuning.settled_ms > 0 && h.ax.tuning.ki_permille_per_count_s > 0.0);  // 既定（全部 ON）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.drive(1990, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(20, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
 }
 
 inline void run_all() {
@@ -3310,6 +3405,9 @@ inline void run_all() {
   test_integral_blocked_during_floor_sign_mismatch_but_unwinds();
   test_integral_holding_bias_retained_in_band();
   test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference();
+  test_settled_entry_requires_dwell_with_measured_rest();
+  test_settled_blocked_by_measured_motion_and_legacy_immediate();
+  test_settled_on_keeps_stationary_stall_fault();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

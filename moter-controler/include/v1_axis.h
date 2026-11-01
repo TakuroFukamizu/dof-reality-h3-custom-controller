@@ -45,6 +45,9 @@ struct V1Tuning {
   double ki_permille_per_count_s = V1_INTEGRAL ? V1_KI_PERMILLE_PER_COUNT_S : 0.0;
   int i_max_permille = V1_I_MAX_PERMILLE;            // |I| の上限
   int i_rate_permille_per_s = V1_I_RATE_PERMILLE_PER_S;  // |dI/dt| の上限
+  // 整定判定（Issue #25 手順 10「S」。config.h V1_SETTLED_MEASURED）。settled_ms = 0 で従来どおり |誤差| ≤ deadband で即入る
+  uint32_t settled_ms = V1_SETTLED_MEASURED ? V1_SETTLED_MS : 0;
+  int32_t settled_meas_vel = V1_SETTLED_MEAS_VEL_COUNT_S;  // 整定とみなす |実測速度| の上限 [count/s]
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
@@ -101,8 +104,11 @@ struct V1DutyState {
 //    ワインドアップは実出力で見る）。|I| ≤ i_max_permille。
 // boost_permille は停止ブースト（Issue #15 H4）の上乗せ（床が ON のときだけ効く）。terms を渡せば各項を書く（計器用）。
 // dt_s は前の tick からの時間 [s]（0 なら積分は動かない。直接呼ぶテストはそのまま）。
+// settle_ok = 不感帯に**入って**よい（Issue #25 手順 10「S」: V1Axis が「軌道速度 0・|誤差| ≤ deadband・|実測速度| ≤ 10 が
+// settled_ms 続いた」で立てる）。false の間は |誤差| ≤ deadband でも入らず、生の P + I（床は |誤差| ≤ 15 で OFF）を出す。
+// すでに中なら出る側の判定だけ（settle_ok は見ない）。
 inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
-                           V1DutyTerms* terms = nullptr, double dt_s = 0.0) {
+                           V1DutyTerms* terms = nullptr, double dt_s = 0.0, bool settle_ok = true) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
   o = V1DutyTerms{};
@@ -125,7 +131,7 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
     if (st.in_band) {
       if (err_abs <= t.deadband_out) return hold_output();
       st.in_band = false;
-    } else if (err_abs <= t.deadband) {
+    } else if (err_abs <= t.deadband && settle_ok) {
       st.in_band = true;
       return hold_output();
     }
@@ -532,6 +538,7 @@ class V1Axis {
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
   V1DutyState duty_state_{};  // 不感帯と床のヒステリシス（位置制御が止まれば戻す）
+  uint64_t settle_dwell_us_ = 0;  // 整定判定（Issue #25 手順 10「S」）: 条件が続いている時間
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
@@ -1331,6 +1338,7 @@ class V1Axis {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
       duty_state_ = V1DutyState{};
+      settle_dwell_us_ = 0;
       reset_stall_boost();
       terms_ = V1DutyTerms{};
       return;
@@ -1341,7 +1349,9 @@ class V1Axis {
     stall_boost_gate(err, now);
     const uint64_t dt_cap_us = ms_to_us(tuning.overrun_ms);
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
-    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s);  // カウント増の向きが正 [permille]
+    const bool settle_ok = update_settle_dwell(err, dt_us);
+    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s,
+                                    settle_ok);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
@@ -1378,6 +1388,20 @@ class V1Axis {
     } else {
       stall_running_ = false;
     }
+  }
+
+  // 整定判定（Issue #25 手順 10「S」）。「軌道速度 0・|誤差| ≤ deadband・|実測速度| ≤ settled_meas_vel」が続いた時間を数え、
+  // settled_ms 以上なら不感帯に入ってよい。条件が 1 tick でも崩れれば 0 から。settled_ms = 0 なら常に可（従来の振る舞い）。
+  // 実測速度は 100 ms 窓（velocity_）なので、動いた直後は最長 100 ms 遅れて 0 になる → 入るまで最長 300 ms。
+  // 「実測静止」だけで判定しない（追従中に止まってしまった軸の補正を止めない）: 軌道速度 0 と |誤差| ≤ deadband も要る。
+  bool update_settle_dwell(int64_t err, uint64_t dt_us) {
+    if (tuning.settled_ms == 0) { settle_dwell_us_ = 0; return true; }
+    const int64_t err_abs = err < 0 ? -err : err;
+    const int32_t v_abs = velocity_ < 0 ? -velocity_ : velocity_;
+    const bool cond = setpoint_vel_ == 0.0 && err_abs <= tuning.deadband && v_abs <= tuning.settled_meas_vel;
+    if (!cond) { settle_dwell_us_ = 0; return false; }
+    settle_dwell_us_ += dt_us;
+    return settle_dwell_us_ >= ms_to_us(tuning.settled_ms);
   }
 
   void reset_stall_boost() {
