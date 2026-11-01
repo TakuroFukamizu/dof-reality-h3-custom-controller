@@ -120,6 +120,12 @@ constexpr uint8_t CANCEL = 0;
 constexpr uint8_t START = 1;
 }  // namespace cal_mode
 
+// CALIBRATE の flags（protocol.md §4）。bit0 = KEEP_POWER: 電源担当軸（CONFIG の role_flags bit0）だけが解釈し、
+// 校正が終わっても主電源 ON 指令を保って CALIBRATING（POWER_HOLD）に留まる。bit1〜7 は予約（受信側は無視する）。
+namespace cal_flag {
+constexpr uint8_t KEEP_POWER = 0x01;
+}  // namespace cal_flag
+
 // CAL_RESULT の result / step（protocol.md §4）
 namespace cal_result {
 constexpr uint8_t OK = 0;
@@ -132,6 +138,7 @@ constexpr uint8_t NONE = 0;
 constexpr uint8_t TO_P = 1;
 constexpr uint8_t TO_N = 2;
 constexpr uint8_t TO_NEUTRAL = 3;
+constexpr uint8_t POWER_HOLD = 4;  // 画面向け（V1Axis::cal_live_step）だけ。CAL_RESULT の step には入れない（校正が終わった段階を入れる）
 }  // namespace cal_step
 
 constexpr size_t CAL_REASON_LEN = 8;  // CAL_RESULT の reason（ASCII、NUL 埋め。8 文字ちょうどなら終端なし）
@@ -356,7 +363,8 @@ struct SetReference {
 };
 struct Calibrate {
   uint32_t request_id;
-  uint8_t mode;  // cal_mode::START / CANCEL
+  uint8_t mode;   // cal_mode::START / CANCEL
+  uint8_t flags;  // cal_flag::*（未知のビットは無視する）
 };
 
 struct Hello {
@@ -530,6 +538,7 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
     case msg::CALIBRATE:
       put_u32(out + 0, m.calibrate.request_id);
       put_u8(out + 4, m.calibrate.mode);
+      put_u8(out + 5, m.calibrate.flags);
       break;
     default:
       return 0;
@@ -696,6 +705,7 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
     case msg::CALIBRATE:
       out->calibrate.request_id = get_u32(p + 0);
       out->calibrate.mode = get_u8(p + 4);
+      out->calibrate.flags = get_u8(p + 5);  // 予約ビット（bit1〜7）が立っていても拒まない
       break;
     default:
       return false;

@@ -114,3 +114,5 @@ constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
 constexpr uint32_t CAL_POWER_SETTLE_MS = 5000;  // CALIBRATING: 主電源 ON 指令からブレーキ解除指令まで（protocol.md §1.2）。2026-10-31 に電源投入 4 s 後は動かず
                                                 // 12 s 後に動いた記録があるため ARMING の POWER_SETTLE_MS より長い。仮値。電源担当でない軸も同じ時間待つ
+constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // CALIBRATING(POWER_HOLD): KEEP_POWER で校正後も主電源を保つ上限。PC の CALIBRATE(0) が
+                                                        // 来なくてもこの時間で主電源 OFF → DISARMED（protocol.md §4 CALIBRATE）。仮値
