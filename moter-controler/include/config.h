@@ -79,9 +79,10 @@ constexpr int32_t COUNTS_PER_MOTOR_REV = 400;  // モーター軸 1 回転の 4 
 // --- 自動移動（端当て原点復帰・中立への比例制御） ---
 constexpr int HOME_DUTY = 10;                   // 端当ての Duty。10 % 250 ms で異常無く止まった
 constexpr int AUTO_DUTY_MAX = 15;               // 自動移動の上限
-constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測
+constexpr int NEUTRAL_DUTY_MIN = 7;             // 7 % で動くことを実測（#3）。持ち上げ側で遅すぎれば HOME_DUTY まで段階的に上げる（#2 は 8 % 台で 150 count/s 未満、2026-10-31）
 constexpr int NEUTRAL_KP_PERCENT_PER_100 = 1;   // 誤差 100 カウントあたり 1 %
-constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差
+constexpr int32_t NEUTRAL_BAND = 10;            // 到達とみなす誤差（入口）
+constexpr int32_t NEUTRAL_BAND_EXIT = 20;       // Dwell 中はこれを超えるまで帯内とみなす（#3 が 3077〜3080 で往復し収束しなかった 2026-10-31）
 constexpr uint32_t STALL_MS = 200;              // 無パルス停止
 constexpr int32_t MIN_COUNT_RATE = 150;         // 駆動中にこれ未満の count/s が STALL_MS 続いたら停止判定。10 % の実測 400〜650 の 1/3 以下。片相断線の 65 count/s を弾く
 constexpr uint32_t START_GRACE_MS = 300;        // 開始直後の猶予
@@ -102,8 +103,8 @@ constexpr int MANUAL_GUARD_MIN_DUTY = NEUTRAL_DUTY_MIN;  // これ未満は機�
 // 速度が出ないので、軌道の目標速度に応じたフィードフォワードを足し、比例は補正に使う。
 constexpr int V1_KP_PERCENT_PER_100 = 2;        // 位置制御の比例ゲイン。誤差 100 カウントあたり 2 %
 constexpr int V1_FF_COUNT_S_PER_PERCENT = 100;  // フィードフォワード: 軌道の目標速度 [count/s] ÷ この値 = Duty [%]（実測の下側を取った仮値）
-constexpr int32_t V1_DEADBAND = 10;             // 目標が止まっているとき、|誤差| がこれ以下になったら Duty 0（入る側）
-constexpr int32_t V1_DEADBAND_OUT = 20;         // Duty 0 のあと、|誤差| がこれを超えるまで再駆動しない（出る側。到達帯の縁での往復を防ぐ）
+constexpr int32_t V1_DEADBAND = NEUTRAL_BAND;   // 目標が止まっているとき、|誤差| がこれ以下になったら Duty 0（入る側。従来 env の到達帯と同じ 10）
+constexpr int32_t V1_DEADBAND_OUT = NEUTRAL_BAND_EXIT;  // Duty 0 のあと、|誤差| がこれを超えるまで再駆動しない（出る側。従来 env の出口帯と同じ 20。到達帯の縁での往復を防ぐ）
 constexpr int V1_DUTY_MIN = NEUTRAL_DUTY_MIN;   // Duty の下限（7 %。これ未満では機構が動かないことを実測）
 constexpr int V1_DUTY_MAX = 20;                 // Duty の上限（実測 20 % ≈ 1900 count/s 前後。overspeed_count_s より十分下の速度に収める）
 constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty|（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）

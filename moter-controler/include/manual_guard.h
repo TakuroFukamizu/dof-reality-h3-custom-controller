@@ -10,6 +10,7 @@
 //   無パルスで止めてしまうため）。7 % に達した時点から計測を始める。
 // - 無パルス: 計測開始から START_GRACE_MS 経過後、カウントが STALL_MS 変わらなければ "stall"。
 // - 遅すぎ: |速度| が HOME_DUTY 以上のときだけ、STALL_MS ごとの窓で MIN_COUNT_RATE 未満なら "slow"。
+// - 速度の符号が変わったら（反転）計測をやり直す。窓が逆向きの動きをまたぐと正味の変化が小さく、遅すぎに見えるため。
 // - ラッチ中は速度指令が残っていても 0 を返す。指令が 0 に戻ったら解除し、次の指令で最初から計測する。
 
 #include <stdint.h>
@@ -34,12 +35,17 @@ struct ManualGuard {
       return 0;
     }
     const int mag = manual_speed < 0 ? -manual_speed : manual_speed;
+    const int sign = manual_speed < 0 ? -1 : 1;
     if (mag < cfg.manual_min_duty) {
       running_ = false;  // 監視範囲に戻ったら最初から計測する
       return manual_speed;
     }
+    if (running_ && sign != sign_) {
+      running_ = false;  // 反転: 窓が逆向きの動きをまたいで遅すぎに見えるので、計測をやり直す
+    }
     if (!running_) {
       running_ = true;
+      sign_ = sign;
       start_ms_ = now_ms;
       last_raw_ = raw;
       last_change_ms_ = now_ms;
@@ -71,6 +77,7 @@ struct ManualGuard {
 
  private:
   bool running_ = false;
+  int sign_ = 1;
   uint32_t start_ms_ = 0;
   int64_t last_raw_ = 0;
   uint32_t last_change_ms_ = 0;

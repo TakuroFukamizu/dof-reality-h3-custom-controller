@@ -21,6 +21,7 @@ struct AutoConfig {
   int neutral_duty_min = NEUTRAL_DUTY_MIN;
   int kp_percent_per_100 = NEUTRAL_KP_PERCENT_PER_100;
   int32_t neutral_band = NEUTRAL_BAND;
+  int32_t neutral_band_exit = NEUTRAL_BAND_EXIT;
   uint32_t stall_ms = STALL_MS;
   int32_t min_count_rate = MIN_COUNT_RATE;
   uint32_t start_grace_ms = START_GRACE_MS;
@@ -94,6 +95,7 @@ struct AutoMachine {
   bool retreating = false;   // 端当てで開始直後に止まり、反対へ退避中
   bool retreat_done = false; // この行程で退避を済ませた（2 回目は失敗にする）
   int64_t retreat_start_raw = 0;
+  int neutral_boost = 0;     // 中立への Duty 下限の上乗せ。遅すぎ／無パルスのたびに上げ、home_duty で頭打ち
 
   int32_t position(int64_t raw) const {
     return static_cast<int32_t>((raw - origin_raw) * working_sign);
@@ -235,6 +237,7 @@ struct AutoMachine {
     slow_event = false;
     retreating = false;
     retreat_done = false;
+    neutral_boost = 0;
     near_end_at_start = false;
     if (leg != AutoKind::Neutral) {
       int32_t dist = 0;
@@ -269,7 +272,9 @@ struct AutoMachine {
       const int32_t err = profile.neutral - position(in.raw_count);
       const int32_t mag = err < 0 ? -err : err;
       int duty = static_cast<int>((static_cast<int64_t>(mag) * cfg.kp_percent_per_100) / 100);
-      if (duty < cfg.neutral_duty_min) duty = cfg.neutral_duty_min;
+      int floor_duty = cfg.neutral_duty_min + neutral_boost;
+      if (floor_duty > cfg.home_duty) floor_duty = cfg.home_duty;
+      if (duty < floor_duty) duty = floor_duty;
       if (duty > cfg.auto_duty_max) duty = cfg.auto_duty_max;
       duty_signed = err > 0 ? -duty : duty;
       return;
@@ -374,7 +379,9 @@ struct AutoMachine {
   void tick_neutral(const AutoInputs& in) {
     const int32_t err = profile.neutral - position(in.raw_count);
     const int32_t mag = err < 0 ? -err : err;
-    if (mag <= cfg.neutral_band) {
+    // Dwell 中は出口帯で判定する（ヒステリシス）。帯の縁で 1〜3 カウント揺れても Dwell を数え続ける。
+    const int32_t band = phase == AutoPhase::Dwell ? cfg.neutral_band_exit : cfg.neutral_band;
+    if (mag <= band) {
       duty_signed = 0;
       if (phase != AutoPhase::Dwell) {
         phase = AutoPhase::Dwell;
@@ -391,13 +398,28 @@ struct AutoMachine {
       rate_anchor_raw = in.raw_count;
       rate_anchor_ms = in.now_ms;
       slow_event = false;
+      neutral_boost = 0;  // 戻りは短距離なので下限から
     }
     compute_duty(in);
-    if (stalled(in)) {
-      finish(AutoPhase::Failed, "stall");
-    } else if (slow_event) {
-      finish(AutoPhase::Failed, "slow");
+    const bool stall = stalled(in);
+    if (!stall && !slow_event) {
+      return;
     }
+    // 下限 Duty では機構が動かない／遅いことがある（重力負荷の持ち上げ側）。home_duty 未満なら失敗にせず下限を上げる。
+    const int mag_duty = duty_signed < 0 ? -duty_signed : duty_signed;
+    if (mag_duty < cfg.home_duty) {
+      const int max_boost = cfg.home_duty - cfg.neutral_duty_min;
+      neutral_boost = stall ? max_boost : neutral_boost + 1;  // 無パルスなら一気に、遅すぎなら 1 % ずつ
+      if (neutral_boost > max_boost) neutral_boost = max_boost;
+      start_ms = in.now_ms;  // 新しい Duty にも猶予を与える
+      last_change_ms = in.now_ms;
+      rate_anchor_raw = in.raw_count;
+      rate_anchor_ms = in.now_ms;
+      slow_event = false;
+      compute_duty(in);
+      return;
+    }
+    finish(AutoPhase::Failed, stall ? "stall" : "slow");
   }
 
   void leg_done(const AutoInputs& in) {
