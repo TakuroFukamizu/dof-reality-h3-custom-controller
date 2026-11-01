@@ -63,7 +63,7 @@ frame:         header(4) payload(N) crc(2)
 - COBS の細目: 非ゼロ 254 byte の連続でデータが終わるときは末尾に空ブロック `0x01` を付けない（Wikipedia の例と同じ）。受信側は付いていても付いていなくても受け付ける。`0x00` が連続した空フレームは数えずに無視する。
 - 受信側は、CRC 不一致・`version` 不一致・未知の `msg_type`・`payload_len` が種別の定義長と異なるフレームを **破棄** し、破棄数を数える（STATUS の `rx_error_count`）。破棄したフレームに応答しない。`rx_error_count` には、v1 で扱えない `apply_at_us ≠ 0` の SET_POSITION（§4）も数える。
 - 将来の拡張でも既存種別の長さは変えない。必要なら新しい `msg_type` を足す。
-- MCU の送信はブロックしない（Issue #15 M7、ファーム `include/v1_tx_pump.h`）: USB CDC の TX リング（1024 byte）に空きが無いとき、**STATUS は捨てる**（次の 20 ms のものが新しい）、それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT）は順序を保って保留する。加えて **積まれてからの滞在時間**で硬い期限を切る: STATUS は 100 ms、それ以外は 200 ms を過ぎたら空きがあっても送らない（後続が 1 本ずつ新しい猶予をもらって数秒分の古い ACK が溜まることはない）。空きが無いときは接続状態に関わらず書かない（HWCDC の write は中で接続を見直すので、再接続の瞬間に待つ経路へ入り得る）。PC が読んでいない間に MCU の受信（SET_POSITION）が止まらないための規則で、PC 側の期限（ACK 1000 ms・STATUS 途絶 200 ms、§6）より短い。PC は、期限を過ぎた ACK が来ないことを ACK 期限切れとして扱う（再送しない、§6）。
+- MCU の送信はブロックしない（Issue #15 M7、ファーム `include/v1_tx_pump.h`）: USB CDC の TX リング（1024 byte）に空きが無いとき、**STATUS は捨てる**（次の 20 ms のものが新しい）、それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT）は **MCU 側で捨てない**: 順序を保って保留し、空きが戻ったら書く。保留が 100 ms 続いたら空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 最大 20 回 = 20 ms で有界。未接続なら HWCDC が古い内容を置き換えて即返る）。積まれてから 100 ms 以上経った STATUS は空きがあっても送らない（古い STATUS を順に流さず新しいものだけ）。STATUS 以外に滞在時間の期限は無い。PC が読んでいない間に MCU の受信（SET_POSITION）が止まらないための規則で、STATUS 側の値は PC の STATUS 途絶 200 ms（§6）より短い。詰まったリンクでは古い ACK が遅れて届くことがあり、PC は期限（1000 ms）を過ぎた ACK を無視する。
 
 ## 3. 共通の値
 

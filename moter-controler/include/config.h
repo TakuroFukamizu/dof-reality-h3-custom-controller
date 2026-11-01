@@ -140,7 +140,8 @@ constexpr uint32_t V1_STALL_BOOST_MAX_MS = 2000;
 #endif
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
-constexpr uint32_t V1_TX_DEFER_MAX_MS = 200;     // STATUS 以外は積まれてからこれ以上経ったら送らない（空きがあっても。硬い期限）。PC の ACK 期限 1000 ms より十分短く、ここまで詰まったリンクは PC 側でも途絶
+constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
+constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで

@@ -38,11 +38,11 @@ struct Sim {
   FakePort port;
   v1::TxPump<Frame> pump;
   uint32_t now = 1000;
-  void push(uint8_t type, uint16_t len = 50) {
+  void push(uint8_t type, uint16_t len = 50, int32_t enqueue_offset_ms = 0) {
     Frame f{};
     f.len = len;
     f.type = type;
-    f.enqueued_ms = now;
+    f.enqueued_ms = static_cast<uint32_t>(static_cast<int32_t>(now) + enqueue_offset_ms);
     f.data[0] = type;
     q.push_back(f);
   }
@@ -55,25 +55,39 @@ struct Sim {
     };
     pump.run(pop, port, now, max_frames);
   }
+  int count(uint8_t type) const {
+    int n = 0;
+    for (uint8_t t : port.written_types) n += (t == type) ? 1 : 0;
+    return n;
+  }
 };
+
+inline void test_age_is_signed_and_clamped() {
+  CHECK(v1::tx_age_ms(1000, 1000) == 0);
+  CHECK(v1::tx_age_ms(1200, 1000) == 200);
+  CHECK(v1::tx_age_ms(1000, 1001) == 0);     // 別コアが run() の途中で積んだ（now より新しい）
+  CHECK(v1::tx_age_ms(1000, 1500) == 0);
+  CHECK(v1::tx_age_ms(5, 0xFFFFFFF0u) == 21);  // millis の巻き戻りをまたぐ
+}
 
 inline void test_decide_table() {
   v1::TxPolicy p;
   p.status_stale_ms = 100;
-  p.defer_max_ms = 200;
+  p.hold_write_through_ms = 100;
   using A = v1::TxAction;
   // 空きがあれば書く
-  CHECK(v1::tx_decide(false, 50, 50, 0, p) == A::Write);
-  CHECK(v1::tx_decide(true, 50, 1000, 99, p) == A::Write);
-  CHECK(v1::tx_decide(false, 50, 1000, 199, p) == A::Write);
-  // 空きが足りない: STATUS は捨てる、それ以外は保留（接続状態は見ない）
-  CHECK(v1::tx_decide(true, 50, 49, 0, p) == A::DropStale);
-  CHECK(v1::tx_decide(false, 50, 49, 0, p) == A::Defer);
-  CHECK(v1::tx_decide(false, 50, 0, 199, p) == A::Defer);
-  // 期限切れは空きがあっても送らない（積まれてからの滞在時間）
-  CHECK(v1::tx_decide(true, 50, 1000, 100, p) == A::DropStale);
-  CHECK(v1::tx_decide(false, 50, 1000, 200, p) == A::DropAged);
-  CHECK(v1::tx_decide(false, 50, 0, 200, p) == A::DropAged);
+  CHECK(v1::tx_decide(false, 50, 50, 0, 0, p) == A::Write);
+  CHECK(v1::tx_decide(true, 50, 1000, 99, 0, p) == A::Write);
+  CHECK(v1::tx_decide(false, 50, 1000, 5000, 0, p) == A::Write);  // STATUS 以外は古くても送る
+  // 空きが足りない: STATUS は捨てる、それ以外は保留
+  CHECK(v1::tx_decide(true, 50, 49, 0, 0, p) == A::DropStale);
+  CHECK(v1::tx_decide(false, 50, 49, 0, 0, p) == A::Defer);
+  CHECK(v1::tx_decide(false, 50, 0, 0, 99, p) == A::Defer);
+  // 保留が続いたら空きが無くても書く（捨てない）
+  CHECK(v1::tx_decide(false, 50, 0, 0, 100, p) == A::WriteThrough);
+  CHECK(v1::tx_decide(false, 50, 49, 10000, 100, p) == A::WriteThrough);
+  // 古い STATUS は空きがあっても送らない
+  CHECK(v1::tx_decide(true, 50, 1000, 100, 0, p) == A::DropStale);
 }
 
 // 通常: 空きがあれば順に書く（1 poll に最大 4 本）。保留なし
@@ -91,7 +105,58 @@ inline void test_pump_writes_in_order_when_space() {
   CHECK(s.q.size() == 1 && !s.pump.holding());
   s.poll();
   CHECK(s.port.written_types.size() == 5 && s.q.empty());
-  CHECK(s.pump.stats.deferred == 0 && s.pump.stats.stale_dropped == 0 && s.pump.stats.aged_dropped == 0);
+  CHECK(s.pump.stats.deferred == 0 && s.pump.stats.stale_dropped == 0 && s.pump.stats.written_through == 0);
+}
+
+// 11-03 未明の実機の再現: START の ACK と遷移後の STATUS が同じ poll で積まれ、ACK の enqueued_ms が run() で取った now より
+// 1 ms 新しい（制御タスクが別コアで run() の途中に積んだ）。r2 は age が巻き戻って ACK を期限切れで捨てた。ACK は必ず出る
+inline void test_ack_enqueued_after_poll_timestamp_is_not_dropped() {
+  Sim s;
+  s.push(v1::msg::STATUS, 50, 0);  // 定期 STATUS
+  s.push(v1::msg::ACK, 50, +1);    // START の ACK（now + 1 ms）
+  s.push(v1::msg::STATUS, 50, +1); // 遷移後の STATUS
+  s.poll();
+  CHECK(s.port.written_types.size() == 3);
+  CHECK(s.port.written_types[1] == v1::msg::ACK);
+  CHECK(s.pump.stats.stale_dropped == 0);
+  // 空きが一瞬 0 でも、ACK は保留して次の poll で出る（捨てない）。STATUS は捨ててよい
+  Sim t;
+  t.port.free_bytes = 0;
+  t.push(v1::msg::ACK, 50, +1);
+  t.push(v1::msg::STATUS, 50, +1);
+  t.poll();
+  CHECK(t.port.written_types.empty() && t.pump.holding() && t.pump.held()->type == v1::msg::ACK);
+  t.now += 1;
+  t.port.free_bytes = 1024;
+  t.poll();
+  CHECK(t.port.written_types.size() == 2 && t.port.written_types[0] == v1::msg::ACK);
+  CHECK(t.pump.stats.stale_dropped == 0);
+}
+
+// 100 Hz の SET_POSITION に応じた STATUS が流れ続ける中で、空きが小さい poll が 1 回挟まっても ACK は落ちない
+inline void test_ack_survives_transient_small_space_with_status_traffic() {
+  Sim s;
+  s.port.free_bytes = 1024;
+  for (int i = 0; i < 20; ++i) {  // 200 ms 分の定期 STATUS（20 ms ごと）
+    s.push(v1::msg::STATUS);
+    s.poll();
+    s.now += 20;
+    s.port.free_bytes = 1024;  // ホストが読んでいる
+  }
+  // ACK + 遷移後 STATUS が積まれた poll で、空きは 30 byte しかない
+  s.port.free_bytes = 30;
+  s.push(v1::msg::ACK, 50, +1);
+  s.push(v1::msg::STATUS, 50, +1);
+  s.poll();
+  CHECK(s.pump.holding() && s.pump.held()->type == v1::msg::ACK);
+  CHECK(s.pump.stats.deferred == 1);
+  // 次の poll（1 ms 後）には空きが戻る → ACK、STATUS の順
+  s.now += 1;
+  s.port.free_bytes = 1024;
+  s.poll();
+  CHECK(s.count(v1::msg::ACK) == 1);
+  CHECK(s.port.written_types.back() == v1::msg::STATUS);
+  CHECK(s.pump.stats.stale_dropped == 0 && s.pump.stats.written_through == 0);
 }
 
 // 背圧（空き無し）: ACK は保留して順序を保ち、後ろは触らない。空きができたら保留から順に出る
@@ -115,7 +180,7 @@ inline void test_pump_defers_ack_and_keeps_order_under_backpressure() {
   CHECK(s.port.written_types.size() == 2);
   CHECK(s.port.written_types[0] == v1::msg::ACK && s.port.written_types[1] == v1::msg::LIMITS);
   CHECK(!s.pump.holding() && s.q.empty());
-  CHECK(s.pump.stats.aged_dropped == 0);
+  CHECK(s.pump.stats.written_through == 0);
 }
 
 // 背圧の間の STATUS は捨てる（次の周期のものが新しい）。ACK → STATUS の順序は崩れない
@@ -137,62 +202,38 @@ inline void test_pump_drops_status_under_backpressure_but_not_ack() {
         s.port.written_types[1] == v1::msg::STATUS);
 }
 
-// 保留した ACK は積まれてから defer_max_ms で捨てる（PC の ACK 期限より十分前。詰まったままのリンクで古い ACK を溜めない）
-inline void test_pump_drops_aged_deferred_frame() {
+// 保留が hold_write_through_ms（100 ms）続いたら空きが無くても書く（捨てない。availableForWrite が 0 を返し続ける状態の退路）。
+// 後続もそれぞれ保留 → 書く、でキューは進む
+inline void test_pump_writes_through_after_long_hold_never_drops_ack() {
   Sim s;
-  s.port.free_bytes = 10;
+  s.port.free_bytes = 0;
   s.push(v1::msg::ACK);
-  s.now += 50;  // 積まれてから 50 ms 後に初めて poll（描画で loop が遅れた）
+  s.push(v1::msg::CAL_RESULT);
   s.poll();
   CHECK(s.pump.holding());
-  s.now += V1_TX_DEFER_MAX_MS - 51;  // 積まれてから 199 ms
+  s.now += V1_TX_HOLD_WRITE_THROUGH_MS - 1;
   s.poll();
-  CHECK(s.pump.holding() && s.pump.stats.aged_dropped == 0);
-  s.now += 1;  // 200 ms
-  s.poll();
-  CHECK(!s.pump.holding() && s.pump.stats.aged_dropped == 1);
-  CHECK(s.port.written_types.empty());
-}
-
-// 期限は積まれてからの滞在時間: 詰まりの間に積まれた ACK 群は、空きが戻っても期限を過ぎたものは送らず、
-// 後続が 1 本ずつ新しい猶予をもらうこともない（硬い期限）
-inline void test_pump_expiry_is_total_residence_not_per_successor() {
-  Sim s;
-  s.port.free_bytes = 10;
-  s.push(v1::msg::ACK);        // t = 1000
-  s.now += 100;
-  s.push(v1::msg::LIMITS);     // t = 1100
-  s.now += 100;
-  s.push(v1::msg::CAL_RESULT); // t = 1200
-  s.poll();                    // t = 1200: ACK（200 ms）は期限切れで捨て、LIMITS（100 ms）を保留
-  CHECK(s.pump.stats.aged_dropped == 1);
-  CHECK(s.pump.holding() && s.pump.held()->type == v1::msg::LIMITS);
-  s.now += 100;                // t = 1300: LIMITS が 200 ms → 捨て、CAL_RESULT（100 ms）を保留
-  s.poll();
-  CHECK(s.pump.stats.aged_dropped == 2);
+  CHECK(s.pump.holding() && s.port.written_types.empty());
+  s.now += 1;
+  s.poll();  // ACK を空きを見ずに書く。CAL_RESULT は新たに保留
+  CHECK(s.port.written_types.size() == 1 && s.port.written_types[0] == v1::msg::ACK);
+  CHECK(s.pump.stats.written_through == 1);
   CHECK(s.pump.holding() && s.pump.held()->type == v1::msg::CAL_RESULT);
-  // 空きが戻っても、期限を過ぎていれば送らない
-  s.now += 100;                // t = 1400: CAL_RESULT が 200 ms
-  s.port.free_bytes = 1024;
-  const int calls_before = s.port.available_calls;
+  s.now += V1_TX_HOLD_WRITE_THROUGH_MS;
   s.poll();
-  CHECK(s.pump.stats.aged_dropped == 3);
-  CHECK(s.port.written_types.empty() && !s.pump.holding());
-  CHECK(s.port.available_calls == calls_before);  // 期限切れの判定では空きを見ない
+  CHECK(s.port.written_types.size() == 2 && s.port.written_types[1] == v1::msg::CAL_RESULT);
+  CHECK(s.pump.stats.written_through == 2);
+  CHECK(!s.pump.holding());
 }
 
-// 期限内なら、保留の後に空きが戻れば送る
-inline void test_pump_sends_deferred_frame_within_deadline() {
+// STATUS 以外は積まれてから古くなっても捨てない（期限は STATUS だけ）
+inline void test_non_status_is_never_expired() {
   Sim s;
-  s.port.free_bytes = 10;
-  s.push(v1::msg::ACK);
-  s.now += 150;
-  s.poll();
-  CHECK(s.pump.holding());
-  s.now += 40;  // 190 ms
-  s.port.free_bytes = 1024;
+  s.push(v1::msg::ACK, 50, -5000);  // 5 s 前に積まれた
+  s.push(v1::msg::STATUS, 50, -5000);
   s.poll();
   CHECK(s.port.written_types.size() == 1 && s.port.written_types[0] == v1::msg::ACK);
+  CHECK(s.pump.stats.stale_dropped == 1);
 }
 
 // 詰まりが解けたとき、積まれて 100 ms 以上経った STATUS は送らず、新しい STATUS だけ送る（最新で置き換える）
@@ -212,8 +253,8 @@ inline void test_pump_skips_stale_status_after_backlog() {
   CHECK(s.q.empty());
 }
 
-// 空きが無ければ接続状態に関わらず書かない（HWCDC::write が中で接続を見直して待つ経路に入り得るため）
-inline void test_pump_never_writes_without_space() {
+// 空きが無いときは（保留が 100 ms 続くまで）書かない
+inline void test_pump_does_not_write_without_space_before_hold_elapses() {
   Sim s;
   s.port.free_bytes = 0;
   s.push(v1::msg::ACK);
@@ -238,15 +279,17 @@ inline void test_pump_space_boundary() {
 }
 
 inline void run_all() {
+  test_age_is_signed_and_clamped();
   test_decide_table();
   test_pump_writes_in_order_when_space();
+  test_ack_enqueued_after_poll_timestamp_is_not_dropped();
+  test_ack_survives_transient_small_space_with_status_traffic();
   test_pump_defers_ack_and_keeps_order_under_backpressure();
   test_pump_drops_status_under_backpressure_but_not_ack();
-  test_pump_drops_aged_deferred_frame();
-  test_pump_expiry_is_total_residence_not_per_successor();
-  test_pump_sends_deferred_frame_within_deadline();
+  test_pump_writes_through_after_long_hold_never_drops_ack();
+  test_non_status_is_never_expired();
   test_pump_skips_stale_status_after_backlog();
-  test_pump_never_writes_without_space();
+  test_pump_does_not_write_without_space_before_hold_elapses();
   test_pump_space_boundary();
 }
 

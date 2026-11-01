@@ -31,6 +31,6 @@ bool v1_link_tx_push(const v1::McuMsg& m);   // 制御タスク。満杯なら f
 uint32_t v1_link_take_rx_dropped();          // メッセージ層より下で捨てた受信フレーム数（前回呼び出しから）
 uint32_t v1_link_tx_dropped();               // 送信キュー満杯で push に失敗した回数（累計、表示用）
 uint32_t v1_link_tx_deferred();              // TX リングに空きが無く次の poll に回した回数（累計、表示用。Issue #15 M7）
-uint32_t v1_link_tx_stale_dropped();         // 古い／入らない STATUS と期限切れの保留を捨てた数（累計、表示用）
+uint32_t v1_link_tx_stale_dropped();         // 古い／入らない STATUS を捨てた数 + 保留が続いて空きを見ずに書いた数（累計、表示用 `old`）
 uint64_t v1_link_device_id();                // eFuse MAC 48 bit、上位 16 bit は 0x5131
 uint32_t v1_link_boot_id();                  // esp_random()

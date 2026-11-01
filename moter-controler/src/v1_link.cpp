@@ -103,13 +103,16 @@ void v1_link_poll() {
   }
 
   // 送信: 送信キュー → Serial（順序を保つため 1 本のキューだけ）。空きが無ければ保留／STATUS は捨てる（v1_tx_pump.h）
+  // STATUS 以外は捨てない（保留 → 空きが戻るか V1_TX_HOLD_WRITE_THROUGH_MS で書く）。now は run() の入口で 1 回取るが、
+  // 制御タスク（別コア）が run() の途中で積んだフレームは enqueued_ms が新しいことがあり、pump 側が符号付きで吸収する。
   SerialPort port;
   const v1::TxPumpStats before = g_pump.stats;
   g_pump.run(pop_tx, port, millis(), kTxFramesPerPoll, usb_diag_note_tx);
   const v1::TxPumpStats& after = g_pump.stats;
   if (after.deferred != before.deferred) g_tx_deferred.fetch_add(after.deferred - before.deferred);
-  const uint32_t dropped_now = (after.stale_dropped - before.stale_dropped) + (after.aged_dropped - before.aged_dropped);
-  if (dropped_now) g_tx_stale_dropped.fetch_add(dropped_now);
+  // old = 捨てた STATUS + 空きを見ずに書いた（WriteThrough）数
+  const uint32_t old_now = (after.stale_dropped - before.stale_dropped) + (after.written_through - before.written_through);
+  if (old_now) g_tx_stale_dropped.fetch_add(old_now);
 }
 
 bool v1_link_rx_pop(V1RxFrame* out) {

@@ -1369,6 +1369,9 @@ void setup() {
   // M5.begin() より前に止める。Arduino core の log_e() は CORE_DEBUG_LEVEL=0（platformio.ini）でコンパイル時に消す。
   esp_log_level_set("*", ESP_LOG_NONE);
   boardBegin();
+  // v1 は書く前に TX リングの空きを見る（v1_tx_pump.h）ので通常 write は待たない。保留が続いて空きを見ずに書く（WriteThrough）
+  // ときだけ HWCDC が tx timeout × 最大 20 回待つ。boardBegin の 20 ms（従来 env 向け）だと 400 ms になるので 1 ms（最大 20 ms）にする。
+  Serial.setTxTimeoutMs(V1_TX_TIMEOUT_MS);
   motor_output_begin();
   if (!encoder_begin()) {
     noteBootError("pcnt");
