@@ -12,6 +12,7 @@
 #include "motor_output.h"
 #include "pmic_log.h"
 #include "profile_store.h"
+#include "usb_diag.h"
 
 #if MC_PROTO_V1
 #include <esp_log.h>
@@ -45,6 +46,34 @@ constexpr uint16_t kDarkOrange = rgb565(35, 12, 0);
 constexpr uint16_t kGreen = rgb565(0, 255, 100);
 constexpr uint16_t kGray = rgb565(60, 60, 60);
 constexpr uint16_t kRed = rgb565(255, 0, 0);
+
+// USB 診断行の色（Issue #11）。緑: バスも IN token も来ている。橙: SOF はあるがホストがこのアドレスを読みに来ない
+//（ポート未オープン、またはアドレス不一致）。赤: SOF が止まっている（バス停止 / suspend / PHY）。
+uint16_t usbDiagColor(const UsbDiag& d) {
+  if (!d.sof_alive) return kRed;
+  if (!d.in_token || d.out_data_avail) return kAmber;
+  return kGreen;
+}
+
+UsbDiag usb_diag{};
+char usb_diag_text[96] = "usb -";
+uint32_t next_usb_diag_ms = 0;
+
+// 500 ms ごとに USB-Serial/JTAG の状態を読み、行を作り直す（両 env 共通）。行が変わったら true（呼び出し側が描き直す）。
+// bus_reset_seen は、このサンプルで bus reset の回数が増えたとき true。
+bool usbDiagTick(bool* bus_reset_seen) {
+  *bus_reset_seen = false;
+  if (static_cast<int32_t>(millis() - next_usb_diag_ms) < 0) return false;
+  next_usb_diag_ms = millis() + 500;
+  const uint32_t resets_before = usb_diag.bus_resets;
+  usb_diag_sample(&usb_diag);
+  *bus_reset_seen = usb_diag.bus_resets != resets_before;
+  char text[sizeof(usb_diag_text)];
+  usb_diag_format(usb_diag, text, sizeof(text));
+  if (strcmp(text, usb_diag_text) == 0) return false;
+  snprintf(usb_diag_text, sizeof(usb_diag_text), "%s", text);
+  return true;
+}
 
 // ピンを安全側に固定してから M5 を初期化する。設定は従来 env と v1 env で同一。
 void boardBegin() {
@@ -85,6 +114,7 @@ void boardBegin() {
   // USB CDC をホストが読んでいないと write / flush は既定 100 ms ずつ待つ。自動移動中は AUTO 行と ENC 行の
   // flush が続くので、UI ループが 200 ms 止まると制御タスクの入力鮮度の守りが働いてしまう。20 ms に短縮する。
   Serial.setTxTimeoutMs(20);
+  usb_diag_begin();  // Issue #11: USB-Serial/JTAG の状態を画面に出す（読むだけ）
 
   if (M5.Display.width() < M5.Display.height()) {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
@@ -143,24 +173,42 @@ bool outputLive() {
   return relay_on && (millis() - relay_on_ms >= RELAY_SETTLE_MS);
 }
 
+// 1 行を書き、Serial.write が途中で諦めた（tx timeout）回数を usb_diag に残す（Issue #11 の TX 側の切り分け）。
+void txLine(const char* line) {
+  const size_t len = strlen(line);
+  const size_t written = Serial.write(reinterpret_cast<const uint8_t*>(line), len);
+  usb_diag_note_tx(len, written);
+}
+
+// USBDIAG: 画面に出ている行をそのまま返す。ここで usb_diag_sample() を呼ぶと、直後の定期サンプルと 1 ms 以内に
+// 2 回読むことになり、SOF フレーム番号が進んでいない（sof0 = 赤）と誤判定する。
+void publishUsbDiag() {
+  char line[sizeof(usb_diag_text) + 2];
+  snprintf(line, sizeof(line), "%s\n", usb_diag_text);
+  txLine(line);
+}
+
 void publish(const char* prefix) {
   const ControlSnapshot now = control_snapshot();
-  Serial.printf("%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d ENC=%lld A=%d B=%d\n",
-                prefix, relay_on ? 1 : 0, brake_on ? 1 : 0, requested_speed,
-                now.applied_speed, digitalRead(PIN_MD13S_DIR),
-                digitalRead(PIN_POWER_RELAY), digitalRead(PIN_MOTOR_BRAKE),
-                outputLive() ? 1 : 0, static_cast<long long>(now.raw_count),
-                now.a_level, now.b_level);
+  char line[160];
+  snprintf(line, sizeof(line), "%s R=%d B=%d S=%d OUT=%d DIR=%d PWR_PIN=%d BRK_PIN=%d LIVE=%d ENC=%lld A=%d B=%d\n",
+           prefix, relay_on ? 1 : 0, brake_on ? 1 : 0, requested_speed, now.applied_speed, digitalRead(PIN_MD13S_DIR),
+           digitalRead(PIN_POWER_RELAY), digitalRead(PIN_MOTOR_BRAKE), outputLive() ? 1 : 0,
+           static_cast<long long>(now.raw_count), now.a_level, now.b_level);
+  txLine(line);
 }
 
 void publishEnc(const ControlSnapshot& now) {
-  Serial.printf("ENC motor=%u count=%lld pos=%ld cps=%d a=%d b=%d origin=%d cal=%d stroke=%ld neutral=%ld sign=%d auto=%s phase=%s reason=%s\n",
-                static_cast<unsigned>(now.profile.motor), static_cast<long long>(now.raw_count),
-                static_cast<long>(now.position), now.count_per_s, now.a_level, now.b_level,
-                now.origin_valid ? 1 : 0, now.profile.calibrated ? 1 : 0,
-                static_cast<long>(now.profile.stroke), static_cast<long>(now.profile.neutral),
-                static_cast<int>(now.working_sign), auto_kind_name(now.kind), auto_phase_name(now.phase),
-                now.reason);
+  char line[256];  // 全フィールドが最長でも約 210 字（reason は 23 字まで）。切れると改行が落ちて次の行とつながる
+  snprintf(line, sizeof(line),
+           "ENC motor=%u count=%lld pos=%ld cps=%d a=%d b=%d origin=%d cal=%d stroke=%ld neutral=%ld sign=%d auto=%s "
+           "phase=%s reason=%s\n",
+           static_cast<unsigned>(now.profile.motor), static_cast<long long>(now.raw_count),
+           static_cast<long>(now.position), now.count_per_s, now.a_level, now.b_level, now.origin_valid ? 1 : 0,
+           now.profile.calibrated ? 1 : 0, static_cast<long>(now.profile.stroke),
+           static_cast<long>(now.profile.neutral), static_cast<int>(now.working_sign), auto_kind_name(now.kind),
+           auto_phase_name(now.phase), now.reason);
+  txLine(line);
 }
 
 // 自動移動の要求。制御タスクが可否を判定し、結果は snapshot.request_seq / request_error に出る。
@@ -280,6 +328,7 @@ void printHelp() {
   Serial.println("  NEUTRAL       move to neutral count, needs origin + calibration");
   Serial.println("  CAL           HOME -> UPPER -> save -> NEUTRAL");
   Serial.println("  UNCAL         clear calibration of selected motor (relay off only)");
+  Serial.println("  USBDIAG       USB-Serial/JTAG state line (same as the bottom line on screen, Issue #11)");
   Serial.printf("PortB(Base15) IO1/Yellow GPIO%d = PWM, IO2/White GPIO%d = DIR\n",
                 PIN_MD13S_PWM, PIN_MD13S_DIR);
   Serial.printf("XH2pin#2 GPIO%d = power (ON level %d), XH8pin#5 GPIO%d = brake (ON level %d)\n",
@@ -317,6 +366,10 @@ void handleLine(char* line) {
   if (strcasecmp(cmd, "?") == 0 || strcasecmp(cmd, "STATUS") == 0) {
     publish("STAT");
     publishEnc(control_snapshot());
+    return;
+  }
+  if (strcasecmp(cmd, "USBDIAG") == 0) {
+    publishUsbDiag();
     return;
   }
   if (strcasecmp(cmd, "M") == 0 || strcasecmp(cmd, "MOTOR") == 0) {
@@ -420,6 +473,7 @@ void handleLine(char* line) {
 void pollSerial() {
   while (Serial.available() > 0) {
     const char c = static_cast<char>(Serial.read());
+    usb_diag_note_rx(1);
     if (c == '\r') {
       continue;
     }
@@ -759,27 +813,33 @@ void render() {
     canvas.drawString(speed_text, x + fifth_w / 2, 119);
   }
 
-  canvas.drawLine(6, 220, width - 6, 220, kAmber);
+  // USB 診断行（Issue #11）。6x8 の ASCII フォントで 1 行。SOF が止まる／IN token が来ない／OUT FIFO 残りを色で示す。
+  canvas.drawLine(6, 217, width - 6, 217, kAmber);
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(usbDiagColor(usb_diag), TFT_BLACK);
+  canvas.drawString(usb_diag_text, 8, 222);
+
   canvas.setFont(&fonts::lgfxJapanGothic_12);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("DIR", 8, 231);
+  canvas.drawString("DIR", 8, 233);
   canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  canvas.drawString(digitalRead(PIN_MD13S_DIR) ? "H" : "L", 34, 231);
+  canvas.drawString(digitalRead(PIN_MD13S_DIR) ? "H" : "L", 34, 233);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("PWR", 50, 231);
+  canvas.drawString("PWR", 50, 233);
   canvas.setTextColor(power_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(power_high ? "H" : "L", 80, 231);
+  canvas.drawString(power_high ? "H" : "L", 80, 233);
   canvas.setTextColor(kOrange, TFT_BLACK);
-  canvas.drawString("BRK", 96, 231);
+  canvas.drawString("BRK", 96, 233);
   canvas.setTextColor(brake_high ? kGreen : kGray, TFT_BLACK);
-  canvas.drawString(brake_high ? "H" : "L", 124, 231);
+  canvas.drawString(brake_high ? "H" : "L", 124, 233);
   canvas.setTextColor(kOrange, TFT_BLACK);
   char stroke_text[40];
   snprintf(stroke_text, sizeof(stroke_text), "行程 %ld 中立 %ld %+d", static_cast<long>(snap.profile.stroke),
            static_cast<long>(snap.profile.neutral), static_cast<int>(snap.working_sign));
   canvas.setTextDatum(middle_right);
-  canvas.drawString(stroke_text, width - 8, 231);
+  canvas.drawString(stroke_text, width - 8, 233);
 
   canvas.pushSprite(0, 0);
 }
@@ -926,6 +986,20 @@ void loop() {
     }
     reportAuto(snap);
   }
+  {
+    // Issue #11: USB-Serial/JTAG の状態（500 ms ごと）。bus reset はシリアルにも出すが、直後は HWCDC が
+    // connected=false なので TX リングの置き換え経路に入り、ホストが戻る前に ENC/STAT 行に押し出されて届かないことが
+    // ある（tx! にも出ない）。確実なのは画面の br。
+    bool bus_reset_seen = false;
+    if (usbDiagTick(&bus_reset_seen)) {
+      ui_dirty = true;
+    }
+    if (bus_reset_seen) {
+      char line[80];
+      snprintf(line, sizeof(line), "WARN usb_bus_reset n=%lu\n", static_cast<unsigned long>(usb_diag.bus_resets));
+      txLine(line);
+    }
+  }
 
   if (ui_dirty) {
     render();
@@ -974,7 +1048,7 @@ void showNotice(const char* text) {
 
 void layoutV1(int width, int height) {
   v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
-  v1_buttons[1] = {kMargin, height - 62, width - kMargin * 2, 56, V1Action::Estop};
+  v1_buttons[1] = {kMargin, height - 50, width - kMargin * 2, 44, V1Action::Estop};  // 上に USB 診断行を置く
 }
 
 const V1Button* hitV1(int x, int y) {
@@ -1198,6 +1272,11 @@ void renderV1() {
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);
 
+  // USB 診断行（Issue #11）。6x8 の ASCII フォント。意味は usb_diag_format() のコメント。
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextColor(usbDiagColor(usb_diag), TFT_BLACK);
+  canvas.drawString(usb_diag_text, 8, 182);
+
   // 非常停止ボタン（ラッチ中は「解除」）
   {
     const V1Button& b = v1_buttons[1];
@@ -1302,6 +1381,13 @@ void loop() {
       control_v1_clear_profile_dirty();
     }
     if (snapChanged(previous, vsnap)) {
+      ui_dirty = true;
+    }
+  }
+  {
+    // Issue #11: USB-Serial/JTAG の状態（500 ms ごと）。v1 の USB はバイナリ専用なので bus reset はログに出さない。
+    bool bus_reset_seen = false;
+    if (usbDiagTick(&bus_reset_seen)) {
       ui_dirty = true;
     }
   }
