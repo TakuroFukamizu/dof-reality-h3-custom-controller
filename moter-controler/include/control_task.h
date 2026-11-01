@@ -83,7 +83,7 @@ struct V1Snapshot {
 };
 
 // signs は系統 1..3 の符号（index = motor。[0] は未使用）。selected_axis は NVS の motor。
-void control_v1_begin(const int8_t signs[4], uint8_t selected_axis);
+void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis);  // profiles[1..3] = NVS の各系統（符号と、校正の速い区間の判定に使う行程）
 void control_v1_select_axis(uint8_t axis);   // DISARMED のときだけ V1Axis が受け付ける
 void control_v1_set_estop(bool latched);     // 画面の非常停止（ラッチ / 解除）
 void control_v1_clear_profile_dirty();       // loop() が NVS に保存した後に呼ぶ

@@ -1258,11 +1258,11 @@ void setup() {
     noteBootError("link");
   }
   saved_motor = profile_store_selected_motor();
-  int8_t signs[4] = {1, 1, 1, 1};
+  MotorProfile profiles[4];
   for (uint8_t m = 1; m <= 3; ++m) {
-    signs[m] = profile_store_load(m).sign;
+    profiles[m] = profile_store_load(m);
   }
-  control_v1_begin(signs, saved_motor);
+  control_v1_begin(profiles, saved_motor);
   vsnap.selected_axis = saved_motor;
 
   if (!spriteBegin()) {

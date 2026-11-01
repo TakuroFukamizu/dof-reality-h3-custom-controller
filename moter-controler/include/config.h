@@ -120,5 +120,6 @@ constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令�
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）
+constexpr int V1_CAL_HOME_DUTY = 13;            // v1 の校正（CALIBRATE）の端当て Duty。従来 env の HOME_DUTY（10 %）では #2 が下限から持ち上がる方向で始動しないことがあった（2026-11-01、2 回）。10/31 の実測で 13 % は 920〜985 count/s。端当ての衝撃は 15 %（従来 env の UPPER の速い区間）より小さい。仮値
 constexpr uint32_t CAL_POWER_SETTLE_MS = 5000;  // CALIBRATING: 主電源 ON 指令からブレーキ解除指令まで（protocol.md §1.2）。2026-10-31 に電源投入 4 s 後は動かず
                                                 // 12 s 後に動いた記録があるため ARMING の POWER_SETTLE_MS より長い。仮値。電源担当でない軸も同じ時間待つ

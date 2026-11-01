@@ -70,6 +70,13 @@ inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tunin
   return cmd < 0 ? -m : m;
 }
 
+// v1 の校正に使う AutoConfig。端当て Duty だけ従来 env より高い（V1_CAL_HOME_DUTY）。
+inline AutoConfig v1_cal_config() {
+  AutoConfig c;
+  c.home_duty = V1_CAL_HOME_DUTY;
+  return c;
+}
+
 struct V1Identity {
   uint64_t device_id = 0;  // eFuse MAC から作る（上位 16 bit は 0x5131）。v1_device_id_from_mac
   uint32_t boot_id = 0;    // 起動ごとの乱数
@@ -95,7 +102,7 @@ class V1Axis {
   static constexpr size_t kDedupeDepth = 16;
 
   V1Tuning tuning;
-  AutoConfig cal_config;  // 端当て校正の調整値（既定は config.h。テストで差し替えられる）
+  AutoConfig cal_config = v1_cal_config();  // 端当て校正の調整値（既定は config.h。テストで差し替えられる）
 
   // BOOT → DISARMED。selected_axis は NVS の motor、sign はその系統のプロファイルの符号。
   void begin(const V1Identity& id, uint8_t selected_axis, int8_t sign, uint64_t now_us, int64_t raw) {
@@ -119,6 +126,11 @@ class V1Axis {
 
   bool began() const { return began_; }
   void set_sign(int8_t sign) { sign_ = sign < 0 ? -1 : 1; }
+  // NVS に保存されている選択中の系統のプロファイル（stroke / neutral / calibrated）。校正の端当てで
+  // 「端まで遠いときは AUTO_DUTY_MAX、近づいたら HOME_DUTY」の判定（auto_move.h の end_distance）に使う。
+  // 無いと全行程を HOME_DUTY（10 %）で動くことになり、#2 の持ち上げ側は下限から動き出せないことがある
+  //（2026-11-01 の実機: N 端へ向かう行程が開始直後に無パルスで失敗）。行程・中立は校正が測り直して上書きする。
+  void set_profile_hint(const MotorProfile& p) { profile_hint_ = p; }
 
   // --- 校正の出力（制御タスク・画面向け） ------------------------------------------
   // 成功した校正のプロファイル（motor = 校正時の系統）。profile_dirty() の間は NVS に未保存。保存したら clear_profile_dirty()。
@@ -403,6 +415,7 @@ class V1Axis {
   bool has_cal_result_ = false;
   v1::CalResult last_cal_result_{};
   MotorProfile dirty_profile_{};
+  MotorProfile profile_hint_{};
   bool profile_dirty_ = false;
 
   // --- DUPLICATE 判定（受理した命令、古い順） ---
@@ -789,6 +802,11 @@ class V1Axis {
     MotorProfile p;
     p.motor = selected_axis_;
     p.sign = sign_;
+    if (profile_hint_.motor == selected_axis_ && profile_hint_.calibrated && profile_hint_.stroke > 0) {
+      p.stroke = profile_hint_.stroke;      // 端までの距離の見積もりに使う（速い区間と遅い区間の切り替え）
+      p.neutral = profile_hint_.neutral;
+      p.calibrated = true;
+    }
     cal_.set_profile(p);  // origin_valid = false・Idle に戻る
     cal_.profile_dirty = false;
     memset(&pending_cal_result_, 0, sizeof(pending_cal_result_));
