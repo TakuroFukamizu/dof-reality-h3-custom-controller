@@ -123,7 +123,7 @@ curl -sX POST -H "$AUTH" -d '{"axis":1,"count":0}' $URL/v1/reference   # 全軸 
 curl -sX POST -H "$AUTH" $URL/v1/calibrate          # 端当て校正（機構が両端まで動く！）。全軸 DISARMED・電源担当軸を含む 3 軸。{"axes":[1,2]} で一部（1 を含むこと）
 curl -sX POST -H "$AUTH" $URL/v1/calibrate/cancel   # 校正の中止（CALIBRATE(0)）。/v1/stop でも止まる
 curl -sX POST -H "$AUTH" $URL/v1/calibration/export # OK の結果を設定ファイルの複製に書き出す（下記）
-curl -s $URL/v1/limits | python3 -m json.tool       # 動きの制限値（effective / requested / ceiling / defaults / limited。認証なし・loopback だけ）
+curl -s $URL/v1/limits | python3 -m json.tool       # 動きの制限値（effective / requested / ceiling / defaults / operator_max / game_fields / limited / reasons。認証なし・loopback だけ）
 curl -sX POST -H "$AUTH" -d '{"max_vel_count_s":1500,"duty_max_percent":30}' $URL/v1/limits   # 書いた項目だけ変える。上限で切られた項目は limited に出る（limits.md）
 ```
 
