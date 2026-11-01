@@ -1584,6 +1584,7 @@ inline void test_stall_boost_cap_without_encoder_fault_when_check_disabled() {
 // 下限 Duty は出るが上乗せしない。不感帯に入ってから（in_band = true）出た 25 は上乗せする
 inline void test_stall_boost_requires_error_outside_outer_band() {
   Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // E と H4 の境界を見る試験。積分（F）が生の P を動かさないよう切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -1794,6 +1795,7 @@ inline void test_duty_command_floor_requires_p_and_respects_small_deadband_out()
   CHECK(v1_duty_command(15, 0.0, st, t) == 3 && !st.floor_on);
   // 軸を通して: SET_LIMITS kp 0・deadband_out 12 を受理し、追従中の FF だけ（max_vel 300 → 30 permille）に床が掛からない
   Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // kp 0 で FF だけが出ることを見る試験。積分（F）は切る
   v1::Config c = base_config();
   c.max_vel_count_s = 300;
   c.following_error_limit_count = 100000;
@@ -3077,6 +3079,163 @@ inline void test_fault_during_calibration_shutdown_keeps_final_result() {
   }
 }
 
+
+// ---- Issue #25 手順 9「F」: 有界の積分と保持バイアス --------------------------------------------------------
+
+// 飽和と変化率: 誤差 400（P 80 ≥ 床 70 なので床は持ち上げず、|出力| < duty_max 60 %）で dt 5 ms を回すと
+// dI = 0.1 × 400 × 0.005 = 0.2 だが変化率 10 permille/s → 0.05 / tick に制限。1 s で 10、3 s で 30 で頭打ち。
+inline void test_integral_rate_limit_and_saturation() {
+  V1Tuning t;
+  t.duty_max = 60;
+  CHECK(t.ki_permille_per_count_s > 0.0);  // 既定 ON（config.h V1_INTEGRAL）
+  V1DutyState st;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  V1DutyTerms o;
+  CHECK(v1_duty_command(400, 0.0, st, t, 0, &o, 0.005) == 90 && o.i_permille == 10 && o.p_permille == 80);
+  for (int i = 0; i < 1000; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 30.0) < 1e-9);  // |I| ≤ 30
+  CHECK(v1_duty_command(400, 0.0, st, t) == 110);
+  // 小さい誤差では Ki × err が変化率より下: 誤差 20 → 0.1 × 20 × 0.005 = 0.01 / tick（2 permille/s）
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(20, 100.0, st2, t, 0, nullptr, 0.005);  // 軌道が動いている（不感帯に入らない）
+  CHECK(fabs(st2.i_pm - 2.0) < 1e-6);
+  // 負の誤差は負に積む
+  V1DutyState st3;
+  for (int i = 0; i < 200; ++i) v1_duty_command(-400, 0.0, st3, t, 0, nullptr, 0.005);
+  CHECK(fabs(st3.i_pm + 10.0) < 1e-6);
+  // dt 0（直接呼ぶ従来のテスト）と ki 0（-DV1_INTEGRAL=0 相当）では積まない
+  V1DutyState st4;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st4, t);
+  CHECK(st4.i_pm == 0.0);
+  t.ki_permille_per_count_s = 0.0;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st4, t, 0, nullptr, 0.005);
+  CHECK(st4.i_pm == 0.0);
+}
+
+// アンチワインドアップは実出力で見る: duty_max で飽和している向きには積まない。床（duty_min ＋ ブースト）が合成を持ち上げて
+// いるときも積まない。どちらも戻す向き（|I| を減らす）は許す。
+inline void test_integral_anti_windup_on_applied_output() {
+  V1Tuning t;  // kp 2、床 7、上限 20
+  V1DutyState st;
+  // 誤差 1500 → P 300 > 200 で飽和 → I は 0 のまま
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(1500, 0.0, st, t, 0, nullptr, 0.005) == 200);
+  CHECK(st.i_pm == 0.0);
+  // 誤差 400（P 80、床 70 を持ち上げない、飽和もしない）で 1 s → I = 10
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  // 再び飽和（同じ向き）: 増えない
+  for (int i = 0; i < 200; ++i) v1_duty_command(1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  // 反対向きに飽和（誤差 −1500 → −200）: I を戻す向きは許す → 1 s で 10 → 0 → 負に積まれる前に反対の飽和で止まる
+  for (int i = 0; i < 200; ++i) v1_duty_command(-1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);
+  for (int i = 0; i < 200; ++i) v1_duty_command(-1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);  // 0 から負へは「増やす向き」なので飽和中は積まない
+  // 床が持ち上げているとき: 誤差 25（P 5）静止 → 床 ON → 出力 70。I は増えない
+  V1DutyState st2;
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(25, 0.0, st2, t, 0, nullptr, 0.005) == 70);
+  CHECK(st2.i_pm == 0.0);
+  // ブースト込みの床（70 + 30 = 100）も同じ
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(25, 0.0, st2, t, 30, nullptr, 0.005) == 100);
+  CHECK(st2.i_pm == 0.0);
+  // 床が持ち上げていても、I が反対符号なら戻す向きは積む（I +2 を持ったまま誤差 −25: P −5 + I 2 = −3 → 床 −70 → I は減る）
+  st2.i_pm = 2.0;
+  for (int i = 0; i < 100; ++i) CHECK(v1_duty_command(-25, 0.0, st2, t, 0, nullptr, 0.005) == -70);
+  CHECK(st2.i_pm < 2.0 && st2.i_pm > 0.0);  // 0.1 × 25 × 0.005 = 0.0125 / tick × 100 = 1.25 → 0.75
+}
+
+// 床の向き不一致（E の抑制中: 合成が P と逆）では |I| を増やさない。戻す向きは許す。
+inline void test_integral_blocked_during_floor_sign_mismatch_but_unwinds() {
+  V1Tuning t;  // kp 2、ff 100
+  V1DutyState st;
+  // 誤差 +50（P +10）・軌道 −600（FF −60）→ 合成 −50 → 不一致。I = 0 → 正に積むのは「増やす」→ 止める
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005) == -50);
+  CHECK(st.i_pm == 0.0);
+  // I = −5 を持っていれば、正に積むのは戻す向き → 許す（0.025 / tick × 200 = 5 → 0 に戻り、0 からは「増やす」なので止まる）
+  st.i_pm = -5.0;
+  for (int i = 0; i < 100; ++i) v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm + 2.5) < 1e-6);
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);
+  // 向きが一致していれば普通に積む（誤差 +50・軌道 +600 → 合成 +70、床 ON だが持ち上げない）
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, 600.0, st2, t, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 5.0) < 1e-6);  // 0.1 × 50 × 0.005 = 0.025 / tick × 200 = 5（変化率 10/s 未満）
+}
+
+// 不感帯の中では I を凍結し、出力は I（保持バイアス）。0 に落とさない。
+inline void test_integral_holding_bias_retained_in_band() {
+  V1Tuning t;
+  t.duty_max = 60;
+  V1DutyState st;
+  for (int i = 0; i < 400; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);  // I = 20
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  V1DutyTerms o;
+  // 静止・誤差 5 → 不感帯に入る → 出力 = I = 20（従来は 0）、床 OFF、積まない
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 20 && o.in_band && !o.floor_on && o.i_permille == 20);
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(-8, 0.0, st, t, 0, nullptr, 0.005) == 20);  // 誤差の符号に依らず凍結
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  // 出る側（> 20）で抜ければ普通の P + I（誤差 25 → P 5 + I 20 = 25 → 床 ON → 70。床が持ち上げるので I は増えない）
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o, 0.005) == 70 && !o.in_band && o.floor_on);
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  // ki 0（-DV1_INTEGRAL=0）なら不感帯の中は従来どおり 0
+  t.ki_permille_per_count_s = 0.0;
+  V1DutyState st2;
+  CHECK(v1_duty_command(5, 0.0, st2, t, 0, &o, 0.005) == 0 && o.in_band);
+  // I が duty_max を超えることは無い（|I| ≤ 30 < duty_max）が、SET_LIMITS で duty_max 2 % にされれば保持も 20 で頭打ち
+  t.ki_permille_per_count_s = V1_KI_PERMILLE_PER_COUNT_S;
+  t.duty_max = 2;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 20);
+  t.duty_max = 1;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 10);
+}
+
+// 軸を通して: 止まったまま誤差 15（床 OFF・P 3）で I が積まれ、出力に足される。DISARM（DISARMED）/ FAULT / SET_REFERENCE で 0。
+inline void test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.integral_permille() == 0);
+  h.stall = true;
+  h.raw -= 25;  // 不感帯の外へ → 床 ON（70）→ I は増えない（床が持ち上げている）
+  h.drive(100, h.ax.actual_count() + 25);
+  CHECK(h.ax.duty_permille() == -70 && h.ax.integral_permille() == 0);
+  h.raw += 10;  // 誤差 15: 床 OFF、生の P 3。ここで I が 0.1 × 15 × dt = 1.5 permille/s で積まれる
+  h.drive(2000, h.ax.actual_count() + 15);
+  CHECK(h.ax.state() == st::HOLDING);
+  CHECK(h.ax.integral_permille() == 3);  // 2 s × 1.5 = 3.0
+  CHECK(h.ax.duty_permille() == -6);     // P 3 + I 3（カウント増の向き → MD13S 符号で −）
+  CHECK(h.ax.duty_terms().i_permille == 3 && h.ax.duty_terms().p_permille == 3);
+  // 不感帯に入れば（誤差 5）出力は I だけ（保持バイアス）、凍結
+  h.raw += 10;
+  h.drive(200, h.ax.actual_count() + 5);
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == -3 && h.ax.integral_permille() == 3);
+  // DISARM → DISARMED で 0
+  Harness::accepted(h.disarm());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
+  // SET_REFERENCE も（DISARMED でしか通らないので 0 のまま 0）
+  Harness::accepted(h.set_reference(0));
+  CHECK(h.ax.integral_permille() == 0);
+  // FAULT: 積んだ I は latch_fault で即 0
+  Harness g;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 25;  // いったん不感帯を出てから誤差 15 へ（15 のままでは出る側 20 の内側で凍結）
+  g.step();
+  g.raw += 10;
+  g.drive(2000, g.ax.actual_count() + 15);
+  CHECK(g.ax.integral_permille() == 3);
+  Harness::accepted(g.host_fault());
+  CHECK(g.ax.state() == st::FAULT && g.ax.integral_permille() == 0 && g.ax.duty_permille() == 0);
+  g.idle(50);
+  CHECK(g.ax.integral_permille() == 0);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -3146,6 +3305,11 @@ inline void run_all() {
   test_duty_command_floor_requires_p_and_respects_small_deadband_out();
   test_encoder_fault_threshold_follows_duty_max();
   test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault();
+  test_integral_rate_limit_and_saturation();
+  test_integral_anti_windup_on_applied_output();
+  test_integral_blocked_during_floor_sign_mismatch_but_unwinds();
+  test_integral_holding_bias_retained_in_band();
+  test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

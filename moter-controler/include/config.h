@@ -151,6 +151,37 @@ constexpr uint32_t V1_STALL_BOOST_MAX_MS = 2000;
 // 狙い: 追従中の小さい誤差で床（9 % ≈ 900 count/s）が軌道速度を超えて「バースト → 停止」になるのをなくし、FF だけで追従させる。
 // 静止の不感帯（10 / 20）と停止ブースト（H4。床が ON のときだけ上乗せが効く）はそのまま。
 constexpr int32_t V1_FLOOR_OFF_COUNT = 15;
+// Issue #25 手順 9「F」: 有界の積分と保持バイアス。I += Ki × 誤差 × dt [permille] を位置制御中だけ積む。|I| ≤ V1_I_MAX_PERMILLE、
+// 変化率 ≤ V1_I_RATE_PERMILLE_PER_S。アンチワインドアップは実出力で見る: 出力が duty_max で飽和、床（duty_min ＋ ブースト／
+// 動き出し補助）が合成を持ち上げている、床の向き不一致（E の抑制中）のどれかなら、|I| を増やす向きには積まない（戻す向きは
+// 常に許す）。静止の不感帯の中では積まない（凍結）が、学んだ I はそのまま出力に出す（保持バイアス。0 に落とさない。自重で
+// 下がる軸を 0 ↔ 9 % の蹴りなしで保持する狙い）。DISARMED / FAULT / SET_REFERENCE / 系統切替 / 位置制御の終了で 0。
+// 実機 A/B 用に -DV1_INTEGRAL=0 で切れる（V1Tuning の ki が 0 になる。I は常に 0 で不感帯の中は従来どおり 0）。
+#ifndef V1_INTEGRAL
+#define V1_INTEGRAL 1
+#endif
+constexpr double V1_KI_PERMILLE_PER_COUNT_S = 0.1;  // Ki = 0.01 %/(count·s) = 0.1 permille/(count·s)。誤差 20 で 2 permille/s
+constexpr int V1_I_MAX_PERMILLE = 30;               // |I| の上限 3 %
+constexpr int V1_I_RATE_PERMILLE_PER_S = 10;        // |dI/dt| の上限 1 %/s
+// Issue #25 手順 9「T」: 追従中の動き出し補助。|軌道速度| > V1_ASSIST_VEL_COUNT_S なのに |実測速度| < V1_ASSIST_MEAS_VEL_COUNT_S
+// のまま |誤差| が増え続けて V1_ASSIST_MS 経ったら、床の適用状態（|誤差| > 20）に依らず床（duty_min、合成の向き）を掛ける。
+// エンコーダが V1_ASSIST_RELEASE_MOVE 以上動いたら即解除。停止ブースト（H4）は静止目標だけなので、その補完。保護との関係は
+// protocol.md §5（床 9 % は ENCODER_FAULT のしきい値 15 % 未満で、FOLLOWING_ERROR の判定は触らない）。-DV1_TRACK_ASSIST=0 で切れる
+#ifndef V1_TRACK_ASSIST
+#define V1_TRACK_ASSIST 1
+#endif
+constexpr int32_t V1_ASSIST_VEL_COUNT_S = 100;       // これより速い軌道速度が対象
+constexpr int32_t V1_ASSIST_MEAS_VEL_COUNT_S = 20;   // 実測速度がこれ未満なら「動いていない」（100 ms 窓なので 0 か ±10）
+constexpr uint32_t V1_ASSIST_MS = 150;               // この時間続いたら補助 ON
+constexpr int32_t V1_ASSIST_RELEASE_MOVE = 3;        // ON の後、これ以上カウントが動けば解除
+// Issue #25 手順 10「S」: 整定判定。静止の不感帯（Duty = I の保持）に入るのは「軌道速度 0 かつ |誤差| ≤ deadband かつ
+// |実測速度| ≤ V1_SETTLED_MEAS_VEL_COUNT_S」が V1_SETTLED_MS 続いたとき。軌道が動く・|誤差| > deadband_out で即抜ける。
+// -DV1_SETTLED_MEASURED=0 で切れる（従来どおり |誤差| ≤ deadband で即入る）
+#ifndef V1_SETTLED_MEASURED
+#define V1_SETTLED_MEASURED 1
+#endif
+constexpr int32_t V1_SETTLED_MEAS_VEL_COUNT_S = 10;
+constexpr uint32_t V1_SETTLED_MS = 200;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

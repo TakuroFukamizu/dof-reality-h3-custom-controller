@@ -1317,15 +1317,15 @@ void renderV1() {
   canvas.drawString(usb_diag_text, 8, 182);
 
   // 制御項の行（Issue #25 手順 8）。単位は permille（0.1 %）、符号はカウントが増える向きが正（STATUS の pwm_permille と同じ）。
-  // FF = 軌道速度 / ff、P = 誤差 × kp / 100、V = 軌道の目標速度 [count/s]、FLR = 床の適用状態（1 = ON。Issue #25 手順 8 c）、
-  // B = 停止ブーストの上乗せ、
-  // PWM = 実際に出している値（pwm_permille）。最長 52 文字（6 px × 52 = 312 < 320）
+  // FF = 軌道速度 / ff、P = 誤差 × kp / 100、I = 積分（保持バイアス。Issue #25 手順 9「F」）、V = 軌道の目標速度 [count/s]、
+  // F = 床の適用状態（1 = ON。Issue #25 手順 8 c）、B = 停止ブーストの上乗せ、
+  // O = 実際に出している値（pwm_permille）。通常 ≤ 50 文字（6 px × 53 = 318 < 320。超えれば切れる）
   {
     const V1DutyTerms& tm = vsnap.terms;
-    char terms_text[56];
-    snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d V %+d FLR %d B %d PWM %+d", static_cast<int>(tm.ff_permille),
-             static_cast<int>(tm.p_permille), static_cast<int>(tm.vel_count_s), tm.floor_on ? 1 : 0,
-             static_cast<int>(tm.boost_permille), static_cast<int>(vsnap.pwm_permille));
+    char terms_text[64];
+    snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d F%d B %d O %+d", static_cast<int>(tm.ff_permille),
+             static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s),
+             tm.floor_on ? 1 : 0, static_cast<int>(tm.boost_permille), static_cast<int>(vsnap.pwm_permille));
     canvas.setTextColor(tm.in_band ? kGray : (tm.floor_on ? kAmber : kGreen), TFT_BLACK);
     canvas.drawString(terms_text, 8, 192);
   }
@@ -1352,6 +1352,7 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          a.stall_boost_permille != b.stall_boost_permille ||
          // 制御項は 5 ms ごとに変わり得る。1 %（10 permille）刻みで見る（描き直しが受信を止めるのは df / old と同じ）
          (a.terms.ff_permille / 10) != (b.terms.ff_permille / 10) || (a.terms.p_permille / 10) != (b.terms.p_permille / 10) ||
+         (a.terms.i_permille / 10) != (b.terms.i_permille / 10) ||
          (a.terms.vel_count_s / 50) != (b.terms.vel_count_s / 50) || a.terms.floor_on != b.terms.floor_on ||
          a.terms.in_band != b.terms.in_band || a.terms.boost_permille != b.terms.boost_permille ||
          (a.pwm_permille / 10) != (b.pwm_permille / 10) ||

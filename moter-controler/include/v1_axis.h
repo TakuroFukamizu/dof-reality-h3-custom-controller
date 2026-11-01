@@ -41,6 +41,10 @@ struct V1Tuning {
   uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
   int32_t floor_off = V1_FLOOR_OFF_COUNT;              // 床の適用状態を OFF にする |誤差|（ON は deadband_out 超。Issue #25 手順 8 c）
+  // 有界の積分（Issue #25 手順 9「F」。config.h V1_INTEGRAL）。ki = 0 で無効（I は常に 0）
+  double ki_permille_per_count_s = V1_INTEGRAL ? V1_KI_PERMILLE_PER_COUNT_S : 0.0;
+  int i_max_permille = V1_I_MAX_PERMILLE;            // |I| の上限
+  int i_rate_permille_per_s = V1_I_RATE_PERMILLE_PER_S;  // |dI/dt| の上限
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
@@ -59,6 +63,7 @@ struct V1DutyTerms {
   bool floor_on = false;       // 床の適用状態が ON（|合成| が床未満なら duty_min ＋ 停止ブーストまで持ち上げる。Issue #25 手順 8 c）
   bool in_band = false;        // 静止の不感帯の中（Duty 0）
   int16_t boost_permille = 0;  // 停止ブースト（Issue #15 H4）の上乗せ。V1Axis が埋める
+  int16_t i_permille = 0;      // 積分項（Issue #25 手順 9「F」）。この tick の出力に入った値（四捨五入）
   int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
 };
 
@@ -75,12 +80,14 @@ constexpr int v1_permille(int percent) { return percent * V1_PERMILLE_PER_PERCEN
 struct V1DutyState {
   bool in_band = false;   // 静止の不感帯の中（入る側 deadband / 出る側 deadband_out）
   bool floor_on = false;  // 床（Duty 下限）の適用状態（ON: |誤差| > deadband_out かつ向き一致 / OFF: |誤差| ≤ floor_off か向き不一致）
+  double i_pm = 0.0;      // 積分項 [permille]（Issue #25 手順 9「F」。|i_pm| ≤ i_max_permille。位置制御が止まれば 0）
 };
 
 // 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
-// フィードフォワード（vel / ff）＋比例（err × kp / 100）を permille で計算し、和を四捨五入（lround）してから整数の permille で
-// 床・上限を掛ける（5.3 % は 53 permille として出る）。
-// 1. 静止の不感帯: 目標が止まっている（vel = 0）ときだけ、入る側 deadband / 出る側 deadband_out のヒステリシスで Duty 0
+// フィードフォワード（vel / ff）＋比例（err × kp / 100）＋積分 I を permille で計算し、和を四捨五入（lround）してから整数の
+// permille で床・上限を掛ける（5.3 % は 53 permille として出る）。
+// 1. 静止の不感帯: 目標が止まっている（vel = 0）ときだけ、入る側 deadband / 出る側 deadband_out のヒステリシスで、出力は
+//    **I（保持バイアス）だけ**（Issue #25 手順 9「F」。I = 0、つまり ki = 0 なら従来どおり 0）。不感帯の中では I を積まない（凍結）。
 //   （到達帯の縁での往復を防ぐ。不感帯の中では床の状態も OFF に戻す）。
 // 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成の向きが P の向きと違えば（P = 0 のときも）即 OFF。
 //    |誤差| ≤ min(floor_off（15）, deadband_out − 1) なら OFF。|誤差| > deadband_out なら ON。その間（既定 15 < |誤差| ≤ 20）は
@@ -88,24 +95,39 @@ struct V1DutyState {
 // 3. ON なら |合成| を 床（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）まで持ち上げる。OFF なら生の合成のまま
 //   （0 に置き換えない。旧 Issue #15 M1 の 0 置換はこれに代わる。「誤差と逆向きに床を掛けない」規則は向きの条件として残る）。
 // 4. |合成| は duty_max × 10 で飽和。
+// 5. 積分の更新（Issue #25 手順 9「F」。dt_s > 0 のときだけ。出力を決めた後、次の tick のために積む）: dI = ki × err × dt を
+//    |dI| ≤ i_rate × dt に制限し、|I| を減らす向き（戻す）なら常に積む。|I| を増やす向きは、実出力が (a) duty_max で飽和して
+//    いて向きが誤差と同じ、(b) 床が合成を持ち上げている、(c) 床の向き不一致（E の抑制中）のどれかなら積まない（アンチ
+//    ワインドアップは実出力で見る）。|I| ≤ i_max_permille。
 // boost_permille は停止ブースト（Issue #15 H4）の上乗せ（床が ON のときだけ効く）。terms を渡せば各項を書く（計器用）。
+// dt_s は前の tick からの時間 [s]（0 なら積分は動かない。直接呼ぶテストはそのまま）。
 inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
-                           V1DutyTerms* terms = nullptr) {
+                           V1DutyTerms* terms = nullptr, double dt_s = 0.0) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
   o = V1DutyTerms{};
   o.vel_count_s = v1_clamp_i16(vel);
   o.boost_permille = static_cast<int16_t>(boost_permille);
   const int64_t err_abs = err < 0 ? -err : err;
+  const long duty_max_pm = v1_permille(t.duty_max);
+  // 不感帯の中: 出力は I（保持バイアス）だけ。積まない。
+  auto hold_output = [&]() -> int {
+    st.floor_on = false;
+    o.in_band = true;
+    long i_out = lround(st.i_pm);
+    if (i_out > duty_max_pm) i_out = duty_max_pm;
+    if (i_out < -duty_max_pm) i_out = -duty_max_pm;
+    o.i_permille = static_cast<int16_t>(i_out);
+    o.cmd_permille = static_cast<int16_t>(i_out);
+    return static_cast<int>(i_out);
+  };
   if (vel == 0.0) {
     if (st.in_band) {
-      if (err_abs <= t.deadband_out) { st.floor_on = false; o.in_band = true; return 0; }
+      if (err_abs <= t.deadband_out) return hold_output();
       st.in_band = false;
     } else if (err_abs <= t.deadband) {
       st.in_band = true;
-      st.floor_on = false;
-      o.in_band = true;
-      return 0;
+      return hold_output();
     }
   } else {
     st.in_band = false;
@@ -115,7 +137,8 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
   const double ff_pm = t.ff_count_s_per_percent > 0 ? vel * V1_PERMILLE_PER_PERCENT / t.ff_count_s_per_percent : 0.0;
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
-  const long cmd = lround(p_pm + ff_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
+  o.i_permille = v1_clamp_i16(st.i_pm);
+  const long cmd = lround(p_pm + ff_pm + st.i_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
   // 床の適用状態（ヒステリシス）。向きは P と合成で比べる（kp = 0 なら P = 0 で向きが無く、FF だけに床を掛けない。
   // Codex レビュー P2-1）。合成が 0 でも OFF。OFF のしきい値は min(floor_off, deadband_out − 1): SET_LIMITS で
   // deadband_out ≤ floor_off にされても ON（> deadband_out）と OFF の領域が重ならない（Codex レビュー P2-2）
@@ -127,17 +150,36 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
     st.floor_on = true;
   }
   o.floor_on = st.floor_on;
-  if (cmd == 0) return 0;
   long mag = cmd < 0 ? -cmd : cmd;
-  const long duty_max_pm = v1_permille(t.duty_max);
-  if (st.floor_on) {
+  bool floor_lifted = false;
+  if (cmd != 0 && st.floor_on) {
     long floor_pm = v1_permille(t.duty_min) + boost_permille;
     if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
-    if (mag < floor_pm) mag = floor_pm;
+    if (mag < floor_pm) { mag = floor_pm; floor_lifted = true; }
   }
   if (mag > duty_max_pm) mag = duty_max_pm;
-  const int out = static_cast<int>(cmd < 0 ? -mag : mag);
+  const int out = cmd == 0 ? 0 : static_cast<int>(cmd < 0 ? -mag : mag);
   o.cmd_permille = static_cast<int16_t>(out);
+  // 積分の更新（次の tick のため）
+  if (dt_s > 0.0 && t.ki_permille_per_count_s > 0.0 && err != 0) {
+    double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+    const double di_max = static_cast<double>(t.i_rate_permille_per_s) * dt_s;
+    if (di > di_max) di = di_max;
+    if (di < -di_max) di = -di_max;
+    const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);
+    bool allow = true;
+    if (!unwinding) {
+      const bool saturated = out != 0 && mag >= duty_max_pm && ((out < 0) == (err < 0));
+      const bool sign_mismatch = cmd != 0 && p_pm != 0.0 && (cmd < 0) != (p_pm < 0.0);  // E の抑制中（合成が P と逆）
+      if (saturated || floor_lifted || sign_mismatch) allow = false;
+    }
+    if (allow) {
+      st.i_pm += di;
+      const double i_max = static_cast<double>(t.i_max_permille);
+      if (st.i_pm > i_max) st.i_pm = i_max;
+      if (st.i_pm < -i_max) st.i_pm = -i_max;
+    }
+  }
   return out;
 }
 
@@ -259,7 +301,7 @@ class V1Axis {
     if (state_ == v1::state::STOPPING && setpoint_vel_ == 0.0) {
       finish_stop(now_us);
     }
-    update_duty(now_us);
+    update_duty(now_us, dt_us);
     tick_calibration(now_us);  // CALIBRATING のときだけ Duty を書く（update_duty の後）
     emit_status_if_changed();
     emit_periodic_status(now_us);
@@ -368,6 +410,8 @@ class V1Axis {
   uint64_t mcu_time_us(uint64_t now_us) const { return now_us > boot_origin_us_ ? now_us - boot_origin_us_ : 0; }
   // 停止ブースト（Issue #15 H4）: いま Duty 下限に上乗せしている permille（0 = なし）。STATUS には載せない（空きフィールドが無い）。画面用
   int stall_boost_permille() const { return stall_boost_; }
+  // 積分項（Issue #25 手順 9「F」）の現在値 [permille]（四捨五入前の値を丸めたもの）。画面の計器行 `I`。STATUS には載せない
+  int integral_permille() const { return static_cast<int>(lround(duty_state_.i_pm)); }
   // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
   const V1DutyTerms& duty_terms() const { return terms_; }
   // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
@@ -964,6 +1008,7 @@ class V1Axis {
     brake_release_cmd_ = false;
     duty_permille_ = 0;  // 次の tick を待たず PWM 0
     terms_ = V1DutyTerms{};
+    duty_state_ = V1DutyState{};  // 積分（保持バイアス）も捨てる（Issue #25 手順 9「F」）
     stall_running_ = false;
     hold_here();
     v1::McuMsg m;
@@ -1280,8 +1325,8 @@ class V1Axis {
     push(m);
   }
 
-  // 位置制御の Duty と無パルス判定
-  void update_duty(uint64_t now) {
+  // 位置制御の Duty と無パルス判定。dt_us は前の tick からの時間（積分の刻み。overrun_ms で頭打ち: 間隔が飛んだ直後に I を跳ねさせない）
+  void update_duty(uint64_t now, uint64_t dt_us = 0) {
     if (!position_control_on()) {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
@@ -1294,7 +1339,9 @@ class V1Axis {
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
     stall_boost_gate(err, now);
-    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_);  // カウント増の向きが正 [permille]
+    const uint64_t dt_cap_us = ms_to_us(tuning.overrun_ms);
+    const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
+    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
