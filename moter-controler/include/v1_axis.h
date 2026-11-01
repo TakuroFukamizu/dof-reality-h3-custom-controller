@@ -98,10 +98,11 @@ struct V1DutyState {
 // 1. 静止の不感帯: 目標が止まっている（vel = 0）ときだけ、入る側 deadband / 出る側 deadband_out のヒステリシスで、出力は
 //    **I（保持バイアス）だけ**（Issue #25 手順 9「F」。I = 0、つまり ki = 0 なら従来どおり 0）。不感帯の中では I を積まない（凍結）。
 //   （到達帯の縁での往復を防ぐ。不感帯の中では床の状態も OFF に戻す）。
-// 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成の向きが P の向きと違えば（P = 0 のときも）即 OFF。
+// 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成（FF + P。I は含めない）の向きが P の向きと違えば（P = 0 のときも）即 OFF。
 //    |誤差| ≤ min(floor_off（15）, deadband_out − 1) なら OFF。|誤差| > deadband_out なら ON。その間（既定 15 < |誤差| ≤ 20）は
 //    前の状態を保つ。誤差 0（P = 0）は向きが無いので OFF（軌道だけが動いている立ち上がりは生の FF）。kp = 0 なら常に OFF。
-// 3. ON なら |合成| を 床（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）まで持ち上げる。OFF なら生の合成のまま
+// 3. ON なら FF + P の向きに、|出力| = max(床（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）, I 込みの合成が同じ向きなら
+//    その大きさ)。I が逆向きに残っていても床の向きは変わらず、床が消えもしない。OFF なら生の合成（FF + P + I）のまま
 //   （0 に置き換えない。旧 Issue #15 M1 の 0 置換はこれに代わる。「誤差と逆向きに床を掛けない」規則は向きの条件として残る）。
 // 4. |合成| は duty_max × 10 で飽和。
 // 5. 積分の更新（Issue #25 手順 9「F」。dt_s > 0 のときだけ。出力を決めた後、次の tick のために積む）: dI = ki × err × dt を
@@ -154,11 +155,14 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
   o.i_permille = v1_clamp_i16(st.i_pm);
+  const long base = lround(p_pm + ff_pm);           // I を含まない合成（床の向きと ON/OFF はこれで決める）
   const long cmd = lround(p_pm + ff_pm + st.i_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
-  // 床の適用状態（ヒステリシス）。向きは P と合成で比べる（kp = 0 なら P = 0 で向きが無く、FF だけに床を掛けない。
-  // Codex レビュー P2-1）。合成が 0 でも OFF。OFF のしきい値は min(floor_off, deadband_out − 1): SET_LIMITS で
-  // deadband_out ≤ floor_off にされても ON（> deadband_out）と OFF の領域が重ならない（Codex レビュー P2-2）
-  const bool sign_match = cmd != 0 && p_pm != 0.0 && (cmd < 0) == (p_pm < 0.0);
+  // 床の適用状態（ヒステリシス）。向きは P と合成（FF + P。**I は含めない**: 静止で I が誤差と逆向きに残っていても床を
+  // 消さない・逆向きにしない。I だけで床の向きが変わると停止ブーストが対象のまま床が消え、2 s で ENCODER_FAULT になる）で
+  // 比べる（kp = 0 なら P = 0 で向きが無く、FF だけに床を掛けない。Codex レビュー P2-1）。合成が 0 でも OFF。
+  // OFF のしきい値は min(floor_off, deadband_out − 1): SET_LIMITS で deadband_out ≤ floor_off にされても ON（> deadband_out）と
+  // OFF の領域が重ならない（Codex レビュー P2-2）
+  const bool sign_match = base != 0 && p_pm != 0.0 && (base < 0) == (p_pm < 0.0);
   const int32_t floor_off = t.floor_off < t.deadband_out ? t.floor_off : t.deadband_out - 1;
   if (!sign_match || err_abs <= floor_off) {
     st.floor_on = false;
@@ -166,17 +170,25 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
     st.floor_on = true;
   }
   o.floor_on = st.floor_on;
-  long mag = cmd < 0 ? -cmd : cmd;
-  bool floor_lifted = false;
-  const bool assist_now = assist && cmd != 0 && vel != 0.0 && ((cmd < 0) == (vel < 0.0));
+  const bool assist_now = assist && base != 0 && vel != 0.0 && ((base < 0) == (vel < 0.0));
   o.assist_on = assist_now;
-  if (cmd != 0 && (st.floor_on || assist_now)) {
+  bool floor_lifted = false;
+  int out;
+  long mag;
+  if (st.floor_on || assist_now) {
+    // 床を掛ける: 向きは FF + P（base ≠ 0）。|出力| = max(床, I 込みの合成が同じ向きならその大きさ、逆向きなら 0)
     long floor_pm = v1_permille(t.duty_min) + boost_permille;
     if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
+    const bool cmd_same_dir = cmd != 0 && (cmd < 0) == (base < 0);
+    mag = cmd_same_dir ? (cmd < 0 ? -cmd : cmd) : 0;
     if (mag < floor_pm) { mag = floor_pm; floor_lifted = true; }
+    if (mag > duty_max_pm) mag = duty_max_pm;
+    out = static_cast<int>(base < 0 ? -mag : mag);
+  } else {
+    mag = cmd < 0 ? -cmd : cmd;
+    if (mag > duty_max_pm) mag = duty_max_pm;
+    out = cmd == 0 ? 0 : static_cast<int>(cmd < 0 ? -mag : mag);
   }
-  if (mag > duty_max_pm) mag = duty_max_pm;
-  const int out = cmd == 0 ? 0 : static_cast<int>(cmd < 0 ? -mag : mag);
   o.cmd_permille = static_cast<int16_t>(out);
   // 積分の更新（次の tick のため）
   if (dt_s > 0.0 && t.ki_permille_per_count_s > 0.0 && err != 0) {
@@ -188,7 +200,7 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
     bool allow = true;
     if (!unwinding) {
       const bool saturated = out != 0 && mag >= duty_max_pm && ((out < 0) == (err < 0));
-      const bool sign_mismatch = cmd != 0 && p_pm != 0.0 && (cmd < 0) != (p_pm < 0.0);  // E の抑制中（合成が P と逆）
+      const bool sign_mismatch = base != 0 && p_pm != 0.0 && (base < 0) != (p_pm < 0.0);  // E の抑制中（FF + P が P と逆）
       if (saturated || floor_lifted || sign_mismatch) allow = false;
     }
     if (allow) {
@@ -1476,7 +1488,8 @@ class V1Axis {
   }
 
   // 停止ブースト（Issue #15 H4）の対象判定。Duty を計算する前に呼ぶ。対象（軌道速度 0・|誤差| > deadband_out）なら床の適用状態
-  // （v1_duty_command の st.floor_on。Issue #25 手順 8 c）は必ず ON になる（静止では合成 = P で向きが一致する）ので上乗せが効く。
+  // （v1_duty_command の st.floor_on。Issue #25 手順 8 c）は必ず ON になる（静止では FF + P = P で向きが一致する。積分 I は床の
+  // 向きと ON/OFF に入れない。Issue #25 手順 9「F」）ので上乗せが効く。
   // 逆に 15 < |誤差| ≤ 20 では床が ON のまま残ることがあるが、対象ではないので上乗せは 0 で床 = duty_min だけ。
   // 対象は「軌道が止まっている（setpoint_vel = 0）」「|誤差| > deadband_out（不感帯の外。in_band の履歴に依らず明示的に見る。
   // 動いた後は in_band = false なので cmd ≠ 0 だけでは 10 < |誤差| ≤ 20 の静止誤差も対象になってしまう）」「ブレーキ解除指令中」。

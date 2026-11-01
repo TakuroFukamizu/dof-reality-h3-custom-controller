@@ -3438,6 +3438,43 @@ inline void test_track_assist_does_not_block_following_error_or_moving_stall_fau
   CHECK(g.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
+
+// 床の向きと ON/OFF は FF + P で決め、I は入れない（Codex/Fable レビュー）: 保持で学んだ I = +30 を持ったまま目標が下に
+// 25 count 動く（誤差 −25、P −5）と、I 込みの合成は +25 だが床は −70（ON、誤差の向き）。I が床を消して停止ブースト対象のまま
+// 2 s で ENCODER_FAULT になる経路を塞ぐ。I は戻す向き（負）なので減っていく。
+inline void test_integral_does_not_flip_floor_direction_when_stationary() {
+  V1Tuning t;  // kp 2、床 7
+  V1DutyState st;
+  st.i_pm = 30.0;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(-25, 0.0, st, t, 0, &o, 0.005) == -70 && o.floor_on && o.i_permille == 30);
+  CHECK(st.i_pm < 30.0 && st.i_pm > 29.9);  // 戻す向き: 0.1 × 25 × 0.005 = 0.0125 減る
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(-25, 0.0, st, t, 0, nullptr, 0.005) == -70);
+  CHECK(st.i_pm < 25.0 + 1e-6 && st.i_pm > 24.9);  // 2 s で 5 減る
+  // I と同じ向きの合成は従来どおり: 誤差 +25（P +5）・I +30 → +35 < 床 70 → 70
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o, 0.0) == 70 && o.floor_on);
+  // 床 OFF（|誤差| ≤ 15）なら I 込みの生の合成（P −3 + I 25 = +22）がそのまま出る
+  CHECK(v1_duty_command(-15, 0.0, st, t, 0, &o, 0.0) == 22 && !o.floor_on);
+  // 軸を通して: 保持で I を持ったまま目標が逆へ 25 動いても停止ブーストが効き、2 s で ENCODER_FAULT にならず動けば抜ける
+  Harness h;
+  h.ax.tuning.settled_ms = 0;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.raw += 10;  // 誤差 15 で 2 s → I = 3
+  h.drive(2000, h.ax.actual_count() + 15);
+  CHECK(h.ax.integral_permille() == 3);
+  h.raw += 40;  // 誤差 −25（I は +3 のまま）→ 床 +70（MD13S −→ +）、停止ブーストが上がる
+  h.drive(100, h.ax.actual_count() - 25);
+  CHECK(h.ax.duty_permille() == 70 && h.ax.duty_terms().floor_on);
+  h.drive(400, h.ax.actual_count() - 25);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost_permille() == 20);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -3512,6 +3549,7 @@ inline void run_all() {
   test_integral_blocked_during_floor_sign_mismatch_but_unwinds();
   test_integral_holding_bias_retained_in_band();
   test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference();
+  test_integral_does_not_flip_floor_direction_when_stationary();
   test_settled_entry_requires_dwell_with_measured_rest();
   test_settled_blocked_by_measured_motion_and_legacy_immediate();
   test_settled_on_keeps_stationary_stall_fault();
