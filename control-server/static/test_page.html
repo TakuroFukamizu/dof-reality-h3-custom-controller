@@ -9,10 +9,11 @@
   サーバーが GET / で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
   - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。
   - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
-  - タブが隠れても姿勢送信は止めない（運用上は別のウィンドウを前に出すことが普通）。隠れたタブでは
-    ブラウザがタイマーを 1 Hz 程度に間引くので frame_seq の進みが遅くなり、サーバー側の鮮度切れ
-    （source_freshness_ms）で減速停止する。安全はサーバーの鮮度判定に任せる。
-    隠れても 0（中央）を送らない: サーバーの source_freshness_ms が止める。
+  - タブが隠れても姿勢送信は止めない（運用上は別のウィンドウを前に出すことが普通）。送信の 50 Hz タイマーは
+    Web Worker で回す: 主スレッドの setInterval は、タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に
+    間引かれ、frame_seq が進まずサーバーの鮮度切れ（source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。
+    Worker のタイマーは間引かれないので、ウィンドウが裏に回っても送り続ける。
+    隠れても 0（中央）を送らない: 止めたいときは STOP か「送信停止」。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
   - 校正（POST /v1/calibrate、DESIGN.md §11）は機構を両端まで動かす。確認ダイアログの後にだけ送る。
 -->
@@ -61,8 +62,8 @@
   </div>
   <div class="row" style="margin-top:8px">
     <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する">session 発行</button>
-    <button id="bArm">ARM</button>
-    <button id="bStart">START</button>
+    <button id="bArm" title="POST /v1/arm。全軸 HOLDING まで">ARM</button>
+    <button id="bStart" title="POST /v1/start。HOLDING → ACTIVE（新鮮な姿勢が要る）">START</button>
     <button id="bDisarm">DISARM</button>
     <button id="bCenter">CENTER</button>
     <button id="bFault" class="warn">FAULT</button>
@@ -123,7 +124,7 @@
     <button id="bZero">スライダーを 0 に</button>
     <span>WS: <b id="wsState">closed</b></span>
     <span>seq: <b id="seq">0</b></span>
-    <span>max_gain: <b id="maxGain">0.5</b></span>
+    <span>max_gain: <b id="maxGain">0.5</b> <span class="dim small">（gain スライダーの上限。下の「動きの制限」の max_gain で変える。送信中につまみを離すと送られる）</span></span>
   </div>
   <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
 </section>
@@ -303,6 +304,35 @@
     }
   }
 
+  // 操作ボタンの押せる／押せない（STOP 以外）。リグ状態から決め、押せない理由を title に出す。
+  // サーバー側の判定が正。ここは「いま意味のある操作」を見せるためのもの。
+  function updateButtons(s) {
+    const st = s.rig_state || '';
+    const armedStates = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
+    const calibrating = (s.axes || []).some((a) => a.mcu_state === 'CALIBRATING');
+    const hasCal = (s.axes || []).some((a) => a.calibration && a.calibration.result === 'OK');
+    const fresh = !!(s.session && s.session.fresh);
+    const rules = {
+      bArm: [st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED', '前提: READY_TO_ARM か BRAKED_DISARMED（いま ' + st + '）'],
+      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
+      bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
+      bCenter: [st === 'HOLDING', '前提: HOLDING（いま ' + st + '）'],
+      bFault: [armedStates.indexOf(st) >= 0 || calibrating, '前提: 駆動中か校正中（いま ' + st + '）'],
+      bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
+      bCalibrate: [!calibrating && armedStates.indexOf(st) < 0 && st !== 'FAULT_LATCHED' && st !== 'OFFLINE', calibrating ? '校正中' : '前提: 全軸接続・DISARMED・FAULT なし（いま ' + st + '）'],
+      bCalibrateCancel: [calibrating, '校正中だけ'],
+      bCalExport: [hasCal, 'OK の校正結果がまだ無い'],
+    };
+    for (const id in rules) {
+      const el = $(id);
+      if (!el) continue;
+      const [ok, why] = rules[id];
+      el.disabled = !ok;
+      el.title = ok ? (el.dataset.titleOk || el.dataset.title0 || '') : why;
+      if (el.dataset.title0 === undefined) el.dataset.title0 = el.getAttribute('title') || '';
+    }
+  }
+
   function renderStatus(s) {
     renderLimits(s.motion_limits);
     if (s.admin_token_required === false) {
@@ -313,6 +343,7 @@
       tokenInput.disabled = false;
     }
     state.lastStatus = s;
+    updateButtons(s);
     const rig = $('rigState');
     rig.textContent = s.rig_state;
     rig.className = 'state ' + s.rig_state;
@@ -459,6 +490,8 @@
   // ---------------------------------------------------------------- motion limits
   [['limGain', 2], ['limVel', 0], ['limAcc', 0], ['limDuty', 0]].forEach(([id, d]) => {
     $(id).addEventListener('input', () => { $(id + 'V').textContent = parseFloat($(id).value).toFixed(d); });
+    // 送信中は、つまみを離した時点で制限を送る（「制限を送る」を押さなくてよい）
+    $(id).addEventListener('change', () => { if (state.ws && state.ws.readyState === WebSocket.OPEN) $('bLimits').click(); });
   });
   function sendLimits(fields) {
     const ws = state.ws;
@@ -493,8 +526,27 @@
     $('wsState').className = bad ? 'bad' : '';
   }
 
-  function stopStream(reason) {
+  // 50 Hz のタイマーは Worker で回す（主スレッドの setInterval は裏に回ると 1 Hz 程度に間引かれる）
+  let tickWorker = null;
+  function startTicker(ms) {
+    stopTicker();
+    try {
+      const src = 'let t=null;onmessage=e=>{if(e.data&&e.data.start){clearInterval(t);t=setInterval(()=>postMessage(1),e.data.start)}else{clearInterval(t);t=null}}';
+      tickWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      tickWorker.onmessage = () => sendPose();
+      tickWorker.postMessage({ start: ms });
+    } catch (e) {
+      log('Worker が使えないので setInterval で送る（裏に回ると間引かれる）: ' + e, true);
+      state.timer = setInterval(sendPose, ms);
+    }
+  }
+  function stopTicker() {
+    if (tickWorker) { try { tickWorker.terminate(); } catch (e) { /* 無視 */ } tickWorker = null; }
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  }
+
+  function stopStream(reason) {
+    stopTicker();
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
     setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
@@ -523,8 +575,8 @@
     setWsState('connecting', false);
     ws.onopen = () => {
       setWsState('open', false);
-      if (state.timer) clearInterval(state.timer);
-      state.timer = setInterval(sendPose, 20);
+      startTicker(20);
+      state.timer = state.timer || true;  // 「送信中」の印（stopStream が片付ける）
       $('bStream').textContent = '送信停止';
     };
     ws.onmessage = (ev) => {
