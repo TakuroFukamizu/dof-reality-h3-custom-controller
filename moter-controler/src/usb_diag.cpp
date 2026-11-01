@@ -10,6 +10,8 @@
 // bus reset の回数は HWCDC の esp_event 経由でしか取れない。登録すると arduino_hw_cdc_events タスク（優先度 5）が
 // 立ち、RX / TX のたびに ISR から esp_event_isr_post_to が走る（キュー 5、溢れは捨てる）。件 #5/#6 はタスク構成を
 // 変えた試作で起きたので、この計器自体が条件を変える可能性を残す。A/B 比較のため -DMC_USB_DIAG_BUSRESET=0 で外せる。
+// イベントタスクは制御タスク（Core 1、優先度 5）と同じ優先度でコア固定なし。制御周期への影響は v1 画面の
+// 「最大間隔 us」（tick gap）で見える。
 #ifndef MC_USB_DIAG_BUSRESET
 #define MC_USB_DIAG_BUSRESET 1
 #endif

@@ -162,12 +162,12 @@ void txLine(const char* line) {
 }
 
 UsbDiag usb_diag{};
-char usb_diag_text[64] = "usb -";
+char usb_diag_text[96] = "usb -";
 
 void publishUsbDiag() {
   usb_diag_sample(&usb_diag);
   usb_diag_format(usb_diag, usb_diag_text, sizeof(usb_diag_text));
-  char line[72];
+  char line[sizeof(usb_diag_text) + 2];
   snprintf(line, sizeof(line), "%s\n", usb_diag_text);
   txLine(line);
 }
@@ -183,7 +183,7 @@ void publish(const char* prefix) {
 }
 
 void publishEnc(const ControlSnapshot& now) {
-  char line[200];
+  char line[256];  // 全フィールドが最長でも約 210 字（reason は 23 字まで）。切れると改行が落ちて次の行とつながる
   snprintf(line, sizeof(line),
            "ENC motor=%u count=%lld pos=%ld cps=%d a=%d b=%d origin=%d cal=%d stroke=%ld neutral=%ld sign=%d auto=%s "
            "phase=%s reason=%s\n",
@@ -1138,7 +1138,7 @@ void pollTouchV1() {
 }
 
 UsbDiag usb_diag{};
-char usb_diag_text[64] = "usb -";
+char usb_diag_text[96] = "usb -";
 
 void renderV1() {
   if (!sprite_ok) return;
