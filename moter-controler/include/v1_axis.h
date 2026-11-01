@@ -40,7 +40,7 @@ struct V1Tuning {
   uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
   uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
-  bool floor_sign_gate = V1_FLOOR_SIGN_GATE != 0;      // Duty 下限を目標へ向かう向きだけに掛ける（Issue #15 M1）
+  int32_t floor_off = V1_FLOOR_OFF_COUNT;              // 床の適用状態を OFF にする |誤差|（ON は deadband_out 超。Issue #25 手順 8 c）
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
@@ -56,7 +56,7 @@ struct V1DutyTerms {
   int16_t ff_permille = 0;     // フィードフォワード項
   int16_t p_permille = 0;      // 比例項
   int16_t vel_count_s = 0;     // 軌道の目標速度 [count/s]（int16 に飽和）
-  bool floor_on = false;       // この tick に Duty 下限（duty_min ＋ 停止ブースト）を掛けた
+  bool floor_on = false;       // 床の適用状態が ON（|合成| が床未満なら duty_min ＋ 停止ブーストまで持ち上げる。Issue #25 手順 8 c）
   bool in_band = false;        // 静止の不感帯の中（Duty 0）
   int16_t boost_permille = 0;  // 停止ブースト（Issue #15 H4）の上乗せ。V1Axis が埋める
   int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
@@ -71,16 +71,25 @@ inline int16_t v1_clamp_i16(double v) {
 // 整数 % → permille（V1Tuning の Duty しきい値の換算）
 constexpr int v1_permille(int percent) { return percent * V1_PERMILLE_PER_PERCENT; }
 
+// 位置ループの tick をまたぐ状態（ヒステリシス）。位置制御が止まれば両方 false に戻す。
+struct V1DutyState {
+  bool in_band = false;   // 静止の不感帯の中（入る側 deadband / 出る側 deadband_out）
+  bool floor_on = false;  // 床（Duty 下限）の適用状態（ON: |誤差| > deadband_out かつ向き一致 / OFF: |誤差| ≤ floor_off か向き不一致）
+};
+
 // 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
 // フィードフォワード（vel / ff）＋比例（err × kp / 100）を permille で計算し、和を四捨五入（lround）してから整数の permille で
-// 下限・上限を掛ける（旧: 整数 % に切り捨て。5.3 % は 53 permille として出る）。目標が止まっている（vel = 0）ときだけ不感帯を
-// 使い、入る側 deadband / 出る側 deadband_out のヒステリシスで到達帯の縁での往復を防ぐ。
-// 0 でなければ |指令| を 下限（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）以上 duty_max × 10 以下に収める。
-// 下限の掛け方（Issue #15 M1、t.floor_sign_gate）: 合成値が下限未満のとき、合成値の向きが誤差の向きと逆（cmd × err < 0）なら
-// 下限まで持ち上げずに 0（惰行）。誤差 0 は「向きが一致」として扱う（旧テストの err 0・vel 600 → 下限 と同じ）。
-// gate が偽なら旧動作（合成値に下限を掛ける。目標から離れる向きの下限バーストが出る）。
-// boost_permille は停止ブースト（Issue #15 H4）の上乗せ。terms を渡せば各項を書く（計器用。振る舞いは変えない）。
-inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t, int boost_permille = 0,
+// 床・上限を掛ける（5.3 % は 53 permille として出る）。
+// 1. 静止の不感帯: 目標が止まっている（vel = 0）ときだけ、入る側 deadband / 出る側 deadband_out のヒステリシスで Duty 0
+//   （到達帯の縁での往復を防ぐ。不感帯の中では床の状態も OFF に戻す）。
+// 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成の向きが P（誤差）の向きと違えば即 OFF。|誤差| > deadband_out なら
+//    ON。|誤差| ≤ floor_off（15）なら OFF。その間（15 < |誤差| ≤ 20）は前の状態を保つ。誤差 0 は「向きの判定が無い」ので
+//    |誤差| ≤ floor_off の側で OFF（軌道だけが動いている立ち上がりは生の FF）。
+// 3. ON なら |合成| を 床（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）まで持ち上げる。OFF なら生の合成のまま
+//   （0 に置き換えない。旧 Issue #15 M1 の 0 置換はこれに代わる。「誤差と逆向きに床を掛けない」規則は向きの条件として残る）。
+// 4. |合成| は duty_max × 10 で飽和。
+// boost_permille は停止ブースト（Issue #15 H4）の上乗せ（床が ON のときだけ効く）。terms を渡せば各項を書く（計器用）。
+inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
                            V1DutyTerms* terms = nullptr) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
@@ -89,16 +98,17 @@ inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tunin
   o.boost_permille = static_cast<int16_t>(boost_permille);
   const int64_t err_abs = err < 0 ? -err : err;
   if (vel == 0.0) {
-    if (in_band) {
-      if (err_abs <= t.deadband_out) { o.in_band = true; return 0; }
-      in_band = false;
+    if (st.in_band) {
+      if (err_abs <= t.deadband_out) { st.floor_on = false; o.in_band = true; return 0; }
+      st.in_band = false;
     } else if (err_abs <= t.deadband) {
-      in_band = true;
+      st.in_band = true;
+      st.floor_on = false;
       o.in_band = true;
       return 0;
     }
   } else {
-    in_band = false;
+    st.in_band = false;
   }
   // 各項を permille で。P = err × kp / 100 × 10（err × kp は整数なので 10 の倍数の分子を 100 で割る: 誤差 345・kp 2 → 69.0 ちょうど）
   const double p_pm = static_cast<double>(err * t.kp_percent_per_100) * V1_PERMILLE_PER_PERCENT / 100.0;
@@ -106,15 +116,23 @@ inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tunin
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
   const long cmd = lround(p_pm + ff_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
+  // 床の適用状態（ヒステリシス）。合成が 0 なら向きが無いので OFF
+  const bool sign_match = cmd != 0 && err != 0 && (cmd < 0) == (err < 0);
+  if (!sign_match) {
+    st.floor_on = false;
+  } else if (err_abs > t.deadband_out) {
+    st.floor_on = true;
+  } else if (err_abs <= t.floor_off) {
+    st.floor_on = false;
+  }
+  o.floor_on = st.floor_on;
   if (cmd == 0) return 0;
   long mag = cmd < 0 ? -cmd : cmd;
   const long duty_max_pm = v1_permille(t.duty_max);
-  long floor_pm = v1_permille(t.duty_min) + boost_permille;
-  if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
-  if (mag < floor_pm) {
-    if (t.floor_sign_gate && err != 0 && (cmd < 0) != (err < 0)) return 0;  // 目標から離れる向きには下限を掛けない
-    mag = floor_pm;
-    o.floor_on = true;
+  if (st.floor_on) {
+    long floor_pm = v1_permille(t.duty_min) + boost_permille;
+    if (floor_pm > duty_max_pm) floor_pm = duty_max_pm;
+    if (mag < floor_pm) mag = floor_pm;
   }
   if (mag > duty_max_pm) mag = duty_max_pm;
   const int out = static_cast<int>(cmd < 0 ? -mag : mag);
@@ -468,7 +486,7 @@ class V1Axis {
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
-  bool in_band_ = false;
+  V1DutyState duty_state_{};  // 不感帯と床のヒステリシス（位置制御が止まれば戻す）
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
@@ -1266,7 +1284,7 @@ class V1Axis {
     if (!position_control_on()) {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
-      in_band_ = false;
+      duty_state_ = V1DutyState{};
       reset_stall_boost();
       terms_ = V1DutyTerms{};
       return;
@@ -1275,7 +1293,7 @@ class V1Axis {
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
     stall_boost_gate(err, now);
-    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, tuning, stall_boost_, &terms_);  // カウント増の向きが正 [permille]
+    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
@@ -1321,7 +1339,9 @@ class V1Axis {
     boost_err_sign_ = 0;
   }
 
-  // 停止ブースト（Issue #15 H4）の対象判定。Duty を計算する前に呼ぶ。
+  // 停止ブースト（Issue #15 H4）の対象判定。Duty を計算する前に呼ぶ。対象（軌道速度 0・|誤差| > deadband_out）なら床の適用状態
+  // （v1_duty_command の st.floor_on。Issue #25 手順 8 c）は必ず ON になる（静止では合成 = P で向きが一致する）ので上乗せが効く。
+  // 逆に 15 < |誤差| ≤ 20 では床が ON のまま残ることがあるが、対象ではないので上乗せは 0 で床 = duty_min だけ。
   // 対象は「軌道が止まっている（setpoint_vel = 0）」「|誤差| > deadband_out（不感帯の外。in_band の履歴に依らず明示的に見る。
   // 動いた後は in_band = false なので cmd ≠ 0 だけでは 10 < |誤差| ≤ 20 の静止誤差も対象になってしまう）」「ブレーキ解除指令中」。
   // 対象外になった tick と誤差の符号が反転した tick は、ここで上乗せを 0 に戻す（この tick の Duty から効く）。

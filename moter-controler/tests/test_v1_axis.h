@@ -1592,10 +1592,10 @@ inline void test_stall_boost_requires_error_outside_outer_band() {
   h.raw -= 25;  // 不感帯の外 → in_band = false、下限 7 %、上乗せ開始
   h.drive(420, h.ax.actual_count() + 25);
   CHECK(h.ax.stall_boost_permille() == 20);
-  h.raw += 10;  // 10 count だけ動いて誤差 15: 入る側 10 より大きいので in_band = false のまま → 下限 7 % は出続ける
+  h.raw += 10;  // 10 count だけ動いて誤差 15: 入る側 10 より大きいので in_band = false のまま。床は |誤差| ≤ 15 で OFF → 生の P 3 permille
   h.drive(1000, h.ax.actual_count() + 15);
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
-  CHECK(h.ax.duty_permille() == -70);
+  CHECK(h.ax.duty_permille() == -3 && !h.ax.duty_terms().floor_on);
   CHECK(h.ax.stall_boost_permille() == 0);  // 20 以下なので上乗せしない（cmd ≠ 0 だけを見ていると 2 s で ENCODER_FAULT になる）
   // 25 に広がれば対象
   h.raw -= 10;
@@ -1711,31 +1711,97 @@ inline void test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_lim
   CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
 }
 
-// Issue #15 M1: Duty 下限は「目標へ向かう向き」のときだけ。FF と P の合成が下限未満で誤差と逆向きなら 0（惰行）。
-inline void test_duty_command_floor_only_toward_target() {
+// Issue #25 手順 8 (c)「E」: 床（Duty 下限）はヒステリシス付きの適用状態が ON のときだけ。ON = |誤差| > deadband_out（20）かつ
+// 合成と P の向きが一致、OFF = |誤差| ≤ 15 または向きの不一致（即時）。OFF のときは有界の生の FF + P（0 にしない。旧 M1 の 0 置換に代わる）。
+inline void test_duty_command_floor_gate_with_hysteresis() {
   V1Tuning t;
   t.kp_percent_per_100 = 6;
   t.duty_min = 9;
   t.duty_max = 20;
-  t.floor_sign_gate = true;
-  bool band = false;
-  // Issue の例: err +50（P +3 %）・vel −200（FF −2 %）→ 合成 +1 % → 目標向き → 下限 9
-  CHECK(v1_duty_command(50, -200.0, band, t) == 90);
-  // err +50（P +3）・vel −600（FF −6）→ 合成 −3 % → 目標から離れる向き → 0（旧: −9 のバースト）
-  CHECK(v1_duty_command(50, -600.0, band, t) == 0);
-  CHECK(v1_duty_command(-50, 600.0, band, t) == 0);
-  // 合成が下限以上なら向きに関わらずそのまま（減速中に実位置が先行: P −18 + FF +2 = −16）
-  CHECK(v1_duty_command(-300, 200.0, band, t) == -160);
-  // 誤差 0 は向きの一致とみなし下限を掛ける（軌道だけが動いている立ち上がり）
-  CHECK(v1_duty_command(0, 200.0, band, t) == 90);
-  // 目標向きの小さい合成は下限（従来どおり）
-  CHECK(v1_duty_command(50, 0.0, band, t) == 90);
-  CHECK(v1_duty_command(-50, 0.0, band, t) == -90);
-  // gate を切れば旧動作（合成値に下限を掛ける）
-  t.floor_sign_gate = false;
-  CHECK(v1_duty_command(50, -600.0, band, t) == -90);
-  CHECK(v1_duty_command(-50, 600.0, band, t) == 90);
-  CHECK(v1_duty_command(-300, 200.0, band, t) == -160);
+  V1DutyState st;
+  // Issue の例: err +50（P +30）・vel −200（FF −20）→ 合成 +10 → 向き一致・|誤差| > 20 → 床 ON → 90
+  CHECK(v1_duty_command(50, -200.0, st, t) == 90 && st.floor_on);
+  // err +50（P +30）・vel −600（FF −60）→ 合成 −30 → 向き不一致 → 即 OFF → 生の −30（旧 M1: 0、それより前: −90 のバースト）
+  CHECK(v1_duty_command(50, -600.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(-50, 600.0, st, t) == 30 && !st.floor_on);
+  // 合成が床以上なら状態に依らずそのまま（減速中に実位置が先行: P −180 + FF +20 = −160）
+  CHECK(v1_duty_command(-300, 200.0, st, t) == -160 && st.floor_on);
+  // 誤差 0（軌道だけが動いている立ち上がり）: 床 OFF → 生の FF 20（旧: 下限 90）
+  CHECK(v1_duty_command(0, 200.0, st, t) == 20 && !st.floor_on);
+  // FF だけの追従（小さい誤差）: 生の FF + P。err 5・vel 400 → 40 + 3 = 43
+  CHECK(v1_duty_command(5, 400.0, st, t) == 43 && !st.floor_on);
+  CHECK(v1_duty_command(-5, -400.0, st, t) == -43 && !st.floor_on);
+  // 静止で目標向きの小さい合成: |誤差| > 20 → 床 ON → ±90
+  CHECK(v1_duty_command(50, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(-50, 0.0, st, t) == -90 && st.floor_on);
+  // ヒステリシス 15 < |誤差| ≤ 20: ON の履歴なら ON のまま（18 → P 10.8 → 11 < 90 → 90）、15 で OFF（生の 9）、
+  // OFF の履歴なら 18 でも OFF（生の 11）、21 で ON
+  CHECK(v1_duty_command(18, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(20, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(15, 0.0, st, t) == 9 && !st.floor_on);
+  CHECK(v1_duty_command(18, 0.0, st, t) == 11 && !st.floor_on);
+  CHECK(v1_duty_command(20, 0.0, st, t) == 12 && !st.floor_on);
+  CHECK(v1_duty_command(21, 0.0, st, t) == 90 && st.floor_on);
+  // 向きの不一致は |誤差| > 20 でも即 OFF。向きが戻れば次の tick で ON
+  CHECK(v1_duty_command(50, -600.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(50, -200.0, st, t) == 90 && st.floor_on);
+  // 合成 0（打ち消し）は向きが無いので OFF、出力 0
+  CHECK(v1_duty_command(50, -300.0, st, t) == 0 && !st.floor_on);  // P +30・FF −30
+  // 静止の不感帯に入れば床の状態も OFF に戻る。出る側 20 までは 0、21 で床 ON
+  CHECK(v1_duty_command(50, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(5, 0.0, st, t) == 0 && st.in_band && !st.floor_on);
+  CHECK(v1_duty_command(18, 0.0, st, t) == 0 && st.in_band && !st.floor_on);
+  CHECK(v1_duty_command(21, 0.0, st, t) == 90 && !st.in_band && st.floor_on);
+  // 停止ブーストは床が ON のときだけ効く
+  CHECK(v1_duty_command(50, 0.0, st, t, 20) == 110 && st.floor_on);
+  CHECK(v1_duty_command(50, -600.0, st, t, 20) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(0, 200.0, st, t, 20) == 20 && !st.floor_on);
+  CHECK(v1_duty_command(50, 0.0, st, t, 500) == 200);  // 床 ＋ 上乗せは上限で頭打ち
+  // 生の合成も上限で飽和
+  CHECK(v1_duty_command(50, -5000.0, st, t) == -200 && !st.floor_on);
+  // 計器: floor_on は状態、cmd は生の値
+  V1DutyTerms o;
+  CHECK(v1_duty_command(50, -600.0, st, t, 20, &o) == -30);
+  CHECK(!o.floor_on && o.p_permille == 30 && o.ff_permille == -60 && o.cmd_permille == -30 && o.boost_permille == 20);
+}
+
+// 軸を通した E: 追従中（誤差が小さい）は床ではなく生の FF が出る。静止の残り誤差 15 では床 OFF で生の P、25 で床 ON。
+inline void test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis() {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_vel_count_s = 400;  // FF 4 % = 40 permille（床 70 未満）
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.drive(600, 5000);  // 速度 400 count/s で追従（プラントは毎 tick 追いつく）
+  CHECK(h.ax.state() == st::ACTIVE);
+  const V1DutyTerms& tm = h.ax.duty_terms();
+  CHECK(tm.vel_count_s == 400 && tm.ff_permille == 40 && !tm.floor_on && !tm.in_band);
+  CHECK(h.ax.pwm_permille() >= 38 && h.ax.pwm_permille() <= 46);  // 生の FF（＋小さい P）。旧: 下限 70 のバースト
+  CHECK(h.ax.pwm_permille() == tm.cmd_permille);
+  // 止めて HOLDING。残り誤差 25 → 床 ON（70）、誤差 15 → OFF（生の P 3）、18 → OFF のまま（4）、25 → ON
+  Harness::accepted(h.stop());
+  h.drive(200, h.ax.target_count());
+  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_permille() == 0);
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  h.raw += 10;  // 誤差 15
+  h.step();
+  CHECK(h.ax.duty_permille() == -3 && !h.ax.duty_terms().floor_on);
+  h.raw -= 3;  // 誤差 18: OFF の履歴なので OFF のまま
+  h.step();
+  CHECK(h.ax.duty_permille() == -4 && !h.ax.duty_terms().floor_on);
+  h.raw -= 7;  // 誤差 25
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  h.raw += 7;  // 誤差 18: ON の履歴なので ON のまま
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  CHECK(h.ax.fault_code() == fc::NONE);
 }
 
 // Issue #15 M2: ENCODER_FAULT のしきい値は max(V1_STALL_DUTY, duty_max × 75 %)。duty_max < 10 なら検出が無効（警告）。
@@ -2109,28 +2175,28 @@ inline void test_duty_sign_follows_profile_sign() {
 // フィードフォワード（docs/multi_axis_20261031.md の実測: 1 % ≈ 100〜130 count/s）。純粋関数を直接検査する。
 inline void test_duty_command_feed_forward() {
   V1Tuning t;
-  bool band = false;
-  CHECK(v1_duty_command(0, 600.0, band, t) == V1_DUTY_MIN_PERMILLE);   // 6 % → 下限 7 %
+  V1DutyState band;
+  CHECK(v1_duty_command(0, 600.0, band, t) == 60);   // FF 6 %。誤差 0 なので床は OFF → 生の 60 permille（旧: 下限 7 %）
   CHECK(v1_duty_command(0, 1500.0, band, t) == 150);            // 速度だけで 15 %
   CHECK(v1_duty_command(0, 2500.0, band, t) == V1_DUTY_MAX_PERMILLE);   // 25 % → 上限 20 %
   CHECK(v1_duty_command(300, 600.0, band, t) == 120);           // 6 + 6
   CHECK(v1_duty_command(-300, 600.0, band, t) == 0);           // 誤差が速度と逆向きで打ち消し → 0
-  CHECK(v1_duty_command(0, -600.0, band, t) == -V1_DUTY_MIN_PERMILLE);  // 向きは速度の符号
+  CHECK(v1_duty_command(0, -600.0, band, t) == -60);  // 向きは速度の符号
   CHECK(v1_duty_command(-100, -1000.0, band, t) == -120);       // −2 − 10
   // 目標が動いている間は不感帯を使わない
-  band = true;
-  CHECK(v1_duty_command(3, 600.0, band, t) == V1_DUTY_MIN_PERMILLE);
-  CHECK(!band);
+  band.in_band = true;
+  CHECK(v1_duty_command(3, 600.0, band, t) == 61);  // 60 + 0.6 → 61。床は OFF（|誤差| 3 ≤ 15）
+  CHECK(!band.in_band);
   // 止まったら不感帯（入る 10 / 出る 20）
-  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band);
-  CHECK(v1_duty_command(20, 0.0, band, t) == 0 && band);
-  CHECK(v1_duty_command(21, 0.0, band, t) == V1_DUTY_MIN_PERMILLE && !band);
-  CHECK(v1_duty_command(11, 0.0, band, t) == V1_DUTY_MIN_PERMILLE && !band);
-  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band);
+  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band.in_band);
+  CHECK(v1_duty_command(20, 0.0, band, t) == 0 && band.in_band);
+  CHECK(v1_duty_command(21, 0.0, band, t) == V1_DUTY_MIN_PERMILLE && !band.in_band && band.floor_on);  // 床 ON
+  CHECK(v1_duty_command(11, 0.0, band, t) == 2 && !band.in_band && !band.floor_on);  // 不感帯の外だが |誤差| ≤ 15 で床 OFF → 生の P 2.2 → 2
+  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band.in_band);
   // ff = 0 なら比例だけ
   V1Tuning p;
   p.ff_count_s_per_percent = 0;
-  bool b2 = false;
+  V1DutyState b2;
   CHECK(v1_duty_command(0, 600.0, b2, p) == 0);
   CHECK(v1_duty_command(500, 600.0, b2, p) == 100);
 }
@@ -2138,26 +2204,26 @@ inline void test_duty_command_feed_forward() {
 // Issue #25 手順 8 (a): 位置ループの各項の計器。v1_duty_command の結果は変えず、FF / P / 軌道速度 / 下限の適用 / 不感帯を書く。
 inline void test_duty_terms_report_ff_p_floor_and_band() {
   V1Tuning t;  // kp 2、ff 100、下限 7、上限 20
-  bool band = false;
+  V1DutyState band;
   V1DutyTerms o;
-  // FF 6 % + P 6 % = 12 %。下限は掛からない
+  // FF 6 % + P 6 % = 12 %。床の状態は ON（|誤差| > 20・向き一致）だが合成が床以上なのでそのまま
   CHECK(v1_duty_command(300, 600.0, band, t, 0, &o) == 120);
-  CHECK(o.ff_permille == 60 && o.p_permille == 60 && o.vel_count_s == 600 && !o.floor_on && !o.in_band &&
+  CHECK(o.ff_permille == 60 && o.p_permille == 60 && o.vel_count_s == 600 && o.floor_on && !o.in_band &&
         o.cmd_permille == 120);
-  // FF 2 % だけ → 下限 7 %（floor_on）
-  CHECK(v1_duty_command(0, 200.0, band, t, 0, &o) == 70);
-  CHECK(o.ff_permille == 20 && o.p_permille == 0 && o.floor_on && o.cmd_permille == 70);
+  // FF 2 % だけ（誤差 0）→ 床は OFF → 生の 20
+  CHECK(v1_duty_command(0, 200.0, band, t, 0, &o) == 20);
+  CHECK(o.ff_permille == 20 && o.p_permille == 0 && !o.floor_on && o.cmd_permille == 20);
   // 負の向き: P −1.2 %・FF −2 % → 合成 −3.2 % → 下限 −7 %
   CHECK(v1_duty_command(-60, -200.0, band, t, 0, &o) == -70);
   CHECK(o.ff_permille == -20 && o.p_permille == -12 && o.floor_on && o.cmd_permille == -70 && o.vel_count_s == -200);
-  // M1: 誤差と逆向きの合成が下限未満 → 0。floor_on は立たない（下限を掛けていない）
-  CHECK(v1_duty_command(50, -600.0, band, t, 0, &o) == 0);
-  CHECK(o.ff_permille == -60 && o.p_permille == 10 && !o.floor_on && o.cmd_permille == 0);
+  // 誤差と逆向きの合成 → 床 OFF → 生の −50
+  CHECK(v1_duty_command(50, -600.0, band, t, 0, &o) == -50);
+  CHECK(o.ff_permille == -60 && o.p_permille == 10 && !o.floor_on && o.cmd_permille == -50);
   // 上限で飽和: FF 25 % → 20 %
   CHECK(v1_duty_command(0, 2500.0, band, t, 0, &o) == 200);
   CHECK(o.ff_permille == 250 && o.cmd_permille == 200 && !o.floor_on);
   // 静止の不感帯の中: in_band が立ち、各項は 0
-  CHECK(v1_duty_command(5, 0.0, band, t, 0, &o) == 0 && band);
+  CHECK(v1_duty_command(5, 0.0, band, t, 0, &o) == 0 && band.in_band);
   CHECK(o.in_band && o.ff_permille == 0 && o.p_permille == 0 && o.cmd_permille == 0 && !o.floor_on);
   // 軌道速度は int16 に飽和
   CHECK(v1_duty_command(0, 40000.0, band, t, 0, &o) == 200);
@@ -2189,7 +2255,7 @@ inline void test_duty_terms_report_ff_p_floor_and_band() {
 inline void test_duty_command_permille_resolution_and_saturation() {
   V1Tuning t;  // kp 2、ff 100、下限 7 %、上限 20 %
   t.duty_min = 0;  // 下限なしで生の分解能を見る
-  bool band = false;
+  V1DutyState band;
   CHECK(v1_duty_command(265, 0.0, band, t) == 53);    // P 5.3 % → 53 permille（旧: 5 %）
   CHECK(v1_duty_command(-265, 0.0, band, t) == -53);
   CHECK(v1_duty_command(0, 530.0, band, t) == 53);    // FF 5.3 %
@@ -2292,10 +2358,10 @@ inline void test_duty_deadband_and_clamp() {
   h.set_position(0);
   h.step();
   CHECK(h.ax.duty_permille() == -V1_DUTY_MIN_PERMILLE);
-  h.raw = -15;  // 駆動中は入る側 10 まで続ける
+  h.raw = -15;  // 駆動中は入る側 10 まで不感帯に入らないが、床は |誤差| ≤ 15 で OFF → 生の P 3 permille（Issue #25 手順 8 c）
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_permille() == -V1_DUTY_MIN_PERMILLE);
+  CHECK(h.ax.duty_permille() == -3);
   h.raw = -10;
   h.set_position(0);
   h.step();
@@ -3031,7 +3097,8 @@ inline void run_all() {
   test_stall_boost_window_restarts_on_motion_but_ignores_jitter();
   test_stall_boost_resets_on_error_sign_flip();
   test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits();
-  test_duty_command_floor_only_toward_target();
+  test_duty_command_floor_gate_with_hysteresis();
+  test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis();
   test_encoder_fault_threshold_follows_duty_max();
   test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault();
   test_device_id_packs_mac_in_printed_order();

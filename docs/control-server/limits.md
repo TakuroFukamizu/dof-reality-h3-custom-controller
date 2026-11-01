@@ -43,7 +43,7 @@
 
 | 項目 | 初期値 | 旧（ファーム直書き） | 役割 |
 | --- | ---: | ---: | --- |
-| `duty_min_percent` | 3 | 7 | 位置ループが出す最小の非 0 Duty。7 % は無負荷で約 700 count/s 出るので、それより遅い目標速度は「7 % で動く / 0 で止まる」の往復になり低速が段付きになる（FF + P の下限が限界サイクルを作る）。3 % はこれを小さくする**仮説**。自動移動（端当て・中立）の 7 %（`NEUTRAL_DUTY_MIN`）は別の定数で、変えていない |
+| `duty_min_percent` | 3 | 7 | **床**: 位置ループが「床の適用状態 ON」のときに出す最小の非 0 Duty（Issue #25 手順 8 c の E、2026-11-02）。ON になるのは |誤差| > `deadband_out_count`（20）で合成（FF + P）が誤差の向きのとき、OFF は |誤差| ≤ 15（`V1_FLOOR_OFF_COUNT`。`deadband_out_count` < 15 なら実効は min(15, `deadband_out_count`) でヒステリシス無し）か向きの不一致。**追従中の小さい誤差（|誤差| ≤ 15、または 15〜20 で OFF の履歴）では床は掛からず、生の FF + P（permille）がそのまま出る**ので、`duty_min` は「停止から動き出すときの押し当て」と「誤差 20 超の補正の最小値」だけを決める。旧（r3 以前）は常に掛けていたので 7 % ≈ 700 count/s より遅い目標速度が「7 % で動く / 0 で止まる」の往復（段付き）になったが、E ではその往復は原理的に出ない（FF が足りず誤差が 20 を超えた所で床が入り、15 以下に戻れば抜ける）。自動移動（端当て・中立）の 7 %（`NEUTRAL_DUTY_MIN`）は別の定数で、変えていない |
 | `kp_percent_per_100` | 2 | 6 | 比例ゲイン。誤差 100 count あたり 2 %。**0 は不可**（目標が止まると出力 0 で保持できない）。設定の検査で `kp × following_error_limit_count / 100 ≥ duty_min_percent` を要求する: これを満たさないと、位置ループは FOLLOWING_ERROR で止まる前に Duty 下限より大きな値を出せない（2026-11-01: kp 2 × 400 / 100 = 8 % に対して自重のかかった軸の動き出しが 9 % → 静止なら動かず、目標が動けば FAULT。bringup は kp 6 / duty_min 9 で確認） |
 | `ff_count_s_per_percent` | 100 | 100 | フィードフォワード。軌道速度 [count/s] ÷ これ = Duty [%]。実測の下側 |
 | `deadband_count` / `deadband_out_count` | 10 / 20 | 10 / 20 | 目標が止まっているときの到達帯（入る側 / 出る側のヒステリシス）。`/v1/center` の到達判定に使う `[game].center_tolerance_count`（既定 50）はこの出る側以上でなければならない（ファームは出る側の内側では補正しないので、それより厳しい許容は永久に満たせない） |
@@ -51,7 +51,7 @@
 ファーム側の固定値との関係（Issue #15 H4 / M1 / M2、2026-11-02。いずれも実機未検証）:
 
 - **動き出し Duty と `duty_min`**: 11-02 の実機（kp 6 / duty_min 9）で、自重のかかった軸の動き出しは約 9 %、7〜8 % では動かなかった。位置ループに積分は無いので、`duty_min` が動き出し Duty より低いと、目標が止まっているときの静的誤差（不感帯の外）は詰められない。ファームはこれを **停止ブースト**で補う: 軌道が止まっていて下限 Duty でもカウントが 200 ms（`V1_STALL_BOOST_MS`）動かなければ下限を 1 % ずつ上げ、`duty_max` で頭打ち、不感帯に入る・誤差の符号が反転する・軌道が動き出すと 0 に戻す（protocol.md §5）。`duty_min` を下げる（§4 手順 3）と、静止時の押し当ては下限から動き出し Duty まで 200 ms × 差分だけ遅れる。上乗せには上限がある: 対象になってから `V1_STALL_BOOST_MAX_MS`（2 s）動かない、または `duty_max` で頭打ちのまま次の窓も動かなければ ENCODER_FAULT（詰まった機構を `duty_max` で押し続けない。基準は消える）。`duty_min` と `duty_max` の差が小さいほど早く頭打ちになる（差 0 なら最初の窓 200 ms で FAULT）。
-- **下限の向き**（`V1_FLOOR_SIGN_GATE`、既定 1）: FF と P の合成が `duty_min` 未満で誤差と逆向きなら 0（惰行）。`duty_min`（9 % ≈ 900 count/s）が `max_vel_count_s`（bringup 600）や center の速度より高いと、軌道速度は原理的に出せず「バースト → 停止」になる。旧動作ではこのとき「反転」も出た（11-02 の正弦波で Duty が常に ±9 % だったのと整合）。反転をなくすのが gate で、バースト自体を減らすのは `duty_min` を下げるか `max_vel` を上げる。
+- **床の適用状態**（E、Issue #25 手順 8 c。旧 M1 `V1_FLOOR_SIGN_GATE` に代わる。フラグは無い）: 床（`duty_min` ＋ 停止ブースト）は |誤差| > 20 かつ合成が誤差の向きのときに ON、|誤差| ≤ 15 か向きの不一致で OFF（15〜20 はヒステリシス）。OFF のときは生の FF + P。`duty_min`（9 % ≈ 900 count/s）が `max_vel_count_s`（bringup 600）より高くても、追従中は床が掛からないので「バースト → 停止」や反転は出ず、FF（`ff_count_s_per_percent`）が速度を決める。FF が負荷で足りなければ誤差が 20 を超えた所で床が入って追いつき、15 以下で抜ける。これが新しい限界サイクル（20 ⇄ 15 の往復）にならないかを実機で見る（protocol.md §5）。
 - **`V1_STALL_DUTY`（10 %）と `duty_max`**: 無パルスの ENCODER_FAULT のしきい値は `max(10 %, duty_max × 75 %)`（bringup の duty_max 20 → 15 %、40 → 30 %）。動けない軸がどちらの異常になるかは `kp × following_error_limit_count / 100 + FF` とこのしきい値の大小で決まる: 未満なら FOLLOWING_ERROR（基準が残り、FAULT_RESET → ARM で続けられる）、以上なら ENCODER_FAULT（FAULT_RESET で基準が消え、SET_REFERENCE か校正が要る）。bringup（kp 6、FE 400、duty_max 20）は 24 % ≥ 15 % なので ENCODER_FAULT 側。**FOLLOWING_ERROR 側に置きたいなら `kp × FE / 100 < 0.75 × duty_max` にする**（PR #14 の `kp × FE / 100 ≥ duty_min` と合わせて、`duty_min ≤ kp × FE / 100 < 0.75 × duty_max`）。`duty_max_percent < 10` は受理されるが無パルス判定が決して成立しない（ファームの画面に「無パルス検出なし」）。**注意**: しきい値を上げたぶん、軌道が動いている間に `duty_min`（9 %）以上・しきい値（15 %）未満で止まっているモーターを直接守る検出は無い。そこで守るのは FOLLOWING_ERROR（誤差が `following_error_limit_count` を超える）だけで、誤差の増え方は軌道速度で決まる（max_vel 600 なら FE 400 まで約 0.7 s）。目標が止まっているときは停止ブーストの上限（2 s / `duty_max` 頭打ち → ENCODER_FAULT）が守る。
 
 ### 2.3 保護（CONFIG で配る。実行時には変えない）
@@ -123,7 +123,7 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 | --- | --- | --- |
 | 動きが小さい | `effective_gain`、`limits` の `gain_limited` | `max_gain`（ゲームの gain 要求がそれ以下なら、ゲーム側の gain） |
 | 追いつかない・遅い | SET_POSITION の `max_vel` / `max_acc`（status の `motion_limits.effective`）、`following_error_count` | `max_vel_count_s`、`max_acc_count_s2` |
-| 低速が段付き・かくつく | `pwm_permille` が 0 と ±下限の間を往復 | `duty_min_percent` を下げる。残るなら `deadband_*`、Kp。下限で目標から離れる向きに走るなら `V1_FLOOR_SIGN_GATE`（ファーム、既定 1）が効いているか |
+| 低速が段付き・かくつく | `pwm_permille` が生の FF（小さい値）と ±床の間を往復し、`following_error_count` が 15〜20 をまたぐ（ファーム画面の `FLR` が 0/1 で点滅） | E の床の往復。`ff_count_s_per_percent` を下げて FF を増やす（同じ速度に多めの Duty）か、`duty_min_percent` を下げる。残るなら `deadband_*`、Kp。r3 以前の「0 と ±下限の往復」はもう出ない |
 | 止まったまま誤差が残る（目標静止） | `following_error_count` が不感帯の外で一定、`pwm_permille` が ±下限 → 200 ms ごとに 10 ずつ増える（停止ブースト） | 動き出し Duty が高い。`duty_min_percent` を動き出し Duty（実測 9 %）に近づける。ブーストが `duty_max` に張り付いても動かないなら機構・電源 |
 | 動けない軸が ENCODER_FAULT になり基準が消える | FAULT_EVENT の直前の `pwm_permille` が `max(100, duty_max × 7.5)` 以上 | `kp × following_error_limit / 100 < 0.75 × duty_max` にする（§2.2）か、機構を直す |
 | 高速側で頭打ち | `pwm_permille` が `duty_max` に張り付く | `duty_max_percent`（絶対上限 60 まで） |
@@ -131,6 +131,8 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 | OVERSPEED | `velocity_count_s` | `overspeed_count_s`（max_vel の 1.5 倍以上を保つ）。暴走なら配線と符号 |
 
 ## 6. 変更履歴
+
+- 2026-11-02（Issue #25 手順 8 c、ファーム。実機未検証）: E。床（`duty_min` ＋ 停止ブースト）はヒステリシス付きの適用状態が ON のときだけ（ON: |誤差| > `deadband_out` かつ向き一致、OFF: |誤差| ≤ `V1_FLOOR_OFF_COUNT` 15 か向き不一致）。OFF では有界の生の FF + P を permille で出す（0 にしない）。Issue #15 M1 の 0 置換と `V1_FLOOR_SIGN_GATE` を廃止（向きの条件として残る）。`duty_min_percent` の意味は §2.2: 床は帯の外だけ。
 
 - 2026-11-02（Issue #25 手順 8 b、ファーム。実機未検証）: 位置ループの分解能を permille（0.1 %）に。`v1_duty_command` → `motor_output_write_permille` → PWM まで permille で運び、STATUS の `pwm_permille` は実際に書いた値になる（旧: 整数 % × 10）。線上の `duty_min_percent` / `duty_max_percent` は整数 % のまま。しきい値は `config.h` の `V1_DUTY_MIN_PERMILLE` / `V1_DUTY_MAX_PERMILLE` / `V1_STALL_DUTY_PERMILLE` / `V1_STALL_BOOST_STEP_PERMILLE` / `V1_ABS_DUTY_MAX_PERMILLE` と `v1_permille()` で換算し、効き目は変えていない（ENCODER_FAULT のしきい値は整数 % で切り捨ててから × 10）。
 

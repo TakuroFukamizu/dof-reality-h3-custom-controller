@@ -1317,7 +1317,8 @@ void renderV1() {
   canvas.drawString(usb_diag_text, 8, 182);
 
   // 制御項の行（Issue #25 手順 8）。単位は permille（0.1 %）、符号はカウントが増える向きが正（STATUS の pwm_permille と同じ）。
-  // FF = 軌道速度 / ff、P = 誤差 × kp / 100、V = 軌道の目標速度 [count/s]、FLR = 下限を掛けた（1）、B = 停止ブーストの上乗せ、
+  // FF = 軌道速度 / ff、P = 誤差 × kp / 100、V = 軌道の目標速度 [count/s]、FLR = 床の適用状態（1 = ON。Issue #25 手順 8 c）、
+  // B = 停止ブーストの上乗せ、
   // PWM = 実際に出している値（pwm_permille）。最長 52 文字（6 px × 52 = 312 < 320）
   {
     const V1DutyTerms& tm = vsnap.terms;

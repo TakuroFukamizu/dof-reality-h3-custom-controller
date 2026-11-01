@@ -144,13 +144,13 @@ constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満し�
 // 上乗せの上限: 対象になってからこれだけ動かなければ（または上乗せが duty_max で頭打ちのまま次の窓も動かなければ）ENCODER_FAULT を
 // ラッチする（詰まった機構を duty_max で押し続けない。静止目標では無パルス判定が回らないので、ここで閉じる）。0 で時間の上限なし。
 constexpr uint32_t V1_STALL_BOOST_MAX_MS = 2000;
-// Issue #15 M1: Duty 下限を「目標へ向かう向き」のときだけ掛ける（1）。FF（軌道速度）と P（誤差）の合成が下限未満で、かつ誤差と
-// 逆向きなら、下限まで持ち上げて目標から離れる向きに走らせるのではなく 0（惰行）にする。例: err +50（P +1 %）・vel −200
-// （FF −2 %）→ 合成 −1 % → 旧: −duty_min で目標から離れる / 新: 0。0 にすると旧動作（合成値に下限を掛ける）。実機 A/B 用に
-// -DV1_FLOOR_SIGN_GATE=0 で切れる。FF が誤差と逆を向くのが正当な場面（減速中に実位置が軌道より先行）があるかは未確定。
-#ifndef V1_FLOOR_SIGN_GATE
-#define V1_FLOOR_SIGN_GATE 1
-#endif
+// Issue #25 手順 8 (c)「E」: Duty 下限（duty_min ＋ 停止ブースト）はヒステリシス付きの「床の適用状態」が ON のときだけ掛ける。
+// ON になる条件: |誤差| > deadband_out（20）かつ P と合成（FF + P）の向きが一致。OFF になる条件: |誤差| ≤ V1_FLOOR_OFF_COUNT（15）
+// または向きの不一致（即時）。15 < |誤差| ≤ 20 は前の状態を保つ。OFF のときは有界の生の FF + P を permille でそのまま出す
+//（0 にはしない。旧 M1 は誤差と逆向きの合成を 0 に置き換えていた。「誤差と逆向きに床を掛けない」という M1 の規則は向きの条件として残る）。
+// 狙い: 追従中の小さい誤差で床（9 % ≈ 900 count/s）が軌道速度を超えて「バースト → 停止」になるのをなくし、FF だけで追従させる。
+// 静止の不感帯（10 / 20）と停止ブースト（H4。床が ON のときだけ上乗せが効く）はそのまま。
+constexpr int32_t V1_FLOOR_OFF_COUNT = 15;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
