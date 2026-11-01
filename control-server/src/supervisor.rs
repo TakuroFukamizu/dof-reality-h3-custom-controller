@@ -72,6 +72,16 @@
 //! - `stop_settle_timeout_ms` bounds the deceleration, the post-center settle
 //!   and the wait for DISARMED; `arm_timeout_ms` bounds ARMING and START
 //!   confirmation.
+//! - "Stopped" is judged on MEASURED values as well as on the trajectory
+//!   (Issue #15 H1): an axis is at rest when its STATUS has shown
+//!   |velocity_count_s| <= `timing.rest_velocity_count_s` and
+//!   |following_error_count| <= `timing.rest_error_count` for
+//!   `timing.rest_dwell_ms`. STOPPING Decel → Hold needs the planner settled,
+//!   every MCU HOLDING and every axis at rest; Hold → DISARM (the brake) needs
+//!   `stop_hold_ms` elapsed and every axis at rest (an axis drifting during the
+//!   hold gets `stop_settle_timeout_ms` more); the post-center settle needs
+//!   HOLDING and at rest. The `StopTimeout` detail lists the axes not at rest
+//!   with their measured velocity and following error.
 //! - Center is complete when the planner is at neutral with zero velocity,
 //!   every axis's STATUS.target_count (MCU setpoint) is within
 //!   [`CENTER_TOLERANCE_COUNT`] of neutral, AND every axis's measured
@@ -109,6 +119,14 @@
 //!   takes the axis) and logged as the event `cal_result`. A successful unit
 //!   re-references itself (P end = 0, POSITION_REFERENCED): the supervisor
 //!   accepts that and also clears any `reference_stale` mark of the unit.
+//! - A CAL_RESULT OK also marks the axis `calibration_stale` (Issue #15 H3):
+//!   the geometry this server was started with (`calibration_valid`, soft
+//!   window, neutral, sign) was approved for the previous origin, so ARM is
+//!   refused (`calibration_stale: axisN recalibrated (stroke S, neutral N); …`,
+//!   `axes[].calibration_stale`, event `calibration_stale`) until the server
+//!   is restarted with the exported config. The mark is in memory only: it
+//!   survives reconnects and reboots of the unit and is cleared by nothing
+//!   but a restart. `/v1/calibration/export` keeps working meanwhile.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -372,6 +390,11 @@ pub struct AxisSnapshot {
     pub configured: bool,
     pub referenced: bool,
     pub calibration_valid: bool,
+    /// Recalibrated (CAL_RESULT OK) in this server run: the configured
+    /// geometry is no longer approved for this axis (blocker
+    /// `calibration_stale`) until the server restarts with the exported
+    /// config (Issue #15 H3).
+    pub calibration_stale: bool,
     pub actual_count: Option<Counts>,
     pub target_count: Option<Counts>,
     pub velocity_count_s: Option<i32>,
@@ -559,6 +582,10 @@ struct AxisTrack {
     limits_inflight: Option<FwTuning>,
     limits_rejected: Option<AckReason>,
     limits_retry_at: Option<Instant>,
+    /// Since when every STATUS has shown the axis at rest (|velocity| and
+    /// |following_error| inside `timing.rest_*`); `None` once one did not.
+    /// `axis_at_rest` needs this to be `rest_dwell_ms` old.
+    rest_since: Option<Instant>,
 }
 
 impl AxisTrack {
@@ -655,6 +682,12 @@ pub struct Supervisor {
     cal: [AxisCalibration; AXIS_COUNT],
     cal_error: [Option<String>; AXIS_COUNT],
     hashes: [u32; AXIS_COUNT],
+    /// Issue #15 H3: the axis was recalibrated (CAL_RESULT OK: `(stroke,
+    /// neutral)`) in this server run, so the configured geometry (`cal`,
+    /// `operator_valid`, `hashes`) may no longer describe the MCU's origin /
+    /// sign. ARM blocker `calibration_stale` until the server is restarted
+    /// with the exported config; survives reboots and reconnects on purpose.
+    calibration_stale: [Option<(Counts, Counts)>; AXIS_COUNT],
     power_axis: AxisId,
 
     axes: [AxisTrack; AXIS_COUNT],
@@ -744,6 +777,7 @@ impl Supervisor {
             cal,
             cal_error,
             hashes,
+            calibration_stale: [None; AXIS_COUNT],
             power_axis: cfg.power_controller_axis,
             axes: Default::default(),
             unknown_ports: BTreeMap::new(),
@@ -941,6 +975,11 @@ impl Supervisor {
             }
             if let Some(e) = &self.cal_error[i] {
                 b.push(format!("calibration_invalid: {e}"));
+            }
+            if let Some((stroke, neutral)) = self.calibration_stale[i] {
+                b.push(format!(
+                    "calibration_stale: axis{n} recalibrated (stroke {stroke}, neutral {neutral}); export and reload config before ARM"
+                ));
             }
             if let Some(r) = t.reset_rejected {
                 b.push(format!("fault_reset_rejected: axis{n} {r:?}"));
@@ -1277,6 +1316,7 @@ impl Supervisor {
                         })
                         .collect(),
                     reference_stale: self.reference_stale(i),
+                    calibration_stale: self.calibration_stale[i].is_some(),
                     boot_id: t.boot_id,
                     mcu_state: t.mcu_state(),
                     fault_code: s.map(|s| s.fault_code),
@@ -1564,6 +1604,7 @@ impl Supervisor {
         if rebooted || reconnect {
             t.status = None;
             t.status_at = None;
+            t.rest_since = None;
             t.configured_epoch = None;
             t.config_rejected = None;
             // A new link / boot has not seen our HOST_FAULT.
@@ -1647,6 +1688,15 @@ impl Supervisor {
         if status.flags & status_flags::CONFIGURED == 0 {
             t.configured_epoch = None;
         }
+        // Measured rest (Issue #15 H1): judged on every STATUS, the dwell
+        // counted from the first one that qualified (a new boot starts over).
+        let at_rest = status.velocity_count_s.unsigned_abs() <= self.timing.rest_velocity_count_s
+            && status.following_error_count.unsigned_abs() <= self.timing.rest_error_count;
+        t.rest_since = match (at_rest, rebooted) {
+            (false, _) => None,
+            (true, true) => Some(received_at),
+            (true, false) => t.rest_since.or(Some(received_at)),
+        };
         t.status = Some(status);
         t.status_at = Some(received_at);
         t.status_ev = self.ev;
@@ -1721,6 +1771,16 @@ impl Supervisor {
             if let (Some(h), Some(b)) = (t.hello, t.boot_id) {
                 self.stale_refs.remove(&(h.device_id, b));
             }
+            // Issue #15 H3: the MCU's origin / stroke / sign are now the
+            // measured ones; the configured geometry this server arms with
+            // was approved for the old ones. Revoke until a restart with the
+            // exported config (the flag lives only in memory).
+            self.calibration_stale[i] = Some((r.n_end_count, r.neutral_count));
+            self.event(
+                now,
+                "calibration_stale",
+                serde_json::json!({"axis": axis, "stroke": r.n_end_count, "neutral": r.neutral_count}),
+            );
         }
     }
 
@@ -1761,6 +1821,7 @@ impl Supervisor {
         t.port = None;
         t.status = None;
         t.status_at = None;
+        t.rest_since = None;
         t.configured_epoch = None;
         t.config_rejected = None;
         t.group_ok = false;
@@ -2486,43 +2547,48 @@ impl Supervisor {
                 start: None,
                 settling: Some(since),
             } => {
-                if all_ok && all_in(McuState::Holding) {
+                // Trajectory stopped (all HOLDING) AND the mechanism measured at
+                // rest (Issue #15 H1): a HOLDING MCU can still be moving.
+                if all_ok && all_in(McuState::Holding) && self.all_at_rest(now) {
                     self.group = None;
                     self.phase = Phase::Holding {
                         start: None,
                         settling: None,
                     };
                 } else if elapsed(now, since) > ms(self.timing.stop_settle_timeout_ms) {
-                    self.latch(
-                        RigFault::StopTimeout,
-                        Some("center stop did not settle".into()),
-                        now,
-                    );
+                    let detail = format!("center stop did not settle: {}", self.rest_detail(now));
+                    self.latch(RigFault::StopTimeout, Some(detail), now);
                 }
             }
             Phase::Holding { .. } | Phase::Active { .. } => {}
             Phase::Stopping { sub, started } => match sub {
                 StopSub::Decel => {
-                    if self.planner_settled && all_ok && all_in(McuState::Holding) {
+                    // Planner settled, every MCU HOLDING (its trajectory at
+                    // velocity 0) AND every axis measured at rest.
+                    if self.planner_settled && all_ok && all_in(McuState::Holding) && self.all_at_rest(now) {
                         self.phase = Phase::Stopping {
                             sub: StopSub::Hold { since: now },
                             started,
                         };
                     } else if elapsed(now, started) > ms(self.timing.stop_settle_timeout_ms) {
-                        self.latch(
-                            RigFault::StopTimeout,
-                            Some("deceleration did not settle".into()),
-                            now,
-                        );
+                        let detail = format!("deceleration did not settle: {}", self.rest_detail(now));
+                        self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
                 StopSub::Hold { since } => {
-                    if elapsed(now, since) >= ms(self.timing.stop_hold_ms) {
+                    // Brake only on a mechanism at rest: `stop_hold_ms` is the
+                    // minimum hold; an axis that drifted meanwhile gets
+                    // `stop_settle_timeout_ms` more to come back to rest.
+                    let held = elapsed(now, since);
+                    if held >= ms(self.timing.stop_hold_ms) && self.all_at_rest(now) {
                         self.send_group_disarm(now);
                         self.phase = Phase::Stopping {
                             sub: StopSub::Disarming { since: now },
                             started,
                         };
+                    } else if held > ms(self.timing.stop_hold_ms) + ms(self.timing.stop_settle_timeout_ms) {
+                        let detail = format!("hold did not come to rest before the brake: {}", self.rest_detail(now));
+                        self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
                 StopSub::Disarming { since } => {
@@ -3073,6 +3139,47 @@ impl Supervisor {
         })
     }
 
+    /// Measured rest (Issue #15 H1): the axis's STATUS has shown
+    /// |velocity_count_s| <= `timing.rest_velocity_count_s` and
+    /// |following_error_count| <= `timing.rest_error_count` for at least
+    /// `timing.rest_dwell_ms`. No STATUS (or a disconnected axis) is not at rest.
+    fn axis_at_rest(&self, i: usize, now: Instant) -> bool {
+        let t = &self.axes[i];
+        t.connected
+            && t.status.is_some()
+            && t
+                .rest_since
+                .is_some_and(|since| elapsed(now, since) >= ms(self.timing.rest_dwell_ms))
+    }
+
+    fn all_at_rest(&self, now: Instant) -> bool {
+        (0..AXIS_COUNT).all(|i| self.axis_at_rest(i, now))
+    }
+
+    /// The axes not at rest with their measured numbers, for a fault detail:
+    /// `axis2 vel -180 count/s fe +212` … `(rest: |vel| <= 50, |fe| <= 50 for 200 ms)`.
+    fn rest_detail(&self, now: Instant) -> String {
+        let moving: Vec<String> = (0..AXIS_COUNT)
+            .filter(|&i| !self.axis_at_rest(i, now))
+            .map(|i| match self.axes[i].status {
+                Some(s) => format!(
+                    "axis{} vel {:+} count/s fe {:+}",
+                    i + 1,
+                    s.velocity_count_s,
+                    s.following_error_count
+                ),
+                None => format!("axis{} no STATUS", i + 1),
+            })
+            .collect();
+        format!(
+            "{} (rest: |vel| <= {}, |fe| <= {} for {} ms)",
+            moving.join(", "),
+            self.timing.rest_velocity_count_s,
+            self.timing.rest_error_count,
+            self.timing.rest_dwell_ms
+        )
+    }
+
     fn first_axis_not_in(&self, s: McuState) -> (AxisId, McuState) {
         for (i, t) in self.axes.iter().enumerate() {
             let st = t.mcu_state();
@@ -3087,7 +3194,10 @@ impl Supervisor {
     }
 
     fn axis_calibration_valid(&self, i: usize) -> bool {
-        self.operator_valid[i] && self.cal_error[i].is_none() && self.axes[i].referenced()
+        self.operator_valid[i]
+            && self.cal_error[i].is_none()
+            && self.calibration_stale[i].is_none()
+            && self.axes[i].referenced()
     }
 
     fn status_timeout(&self) -> Duration {

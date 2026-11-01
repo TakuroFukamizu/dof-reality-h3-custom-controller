@@ -31,6 +31,9 @@ stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 5
 center_reach_timeout_ms = 5000   # measured positions must catch up with the centre setpoint within this
+rest_velocity_count_s = 50       # "at rest" = |velocity| <= this AND |following_error| <= rest_error_count ...
+rest_error_count = 50            # ... (>= limits.deadband_out_count) held for rest_dwell_ms; STOPPING and the
+rest_dwell_ms = 200              # post-center settle judge the MEASURED axes with it, not only the trajectory
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 

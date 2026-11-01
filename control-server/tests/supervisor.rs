@@ -1045,6 +1045,88 @@ fn stop_mid_motion_decelerates_without_reversal() {
     assert!(r.sup.fault().is_none());
 }
 
+/// Issue #15 H1: "stopped" was judged on the commanded trajectory alone
+/// (planner settled, MCUs HOLDING). The MCU declares HOLDING when its
+/// SETPOINT velocity is 0, so a gravity-loaded axis still 200 counts off
+/// would have been braked there. The rig must wait for the MEASURED rest
+/// and fault, with the numbers, when it never comes.
+#[test]
+fn stop_waits_for_measured_rest_and_faults_on_a_stalled_axis() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.holding();
+    // Axis 2 is pushed 200 counts off its setpoint and cannot move back
+    // (inside following_error_limit 800: the MCU itself stays quiet).
+    r.mcus[1].set_stall(true);
+    r.mcus[1].nudge_actual(200);
+    r.run_ms(50);
+    assert_eq!(r.mcu_states(), vec![McuState::Holding; 3]);
+    r.admin(AdminCmd::Stop).unwrap();
+    r.wait_state(RigState::Stopping, 100);
+    // Trajectory stopped at once (nothing was moving), but axis 2 is not at rest.
+    r.run_ms(cfg.timing.stop_settle_timeout_ms - 200);
+    assert_eq!(r.sup.state(), RigState::Stopping, "{:?}", r.sup.fault());
+    assert_eq!(r.mcu_states(), vec![McuState::Holding; 3], "no brake while an axis is off");
+    r.wait_state(RigState::FaultLatched, 600);
+    assert_eq!(r.sup.fault(), Some(&RigFault::StopTimeout));
+    let rec = r.sup.fault_history().last().unwrap();
+    let detail = rec.detail.clone().unwrap_or_default();
+    assert!(detail.starts_with("deceleration did not settle: axis2 vel +0 count/s fe +200"), "{detail}");
+    assert!(detail.contains("|fe| <= 50 for 200 ms"), "{detail}");
+}
+
+/// An axis that drifts off during the hold is not braked where it is: the
+/// hold waits (up to stop_settle_timeout_ms more) and faults with the numbers.
+#[test]
+fn hold_does_not_brake_an_axis_that_drifted_and_faults_in_time() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.active(POSE_A, 0.3);
+    r.run_ms(1500);
+    let mark = r.sent.len();
+    r.admin(AdminCmd::Stop).unwrap();
+    // Into the hold (all HOLDING, planner settled, at rest), then push axis 3.
+    assert!(r.run_until(2000, |r| r.sup.state() == RigState::Stopping && r.mcu_states() == vec![McuState::Holding; 3]));
+    r.run_ms(cfg.timing.rest_dwell_ms + 100);
+    r.mcus[2].set_stall(true);
+    r.mcus[2].nudge_actual(-120);
+    r.run_ms(cfg.timing.stop_hold_ms + cfg.timing.stop_settle_timeout_ms - 300);
+    assert_eq!(r.sup.state(), RigState::Stopping, "{:?}", r.sup.fault());
+    assert_eq!(r.count(mark, msg_type::DISARM), [0; 3], "no DISARM (brake) with axis 3 off");
+    r.wait_state(RigState::FaultLatched, 800);
+    assert_eq!(r.sup.fault(), Some(&RigFault::StopTimeout));
+    let detail = r.sup.fault_history().last().unwrap().detail.clone().unwrap_or_default();
+    assert!(detail.starts_with("hold did not come to rest before the brake: axis3 vel +0 count/s fe -120"), "{detail}");
+}
+
+/// A healthy stop still brakes in the usual time: the rest dwell adds at most
+/// `rest_dwell_ms` to the deceleration and nothing to the hold.
+#[test]
+fn healthy_stop_reaches_braked_within_hold_plus_dwell() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.active(POSE_A, 0.3);
+    r.run_ms(1500);
+    r.set_game(Some((POSE_B, 0.3)));
+    r.run_ms(200); // moving again
+    let mark = r.sent.len();
+    let t_stop = r.now;
+    r.admin(AdminCmd::Stop).unwrap();
+    r.wait_state(RigState::BrakedDisarmed, 4000);
+    let took = r.now - t_stop;
+    let disarm_at = r.sent_since(mark).iter().find(|(_, _, m)| m.msg_type() == msg_type::DISARM).unwrap().1;
+    assert!(disarm_at - t_stop >= Duration::from_millis(cfg.timing.stop_hold_ms), "{:?}", disarm_at - t_stop);
+    // Deceleration from 0.3 x max_vel plus the dwell, the hold and the sim's
+    // disarming delay: well inside hold + dwell + 1 s.
+    let budget = Duration::from_millis(cfg.timing.stop_hold_ms + cfg.timing.rest_dwell_ms + 1000);
+    assert!(took <= budget, "{took:?} > {budget:?}");
+    assert!(r.sup.fault().is_none());
+    for k in 0..3 {
+        assert_eq!(r.mcus[k].status().velocity_count_s, 0);
+        assert_eq!(r.mcus[k].status().following_error_count, 0);
+    }
+}
+
 #[test]
 fn disarm_from_active_brakes_without_center() {
     let cfg = sim_cfg();
@@ -1373,7 +1455,12 @@ fn center_moves_to_neutral_at_reduced_speed_then_holds() {
     r.wait_state(RigState::Active, 500);
     assert_eq!(r.sup.active_source(), Some(ActiveSource::Center));
     r.wait_state(RigState::Holding, 5000);
-    r.run_ms(100);
+    // Back in HOLDING but still settling (Issue #15 H1: the measured rest
+    // dwell must pass): START is refused as busy until then.
+    r.run_ms(50);
+    assert_eq!(r.sup.state(), RigState::Holding);
+    assert_eq!(r.admin(AdminCmd::Start).unwrap_err().error, admin_error::BUSY);
+    r.run_ms(cfg.timing.rest_dwell_ms + 100);
     assert_eq!(r.sup.state(), RigState::Holding);
     assert!(r.sup.is_armed());
     assert_eq!(r.mcu_states(), vec![McuState::Holding; 3]);
@@ -1649,6 +1736,7 @@ fn snapshot_json_shape() {
         "assignment",
         "claimants",
         "reference_stale",
+        "calibration_stale",
         "boot_id",
         "mcu_state",
         "fault_code",
@@ -1681,6 +1769,7 @@ fn snapshot_json_shape() {
     assert_eq!(axis["assignment"], "selected");
     assert_eq!(axis["claimants"], serde_json::json!([{"port": "sim:1", "device_id": "5131000000000001"}]));
     assert_eq!(axis["reference_stale"], false);
+    assert_eq!(axis["calibration_stale"], false);
     assert_eq!(v["axis_conflict"], serde_json::json!([]));
     assert_eq!(axis["mcu_state"], "ACTIVE");
     assert_eq!(axis["fault_code"], "NONE");
@@ -2463,12 +2552,56 @@ fn calibrate_all_runs_to_cal_result_references_and_blocks_arm_meanwhile() {
         assert_eq!(a.actual_count, Some(500));
     }
     assert_eq!(r.count(sent, msg_type::SET_REFERENCE), [0; 3], "no SET_REFERENCE from the PC");
-    // Referenced at the neutral and inside the soft window: ready again.
-    r.wait_state(RigState::ReadyToArm, 500);
-    assert!(r.blockers().is_empty(), "{:?}", r.blockers());
+    // Referenced at the neutral and inside the soft window, but the geometry
+    // this server was started with was approved for the OLD origin (Issue
+    // #15 H3): ARM stays refused until a restart with the exported config.
+    r.run_ms(500);
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    let b = r.blockers();
+    assert_eq!(b.len(), 3, "{b:?}");
+    for n in 1..=3 {
+        assert!(
+            has(&b, &format!("calibration_stale: axis{n} recalibrated (stroke 1000, neutral 500); export and reload config before ARM")),
+            "{b:?}"
+        );
+    }
+    let e = r.admin(AdminCmd::Arm).unwrap_err();
+    assert_eq!(e.error, admin_error::NOT_READY);
+    assert!(has(&e.blockers, "calibration_stale: axis1"), "{:?}", e.blockers);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.axes.iter().all(|a| a.calibration_stale && !a.calibration_valid));
+    assert!(!snap.calibration_valid);
     let (events, _) = r.sup.drain_events();
     assert_eq!(events.iter().filter(|e| e.kind == "cal_result").count(), 3);
     assert_eq!(events.iter().filter(|e| e.kind == "calibrate").count(), 1);
+    let stale: Vec<_> = events.iter().filter(|e| e.kind == "calibration_stale").collect();
+    assert_eq!(stale.len(), 3, "{events:?}");
+    assert_eq!(stale[0].detail["stroke"], 1000);
+    assert_eq!(stale[0].detail["neutral"], 500);
+
+    // The mark survives a reconnect and a reboot of the unit (the operator
+    // must not be able to clear it by power-cycling and re-referencing).
+    r.disconnect(1);
+    r.run_ms(20);
+    r.connect(1);
+    r.run_ms(50);
+    assert!(has(&r.blockers(), "calibration_stale: axis2"), "{:?}", r.blockers());
+    r.mcus[1].reboot(4242);
+    r.connect(1);
+    r.run_ms(50);
+    assert!(has(&r.blockers(), "calibration_stale: axis2"), "{:?}", r.blockers());
+    assert!(r.sup.snapshot(r.now).axes[1].calibration.is_none(), "the CAL_RESULT itself is gone with the boot");
+
+    // A new server (restart with the config): the mark is in memory only.
+    // Sims 1 and 3 keep their reference; sim 2 rebooted and has none, so
+    // only `not_referenced: axis2` is left (hardware-bringup.md §5.0 step 6).
+    r.sup = Supervisor::new(&r.cfg);
+    r.connect_all();
+    r.run_ms(200);
+    let b = r.blockers();
+    assert!(!has(&b, "calibration_stale"), "{b:?}");
+    assert!(b.iter().all(|x| x.starts_with("not_referenced: axis2")), "{b:?}");
+    assert!(r.sup.snapshot(r.now).axes.iter().all(|a| !a.calibration_stale));
 }
 
 #[test]
@@ -2745,9 +2878,11 @@ fn successful_calibration_clears_reference_stale() {
     r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
     assert!(r.run_until(300, all_calibrating));
     assert!(r.run_until(3000, all_disarmed));
-    r.wait_state(RigState::ReadyToArm, 500);
+    assert!(r.run_until(500, |r| !has(&r.blockers(), "reference_stale")), "{:?}", r.blockers());
     let b = r.blockers();
     assert!(!has(&b, "reference_stale"), "{b:?}");
+    // Only the recalibration mark (Issue #15 H3) is left.
+    assert!(!b.is_empty() && b.iter().all(|x| x.starts_with("calibration_stale:")), "{b:?}");
     let snap = r.sup.snapshot(r.now);
     assert!(snap.axes.iter().all(|a| !a.reference_stale && a.referenced));
     assert_eq!(r.count(0, msg_type::SET_REFERENCE), [0; 3]);

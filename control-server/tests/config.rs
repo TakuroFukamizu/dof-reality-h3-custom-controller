@@ -158,6 +158,10 @@ fn limits_rules() {
         // CENTER's measured tolerance must cover the firmware deadband.
         (|c| c.game.center_tolerance_count = 0, "game.center_tolerance_count"),
         (|c| c.game.center_tolerance_count = 19, "game.center_tolerance_count"),
+        // So must the measured-rest tolerance of STOP (Issue #15 H1), and the
+        // rest dwell must fit inside the settle window.
+        (|c| c.timing.rest_error_count = 19, "timing.rest_error_count (19) must be >= limits.deadband_out_count (20)"),
+        (|c| c.timing.rest_dwell_ms = 3000, "timing.rest_dwell_ms (3000) must be < timing.stop_settle_timeout_ms (3000)"),
     ];
     for (mutate, needle) in cases {
         let mut cfg = sim();
@@ -181,6 +185,14 @@ fn limits_rules() {
     cfg.validate().unwrap();
     assert_eq!(cfg.game.center_tolerance_count, 50);
     assert_eq!(cfg.timing.center_reach_timeout_ms, 5000);
+    assert_eq!(
+        (cfg.timing.rest_velocity_count_s, cfg.timing.rest_error_count, cfg.timing.rest_dwell_ms),
+        (50, 50, 200)
+    );
+    // Exactly at the deadband is accepted.
+    let mut cfg = sim();
+    cfg.timing.rest_error_count = 20;
+    cfg.validate().unwrap();
     // Defaults are the documented initial values.
     let d = LimitsConfig::default();
     assert_eq!((d.max_gain, d.max_vel_count_s, d.max_acc_count_s2, d.duty_max_percent), (0.5, 3000, 15000, 40));
@@ -230,7 +242,10 @@ fn center_speed_fraction_bounds() {
 #[test]
 fn zero_timing_rejected() {
     type Set = fn(&mut Config);
-    let cases: [(Set, &str); 12] = [
+    let cases: [(Set, &str); 15] = [
+        (|c| c.timing.rest_velocity_count_s = 0, "timing.rest_velocity_count_s"),
+        (|c| c.timing.rest_error_count = 0, "timing.rest_error_count"),
+        (|c| c.timing.rest_dwell_ms = 0, "timing.rest_dwell_ms"),
         (|c| c.timing.planner_period_ms = 0, "timing.planner_period_ms"),
         (|c| c.timing.set_position_valid_for_ms = 0, "timing.set_position_valid_for_ms"),
         (|c| c.timing.mcu_command_timeout_ms = 0, "timing.mcu_command_timeout_ms"),
@@ -355,7 +370,8 @@ fn axis_lookup_on_unvalidated_config_does_not_panic() {
 fn huge_timing_values_rejected() {
     use h3cs::config::MAX_TIMING_MS;
     type Set = fn(&mut Config, u64);
-    let cases: [(Set, &str); 9] = [
+    let cases: [(Set, &str); 10] = [
+        (|c, v| c.timing.rest_dwell_ms = v, "timing.rest_dwell_ms"),
         (|c, v| c.timing.planner_period_ms = v, "timing.planner_period_ms"),
         (|c, v| c.timing.axis_status_timeout_ms = v, "timing.axis_status_timeout_ms"),
         (|c, v| c.timing.source_freshness_ms = v, "timing.source_freshness_ms"),
