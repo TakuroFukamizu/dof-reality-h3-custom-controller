@@ -216,15 +216,20 @@ struct Harness {
     }
     return pred();
   }
-  v1::HostMsg calibrate_msg(uint8_t mode, uint32_t request_id) {
+  v1::HostMsg calibrate_msg(uint8_t mode, uint32_t request_id, uint8_t flags = 0) {
     v1::HostMsg m;
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::CALIBRATE;
     m.calibrate.request_id = request_id;
     m.calibrate.mode = mode;
+    m.calibrate.flags = flags;
     return m;
   }
-  v1::Ack calibrate(uint8_t mode = 1) { return cmd(calibrate_msg(mode, next_rid())); }
+  v1::Ack calibrate(uint8_t mode = 1, uint8_t flags = 0) { return cmd(calibrate_msg(mode, next_rid(), flags)); }
+  // 校正の終了手順が終わって CAL_RESULT が出るまで進める（成功・失敗・中止のいずれでも）
+  bool run_until_cal_result(uint32_t max_ms = 40000) {
+    return run_until([&] { return ax.has_cal_result(); }, max_ms);
+  }
   std::vector<v1::CalResult> cal_results() const {
     std::vector<v1::CalResult> r;
     for (const v1::McuMsg& m : out) {
@@ -2061,6 +2066,366 @@ inline void test_fault_during_calibration_shutdown_keeps_final_result() {
   }
 }
 
+
+// ---- KEEP_POWER（protocol.md §4 CALIBRATE の flags bit0、§1.2 最終項） ------------------------------
+// 電源担当軸が校正の終了手順の後も主電源 ON 指令を保ったまま CALIBRATING（POWER_HOLD）に留まり、
+// 他の軸の校正が終わるのを PC が待てるようにする。
+
+// 電源保持中（CALIBRATING / POWER_HOLD）の出力と STATUS: 主電源 ON 指令、ブレーキ作動、PWM 0、段階 4
+inline void check_power_hold(Harness& h) {
+  CHECK(h.ax.state() == st::CALIBRATING);
+  CHECK(h.ax.cal_live_step() == v1::cal_step::POWER_HOLD);
+  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  const v1::Status s = h.status();
+  CHECK(s.mcu_state == st::CALIBRATING && (s.flags & fl::POWER_ON_CMD) != 0 && (s.flags & fl::BRAKE_RELEASE_CMD) == 0 &&
+        s.pwm_permille == 0 && s.fault_code == fc::NONE);
+}
+
+// 成功 + KEEP_POWER（電源担当軸）: 終了手順（ブレーキ給電 OFF → BRAKE_APPLY_WAIT_MS → PWM 0）の後に CAL_RESULT を 1 回送り、
+// 主電源を切らずに CALIBRATING（POWER_HOLD）に留まる。基準・プロファイルは校正の終了時に確定する。
+// CALIBRATE(0) で主電源 OFF → DISARMED（2 回目の CAL_RESULT は無い）。
+inline void test_keep_power_holds_main_power_after_success_until_cancel() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());  // 電源担当
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd());
+  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  // 中立に着いて終了手順（ブレーキ給電 OFF、まだ CAL_RESULT は無い）
+  CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL && !h.ax.brake_release_cmd(); },
+                    40000));
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.cal_results().empty() && h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL);
+  CHECK(h.ax.referenced() && h.ax.profile_dirty());  // 基準とプロファイルは終了手順の前に確定している
+  const int64_t raw_at_end = h.raw;
+  // BRAKE_APPLY_WAIT_MS（300）の後に CAL_RESULT。DISARMED にはならず POWER_HOLD へ
+  h.idle(295);
+  CHECK(h.cal_results().empty() && h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL);
+  h.idle(10);
+  std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1);
+  CHECK(res[0].result == v1::cal_result::OK && res[0].step == v1::cal_step::TO_NEUTRAL);  // step は校正が終わった段階（4 ではない）
+  CHECK(res[0].n_end_count == 5551 && res[0].neutral_count == 2775 && res[0].sign == 1 && reason_is(res[0], "ok"));
+  check_power_hold(h);
+  CHECK((h.status().flags & fl::POSITION_REFERENCED) != 0);
+  CHECK(h.ax.referenced() && h.ax.profile_dirty() && h.ax.dirty_profile().stroke == 5551);
+  CHECK(h.ax.actual_count() == h.raw - h.end_lo);
+  CHECK(h.ax.target_count() == h.ax.actual_count());
+  for (size_t i = from; i < h.out.size(); ++i) {
+    if (h.out[i].type == v1::msg::STATUS) CHECK(h.out[i].status.mcu_state == st::CALIBRATING);  // DISARMED の STATUS はまだ無い
+  }
+  // HELLO も CALIBRATING
+  for (const v1::McuMsg& m : h.hello(6)) {
+    if (m.type == v1::msg::HELLO) CHECK(m.hello.mcu_state == st::CALIBRATING);
+  }
+  // 保持は続く（定期 STATUS も CALIBRATING + POWER_ON_CMD）。動かない、FAULT にならない
+  h.idle(3000);
+  check_power_hold(h);
+  CHECK(h.raw == raw_at_end && h.ax.fault_code() == fc::NONE && h.fault_events().empty());
+  CHECK(h.cal_results().size() == 1);
+  const v1::Status last = h.statuses().back();
+  CHECK(last.mcu_state == st::CALIBRATING && (last.flags & fl::POWER_ON_CMD) != 0 &&
+        (last.flags & fl::BRAKE_RELEASE_CMD) == 0);
+  // CALIBRATE(0): ACK → STATUS(DISARMED、主電源 OFF 指令)。CAL_RESULT は増えない
+  const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(0, h.next_rid()));
+  CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED &&
+        r[0].ack.acked_type == v1::msg::CALIBRATE);
+  CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::DISARMED &&
+        (r[1].status.flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0 &&
+        (r[1].status.flags & fl::POSITION_REFERENCED) != 0);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.cal_live_step() == v1::cal_step::NONE);
+  h.idle(500);
+  CHECK(h.ax.state() == st::DISARMED && h.cal_results().size() == 1);
+  cal_result_precedes_disarmed_status(h.out, from);
+  CHECK(h.ax.referenced() && h.ax.profile_dirty());
+  CHECK(h.ax.has_cal_result() && h.ax.last_cal_result().result == v1::cal_result::OK);
+  // DISARMED での CALIBRATE(0) は no-op ACCEPTED。基準があるので（窓を作り直せば）ARM できる
+  Harness::accepted(h.calibrate(0));
+  CHECK(h.ax.state() == st::DISARMED && h.cal_results().size() == 1);
+  v1::Config c = base_config();
+  c.soft_min_count = 100;
+  c.soft_max_count = 5451;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.state() == st::HOLDING);
+}
+
+// CAL_POWER_HOLD_TIMEOUT_MS: PC の CALIBRATE(0) が来なければ、POWER_HOLD に入ってからこの時間で主電源 OFF → DISARMED。
+// CAL_RESULT は増えない。
+inline void test_keep_power_times_out_to_disarmed() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(h.run_until_cal_result());
+  check_power_hold(h);
+  const uint32_t timeout_ms = h.ax.tuning.cal_power_hold_timeout_ms;
+  CHECK(timeout_ms == CAL_POWER_HOLD_TIMEOUT_MS && timeout_ms == 120000);
+  h.idle(timeout_ms - 5);
+  check_power_hold(h);
+  CHECK(h.cal_results().size() == 1);
+  h.idle(10);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.cal_live_step() == v1::cal_step::NONE);
+  CHECK(h.cal_results().size() == 1 && h.fault_events().empty() && h.ax.fault_code() == fc::NONE);
+  cal_result_precedes_disarmed_status(h.out, from);
+  CHECK(h.ax.referenced() && h.ax.profile_dirty());
+  const v1::Status last = h.statuses().back();
+  CHECK(last.mcu_state == st::DISARMED && (last.flags & fl::POWER_ON_CMD) == 0);
+  // テスト用に短くした上限でも同じ（起点は POWER_HOLD に入った時刻）
+  Harness g(1, 1, 0, false);
+  g.ax.tuning.cal_power_hold_timeout_ms = 1000;
+  Harness::accepted(g.config());
+  Harness::accepted(g.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(g.run_until_cal_result());
+  g.idle(995);
+  check_power_hold(g);
+  g.idle(10);
+  CHECK(g.ax.state() == st::DISARMED && !g.ax.power_on_cmd() && g.cal_results().size() == 1);
+}
+
+// DISARM も POWER_HOLD を終える（ACCEPTED → 主電源 OFF → DISARMED、CAL_RESULT は増えない）。
+inline void test_keep_power_disarm_ends_hold() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(h.run_until_cal_result());
+  check_power_hold(h);
+  const std::vector<v1::McuMsg> r = h.send(h.disarm_msg(h.next_rid()));
+  CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED &&
+        r[0].ack.acked_type == v1::msg::DISARM);
+  CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::DISARMED &&
+        (r[1].status.flags & fl::POWER_ON_CMD) == 0);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && !h.ax.brake_release_cmd());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && h.cal_results().size() == 1 && h.fault_events().empty());
+  cal_result_precedes_disarmed_status(h.out, from);
+  CHECK(h.ax.referenced());
+  Harness::accepted(h.disarm());  // DISARMED では no-op
+}
+
+// POWER_HOLD 中の HOST_FAULT / 画面の非常停止: いつも通り即 FAULT（主電源 OFF 指令）。結果は送信済みなので CAL_RESULT は増えず、
+// FAULT_EVENT の mcu_state_before は CALIBRATING。成功の基準は残る（FAULT は ENCODER_FAULT 以外では基準を消さない）。
+inline void test_keep_power_host_fault_and_estop_in_hold() {
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+    CHECK(h.run_until_cal_result());
+    check_power_hold(h);
+    const std::vector<v1::McuMsg> r = h.send(h.host_fault_msg(h.next_rid()));
+    CHECK(r.size() == 3 && r[0].type == v1::msg::FAULT_EVENT && r[1].type == v1::msg::ACK && r[2].type == v1::msg::STATUS);
+    CHECK(r[0].fault_event.fault_code == fc::HOST_FAULT && r[0].fault_event.mcu_state_before == st::CALIBRATING);
+    CHECK(r[1].ack.result == ar::ACCEPTED && r[1].ack.acked_type == v1::msg::HOST_FAULT);
+    CHECK(r[2].status.mcu_state == st::FAULT && r[2].status.fault_code == fc::HOST_FAULT &&
+          (r[2].status.flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0 && r[2].status.pwm_permille == 0);
+    CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+    CHECK(h.ax.cal_live_step() == v1::cal_step::NONE);
+    h.idle(1000);
+    CHECK(h.ax.state() == st::FAULT && h.cal_results().size() == 1 && h.fault_events().size() == 1);
+    CHECK(h.ax.referenced() && h.ax.profile_dirty());
+    Harness::rejected(h.calibrate(0), rs::FAULT_ACTIVE);
+    Harness::accepted(h.fault_reset());
+    CHECK(h.ax.state() == st::DISARMED && h.ax.referenced() && !h.ax.power_on_cmd());
+    CHECK(h.cal_results().size() == 1);
+    // 改めて校正できる（KEEP_POWER 無しなら DISARMED で終わる）
+    h.start_calibration_and_reach_running();
+    CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+    CHECK(h.cal_results().size() == 2 && h.cal_results()[1].result == v1::cal_result::OK && !h.ax.power_on_cmd());
+  }
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+    CHECK(h.run_until_cal_result());
+    check_power_hold(h);
+    h.ax.set_local_estop(true, h.now);
+    h.drain();
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP && !h.ax.power_on_cmd());
+    CHECK(h.cal_results().size() == 1 && h.cal_results()[0].result == v1::cal_result::OK);
+    const std::vector<v1::FaultEvent> ev = h.fault_events();
+    CHECK(ev.size() == 1 && ev[0].mcu_state_before == st::CALIBRATING && ev[0].fault_code == fc::LOCAL_ESTOP);
+    Harness::rejected(h.fault_reset(), rs::FAULT_CAUSE_PRESENT);
+    h.ax.set_local_estop(false, h.now);
+    Harness::accepted(h.fault_reset());
+    CHECK(h.ax.state() == st::DISARMED && h.ax.referenced());
+  }
+}
+
+// 電源担当でない軸は KEEP_POWER を無視する（flags 無しと同じ: 終了手順の後 DISARMED、主電源 ON 指令は一度も出ない）。
+// CONFIG 無し（役割不明）と、CONFIG はあるが role_flags bit0 が無い場合の両方。
+inline void test_keep_power_ignored_on_non_power_axis() {
+  {
+    Harness h(3, 1, 0, false);
+    CHECK(!h.ax.configured());
+    const size_t from = h.out.size();
+    Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+    CHECK(h.ax.state() == st::CALIBRATING && !h.ax.power_on_cmd());
+    CHECK(h.run_until_cal_result());
+    CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && !h.ax.brake_release_cmd());
+    CHECK(h.ax.cal_live_step() == v1::cal_step::NONE);
+    h.idle(1000);
+    CHECK(h.ax.state() == st::DISARMED);
+    for (size_t i = from; i < h.out.size(); ++i) {
+      if (h.out[i].type == v1::msg::STATUS) CHECK((h.out[i].status.flags & (fl::POWER_ON_CMD | fl::POWER_CONTROLLER)) == 0);
+    }
+    cal_result_precedes_disarmed_status(h.out, from);
+    const std::vector<v1::CalResult> res = h.cal_results();
+    CHECK(res.size() == 1 && res[0].result == v1::cal_result::OK && res[0].step == v1::cal_step::TO_NEUTRAL &&
+          res[0].n_end_count == 5551);
+    CHECK(h.ax.referenced() && h.ax.profile_dirty() && h.ax.dirty_profile().motor == 3);
+  }
+  {
+    Harness h(2, 1, 0, false);
+    v1::Config c = base_config();
+    c.role_flags = 0;  // 電源担当でない
+    Harness::accepted(h.config_with(c));
+    const size_t from = h.out.size();
+    Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+    CHECK(h.ax.state() == st::CALIBRATING && !h.ax.power_on_cmd());
+    CHECK(h.run_until_cal_result());
+    CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd());
+    h.idle(1000);
+    CHECK(h.ax.state() == st::DISARMED);
+    for (size_t i = from; i < h.out.size(); ++i) {
+      if (h.out[i].type == v1::msg::STATUS) CHECK((h.out[i].status.flags & (fl::POWER_ON_CMD | fl::POWER_CONTROLLER)) == 0);
+    }
+    cal_result_precedes_disarmed_status(h.out, from);
+    CHECK(h.cal_results().size() == 1 && h.cal_results()[0].result == v1::cal_result::OK);
+    CHECK(h.ax.referenced() && h.ax.profile_dirty() && h.ax.dirty_profile().motor == 2);
+  }
+}
+
+// flags の未知のビット（bit1〜7）は無視する: bit0 が立っていれば KEEP_POWER、bit0 が無ければ flags 無しと同じ。
+inline void test_keep_power_unknown_flag_bits_ignored() {
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    Harness::accepted(h.calibrate(1, 0x83));  // bit0 + 予約ビット
+    CHECK(h.run_until_cal_result());
+    check_power_hold(h);
+    Harness::accepted(h.calibrate(0));
+    CHECK(h.ax.state() == st::DISARMED && h.cal_results().size() == 1);
+  }
+  {
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    Harness::accepted(h.calibrate(1, 0xFE));  // 予約ビットだけ
+    CHECK(h.run_until_cal_result());
+    CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && h.cal_results().size() == 1);
+  }
+}
+
+// 失敗した校正でも KEEP_POWER なら主電源を保つ（他の軸はまだ校正中かもしれない）。FAILED "stall"（step 1）、基準なし。
+// CALIBRATE(0) で DISARMED。その後 ARM は NOT_REFERENCED。
+inline void test_keep_power_with_failed_calibration_still_holds() {
+  Harness h(1, 1, 0, true);
+  Harness::accepted(h.config());
+  h.stall = true;
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(!h.ax.referenced());
+  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  CHECK(h.run_until([&] { return !h.ax.brake_release_cmd(); }, 3000));  // 退避しても動かず FAILED → 終了手順
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() == 0 && h.ax.power_on_cmd() && h.cal_results().empty());
+  h.idle(295);
+  CHECK(h.ax.state() == st::CALIBRATING && h.cal_results().empty());
+  h.idle(10);
+  std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1 && res[0].result == v1::cal_result::FAILED && res[0].step == v1::cal_step::TO_P);
+  CHECK(reason_is(res[0], "stall") && res[0].n_end_count == 0 && res[0].neutral_count == 0);
+  check_power_hold(h);
+  CHECK((h.status().flags & fl::POSITION_REFERENCED) == 0);
+  CHECK(!h.ax.referenced() && !h.ax.profile_dirty() && h.fault_events().empty());
+  h.idle(2000);
+  check_power_hold(h);
+  Harness::accepted(h.calibrate(0));
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && h.cal_results().size() == 1);
+  cal_result_precedes_disarmed_status(h.out, from);
+  CHECK(!h.ax.referenced());
+  Harness::rejected(h.arm(), rs::NOT_REFERENCED);
+}
+
+// 中止（CALIBRATE(0)）でも KEEP_POWER なら終了手順の後 POWER_HOLD に留まる（CANCELLED "stop"）。
+// もう一度 CALIBRATE(0) で主電源 OFF → DISARMED。CAL_RESULT は 1 回だけ。
+inline void test_keep_power_with_cancelled_calibration_still_holds() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  const size_t from = h.out.size();
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  h.idle(500);  // P 端へ動いている途中
+  Harness::accepted(h.calibrate(0));
+  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0 && h.ax.power_on_cmd());
+  Harness::accepted(h.calibrate(0));  // 終了手順中の 2 回目は何もしない
+  h.idle(400);
+  std::vector<v1::CalResult> res = h.cal_results();
+  CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && res[0].step == v1::cal_step::TO_P &&
+        reason_is(res[0], "stop"));
+  check_power_hold(h);
+  CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
+  Harness::accepted(h.calibrate(0));
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd() && h.cal_results().size() == 1);
+  cal_result_precedes_disarmed_status(h.out, from);
+  // 改めて校正できる（KEEP_POWER は毎回の CALIBRATE(1) で決める: 今回は無しなので DISARMED で終わる）
+  h.start_calibration_and_reach_running();
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
+  CHECK(h.cal_results().size() == 2 && h.cal_results()[1].result == v1::cal_result::OK && !h.ax.power_on_cmd());
+  CHECK(h.ax.referenced());
+}
+
+// POWER_HOLD 中の他の命令: ARM_PREPARE / START / CONFIG / SET_REFERENCE / FAULT_RESET / CALIBRATE(1) → BAD_STATE、
+// CONTROLLED_STOP → no-op ACCEPTED、SET_POSITION は捨てる（数えない）、系統の切り替えは無視、lease は見ない。
+inline void test_keep_power_hold_rejects_or_drops_other_commands() {
+  Harness h(1, 1, 0, false);
+  Harness::accepted(h.config());
+  h.set_position(0);  // last_rx_seq = 1
+  CHECK(h.ax.last_rx_seq() == 1);
+  Harness::accepted(h.calibrate(1, v1::cal_flag::KEEP_POWER));
+  CHECK(h.run_until_cal_result());
+  check_power_hold(h);
+  Harness::rejected(h.arm(), rs::BAD_STATE);
+  Harness::rejected(h.start(), rs::BAD_STATE);
+  Harness::rejected(h.config(), rs::BAD_STATE);
+  Harness::rejected(h.set_reference(0), rs::BAD_STATE);
+  Harness::rejected(h.fault_reset(), rs::BAD_STATE);
+  Harness::rejected(h.calibrate(1), rs::BAD_STATE);
+  Harness::rejected(h.calibrate(1, v1::cal_flag::KEEP_POWER), rs::BAD_STATE);
+  Harness::rejected(h.calibrate(2), rs::INVALID_PARAM);
+  Harness::accepted(h.stop());
+  check_power_hold(h);
+  const uint16_t stale = h.ax.stale_drop_count();
+  const uint16_t rxerr = h.ax.rx_error_count();
+  h.set_position(100);
+  v1::HostMsg m = h.set_position_msg(100);
+  m.set_position.seq = 1;
+  h.send(m);
+  m = h.set_position_msg(100);
+  m.set_position.apply_at_us = 5;
+  h.send(m);
+  CHECK(h.ax.last_rx_seq() == 1 && h.ax.stale_drop_count() == stale && h.ax.rx_error_count() == rxerr);
+  CHECK(h.ax.last_applied_seq() == 0);
+  CHECK(!h.ax.select_axis(2, h.now));
+  CHECK(h.ax.selected_axis() == 1 && h.axis_selects().empty());
+  h.idle(500);  // lease（command_timeout 100 ms）は見ない
+  check_power_hold(h);
+  CHECK(h.ax.fault_code() == fc::NONE && h.fault_events().empty());
+  CHECK(h.ax.configured() && h.ax.referenced() && h.cal_results().size() == 1);
+  // 受理した CALIBRATE(0) の再送は DUPLICATE
+  const uint32_t r = h.next_rid();
+  Harness::accepted(h.cmd(h.calibrate_msg(0, r)));
+  CHECK(h.ax.state() == st::DISARMED);
+  Harness::duplicate(h.cmd(h.calibrate_msg(0, r)));
+  // DISARMED に戻れば SET_POSITION はまた数え、系統も切り替えられる
+  h.set_position(0);
+  CHECK(h.ax.last_rx_seq() == h.seq);
+  CHECK(h.ax.select_axis(2, h.now));
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -2144,6 +2509,15 @@ inline void run_all() {
   test_host_fault_during_calibration();
   test_local_estop_and_overrun_during_calibration();
   test_fault_during_calibration_shutdown_keeps_final_result();
+  test_keep_power_holds_main_power_after_success_until_cancel();
+  test_keep_power_times_out_to_disarmed();
+  test_keep_power_disarm_ends_hold();
+  test_keep_power_host_fault_and_estop_in_hold();
+  test_keep_power_ignored_on_non_power_axis();
+  test_keep_power_unknown_flag_bits_ignored();
+  test_keep_power_with_failed_calibration_still_holds();
+  test_keep_power_with_cancelled_calibration_still_holds();
+  test_keep_power_hold_rejects_or_drops_other_commands();
 }
 
 }  // namespace v1axis_test

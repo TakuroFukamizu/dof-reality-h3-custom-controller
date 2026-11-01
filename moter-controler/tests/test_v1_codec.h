@@ -128,7 +128,8 @@ inline bool eq_set_reference(const v1::HostMsg& a, const v1::HostMsg& b) {
          a.set_reference.reference_count == b.set_reference.reference_count;
 }
 inline bool eq_calibrate(const v1::HostMsg& a, const v1::HostMsg& b) {
-  return a.calibrate.request_id == b.calibrate.request_id && a.calibrate.mode == b.calibrate.mode;
+  return a.calibrate.request_id == b.calibrate.request_id && a.calibrate.mode == b.calibrate.mode &&
+         a.calibrate.flags == b.calibrate.flags;
 }
 
 inline bool eq_hello(const v1::McuMsg& a, const v1::McuMsg& b) {
@@ -269,16 +270,34 @@ inline void test_vectors_host() {
   {  // 7.19 CALIBRATE（request_id 7、mode 1 = 開始）。CRC は独立した実装（Python）でも確認した値
     v1::HostMsg m{};
     m.type = v1::msg::CALIBRATE;
-    m.calibrate = {7, 1};
+    m.calibrate = {7, 1, 0};
     check_host_vector("01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F",
                       "04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00", m, eq_calibrate);
     CHECK(v1::host_payload_len(v1::msg::CALIBRATE) == 8);
     // mode 0（中止）も同じ長さ
-    m.calibrate = {12, 0};
+    m.calibrate = {12, 0, 0};
     uint8_t f[v1::MAX_FRAME_LEN];
     CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 4 + 8 + 2);
     v1::HostMsg d{};
-    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 12 && d.calibrate.mode == 0);
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 12 && d.calibrate.mode == 0 &&
+          d.calibrate.flags == 0);
+    // byte 5 = flags（bit0 = KEEP_POWER）。符号化で byte 5 に入り、復号で戻る
+    m.calibrate = {7, 1, v1::cal_flag::KEEP_POWER};
+    CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 14);
+    CHECK(f[4 + 4] == 1 && f[4 + 5] == 0x01 && f[4 + 6] == 0 && f[4 + 7] == 0);
+    d = v1::HostMsg{};
+    CHECK(v1::decode_host_frame(f, 14, &d) && eq_calibrate(d, m) && d.calibrate.flags == v1::cal_flag::KEEP_POWER);
+    // 予約ビット（bit1〜7）が立っていても拒まず、そのまま復号する
+    m.calibrate = {7, 1, 0x83};
+    CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 14);
+    d = v1::HostMsg{};
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.mode == 1 && d.calibrate.flags == 0x83);
+    CHECK((d.calibrate.flags & v1::cal_flag::KEEP_POWER) != 0);
+    m.calibrate = {7, 0, 0xFE};
+    CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 14);
+    d = v1::HostMsg{};
+    CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.mode == 0 && d.calibrate.flags == 0xFE);
+    CHECK((d.calibrate.flags & v1::cal_flag::KEEP_POWER) == 0);
   }
 }
 

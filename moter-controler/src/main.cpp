@@ -1004,6 +1004,7 @@ const char* calStepName(uint8_t s) {
     case v1::cal_step::TO_P: return "P端へ";
     case v1::cal_step::TO_N: return "N端へ";
     case v1::cal_step::TO_NEUTRAL: return "中立へ";
+    case v1::cal_step::POWER_HOLD: return "電源保持";  // KEEP_POWER: 校正は終わり、他の軸のために主電源を保っている
   }
   return "";
 }

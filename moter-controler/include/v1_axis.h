@@ -13,6 +13,8 @@
 // 時刻はマイクロ秒で注入する（MCU では esp_timer_get_time()）。
 // 校正（protocol.md §1.2）: CALIBRATE で従来 env と同じ端当て状態機械 AutoMachine（auto_move.h）を内蔵のまま回し、
 //   成功で P 端 = 0 の基準を自分で確立する。Duty は AutoMachine の duty_signed（MD13S の符号付き %）をそのまま出す。
+//   KEEP_POWER（電源担当軸だけ）: 校正が終わっても主電源 ON 指令を保ったまま CALIBRATING（POWER_HOLD）に留まり、
+//   他の軸の校正が終わるのを PC が待てるようにする。CALIBRATE(0) / DISARM / CAL_POWER_HOLD_TIMEOUT_MS で主電源 OFF → DISARMED。
 
 #include <math.h>
 #include <stdint.h>
@@ -39,6 +41,7 @@ struct V1Tuning {
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
   uint32_t brake_apply_wait_ms = BRAKE_APPLY_WAIT_MS;
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
+  uint32_t cal_power_hold_timeout_ms = CAL_POWER_HOLD_TIMEOUT_MS;
   uint32_t status_period_ms = 20;
   uint32_t velocity_window_ms = 100;
 };
@@ -111,6 +114,7 @@ class V1Axis {
     vel_anchor_us_ = now_us;
     state_ = v1::state::DISARMED;
     cal_phase_ = CalPhase::Idle;
+    cal_keep_power_ = false;
     cal_.cfg = cal_config;
     cal_.set_profile(MotorProfile{});
     hold_here();
@@ -128,8 +132,12 @@ class V1Axis {
   // この boot で最後に送った CAL_RESULT（画面の表示用）
   bool has_cal_result() const { return has_cal_result_; }
   const v1::CalResult& last_cal_result() const { return last_cal_result_; }
-  // 校正中の段階（CALIBRATING 以外では NONE）と AutoMachine の直近の理由（"retreat" など）
-  uint8_t cal_live_step() const { return state_ == v1::state::CALIBRATING ? cal_step_code() : v1::cal_step::NONE; }
+  // 校正中の段階（CALIBRATING 以外では NONE。電源保持中は POWER_HOLD）と AutoMachine の直近の理由（"retreat" など）
+  uint8_t cal_live_step() const {
+    if (state_ != v1::state::CALIBRATING) return v1::cal_step::NONE;
+    if (cal_phase_ == CalPhase::PowerHold) return v1::cal_step::POWER_HOLD;
+    return cal_step_code();
+  }
   const char* cal_live_reason() const { return cal_.reason; }
 
   // --- 入力 ---------------------------------------------------------------
@@ -320,8 +328,10 @@ class V1Axis {
  private:
   enum class StopKind : uint8_t { Hold, Disarm, Fault };
   // 校正の段階（protocol.md §1.2 の手順）: 主電源 ON 指令 → cal_power_settle → ブレーキ解除指令 → brake_release_wait →
-  // AutoMachine（Cal）→ 終了手順（ブレーキ給電 OFF → brake_apply_wait → CAL_RESULT → DISARMED）
-  enum class CalPhase : uint8_t { Idle, PowerSettle, BrakeRelease, Running, Shutdown };
+  // AutoMachine（Cal）→ 終了手順（ブレーキ給電 OFF → brake_apply_wait → CAL_RESULT → DISARMED）。
+  // KEEP_POWER の電源担当軸は CAL_RESULT の後に PowerHold（主電源 ON 指令のまま CALIBRATING）に留まり、
+  // CALIBRATE(0) / DISARM / cal_power_hold_timeout で DISARMED（CAL_RESULT は送らない）。
+  enum class CalPhase : uint8_t { Idle, PowerSettle, BrakeRelease, Running, Shutdown, PowerHold };
 
   struct Accepted {
     uint8_t type;
@@ -395,6 +405,7 @@ class V1Axis {
   AutoMachine cal_{};
   CalPhase cal_phase_ = CalPhase::Idle;
   uint64_t cal_phase_started_us_ = 0;  // いまの段階に入った時刻
+  bool cal_keep_power_ = false;        // CALIBRATE(1) の KEEP_POWER を電源担当軸として受理した（終了手順の後に PowerHold）
   v1::CalResult pending_cal_result_{};  // 終了手順の後に送る結果
   bool has_cal_result_ = false;
   v1::CalResult last_cal_result_{};
@@ -515,7 +526,7 @@ class V1Axis {
       case v1::msg::DISARM: return on_disarm(now);
       case v1::msg::FAULT_RESET: return on_fault_reset();
       case v1::msg::SET_REFERENCE: return on_set_reference(m.set_reference.reference_count);
-      case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, now);
+      case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, m.calibrate.flags, now);
       default: return v1::ack_reason::BAD_STATE;
     }
   }
@@ -738,8 +749,9 @@ class V1Axis {
   }
 
   // CALIBRATE（protocol.md §4、§1.2）: mode 1 は DISARMED のときだけ（CONFIG・基準は不要）。受理で CALIBRATING。
-  // mode 0 は CALIBRATING なら中止、それ以外は何もせず受理。0・1 以外は INVALID_PARAM。
-  uint16_t on_calibrate(uint8_t mode, uint64_t now) {
+  // mode 0 は CALIBRATING（PowerHold を含む）なら中止、それ以外は何もせず受理。0・1 以外は INVALID_PARAM。
+  // flags の KEEP_POWER は電源担当軸（CONFIG の role_flags bit0）だけが解釈し、他の軸と未知のビットは無視する。
+  uint16_t on_calibrate(uint8_t mode, uint8_t flags, uint64_t now) {
     if (mode != v1::cal_mode::START && mode != v1::cal_mode::CANCEL) return v1::ack_reason::INVALID_PARAM;
     if (mode == v1::cal_mode::CANCEL) {
       if (state_ == v1::state::CALIBRATING) cal_cancel(now);
@@ -750,6 +762,7 @@ class V1Axis {
     state_ = v1::state::CALIBRATING;
     cal_phase_ = CalPhase::PowerSettle;  // 主電源 ON 指令（電源担当軸のみ。powered_state で立つ）
     cal_phase_started_us_ = now;
+    cal_keep_power_ = (flags & v1::cal_flag::KEEP_POWER) != 0 && power_controller();
     brake_release_cmd_ = false;
     duty_ = 0;
     referenced_ = false;  // 端当てで原点を取り直す。成功したときだけ P 端 = 0 で立て直す
@@ -1018,9 +1031,22 @@ class V1Axis {
         duty_ = 0;  // AutoMachine の finish で既に 0。ブレーキ作動待ちの間も 0
         if (elapsed >= ms_to_us(tuning.brake_apply_wait_ms)) {
           push_cal_result();
-          cal_phase_ = CalPhase::Idle;
-          state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
-          hold_here();
+          if (cal_keep_power_) {
+            // KEEP_POWER: 主電源 ON 指令のまま CALIBRATING に留まる（ブレーキ作動・PWM 0）。結果は上で送った 1 回だけ
+            cal_phase_ = CalPhase::PowerHold;
+            cal_phase_started_us_ = now;
+            hold_here();
+          } else {
+            cal_phase_ = CalPhase::Idle;
+            state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
+            hold_here();
+          }
+        }
+        break;
+      case CalPhase::PowerHold:
+        duty_ = 0;
+        if (elapsed >= ms_to_us(tuning.cal_power_hold_timeout_ms)) {
+          cal_power_hold_end();  // PC の CALIBRATE(0) が来ないまま上限に達した: 主電源 OFF → DISARMED
         }
         break;
       case CalPhase::Idle: break;
@@ -1060,8 +1086,21 @@ class V1Axis {
     cal_phase_started_us_ = now;
   }
 
+  // 電源保持（PowerHold）の終わり: 主電源 OFF 指令 → DISARMED。CAL_RESULT は校正の終了時に送った 1 回だけ（ここでは送らない）。
+  void cal_power_hold_end() {
+    cal_phase_ = CalPhase::Idle;
+    cal_keep_power_ = false;
+    state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
+    hold_here();
+  }
+
   // CALIBRATE(0) / DISARM による中止。AutoMachine が動いていれば stop を渡して "stop" で止め、まだなら直接終了手順へ。
+  // 電源保持中なら主電源を切って DISARMED（結果は送らない）。
   void cal_cancel(uint64_t now) {
+    if (cal_phase_ == CalPhase::PowerHold) {
+      cal_power_hold_end();
+      return;
+    }
     if (cal_phase_ == CalPhase::Shutdown || cal_phase_ == CalPhase::Idle) return;  // 既に終わりかけ
     if (cal_phase_ == CalPhase::Running) {
       AutoInputs in = cal_inputs(now);
@@ -1076,7 +1115,13 @@ class V1Axis {
   // FAULT による打ち切り（latch_fault から）。終了手順は踏まない（FAULT が出力を落とす）。CAL_RESULT だけ即送る。
   // 終了手順（ブレーキ作動待ち）の間なら結果は確定済み: そのまま送る（成功なら基準・プロファイルも保つ。
   // FAULT は ENCODER_FAULT 以外では基準を消さない）。
+  // 電源保持中（結果は送信済み）なら何も送らず、FAULT が主電源を切る。
   void cal_abort_for_fault(const char* reason, uint64_t now) {
+    if (cal_phase_ == CalPhase::PowerHold) {
+      cal_phase_ = CalPhase::Idle;
+      cal_keep_power_ = false;
+      return;
+    }
     if (cal_phase_ == CalPhase::Shutdown) {
       push_cal_result();
       cal_phase_ = CalPhase::Idle;
