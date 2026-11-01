@@ -54,7 +54,7 @@
 
 - プランナーは 10 ms ごとに「いまの目標」へ、`max_vel_count_s`（600）と `max_acc_count_s2`（2000）の範囲で近づく軌道を作る。目標に着く前に減速し、目標を越えない[^src-planner]。
 - **ステップ入力は常に最高速で動く。** 姿勢を 0 → 0.5 に一気に変えると、約 1290 count（gain 1.0）を 600 count/s で約 2.4 s かけて移動する。0.3 s（= 600 / 2000）で最高速に達し、終わりで 0.3 s かけて止まる。速度の大小を姿勢の大きさで表現することはできない。
-- **ゆっくり変える姿勢は、そのまま追従する。** 変化率が 600 count/s、加速度が 2000 count/s² の内側なら、プランナーは入力をそのまま通す。ファームの追従誤差は新ファームで平均 2〜4 count、最大 12〜57 count（旧ファーム平均 14〜16、`runs/hw_20261102.md`）。
+- **ゆっくり変える姿勢は、少し遅れて追従する。** プランナーは毎 tick「目標で止まれる速度」`sqrt(2·max_acc·遅れ)` で走るので、目標が速度 v で動いているとき、定常では `v² / (2·max_acc)` だけ後ろを付いてくる。600 / 2000 なら最高速で約 90 count（時間にして約 0.15 s）、450 count/s で約 50 count、200 count/s で約 10 count。これはサーバー側の決まった遅れで、ファームの追従誤差（新ファームで平均 2〜4 count、最大 12〜57 count。旧ファーム平均 14〜16、`runs/hw_20261102.md`）とは別に乗る。音や映像と同期させるなら、この 0.1〜0.15 s を見込む。
 - **3 軸は同じ時間軸で動く。** 速度制限は 3 軸に同じ倍率を掛ける（軸空間で方向を保つ）。1 軸が飽和すると他の 2 軸も同じ割合で遅くなる。大きな pitch 移動の最中に yaw を足しても、yaw はその分遅れる。
 
 目安（gain 1.0、片軸だけ動かす）:
@@ -72,7 +72,7 @@
 
 やり方は 2 つ。向き不向きが違う。
 
-**A. ゲーム側で姿勢を時間で滑らかにする（推奨）。** ゲームが毎フレーム補間した姿勢を送り、プランナーの制限に当てない。サーバーは「そのまま通す」だけになり、演出の速さ・緩急はゲームが完全に決められる。
+**A. ゲーム側で姿勢を時間で滑らかにする（推奨）。** ゲームが毎フレーム補間した姿勢を送り、プランナーの制限に当てない。サーバーは §3.1 の小さな遅れで付いてくるだけになり、演出の速さ・緩急はゲームが決められる。
 
 ```python
 # 一次遅れ（指数平滑）。tau が小さいほど速い。dt はフレーム時間
@@ -114,7 +114,7 @@ val = a + (b - a) * s
 | **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない** |
 | `limits` メッセージの ack `limits` | `ceiling_clamped` / `stop_time_limited` | 要求した制限値がサーバーで変えられた。`effective_limits` に結果 |
 
-status は `server.status_period_ms`（bring-up 100 ms）ごとに WS に届く。演出を作るときは `limits` に `velocity_limited` / `acceleration_limited` が **出ない**ことを確かめる（出ているなら、その瞬間はゲームの意図した速さではなくサーバーの上限で動いている）。`virtual_saturated` / `soft_limited` が出たら姿勢が端に当たっている。
+status は `server.status_period_ms`（bring-up 100 ms）ごとに WS に届く。演出を作るときは `limits` に **`velocity_limited` が出ない**ことを確かめる（出ていれば、その瞬間は意図した速さではなくサーバーの上限 600 count/s で動いている。信頼できる印）。`acceleration_limited` は読み方に注意: 30〜50 Hz で送る姿勢は 100 Hz の tick から見ると階段で、段の縁ごとに目標速度が `max_acc × 送信間隔`（20〜60 count/s）跳ぶのに対し 1 tick の加速度の余地は `max_acc × 0.01` = 20 count/s なので、**制限の内側でもフレームごとに点滅する**。点滅は正常、**連続して立ち続ける**ならランプが急すぎる。`virtual_saturated` / `soft_limited` が出たら姿勢が端に当たっている。
 
 [^src-planner]: `planner::step_track`。目標で止まれる速度 `sqrt(2·a·|err|)` 以下に切り、3 軸共通の倍率で `max_vel` に収め、軸ごとに `|Δv| ≤ a·dt` で加速度を切る。`dt` は 10 ms。
 [^src-limits]: `limits::clamp`（WS の ack、`GET/POST /v1/limits`、制御ループが同じ関数を使う）。停止期限は `limits::stop_deadline` = 0.8 × min(`mcu_stop_timeout_ms` 1500, `stop_settle_timeout_ms` 3000) = 1.2 s。詳細は [limits.md](limits.md) §1.1。
@@ -133,12 +133,12 @@ status は `server.status_period_ms`（bring-up 100 ms）ごとに WS に届く�
 | 1000 | 0.4 | 0.095 Hz | 0.22 Hz | ≈ 0.1 Hz |
 | 2500 | 1.0 | 0.038 Hz | 0.14 Hz | ≈ 0.04 Hz（周期 26 s） |
 
-- **「速く小さく」は加速度で、「大きく」は速度で頭打ちになる。** 振幅 180 count（姿勢 0.07）より小さい揺れは加速度 2000 が、大きい揺れは速度 600 が上限を決める。2026-11-02 の試験（pitch ±0.4 @0.07 Hz、roll ±0.4 @0.10 Hz、gain 0.3）で `acceleration_limited` が周期的に立っていたのはこの境目のため。
+- **「速く小さく」は加速度で、「大きく」は速度で頭打ちになる。** 振幅 180 count（姿勢 0.07）より小さい揺れは加速度 2000 が、大きい揺れは速度 600 が上限を決める。2026-11-02 の試験（pitch ±0.4 @0.07 Hz、roll ±0.4 @0.10 Hz、gain 0.3。1 軸あたり約 600 count の振幅、ピーク加速度は 200 count/s² 程度）で `acceleration_limited` が周期的に立っていたのは、この表の上限に当たったのではなく §3.3 の階段による点滅。
 - **1 Hz を超える振動は出ない。** 600 / 2000 のリグでは、振幅を何 count にしても 1 Hz 前後が上限。「ガタガタ」「ブルブル」は周波数ではなく、0.5〜1 Hz の揺れに振幅や位相のばらつきを付けて表現する。
 - **小振幅は不感帯に飲まれる。** ファームの不感帯は入る側 10 count、出る側 20 count（`[limits].deadband_count` / `deadband_out_count`）。振幅 20 count（姿勢 0.008）以下の揺れは、目標が不感帯の中を往復するだけでモーターが動かないことがある。最低でも振幅 50 count（姿勢 0.02）を目安にする。
 - **低速は段付きになる（現状）。** 位置ループの最小 Duty は 9 %（`duty_min_percent`。自重のかかる軸が動き出す値）で、無負荷換算で約 900〜1200 count/s、自重のかかった軸の実測で 100〜240 count/s。これより遅い目標速度では「9 % で動く / 0 で止まる」の繰り返しになり、ゆっくりした揺れがなめらかに出ないことがある。新ファーム（PR #19）で往復は 1/8 に減ったが残っている。遅い揺れは、速度が遅くなり過ぎない振幅・周波数の組み合わせを選ぶ。
 - **衝撃（ステップ）は「最高速で動いて止まる」にしかならない。** 0 → 姿勢 0.1 → 0 のパルスは 260 count を片道 0.7 s（往復 1.5 s）で動く。もっと短く感じさせたいなら振幅を小さくする（50 count なら片道 0.3 s）。加速度 2000 を超える「ドン」は出ない。
-- 揺れの合成は、まずゲーム側で姿勢を合成してから送る（1 本の WS、1 つの姿勢）。gain を揺らして揺れを作らない（§5 の鮮度と、gain だけの更新は別メッセージ扱いになるため）。
+- 揺れの合成は、まずゲーム側で姿勢を合成してから送る（1 本の WS、1 つの姿勢）。揺れの大きさは姿勢の振幅で表し、gain を揺らして作らない（§6）。
 
 ## 5. 開始・停止・中立
 
@@ -207,7 +207,7 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 | **`limits` で初期値より上げる**（`max_vel` 600 → 1333、`duty_max` 20 → 60 など） | サーバーはファームの絶対上限までは受け付けてしまうが、`[limits]` の初期値は操作者が機体の状態を見て決めた値。上げるのは操作者が `POST /v1/limits` か設定で。ゲームは **下げる用途だけ** |
 | **`duty_max_percent` を触る** | ファームの出力上限。モーターと機構の保護側の値で、操作者が実機を見ながら上げるもの |
 | **ソフトリミット・校正値・中立位置を知っている前提で姿勢を計算する** | count はゲームに見えない単位。姿勢 −1..1 と gain だけで書き、端は `virtual_saturated` / `soft_limited` で知る |
-| **gain で範囲を表現する**（「このシーンは小さく動かしたいから gain 0.3」） | 範囲は姿勢の振幅で表現する（gain 1.0 固定で pitch ±0.3）。gain は h3game 互換の「全体の効き」であり、毎フレーム変えてよいが鮮度は延ばさない。混ぜると飽和の条件（§2）が読みにくくなる |
+| **gain で範囲を表現する**（「このシーンは小さく動かしたいから gain 0.3」） | 範囲は姿勢の振幅で表現する（gain 1.0 固定で pitch ±0.3）。gain は h3game 互換の「全体の効き」。pose の中で毎フレーム変えてよい（`{"type":"gain"}` 単独では鮮度が延びない）が、範囲表現に混ぜると飽和の条件（§2）が読みにくくなる |
 | **止まった後に自動で再接続して動かそうとする** | 再接続しても ARM / START は操作者。ゲームは中立を送って待つ |
 | **止める代わりに中立 (0,0,0) を送り続ける** | 止めたいなら `frame_seq` を止める（鮮度切れ → 減速 → ブレーキ）か `POST /v1/stop`。中立を送ると「中立へ最高速で動く」になる |
 
@@ -218,7 +218,7 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 1. `POST /v1/session` → WS → 中立を 50 Hz で送り、status の `session.fresh` が `true` になる。
 2. 操作者が ARM → CENTER → START できる（409 が出ない）。START 待ちの姿勢が中立になっている。
 3. gain 1.0・pitch ±1 で status の `virtual_targets` が 1 / 1023 付近に届く。pitch と roll 同時に ±1 で `virtual_saturated` が出ることを知っている（出てよいか判断済み）。
-4. 一番速い演出で status の `limits` に `velocity_limited` / `acceleration_limited` が出ないこと（出るなら意図した速さになっていない）。
+4. 一番速い演出で status の `limits` に `velocity_limited` が出ないこと、`acceleration_limited` が立ち続けないこと（出るなら意図した速さになっていない。フレームごとの点滅は正常、§3.3）。
 5. タブを裏に回す・ゲームを一時停止する → 250 ms 以内に `STOPPING` → `BRAKED_DISARMED`。中立へ戻らない。
 6. 画面を再読み込み → 旧 session が `stale_session`、座席は止まる、再開には操作者の ARM + START が要ることを画面に出せる。
 7. `limits` を送っているなら、ack の `effective_limits` を表示し、`ceiling_clamped` / `stop_time_limited` が出たら要求値と違うことが分かる。再接続後に送り直している。
@@ -231,9 +231,9 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 | 症状 | まず疑うもの | 見る場所 |
 | --- | --- | --- |
 | スティック全開でも端まで行かない | 送っている gain が小さい（例: 0.1）。次に操作者の `max_gain` | ack の `effective_gain` と `gain_limited`、status の `virtual_targets`（端なら 1 / 1023 付近） |
-| 動きが鈍い・遅れる | `max_vel_count_s` / `max_acc_count_s2`（600 / 2000）に当たっている | status の `limits` に `velocity_limited` / `acceleration_limited`、`motion_limits.effective` |
+| 動きが鈍い・遅れる | `max_vel_count_s` / `max_acc_count_s2`（600 / 2000）に当たっている。遅れだけなら §3.1 の定常遅れ（最高速で約 90 count、0.15 s） | status の `limits` に `velocity_limited`（`acceleration_limited` は連続して立つか）、`motion_limits.effective` |
 | 速くしたのに速度が変わらない | 位置指令なので姿勢の変化率が速度。ステップは常に最高速 | §3.1 |
-| pitch と roll を同時に倒すと片方が効かない | 仮想位置の飽和（|roll| + |pitch| > 1 で gain 1.0） | status の `limits` に `virtual_saturated` |
+| pitch と roll を同時に倒すと片方が効かない | 仮想位置の飽和（\|roll\| + \|pitch\| > 1 で gain 1.0） | status の `limits` に `virtual_saturated` |
 | START が 409 `pose_not_near_hold` | START 時の姿勢が中立から 300 count 超（gain 1.0 なら姿勢 0.12 超） | 409 の `blockers` に軸ごとの距離 |
 | START が 409 `no_fresh_pose` | 姿勢を送っていない、`frame_seq` が進んでいない、`missing_frame_seq` で拒否されている | ack の `reason`、status の `session.fresh` |
 | すぐ止まる（数百 ms で STOPPING） | `frame_seq` が進んでいない（同じ値の再送、隠れたタブ、送信が 250 ms 空く）。`source_age_ms` を盛っている | status の `session.fresh`、`session.last_frame_seq` が増えるか、イベント `stopping reason 2` |
