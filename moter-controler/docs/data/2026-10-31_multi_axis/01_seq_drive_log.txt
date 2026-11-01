@@ -1,0 +1,124 @@
+17:23:48.677 # drive start axes=['#3@/dev/cu.usbmodem214201', '#2@/dev/cu.usbmodem214101']
+17:23:50.179 # run mode=seq
+17:23:50.179 [#3] > ?
+17:23:50.202 [#3] STAT R=1 B=1 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=1 A=0 B=1
+17:23:50.202 [#3] ENC motor=2 count=1 pos=1 cps=0 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=idle phase=idle reason=
+17:23:51.196 [#3] state motor=2 cal=1 stroke=6138 neutral=3069 R=1 B=1 LIVE=1 count=1
+17:23:51.196 [#3] > ?
+17:23:51.220 [#3] STAT R=1 B=1 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=1 A=0 B=1
+17:23:51.220 [#3] ENC motor=2 count=1 pos=1 cps=0 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=idle phase=idle reason=
+17:23:52.218 [#2] > ?
+17:23:52.242 [#2] STAT R=1 B=1 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=0 A=0 B=1
+17:23:52.242 [#2] ENC motor=2 count=0 pos=0 cps=0 a=0 b=1 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=idle phase=idle reason=
+17:23:53.221 [#2] state motor=2 cal=1 stroke=5462 neutral=2731 R=1 B=1 LIVE=1 count=0
+17:23:53.221 [#2] > ?
+17:23:53.243 [#2] STAT R=1 B=1 S=0 OUT=0 DIR=0 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=0 A=0 B=1
+17:23:53.243 [#2] ENC motor=2 count=0 pos=0 cps=0 a=0 b=1 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=idle phase=idle reason=
+17:23:54.237 [#3] > HOME
+17:23:54.261 [#3] AUTO home moving  pos=1
+17:23:54.261 [#3] ENC motor=2 count=1 pos=1 cps=0 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:54.756 [#3] ENC motor=2 count=-323 pos=-323 cps=-640 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:55.275 [#3] ENC motor=2 count=-672 pos=-672 cps=-660 a=1 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:55.789 [#3] ENC motor=2 count=-1030 pos=-1030 cps=-700 a=0 b=0 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:56.293 [#3] ENC motor=2 count=-1386 pos=-1386 cps=-710 a=0 b=0 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:56.803 [#3] ENC motor=2 count=-1751 pos=-1751 cps=-730 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:57.323 [#3] ENC motor=2 count=-2115 pos=-2115 cps=-710 a=0 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:57.829 [#3] ENC motor=2 count=-2476 pos=-2476 cps=-720 a=1 b=1 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:58.340 [#3] ENC motor=2 count=-2830 pos=-2830 cps=-670 a=0 b=0 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:58.894 [#3] ENC motor=2 count=-3077 pos=-3077 cps=0 a=1 b=0 origin=0 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:23:58.940 [#3] AUTO home done ok pos=5
+17:23:58.940 [#3] HOME -> done AUTO home done ok pos=5
+17:23:59.943 [#3] > NEUTRAL
+17:24:00.013 [#3] AUTO neutral moving  pos=47
+17:24:00.014 [#3] ENC motor=2 count=-3030 pos=47 cps=0 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:00.509 [#3] ENC motor=2 count=-2400 pos=677 cps=1270 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:01.023 [#3] ENC motor=2 count=-1767 pos=1310 cps=1260 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:01.539 [#3] ENC motor=2 count=-1194 pos=1883 cps=930 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:02.046 [#3] ENC motor=2 count=-855 pos=2222 cps=520 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:02.556 [#3] ENC motor=2 count=-665 pos=2412 cps=340 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:03.049 [#3] ENC motor=2 count=-463 pos=2614 cps=430 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:03.575 [#3] ENC motor=2 count=-251 pos=2826 cps=430 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:04.081 [#3] AUTO neutral dwell  pos=3059
+17:24:04.081 [#3] ENC motor=2 count=-18 pos=3059 cps=440 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=dwell reason=
+17:24:04.310 [#3] AUTO neutral done ok pos=3060
+17:24:04.310 [#3] NEUTRAL -> done AUTO neutral done ok pos=3060
+17:24:05.315 [#3] > UPPER
+17:24:05.382 [#3] AUTO upper moving  pos=3085
+17:24:05.382 [#3] ENC motor=2 count=8 pos=3085 cps=0 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:05.892 [#3] ENC motor=2 count=663 pos=3740 cps=1300 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:06.382 [#3] ENC motor=2 count=1339 pos=4416 cps=1330 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:06.907 [#3] ENC motor=2 count=2031 pos=5108 cps=1400 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:07.414 [#3] ENC motor=2 count=2719 pos=5796 cps=1390 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:07.914 [#3] ENC motor=2 count=3060 pos=6137 cps=800 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=upper phase=moving reason=
+17:24:08.031 [#3] AUTO upper done ok pos=6137
+17:24:08.031 [#3] UPPER -> done AUTO upper done ok pos=6137
+17:24:09.032 [#3] > NEUTRAL
+17:24:09.055 [#3] AUTO neutral moving  pos=6127
+17:24:09.055 [#3] ENC motor=2 count=3050 pos=6127 cps=0 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:09.572 [#3] ENC motor=2 count=2342 pos=5419 cps=-1370 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:10.092 [#3] ENC motor=2 count=1635 pos=4712 cps=-1370 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:10.602 [#3] ENC motor=2 count=1057 pos=4134 cps=-990 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:11.101 [#3] ENC motor=2 count=743 pos=3820 cps=-570 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:11.616 [#3] ENC motor=2 count=519 pos=3596 cps=-410 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:12.125 [#3] ENC motor=2 count=294 pos=3371 cps=-460 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:12.635 [#3] ENC motor=2 count=74 pos=3151 cps=-440 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:12.823 [#3] AUTO neutral dwell  pos=3076
+17:24:13.009 [#3] AUTO neutral done ok pos=3079
+17:24:13.009 [#3] NEUTRAL -> done AUTO neutral done ok pos=3079
+17:24:14.013 [#3] > HOME
+17:24:14.037 [#3] AUTO home moving  pos=3080
+17:24:14.037 [#3] ENC motor=2 count=3 pos=3080 cps=0 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:14.548 [#3] ENC motor=2 count=-631 pos=2446 cps=-1300 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:15.048 [#3] ENC motor=2 count=-1289 pos=1788 cps=-1280 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:15.560 [#3] ENC motor=2 count=-1949 pos=1128 cps=-1300 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:16.071 [#3] ENC motor=2 count=-2599 pos=478 cps=-1280 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:16.569 [#3] ENC motor=2 count=-2990 pos=87 cps=-680 a=1 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=home phase=moving reason=
+17:24:16.939 [#3] AUTO home done ok pos=8
+17:24:16.939 [#3] HOME -> done AUTO home done ok pos=8
+17:24:17.943 [#3] > NEUTRAL
+17:24:18.009 [#3] AUTO neutral moving  pos=38
+17:24:18.010 [#3] ENC motor=2 count=-3037 pos=38 cps=0 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:18.502 [#3] ENC motor=2 count=-2391 pos=684 cps=1290 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:19.011 [#3] ENC motor=2 count=-1748 pos=1327 cps=1270 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:19.521 [#3] ENC motor=2 count=-1173 pos=1902 cps=920 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:20.040 [#3] ENC motor=2 count=-836 pos=2239 cps=490 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:20.551 [#3] ENC motor=2 count=-645 pos=2430 cps=350 a=0 b=1 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:21.061 [#3] ENC motor=2 count=-432 pos=2643 cps=420 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:21.563 [#3] ENC motor=2 count=-211 pos=2864 cps=430 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=moving reason=
+17:24:22.001 [#3] AUTO neutral dwell  pos=3061
+17:24:22.065 [#3] ENC motor=2 count=-15 pos=3060 cps=260 a=1 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=dwell reason=
+17:24:22.206 [#3] AUTO neutral done ok pos=3059
+17:24:22.206 [#3] NEUTRAL -> done AUTO neutral done ok pos=3059
+17:24:23.207 [#2] > HOME
+17:24:23.232 [#2] AUTO home moving  pos=-1
+17:24:23.232 [#2] ENC motor=2 count=-1 pos=-1 cps=0 a=1 b=1 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:23.738 [#2] ENC motor=2 count=-358 pos=-358 cps=-720 a=1 b=0 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:24.247 [#2] ENC motor=2 count=-740 pos=-740 cps=-820 a=0 b=1 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:24.759 [#2] ENC motor=2 count=-1142 pos=-1142 cps=-820 a=1 b=0 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:25.284 [#2] ENC motor=2 count=-1570 pos=-1570 cps=-910 a=1 b=0 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:25.779 [#2] ENC motor=2 count=-2015 pos=-2015 cps=-920 a=0 b=0 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:26.292 [#2] ENC motor=2 count=-2502 pos=-2502 cps=-940 a=1 b=0 origin=0 cal=1 stroke=5462 neutral=2731 sign=1 auto=home phase=moving reason=
+17:24:26.801 [#2] AUTO home done ok pos=7
+17:24:26.801 [#2] HOME -> done AUTO home done ok pos=7
+17:24:27.806 [#2] > NEUTRAL
+17:24:27.851 [#2] AUTO neutral moving  pos=28
+17:24:27.852 [#2] ENC motor=2 count=-2714 pos=28 cps=0 a=1 b=0 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:28.363 [#2] ENC motor=2 count=-2252 pos=490 cps=910 a=0 b=1 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:28.868 [#2] ENC motor=2 count=-1762 pos=980 cps=990 a=1 b=0 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:29.362 [#2] ENC motor=2 count=-1288 pos=1454 cps=880 a=0 b=1 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:29.873 [#2] ENC motor=2 count=-995 pos=1747 cps=500 a=0 b=0 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:30.389 [#2] ENC motor=2 count=-845 pos=1897 cps=200 a=1 b=1 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=moving reason=
+17:24:30.826 [#2] AUTO neutral failed slow pos=1957
+17:24:30.826 [#2] NEUTRAL -> failed AUTO neutral failed slow pos=1957
+17:24:30.826 [#2] > X
+17:24:31.828 [#3] > ?
+17:24:31.853 [#3] STAT R=1 B=1 S=0 OUT=0 DIR=1 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=-16 A=0 B=0
+17:24:31.853 [#3] ENC motor=2 count=-16 pos=3059 cps=0 a=0 b=0 origin=1 cal=1 stroke=6138 neutral=3069 sign=1 auto=neutral phase=done reason=ok
+17:24:32.849 [#3] final pos=3059 origin=1 stroke=6138 R=1 B=0 LIVE=1 auto=neutral/done/ok
+17:24:32.849 [#2] > ?
+17:24:32.872 [#2] STAT R=1 B=1 S=0 OUT=0 DIR=1 PWR_PIN=1 BRK_PIN=1 LIVE=1 ENC=-796 A=0 B=1
+17:24:32.872 [#2] ENC motor=2 count=-796 pos=1946 cps=0 a=0 b=1 origin=1 cal=1 stroke=5462 neutral=2731 sign=1 auto=neutral phase=failed reason=slow
+17:24:33.851 [#2] final pos=1946 origin=1 stroke=5462 R=1 B=1 LIVE=1 auto=neutral/failed/slow  FAILED: NEUTRAL: failed AUTO neutral failed slow pos=1957
+17:24:33.851 # run end mode=seq
+17:24:33.851 # holding ports open; waiting for drive_cmd.txt (seq|par|quit)
+17:30:16.782 # quit requested; closing ports

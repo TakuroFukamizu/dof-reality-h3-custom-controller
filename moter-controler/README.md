@@ -1,6 +1,6 @@
 # moter-controler
 
-M5Stack CoreS3 SE で MD13S・主電源リレー・ブレーキリレーを操作し、フィードバックセンサーを読んで、系統ごとの原点復帰・定位置移動を行う。設計は `docs/superpowers/specs/2026-10-25-moter-controler-homing-design.md`、実機記録は [docs/acceptance_homing.md](docs/acceptance_homing.md)。
+M5Stack CoreS3 SE で MD13S・主電源リレー・ブレーキリレーを操作し、フィードバックセンサーを読んで、系統ごとの原点復帰・定位置移動を行う。設計は `docs/superpowers/specs/2026-10-25-moter-controler-homing-design.md`、実機記録は [docs/acceptance_homing.md](docs/acceptance_homing.md)、PC から 3 系統を操作した記録は [docs/multi_axis_20261031.md](docs/multi_axis_20261031.md)（スクリプトは `tools/multi_axis/`）。
 
 ## ビルド
 
