@@ -287,7 +287,7 @@ curl -s $URL/v1/status | python3 -m json.tool
 curl -sX POST -H "$AUTH" $URL/v1/start
 ```
 
-- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。
+- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。その Pose が作る目標は保持位置から `[game].start_max_offset_count`（300 count）以内でなければならない（`409 pose_not_near_hold`。上の `0 0 0 0.05` なら中立で問題ない。§10 の表）。
 - 受理後 `rig_state = ACTIVE`、`active_source = "game"`、3 軸 `mcu_state = ACTIVE`。目標は `count_at_virtual_512` へ `[limits].max_vel_count_s` 以内で動く（limits.md §4 の低い値 600 count/s で始める）。
 - **ここで 3 通りに分かれる**（ファームの無パルス判定は「ブレーキ解除指令中に目標（軌道）が動いている間」だけ働く。設計 §3）:
   - `|actual_count − count_at_virtual_512| ≤ 5`（基準がぴったり）: 目標 = 実位置で Duty 0 のまま。ACTIVE が続く。送信停止 → `BRAKED_DISARMED` まで進むことを見る。
