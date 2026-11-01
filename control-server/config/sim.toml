@@ -42,6 +42,10 @@ virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25
 center_tolerance_count = 50
+# START の姿勢関門（既定 300）。模擬軸の試験は姿勢を入れたまま START するので広く取る
+# （軸 1 は仮想 1 あたり 3.9 count、gain 0.5 の pitch+roll 0.7 で約 700 count）。
+# 関門そのものの試験は tests/supervisor.rs が 300 で行う。
+start_max_offset_count = 1000
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証の見積もり
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）。

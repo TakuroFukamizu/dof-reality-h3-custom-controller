@@ -168,6 +168,9 @@ pub mod admin_error {
     pub const NOT_HOLDING: &str = "not_holding";
     pub const BUSY: &str = "busy";
     pub const NO_FRESH_POSE: &str = "no_fresh_pose";
+    /// START (game): the fresh pose would command an axis farther than
+    /// `game.start_max_offset_count` from its hold position (Issue #15 M4).
+    pub const POSE_NOT_NEAR_HOLD: &str = "pose_not_near_hold";
     pub const FAULT_LATCHED: &str = "fault_latched";
     pub const NOT_FAULTED: &str = "not_faulted";
     pub const RESET_IN_PROGRESS: &str = "reset_in_progress";
@@ -646,9 +649,18 @@ pub struct Supervisor {
     limits_cfg: LimitsConfig,
     /// What the API asked for (shared set, before the ceilings).
     requested_limits: MotionLimits,
-    /// `requested_limits` clamped to the current ceilings.
+    /// `requested_limits` clamped (ceilings + stop-time rule): what we want
+    /// in force and what SET_LIMITS carries.
+    target_limits: MotionLimits,
+    /// What the planner / SET_POSITION use. Equals `target_limits` once the
+    /// SET_LIMITS carrying the target's duty tuning is ACKed by every
+    /// connected axis; until then it keeps the confirmed tuning and takes
+    /// only the lowered components of the target (Issue #15 M3).
     effective_limits: MotionLimits,
     limited: Vec<LimitedField>,
+    limit_reasons: Vec<LimitReason>,
+    /// `target_limits` is waiting for SET_LIMITS ACKs (status `pending`).
+    limits_pending: bool,
     names: [String; AXIS_COUNT],
     device_ids: [DeviceId; AXIS_COUNT],
     operator_valid: [bool; AXIS_COUNT],
@@ -729,15 +741,21 @@ impl Supervisor {
         let hashes = std::array::from_fn(|i| calibration::calibration_hash(&cfg.rig_id, &cal[i]));
         let neutral: [Counts; AXIS_COUNT] = std::array::from_fn(|i| cal[i].neutral_count());
         let requested_limits = MotionLimits::from_config(&cfg.limits);
-        let (effective_limits, limited) =
-            motion_limits::clamp(&requested_limits, &Ceilings::fallback(cfg.limits.overspeed_count_s));
+        let clamped = motion_limits::clamp(
+            &requested_limits,
+            &Ceilings::fallback(cfg.limits.overspeed_count_s),
+            motion_limits::stop_deadline(&cfg.timing),
+        );
         Self {
             timing: cfg.timing.clone(),
             game: cfg.game.clone(),
             limits_cfg: cfg.limits.clone(),
             requested_limits,
-            effective_limits,
-            limited,
+            target_limits: clamped.effective,
+            effective_limits: clamped.effective,
+            limited: clamped.limited,
+            limit_reasons: clamped.reasons,
+            limits_pending: false,
             names,
             device_ids,
             operator_valid,
@@ -1342,9 +1360,27 @@ impl Supervisor {
         self.requested_limits = requested;
     }
 
-    /// The set in effect (requested, clamped to the ceilings).
+    /// The set in effect: what the planner and SET_POSITION use (the clamped
+    /// request once its duty tuning is confirmed on every axis, see
+    /// [`Self::limits_pending`]).
     pub fn effective_limits(&self) -> MotionLimits {
         self.effective_limits
+    }
+
+    /// The clamped request (ceilings + stop-time rule), confirmed or not.
+    pub fn target_limits(&self) -> MotionLimits {
+        self.target_limits
+    }
+
+    /// The clamped request changes the firmware tuning and not every
+    /// connected axis has ACKed that SET_LIMITS yet.
+    pub fn limits_pending(&self) -> bool {
+        self.limits_pending
+    }
+
+    /// The deadline the stop-time rule enforces (`limits::stop_deadline`).
+    fn stop_deadline(&self) -> Duration {
+        motion_limits::stop_deadline(&self.timing)
     }
 
     /// Ceilings the requested set is clamped to: the minimum of the absolute
@@ -1371,18 +1407,53 @@ impl Supervisor {
             ceiling: self.ceilings(),
             defaults: MotionLimits::from_config(&self.limits_cfg),
             limited: self.limited.clone(),
+            reasons: self.limit_reasons.clone(),
+            pending: self.limits_pending,
         }
     }
 
+    /// Clamp the request into `target_limits`, then decide what the planner
+    /// may use now (Issue #15 M3):
+    /// - the target's SET_LIMITS content equals the one in force → apply at
+    ///   once (velocity / acceleration / gain changes never wait);
+    /// - otherwise wait until every connected axis that speaks SET_LIMITS has
+    ///   ACKed the target tuning (`reconcile_limits` sends it), and meanwhile
+    ///   keep the confirmed set, taking only the *lowered* components of the
+    ///   target (a lowered cap is safe with the old tuning; a raised velocity
+    ///   with an unconfirmed duty cap is the FOLLOWING_ERROR the issue
+    ///   describes). The stop-time rule survives the component-wise minimum:
+    ///   both sets satisfy `acc ≥ vel / deadline`, so their minima do too.
     fn recompute_limits(&mut self) {
-        let (e, l) = motion_limits::clamp(&self.requested_limits, &self.ceilings());
-        self.effective_limits = e;
-        self.limited = l;
+        let c = motion_limits::clamp(&self.requested_limits, &self.ceilings(), self.stop_deadline());
+        self.target_limits = c.effective;
+        self.limited = c.limited;
+        self.limit_reasons = c.reasons;
+        let want = self.desired_tuning();
+        let in_force = FwTuning::new(&self.limits_cfg, &self.effective_limits);
+        let confirmed = want == in_force
+            || self
+                .axes
+                .iter()
+                .filter(|t| t.connected && t.supports_limits())
+                .all(|t| t.limits_acked == Some(want));
+        if confirmed {
+            self.effective_limits = self.target_limits;
+            self.limits_pending = false;
+        } else {
+            let (t, e) = (&self.target_limits, &self.effective_limits);
+            self.effective_limits = MotionLimits {
+                max_gain: e.max_gain.min(t.max_gain),
+                max_vel_count_s: e.max_vel_count_s.min(t.max_vel_count_s),
+                max_acc_count_s2: e.max_acc_count_s2.min(t.max_acc_count_s2),
+                duty_max_percent: e.duty_max_percent,
+            };
+            self.limits_pending = true;
+        }
     }
 
-    /// The SET_LIMITS content for the current effective set.
+    /// The SET_LIMITS content for the clamped request (`target_limits`).
     fn desired_tuning(&self) -> FwTuning {
-        FwTuning::new(&self.limits_cfg, &self.effective_limits)
+        FwTuning::new(&self.limits_cfg, &self.target_limits)
     }
 
     /// Send SET_LIMITS to every connected axis on which the desired tuning is
@@ -1391,6 +1462,8 @@ impl Supervisor {
     /// the rig is latched (HOST_FAULT first). An ACK whose LIMITS never
     /// arrives is re-sent after `LIMITS_RETRY` with a new request_id (a
     /// resend of the same request would only be DUPLICATE, without LIMITS).
+    /// A tuning that changed while the previous SET_LIMITS was in flight goes
+    /// out as soon as that one is ACKed (the ACK handler sets no retry wait).
     fn reconcile_limits(&mut self, now: Instant) {
         if matches!(self.phase, Phase::Fault { .. }) {
             return;
@@ -1876,11 +1949,14 @@ impl Supervisor {
                         }
                     }
                     Purpose::SetLimits => {
+                        let want = self.desired_tuning();
                         let t = &mut self.axes[i];
                         t.limits_acked = t.limits_inflight.take();
                         t.limits_rejected = None;
-                        // LIMITS should follow at once; if it is lost, resend after this.
-                        t.limits_retry_at = Some(now + LIMITS_RETRY);
+                        // LIMITS should follow at once; if it is lost, resend after
+                        // this. A tuning that changed while this one was in flight
+                        // goes out at the next tick instead (Issue #15 M3).
+                        t.limits_retry_at = (t.limits_acked == Some(want)).then_some(now + LIMITS_RETRY);
                     }
                     _ => {}
                 }
@@ -2229,11 +2305,37 @@ impl Supervisor {
             }
         }
         let fresh = self.last_pose.as_ref().filter(|p| p.fresh_until > now);
-        if source == ActiveSource::Game && fresh.is_none() {
-            return Err(AdminError::new(
-                admin_error::NO_FRESH_POSE,
-                vec!["no_fresh_pose: no fresh game pose in the last tick".into()],
-            ));
+        if source == ActiveSource::Game {
+            let Some(p) = fresh else {
+                return Err(AdminError::new(
+                    admin_error::NO_FRESH_POSE,
+                    vec!["no_fresh_pose: no fresh game pose in the last tick".into()],
+                ));
+            };
+            // Pose-magnitude interlock (Issue #15 M4): the pose START would
+            // hand to the planner must be near where the axes are held, or a
+            // forgotten tab's extreme pose launches the seat at full speed.
+            let (targets, _, _) = self.pose_targets(&p.checked);
+            let hold = self.hold_positions();
+            let max = self.game.start_max_offset_count;
+            let far: Vec<String> = (0..AXIS_COUNT)
+                .filter_map(|i| {
+                    let d = targets[i] - hold[i];
+                    (d.abs() > f64::from(max)).then(|| {
+                        format!(
+                            "{}: axis{} target {:.0} is {:+.0} counts from hold {:.0} (max {max})",
+                            admin_error::POSE_NOT_NEAR_HOLD,
+                            i + 1,
+                            targets[i],
+                            d,
+                            hold[i]
+                        )
+                    })
+                })
+                .collect();
+            if !far.is_empty() {
+                return Err(AdminError::new(admin_error::POSE_NOT_NEAR_HOLD, far));
+            }
         }
         self.drive_session = match source {
             ActiveSource::Game => fresh.map(|p| p.session_gen),
@@ -2844,10 +2946,23 @@ impl Supervisor {
 
     /// pose → mix → saturate → virtual_to_count → clamp_soft → step_track.
     fn track_game(&mut self, pose: &AcceptedPose, dt: f64) -> Vec<LimitReason> {
-        let checked = &pose.checked;
+        let (targets, virt, mut limits) = self.pose_targets(&pose.checked);
+        let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
+        limits.extend(out.limits);
+        self.drive.virtual_targets = virt;
+        limits
+    }
+
+    /// The count targets a checked pose commands: mix → saturate →
+    /// virtual_to_count → clamp_soft (the one path for tracking and for the
+    /// START interlock), with the virtual positions and the reasons that
+    /// clipped them.
+    fn pose_targets(
+        &self,
+        checked: &compat::CheckedPose,
+    ) -> ([f64; AXIS_COUNT], [f64; AXIS_COUNT], Vec<LimitReason>) {
         let mixed = compat::mix(checked.pose, checked.effective_gain);
-        let (virt, saturated) =
-            compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
+        let (virt, saturated) = compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
         let mut limits = Vec::new();
         if saturated {
             limits.push(LimitReason::VirtualSaturated);
@@ -2861,10 +2976,17 @@ impl Supervisor {
         if soft {
             limits.push(LimitReason::SoftLimited);
         }
-        let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
-        limits.extend(out.limits);
-        self.drive.virtual_targets = virt.map(|v| v.0);
-        limits
+        (targets, virt.map(|v| v.0), limits)
+    }
+
+    /// Where the axes are held: the planner's positions once it was
+    /// initialised (ARMING → HOLDING), else the measured counts.
+    fn hold_positions(&self) -> [f64; AXIS_COUNT] {
+        if self.planner.is_initialized() {
+            self.planner.positions()
+        } else {
+            self.actual_counts().map(f64::from)
+        }
     }
 
     /// Planner limits: the shared effective set (the same for every axis),

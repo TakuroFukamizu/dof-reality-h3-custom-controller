@@ -10,7 +10,7 @@ use std::time::Duration;
 use h3cs::calibration;
 use h3cs::compat;
 use h3cs::config::Config;
-use h3cs::limits::MotionLimits;
+use h3cs::limits::{LimitedField, MotionLimits};
 use h3cs::protocol::{capabilities, msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
 use h3cs::session::{AcceptedPose, PoseIntake, PoseMsg};
 use h3cs::sim_axis::{SimMcu, SimParams};
@@ -56,6 +56,10 @@ struct Rig {
     /// XORed into every STATUS `flags` of sim i (a firmware that misreports).
     flip_flags: [u16; 3],
     pre_tick: Vec<LinkEvent>,
+    /// SET_LIMITS to sim i is captured in `held` instead of delivered (a unit
+    /// slow to answer); `release_held` delivers it later.
+    hold_set_limits: [bool; 3],
+    held: Vec<(usize, HostMsg)>,
 }
 
 impl Rig {
@@ -111,6 +115,8 @@ impl Rig {
             drop_setpos: [false; 3],
             flip_flags: [0; 3],
             pre_tick: Vec::new(),
+            hold_set_limits: [false; 3],
+            held: Vec::new(),
         }
     }
 
@@ -327,6 +333,10 @@ impl Rig {
             let k = axis.index();
             for m in &out.admin_msgs[k] {
                 self.sent.push((i, self.now, *m));
+                if self.hold_set_limits[i] && matches!(m, HostMsg::SetLimits(_)) {
+                    self.held.push((i, *m));
+                    continue;
+                }
                 if self.linked[i] {
                     let r = self.mcus[i].handle(m, us);
                     self.feed(i, r);
@@ -348,6 +358,17 @@ impl Rig {
     fn run_ms(&mut self, ms: u64) {
         for _ in 0..ms / 10 {
             self.step();
+        }
+    }
+
+    /// Deliver the SET_LIMITS captured by `hold_set_limits` (replies fed back).
+    fn release_held(&mut self) {
+        let us = self.us();
+        for (i, m) in std::mem::take(&mut self.held) {
+            if self.linked[i] {
+                let r = self.mcus[i].handle(&m, us);
+                self.feed(i, r);
+            }
         }
     }
 
@@ -1092,6 +1113,8 @@ fn saturation_and_soft_limits_reported() {
     let mut cfg = sim_cfg();
     cfg.limits.max_gain = 1.0;
     cfg.game.virtual_max = 900.0;
+    // The saturated pose is ~1500 counts out at START (the interlock is M4's own test).
+    cfg.game.start_max_offset_count = 3000;
     let mut r = Rig::new(cfg.clone());
     r.active(
         Pose {
@@ -3028,4 +3051,185 @@ fn set_limits_acked_but_limits_report_lost_is_resent_with_a_new_request_id() {
     }
     assert!(!has(&sup.blockers(t2), "limits_unconfirmed"), "{:?}", sup.blockers(t2));
     assert!(sup.snapshot(t2).axes[0].fw_limits.is_some());
+}
+
+// ------------------------------------------------------------------ Issue #15 H2 / M3 / M4
+
+/// H2: a runtime request whose `max_acc` cannot stop `max_vel` inside the
+/// stop deadline (0.8 x min(mcu_stop_timeout 1500, stop_settle 3000) = 1.2 s)
+/// is raised to the bound, reported, and a STOP from it completes.
+#[test]
+fn runtime_limits_that_cannot_stop_in_time_are_raised_to_the_bound() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 600, max_acc_count_s2: 1, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.motion_limits.requested.max_acc_count_s2, 1);
+    assert_eq!(snap.motion_limits.effective.max_vel_count_s, 600);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 500);
+    assert_eq!(snap.motion_limits.limited, vec![LimitedField::MaxAccCountS2]);
+    assert_eq!(snap.motion_limits.reasons, vec![LimitReason::StopTimeLimited]);
+    assert!(!snap.motion_limits.pending);
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!((sp[0].max_vel_count_s, sp[0].max_acc_count_s2), (600, 500));
+    // A consistent joint request is taken as is.
+    r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 600, max_acc_count_s2: 500, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.limited.is_empty() && snap.motion_limits.reasons.is_empty(), "{:?}", snap.motion_limits);
+    // A STOP at the bound settles inside the timeouts instead of faulting.
+    r.set_game(None);
+    r.run_ms(300);
+    r.admin(AdminCmd::Stop).unwrap();
+    r.wait_state(RigState::BrakedDisarmed, 6000);
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+}
+
+/// M3: raising velocity together with the duty cap waits until every axis has
+/// ACKed the SET_LIMITS carrying the new cap; lowering applies at once.
+#[test]
+fn raised_limits_wait_for_every_set_limits_ack_but_lowered_ones_apply_at_once() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    let before = r.sup.effective_limits();
+    assert_eq!((before.max_vel_count_s, before.duty_max_percent), (3000, 40));
+    let (mark, mark_sp) = (r.sent.len(), r.setpos.len());
+    r.hold_set_limits[1] = true;
+    let raised = MotionLimits { max_vel_count_s: 4000, max_acc_count_s2: 20000, duty_max_percent: 50, ..before };
+    r.sup.set_requested_limits(raised);
+    r.run_ms(200);
+    // SET_LIMITS went to every axis; axes 1 and 3 applied it, axis 2 has not answered.
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    assert_eq!(r.mcus[0].tuning().duty_max_percent, 50);
+    assert_eq!(r.mcus[1].tuning().duty_max_percent, 40);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective, before, "planner keeps the confirmed set");
+    assert_eq!(snap.motion_limits.requested, raised);
+    assert_eq!(r.sup.target_limits(), raised);
+    assert!(r.setpos.len() > mark_sp + 10);
+    for (_, _, sp) in &r.setpos[mark_sp..] {
+        for k in 0..3 {
+            assert_eq!((sp[k].max_vel_count_s, sp[k].max_acc_count_s2), (3000, 15000));
+        }
+    }
+    // Axis 2 answers: the new set applies at the next tick.
+    r.hold_set_limits[1] = false;
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective, raised);
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!((sp[0].max_vel_count_s, sp[0].max_acc_count_s2), (4000, 20000));
+    assert_eq!(r.mcus[1].tuning().duty_max_percent, 50);
+    assert_eq!(r.sup.state(), RigState::Active);
+    assert!(r.sup.fault().is_none());
+
+    // Lowering velocity while another duty raise is pending applies at once;
+    // the duty cap in effect stays the confirmed one until the ACK.
+    r.hold_set_limits[1] = true;
+    let mixed = MotionLimits { max_vel_count_s: 1000, duty_max_percent: 55, ..raised };
+    r.sup.set_requested_limits(mixed);
+    r.run_ms(100);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending);
+    assert_eq!(snap.motion_limits.effective, MotionLimits { max_vel_count_s: 1000, duty_max_percent: 50, ..raised });
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!(sp[0].max_vel_count_s, 1000);
+    r.hold_set_limits[1] = false;
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending);
+    assert_eq!(snap.motion_limits.effective, mixed);
+
+    // A change that leaves the duty cap alone never waits.
+    r.hold_set_limits[1] = true;
+    let mark = r.sent.len();
+    r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 2000, ..mixed });
+    r.run_ms(50);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending);
+    assert_eq!(snap.motion_limits.effective.max_vel_count_s, 2000);
+}
+
+/// M3: a request that changes again while its SET_LIMITS is in flight is
+/// re-sent as soon as the old one is answered (no LIMITS_RETRY wait).
+#[test]
+fn a_changed_tuning_is_resent_right_after_the_previous_ack() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    r.hold_set_limits = [true; 3];
+    let mark = r.sent.len();
+    r.sup.set_requested_limits(MotionLimits { duty_max_percent: 45, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    r.sup.set_requested_limits(MotionLimits { duty_max_percent: 50, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1], "one in flight per axis");
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(30);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [2, 2, 2], "the newer tuning went out at once");
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending);
+    assert_eq!(snap.motion_limits.effective.duty_max_percent, 50);
+    for m in r.mcus.iter() {
+        assert_eq!(m.tuning().duty_max_percent, 50);
+    }
+}
+
+/// M4: START (game) refuses a fresh pose that would send an axis farther than
+/// `game.start_max_offset_count` from where it is held.
+#[test]
+fn start_is_refused_when_the_pose_is_far_from_the_hold_position() {
+    let mut cfg = sim_cfg();
+    cfg.game.start_max_offset_count = 300;
+    let mut r = Rig::new(cfg.clone());
+    r.holding();
+    let mark = r.sent.len();
+    // Full pitch + roll at the gain ceiling: axis 1 (right front, roll + pitch)
+    // would go to +2000 from its hold at 0; axes 2 and 3 stay at 0.
+    let far = Pose { pitch: 1.0, roll: 1.0, yaw: 0.0 };
+    r.set_game(Some((far, 0.5)));
+    r.run_ms(30);
+    let err = r.admin(AdminCmd::Start).unwrap_err();
+    assert_eq!(err.error, admin_error::POSE_NOT_NEAR_HOLD);
+    assert_eq!(expected_counts(&cfg, far, 0.5), [2000, 0, 0]);
+    assert_eq!(
+        err.blockers,
+        vec!["pose_not_near_hold: axis1 target 2000 is +2000 counts from hold 0 (max 300)".to_string()],
+        "{:?}",
+        err.blockers
+    );
+    assert_eq!(r.sup.state(), RigState::Holding);
+    assert_eq!(r.count(mark, msg_type::START), [0, 0, 0], "no START reached the MCUs");
+    // Outside on two axes: axis 1 (roll + pitch = 0.4) → 400, axis 2 (roll − pitch
+    // = 1.6 on its ±400 geometry) → 320, axis 3 (yaw 0) stays.
+    let two = Pose { pitch: -0.6, roll: 1.0, yaw: 0.0 };
+    r.set_game(Some((two, 0.5)));
+    r.run_ms(30);
+    assert_eq!(expected_counts(&cfg, two, 0.5), [400, 320, 0]);
+    let err = r.admin(AdminCmd::Start).unwrap_err();
+    assert_eq!(err.error, admin_error::POSE_NOT_NEAR_HOLD);
+    assert_eq!(err.blockers.len(), 2, "{:?}", err.blockers);
+    assert!(err.blockers[0].starts_with("pose_not_near_hold: axis1 target 400 is +400 counts"), "{:?}", err.blockers);
+    assert!(err.blockers[1].starts_with("pose_not_near_hold: axis2 target 320 is +320 counts"), "{:?}", err.blockers);
+    // A pose near the hold position starts.
+    r.set_game(Some((Pose { pitch: 0.1, roll: 0.0, yaw: 0.0 }, 0.3)));
+    r.run_ms(30);
+    assert_eq!(expected_counts(&cfg, Pose { pitch: 0.1, roll: 0.0, yaw: 0.0 }, 0.3), [60, -12, 0]);
+    r.admin(AdminCmd::Start).unwrap();
+    r.wait_state(RigState::Active, 1000);
+    assert!(r.sup.fault().is_none());
+    // CENTER is not a game START: no pose check.
+    r.admin(AdminCmd::Stop).unwrap();
+    r.wait_state(RigState::BrakedDisarmed, 6000);
+    r.set_game(Some((far, 0.5)));
+    r.admin(AdminCmd::Arm).unwrap();
+    r.wait_state(RigState::Holding, 2000);
+    r.admin(AdminCmd::Center).unwrap();
 }

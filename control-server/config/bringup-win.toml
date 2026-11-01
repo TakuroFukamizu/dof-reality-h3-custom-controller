@@ -54,6 +54,7 @@ clamp_out_of_range = true
 virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
+start_max_offset_count = 300     # START 時の姿勢が保持位置からこの count を超えて離れる軸があれば 409 pose_not_near_hold。ゲームを中立にしてから START
 
 [backend]
 kind = "serial"

@@ -13,13 +13,25 @@
 //! Everything else in `[limits]` (duty_min, Kp, FF, deadbands, the
 //! FOLLOWING_ERROR / OVERSPEED thresholds) is an initial value or a protection
 //! threshold: distributed to the MCUs, not changeable at runtime.
+//!
+//! **Stop-time rule (Issue #15 H2).** A STOP decelerates the planner at the
+//! effective `max_acc_count_s2`; the MCU gives up after `mcu_stop_timeout_ms`
+//! and the server after `stop_settle_timeout_ms`, and both end in a FAULT that
+//! brakes at whatever speed is left. So the worst-case stop time
+//! `max_vel / max_acc` must fit inside [`stop_deadline`] (a fraction of the
+//! shorter timeout). [`clamp`] enforces it on every requested set — raising
+//! `max_acc` to the bound, or, when the acceleration ceiling cannot deliver
+//! that, lowering `max_vel` instead — and reports `StopTimeLimited`;
+//! `Config::validate` enforces it on `[limits]` and on the firmware ceilings.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, TimingConfig};
 use crate::protocol::{fw_absolute, Limits as FwLimits, SetLimits};
+use crate::types::LimitReason;
 
 /// The four runtime-changeable limits.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -91,6 +103,43 @@ pub fn vel_ceiling_for_overspeed(overspeed_count_s: u32) -> u32 {
     (f64::from(overspeed_count_s) / OVERSPEED_MARGIN).floor() as u32
 }
 
+/// Fraction of the shorter stop timeout a worst-case deceleration may use
+/// (the rest covers link latency, the MCU's own ramp and the settle check).
+pub const STOP_TIME_FRACTION: f64 = 0.8;
+
+/// The deadline a controlled stop from `max_vel` at `max_acc` must meet:
+/// `STOP_TIME_FRACTION × min(mcu_stop_timeout_ms, stop_settle_timeout_ms)`.
+/// The one definition the config check and the runtime clamp share.
+pub fn stop_deadline(t: &TimingConfig) -> Duration {
+    let ms = u64::from(t.mcu_stop_timeout_ms).min(t.stop_settle_timeout_ms);
+    Duration::from_secs_f64(ms as f64 / 1000.0 * STOP_TIME_FRACTION)
+}
+
+/// Worst-case time (s) to decelerate from `max_vel` at `max_acc`
+/// (`max_acc` 0 → infinite).
+pub fn stop_time_s(max_vel_count_s: u32, max_acc_count_s2: u32) -> f64 {
+    if max_acc_count_s2 == 0 {
+        f64::INFINITY
+    } else {
+        f64::from(max_vel_count_s) / f64::from(max_acc_count_s2)
+    }
+}
+
+/// Smallest `max_acc_count_s2` that stops `max_vel` within `deadline`
+/// (ceil of `vel / deadline`; a zero deadline → `u32::MAX`).
+pub fn min_acc_for_stop(max_vel_count_s: u32, deadline: Duration) -> u32 {
+    let d = deadline.as_secs_f64();
+    if d <= 0.0 {
+        return u32::MAX;
+    }
+    let a = (f64::from(max_vel_count_s) / d).ceil();
+    if a >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        a as u32
+    }
+}
+
 /// Absolute ceilings one MCU reported (LIMITS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FwAbsolute {
@@ -118,7 +167,8 @@ impl FwAbsolute {
     }
 }
 
-/// Which field [`clamp`] reduced.
+/// Which field [`clamp`] changed (reduced to a ceiling, or moved by the
+/// stop-time rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitedField {
@@ -128,36 +178,94 @@ pub enum LimitedField {
     DutyMaxPercent,
 }
 
-/// Clamp a requested set to the ceilings. Non-finite / negative gain
-/// degrades to 0 (never panics); `duty_max_percent` 0 stays 0.
-pub fn clamp(requested: &MotionLimits, c: &Ceilings) -> (MotionLimits, Vec<LimitedField>) {
-    let mut limited = Vec::new();
+impl LimitedField {
+    pub const ALL: [LimitedField; 4] =
+        [LimitedField::MaxGain, LimitedField::MaxVelCountS, LimitedField::MaxAccCountS2, LimitedField::DutyMaxPercent];
+}
+
+/// Result of [`clamp`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clamped {
+    /// The set to use.
+    pub effective: MotionLimits,
+    /// Fields that differ from the request (each at most once, in field order).
+    pub limited: Vec<LimitedField>,
+    /// Why: `CeilingClamped` (a field exceeded a ceiling) and/or
+    /// `StopTimeLimited` (the stop-time rule moved `max_acc` up or `max_vel`
+    /// down). Empty when `limited` is.
+    pub reasons: Vec<LimitReason>,
+}
+
+/// Clamp a requested set to the ceilings, then enforce the stop-time rule
+/// (module docs): `max_acc ≥ ceil(max_vel / deadline)`, evaluated on the
+/// *effective* `max_vel` (so a patch that changes both is judged jointly).
+/// When that bound exceeds the acceleration ceiling, `max_acc` takes the
+/// ceiling and `max_vel` is lowered to `floor(ceiling × deadline)` instead.
+/// Non-finite / negative gain degrades to 0 (never panics);
+/// `duty_max_percent` 0 stays 0.
+pub fn clamp(requested: &MotionLimits, c: &Ceilings, stop_deadline: Duration) -> Clamped {
+    let mut ceiling = Vec::new();
     let gain = if requested.max_gain.is_finite() && requested.max_gain > 0.0 { requested.max_gain } else { 0.0 };
     let max_gain = if gain > c.max_gain {
-        limited.push(LimitedField::MaxGain);
+        ceiling.push(LimitedField::MaxGain);
         c.max_gain
     } else {
         gain
     };
-    let max_vel_count_s = if requested.max_vel_count_s > c.max_vel_count_s {
-        limited.push(LimitedField::MaxVelCountS);
+    let mut max_vel_count_s = if requested.max_vel_count_s > c.max_vel_count_s {
+        ceiling.push(LimitedField::MaxVelCountS);
         c.max_vel_count_s
     } else {
         requested.max_vel_count_s
     };
-    let max_acc_count_s2 = if requested.max_acc_count_s2 > c.max_acc_count_s2 {
-        limited.push(LimitedField::MaxAccCountS2);
+    let mut max_acc_count_s2 = if requested.max_acc_count_s2 > c.max_acc_count_s2 {
+        ceiling.push(LimitedField::MaxAccCountS2);
         c.max_acc_count_s2
     } else {
         requested.max_acc_count_s2
     };
     let duty_max_percent = if requested.duty_max_percent > c.duty_max_percent {
-        limited.push(LimitedField::DutyMaxPercent);
+        ceiling.push(LimitedField::DutyMaxPercent);
         c.duty_max_percent
     } else {
         requested.duty_max_percent
     };
-    (MotionLimits { max_gain, max_vel_count_s, max_acc_count_s2, duty_max_percent }, limited)
+
+    // Stop-time rule, judged on the ceiling-clamped velocity.
+    let mut stop = Vec::new();
+    let min_acc = min_acc_for_stop(max_vel_count_s, stop_deadline);
+    if max_acc_count_s2 < min_acc {
+        if min_acc <= c.max_acc_count_s2 {
+            max_acc_count_s2 = min_acc;
+            stop.push(LimitedField::MaxAccCountS2);
+        } else {
+            // Even the ceiling cannot stop this speed in time: cap the speed.
+            if max_acc_count_s2 != c.max_acc_count_s2 {
+                max_acc_count_s2 = c.max_acc_count_s2;
+                stop.push(LimitedField::MaxAccCountS2);
+            }
+            let v = (f64::from(c.max_acc_count_s2) * stop_deadline.as_secs_f64()).floor();
+            let v = if v.is_finite() && v >= 0.0 { v.min(f64::from(u32::MAX)) as u32 } else { 0 };
+            if v < max_vel_count_s {
+                max_vel_count_s = v;
+                stop.push(LimitedField::MaxVelCountS);
+            }
+        }
+    }
+
+    let mut reasons = Vec::new();
+    if !ceiling.is_empty() {
+        reasons.push(LimitReason::CeilingClamped);
+    }
+    if !stop.is_empty() {
+        reasons.push(LimitReason::StopTimeLimited);
+    }
+    let limited = LimitedField::ALL.into_iter().filter(|f| ceiling.contains(f) || stop.contains(f)).collect();
+    Clamped {
+        effective: MotionLimits { max_gain, max_vel_count_s, max_acc_count_s2, duty_max_percent },
+        limited,
+        reasons,
+    }
 }
 
 /// A partial update (WS `limits` message body / `POST /v1/limits`): only the
@@ -271,14 +379,21 @@ impl FwTuning {
 /// `motion_limits` of the status snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MotionLimitsSnapshot {
-    /// In effect now (requested, clamped to the ceilings).
+    /// In effect now: what the planner / SET_POSITION use and the duty cap
+    /// the MCUs confirmed. Lags the clamped `requested` while `pending`.
     pub effective: MotionLimits,
     pub requested: MotionLimits,
     pub ceiling: Ceilings,
     /// The `[limits]` values (what a new session resets to).
     pub defaults: MotionLimits,
-    /// Fields of `requested` the ceilings reduced.
+    /// Fields of `requested` that [`clamp`] changed.
     pub limited: Vec<LimitedField>,
+    /// Why (`ceiling_clamped` / `stop_time_limited`).
+    pub reasons: Vec<LimitReason>,
+    /// The clamped request changes the firmware tuning (duty cap) and not
+    /// every connected axis has ACKed that SET_LIMITS yet: `effective` keeps
+    /// the confirmed set (only lowered components are taken at once).
+    pub pending: bool,
 }
 
 /// The requested set shared by the API (writer) and the control loop (reader).
@@ -305,25 +420,82 @@ mod tests {
         Ceilings { max_gain: 1.0, max_vel_count_s: 6000, max_acc_count_s2: 40000, duty_max_percent: 60 }
     }
 
+    /// 0.8 × min(1500, 3000) ms, the default timing.
+    const DEADLINE: Duration = Duration::from_millis(1200);
+
     #[test]
     fn clamp_reports_each_field() {
         let req = MotionLimits { max_gain: 1.5, max_vel_count_s: 7000, max_acc_count_s2: 50000, duty_max_percent: 90 };
-        let (e, l) = clamp(&req, &ceilings());
-        assert_eq!(e, MotionLimits { max_gain: 1.0, max_vel_count_s: 6000, max_acc_count_s2: 40000, duty_max_percent: 60 });
+        let c = clamp(&req, &ceilings(), DEADLINE);
         assert_eq!(
-            l,
+            c.effective,
+            MotionLimits { max_gain: 1.0, max_vel_count_s: 6000, max_acc_count_s2: 40000, duty_max_percent: 60 }
+        );
+        assert_eq!(
+            c.limited,
             vec![LimitedField::MaxGain, LimitedField::MaxVelCountS, LimitedField::MaxAccCountS2, LimitedField::DutyMaxPercent]
         );
+        assert_eq!(c.reasons, vec![LimitReason::CeilingClamped]);
         let ok = MotionLimits { max_gain: 0.5, max_vel_count_s: 3000, max_acc_count_s2: 15000, duty_max_percent: 40 };
-        assert_eq!(clamp(&ok, &ceilings()), (ok, vec![]));
+        assert_eq!(clamp(&ok, &ceilings(), DEADLINE), Clamped { effective: ok, limited: vec![], reasons: vec![] });
     }
 
     #[test]
     fn clamp_degrades_bad_gain_to_zero() {
         let req = MotionLimits { max_gain: f64::NAN, max_vel_count_s: 1, max_acc_count_s2: 1, duty_max_percent: 1 };
-        assert_eq!(clamp(&req, &ceilings()).0.max_gain, 0.0);
+        assert_eq!(clamp(&req, &ceilings(), DEADLINE).effective.max_gain, 0.0);
         let req = MotionLimits { max_gain: -0.1, ..req };
-        assert_eq!(clamp(&req, &ceilings()).0.max_gain, 0.0);
+        assert_eq!(clamp(&req, &ceilings(), DEADLINE).effective.max_gain, 0.0);
+    }
+
+    #[test]
+    fn stop_deadline_is_a_fraction_of_the_shorter_timeout() {
+        let t = TimingConfig::default(); // mcu_stop 1500, stop_settle 3000
+        assert_eq!(stop_deadline(&t), DEADLINE);
+        let t = TimingConfig { stop_settle_timeout_ms: 1000, ..t };
+        assert_eq!(stop_deadline(&t), Duration::from_millis(800));
+        assert_eq!(stop_time_s(600, 1), 600.0);
+        assert_eq!(stop_time_s(600, 0), f64::INFINITY);
+        assert_eq!(min_acc_for_stop(600, DEADLINE), 500);
+        assert_eq!(min_acc_for_stop(6000, DEADLINE), 5000);
+        assert_eq!(min_acc_for_stop(0, DEADLINE), 0);
+        assert_eq!(min_acc_for_stop(600, Duration::ZERO), u32::MAX);
+    }
+
+    #[test]
+    fn clamp_raises_acc_to_the_stop_bound() {
+        // Issue #15 H2: 600 count/s with acc 1 would take 600 s to stop.
+        let req = MotionLimits { max_gain: 0.5, max_vel_count_s: 600, max_acc_count_s2: 1, duty_max_percent: 20 };
+        let c = clamp(&req, &ceilings(), DEADLINE);
+        assert_eq!(c.effective, MotionLimits { max_acc_count_s2: 500, ..req });
+        assert_eq!(c.limited, vec![LimitedField::MaxAccCountS2]);
+        assert_eq!(c.reasons, vec![LimitReason::StopTimeLimited]);
+        // Exactly at the bound: untouched.
+        let ok = MotionLimits { max_acc_count_s2: 500, ..req };
+        assert_eq!(clamp(&ok, &ceilings(), DEADLINE), Clamped { effective: ok, limited: vec![], reasons: vec![] });
+        // Judged on the ceiling-clamped velocity: 7000 → 6000 needs 5000.
+        let req = MotionLimits { max_vel_count_s: 7000, max_acc_count_s2: 1000, ..req };
+        let c = clamp(&req, &ceilings(), DEADLINE);
+        assert_eq!((c.effective.max_vel_count_s, c.effective.max_acc_count_s2), (6000, 5000));
+        assert_eq!(c.limited, vec![LimitedField::MaxVelCountS, LimitedField::MaxAccCountS2]);
+        assert_eq!(c.reasons, vec![LimitReason::CeilingClamped, LimitReason::StopTimeLimited]);
+    }
+
+    #[test]
+    fn clamp_lowers_vel_when_the_acc_ceiling_cannot_stop_it() {
+        // A unit whose absolute acceleration ceiling is tiny: 6000 count/s
+        // needs 5000 count/s², the ceiling gives 1000 → cap vel at 1200.
+        let c = Ceilings { max_acc_count_s2: 1000, ..ceilings() };
+        let req = MotionLimits { max_gain: 0.5, max_vel_count_s: 6000, max_acc_count_s2: 800, duty_max_percent: 20 };
+        let r = clamp(&req, &c, DEADLINE);
+        assert_eq!((r.effective.max_vel_count_s, r.effective.max_acc_count_s2), (1200, 1000));
+        assert_eq!(r.limited, vec![LimitedField::MaxVelCountS, LimitedField::MaxAccCountS2]);
+        assert_eq!(r.reasons, vec![LimitReason::StopTimeLimited]);
+        // acc already at the ceiling: only the velocity moves.
+        let req = MotionLimits { max_acc_count_s2: 1000, ..req };
+        let r = clamp(&req, &c, DEADLINE);
+        assert_eq!((r.effective.max_vel_count_s, r.effective.max_acc_count_s2), (1200, 1000));
+        assert_eq!(r.limited, vec![LimitedField::MaxVelCountS]);
     }
 
     #[test]

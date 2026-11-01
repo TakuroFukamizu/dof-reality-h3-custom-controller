@@ -289,7 +289,12 @@
   }
   function renderLimits(ml) {
     if (!ml) return;
-    $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '');
+    // `limited` = fields the clamp changed, `reasons` = why (ceiling_clamped / stop_time_limited),
+    // `pending` = waiting for every axis to ACK the new duty cap before the planner uses it.
+    const why = (ml.limited && ml.limited.length)
+      ? ' (clamped: ' + ml.limited.join(',') + ((ml.reasons && ml.reasons.length) ? ' — ' + ml.reasons.join(',') : '') + ')'
+      : '';
+    $('limEff').textContent = limitsText(ml.effective) + why + (ml.pending ? ' [pending: SET_LIMITS 未 ACK]' : '');
     $('limCeil').textContent = limitsText(ml.ceiling);
     if (ml.ceiling) {
       state.limitsCeiling = ml.ceiling;
