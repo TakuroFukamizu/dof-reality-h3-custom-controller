@@ -10,7 +10,8 @@ use std::time::Duration;
 use h3cs::calibration;
 use h3cs::compat;
 use h3cs::config::Config;
-use h3cs::protocol::{msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
+use h3cs::limits::MotionLimits;
+use h3cs::protocol::{capabilities, msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
 use h3cs::session::{AcceptedPose, PoseIntake, PoseMsg};
 use h3cs::sim_axis::{SimMcu, SimParams};
 use h3cs::supervisor::{admin_error, ActiveSource, AdminCmd, LinkEvent, Supervisor};
@@ -229,6 +230,10 @@ impl Rig {
                     Some(axis) => LinkEvent::CalResult { axis, result },
                     None => continue,
                 },
+                McuMsg::Limits(limits) => match self.axis_of[i] {
+                    Some(axis) => LinkEvent::Limits { axis, limits },
+                    None => continue,
+                },
                 McuMsg::ClockSyncReply(_) => continue,
             };
             self.sup.on_link_event(ev, self.now);
@@ -284,6 +289,7 @@ impl Rig {
             &msg,
             self.now,
             &self.cfg.game,
+            self.cfg.limits.max_gain,
             self.cfg.timing.source_freshness_ms,
         );
         self.pose = Some(p.unwrap());
@@ -434,7 +440,7 @@ fn has(blockers: &[String], needle: &str) -> bool {
 /// Count targets the supervisor should command for `pose` at `gain`, from the
 /// library's own compat mix and calibration.
 fn expected_counts(cfg: &Config, pose: Pose, gain: f64) -> [i32; 3] {
-    let checked = compat::check_pose(pose, gain, cfg.game.max_gain, true).unwrap();
+    let checked = compat::check_pose(pose, gain, cfg.limits.max_gain, true).unwrap();
     let (virt, _) = compat::saturate(
         compat::mix(checked.pose, checked.effective_gain),
         cfg.game.virtual_min,
@@ -464,10 +470,12 @@ fn identify_sends_only_config_and_moves_nothing() {
     r.run_ms(2000);
     assert_eq!(r.sup.state(), RigState::ReadyToArm);
     assert!(!r.sent.is_empty());
+    // CONFIG and SET_LIMITS (the position-loop tuning) only: nothing moves.
     for (_, _, m) in &r.sent {
-        assert!(matches!(m, HostMsg::Config(_)), "unexpected {m:?}");
+        assert!(matches!(m, HostMsg::Config(_) | HostMsg::SetLimits(_)), "unexpected {m:?}");
     }
     assert_eq!(r.count(0, msg_type::CONFIG), [1, 1, 1]);
+    assert_eq!(r.count(0, msg_type::SET_LIMITS), [1, 1, 1]);
     assert!(r.setpos.is_empty(), "SET_POSITION sent without ARM");
     assert_eq!(r.mcu_states(), vec![McuState::Disarmed; 3]);
     assert!(r.mcus.iter().all(|m| m.actual_count() == 0));
@@ -515,7 +523,7 @@ fn reconnect_after_session_does_not_arm() {
     assert_eq!(r.sup.state(), RigState::ReadyToArm);
     assert!(!r.sup.is_armed());
     for (_, _, m) in r.sent_since(mark) {
-        assert!(matches!(m, HostMsg::Config(_)), "unexpected {m:?}");
+        assert!(matches!(m, HostMsg::Config(_) | HostMsg::SetLimits(_)), "unexpected {m:?}");
     }
     assert_eq!(r.setpos.len(), sp_mark);
     assert_eq!(r.mcu_states(), vec![McuState::Disarmed; 3]);
@@ -567,11 +575,11 @@ fn unit_without_selection_and_without_configured_device_id_is_unknown() {
         "{:?}",
         e.blockers
     );
-    // Nothing but CONFIG to the known axes, nothing at all to the unknown port.
+    // Nothing but CONFIG / SET_LIMITS to the known axes, nothing at all to the unknown port.
     assert!(r
         .sent
         .iter()
-        .all(|(i, _, m)| *i != 1 && matches!(m, HostMsg::Config(_))));
+        .all(|(i, _, m)| *i != 1 && matches!(m, HostMsg::Config(_) | HostMsg::SetLimits(_))));
 }
 
 #[test]
@@ -849,10 +857,10 @@ fn happy_path_arm_start_track_stale_stop_hold_disarm() {
     }
     let first = &r.setpos[0].2;
     assert_eq!([first[0].seq, first[1].seq, first[2].seq], [1, 1, 1]);
-    for (k, a) in cfg.axes.iter().enumerate() {
+    for k in 0..3 {
         assert_eq!(first[k].session_epoch, r.sup.session_epoch());
-        assert_eq!(first[k].max_vel_count_s, a.max_vel_count_s);
-        assert_eq!(first[k].max_acc_count_s2, a.max_acc_count_s2);
+        assert_eq!(first[k].max_vel_count_s, cfg.limits.max_vel_count_s);
+        assert_eq!(first[k].max_acc_count_s2, cfg.limits.max_acc_count_s2);
         assert_eq!(first[k].valid_for_ms, cfg.timing.set_position_valid_for_ms);
         assert_eq!(first[k].apply_at_us, 0);
     }
@@ -1063,11 +1071,11 @@ fn disarm_from_active_brakes_without_center() {
 fn gain_over_max_reported_in_snapshot() {
     let cfg = sim_cfg();
     let mut r = Rig::new(cfg.clone());
-    r.active(POSE_A, 0.6); // max_gain 0.35
+    r.active(POSE_A, 0.6); // limits.max_gain 0.5
     r.run_ms(3000);
     let snap = r.sup.snapshot(r.now);
     assert_eq!(snap.requested_gain, Some(0.6));
-    assert_eq!(snap.effective_gain, Some(cfg.game.max_gain));
+    assert_eq!(snap.effective_gain, Some(cfg.limits.max_gain));
     assert!(
         snap.limits.contains(&LimitReason::GainLimited),
         "{:?}",
@@ -1075,14 +1083,14 @@ fn gain_over_max_reported_in_snapshot() {
     );
     assert_eq!(
         snap.target_counts,
-        expected_counts(&cfg, POSE_A, cfg.game.max_gain)
+        expected_counts(&cfg, POSE_A, cfg.limits.max_gain)
     );
 }
 
 #[test]
 fn saturation_and_soft_limits_reported() {
     let mut cfg = sim_cfg();
-    cfg.game.max_gain = 1.0;
+    cfg.limits.max_gain = 1.0;
     cfg.game.virtual_max = 900.0;
     let mut r = Rig::new(cfg.clone());
     r.active(
@@ -1385,17 +1393,17 @@ fn center_moves_to_neutral_at_reduced_speed_then_holds() {
         .collect();
     assert!(!centering.is_empty());
     for (_, _, sp) in &centering {
-        for (k, a) in cfg.axes.iter().enumerate() {
+        for k in 0..3 {
             assert_eq!(
                 sp[k].max_vel_count_s,
-                (f64::from(a.max_vel_count_s) * f).round() as u32
+                (f64::from(cfg.limits.max_vel_count_s) * f).round() as u32
             );
         }
     }
     for w in r.setpos[sp_mark..].windows(2) {
-        for (k, a) in cfg.axes.iter().enumerate() {
+        for k in 0..3 {
             let step = (w[1].2[k].target_count - w[0].2[k].target_count).abs();
-            let max = f64::from(a.max_vel_count_s) * f * STEP.as_secs_f64() + 1.0;
+            let max = f64::from(cfg.limits.max_vel_count_s) * f * STEP.as_secs_f64() + 1.0;
             assert!(f64::from(step) <= max, "axis{} step {step} > {max}", k + 1);
         }
     }
@@ -1480,7 +1488,7 @@ fn config_rejection_outside_arming_is_not_a_fault() {
     );
     let out = sup.tick(now, 0.01, None);
     assert!(out.set_position.is_none());
-    let [HostMsg::Config(c)] = out.admin_msgs[0].as_slice() else {
+    let [HostMsg::Config(c), HostMsg::SetLimits(_)] = out.admin_msgs[0].as_slice() else {
         panic!("{:?}", out.admin_msgs)
     };
     assert!(out.admin_msgs[1].is_empty() && out.admin_msgs[2].is_empty());
@@ -1553,6 +1561,7 @@ fn snapshot_json_shape() {
         "measured_angles",
         "physical_estop",
         "telemetry",
+        "motion_limits",
     ];
     let mut got = keys.clone();
     got.sort_unstable();
@@ -1601,6 +1610,7 @@ fn snapshot_json_shape() {
         "stale_drop_count",
         "decode_errors",
         "calibration",
+        "fw_limits",
     ];
     akeys.sort_unstable();
     awant.sort_unstable();
@@ -2725,4 +2735,132 @@ fn unanswered_calibrate_is_forgotten_after_ack_timeout_and_the_power_axis_cancel
     let (events, _) = r.sup.drain_events();
     assert!(events.iter().any(|e| e.kind == "ack_timeout"));
     assert!(events.iter().any(|e| e.kind == "calibrate_cancelled"));
+}
+
+// ------------------------------------------------------------------ motion limits (design 2026-11-01)
+
+#[test]
+fn limits_are_distributed_once_and_follow_runtime_changes() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.ready();
+    // One SET_LIMITS per axis with the [limits] values; CONFIG carried the ceilings.
+    assert_eq!(r.count(0, msg_type::SET_LIMITS), [1, 1, 1]);
+    let sl = r
+        .sent
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::SetLimits(l) => Some(*l),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((sl.duty_max_percent, sl.duty_min_percent, sl.kp_percent_per_100), (40, 3, 2));
+    assert_eq!((sl.ff_count_s_per_percent, sl.deadband_count, sl.deadband_out_count), (100, 10, 20));
+    let c = r
+        .sent
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::Config(c) => Some(*c),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((c.max_vel_count_s, c.max_acc_count_s2), (6000, 40000));
+    assert_eq!((c.following_error_limit_count, c.overspeed_count_s), (800, 9000));
+    // The units applied it and reported LIMITS.
+    let snap = r.sup.snapshot(r.now);
+    for a in &snap.axes {
+        let l = a.fw_limits.expect("LIMITS received");
+        assert_eq!((l.duty_max_percent, l.abs_duty_max_percent, l.abs_max_vel_count_s), (40, 60, 6000));
+    }
+    assert_eq!(snap.motion_limits.effective, MotionLimits::from_config(&cfg.limits));
+    assert_eq!(snap.motion_limits.requested, snap.motion_limits.effective);
+    assert_eq!(snap.motion_limits.defaults, snap.motion_limits.effective);
+    assert_eq!(snap.motion_limits.ceiling.max_vel_count_s, 6000);
+    assert_eq!(snap.motion_limits.ceiling.max_gain, 1.0);
+    assert!(snap.motion_limits.limited.is_empty());
+    assert!(!has(&r.blockers(), "firmware_limits_unsupported"));
+    for m in r.mcus.iter() {
+        assert_eq!((m.tuning().duty_max_percent, m.tuning().duty_min_percent), (40, 3));
+    }
+
+    // A request above every ceiling: clamped, one new SET_LIMITS per axis.
+    let mark = r.sent.len();
+    r.sup.set_requested_limits(MotionLimits {
+        max_gain: 1.5,
+        max_vel_count_s: 7000,
+        max_acc_count_s2: 50000,
+        duty_max_percent: 90,
+    });
+    r.run_ms(200);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(
+        snap.motion_limits.effective,
+        MotionLimits { max_gain: 1.0, max_vel_count_s: 6000, max_acc_count_s2: 40000, duty_max_percent: 60 }
+    );
+    assert_eq!(snap.motion_limits.limited.len(), 4);
+    for m in r.mcus.iter() {
+        assert_eq!(m.tuning().duty_max_percent, 60);
+    }
+    // Nothing more while the request stays the same.
+    let mark = r.sent.len();
+    r.run_ms(500);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
+    // A change that does not touch the firmware tuning sends nothing to the MCUs.
+    r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 2000, ..r.sup.effective_limits() });
+    r.run_ms(200);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
+    assert_eq!(r.sup.effective_limits().max_vel_count_s, 2000);
+}
+
+#[test]
+fn runtime_velocity_limit_governs_set_position_while_active() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 1200, max_acc_count_s2: 5000, ..r.sup.effective_limits() });
+    let mark = r.setpos.len();
+    r.run_ms(200);
+    assert!(r.setpos.len() > mark);
+    for (_, _, sp) in &r.setpos[mark + 1..] {
+        for k in 0..3 {
+            assert_eq!(sp[k].max_vel_count_s, 1200);
+            assert_eq!(sp[k].max_acc_count_s2, 5000);
+        }
+    }
+    assert_eq!(r.sup.state(), RigState::Active);
+    assert!(r.sup.fault().is_none());
+}
+
+#[test]
+fn limits_are_resent_after_a_reconnect() {
+    let mut r = Rig::new(sim_cfg());
+    r.ready();
+    let mark = r.sent.len();
+    r.disconnect(1);
+    r.run_ms(100);
+    r.connect(1);
+    r.run_ms(500);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 1, 0]);
+    assert_eq!(r.sup.state(), RigState::ReadyToArm);
+}
+
+#[test]
+fn firmware_without_limits_capability_blocks_arm_and_gets_no_set_limits() {
+    let cfg = sim_cfg();
+    let mut sup = Supervisor::new(&cfg);
+    let mut mcu = SimMcu::new(SimParams { device_id: cfg.axes[0].device_id, ..SimParams::default() });
+    let now = Instant::now();
+    let Some(McuMsg::Hello(hello)) = mcu.handle(&HostMsg::HelloReq { request_id: 1 }, 1).into_iter().next() else {
+        panic!("no hello")
+    };
+    // An older firmware: POSITION_MODE only.
+    let hello = Hello { capabilities: capabilities::POSITION_MODE, ..hello };
+    sup.on_link_event(LinkEvent::Identified { axis: ax(1), hello, port: "sim:1".into() }, now);
+    sup.on_link_event(LinkEvent::Status { axis: ax(1), status: mcu.status(), received_at: now }, now);
+    let out = sup.tick(now, 0.01, None);
+    assert!(out.admin_msgs[0].iter().all(|m| matches!(m, HostMsg::Config(_))), "{:?}", out.admin_msgs);
+    assert!(has(&sup.blockers(now), "firmware_limits_unsupported: axis1"), "{:?}", sup.blockers(now));
+    // Its CONFIG still carries the fallback ceilings.
+    let HostMsg::Config(c) = out.admin_msgs[0][0] else { panic!() };
+    assert_eq!((c.max_vel_count_s, c.max_acc_count_s2), (6000, 40000));
 }

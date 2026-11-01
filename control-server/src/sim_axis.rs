@@ -169,9 +169,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::config::SimBackendConfig;
 use crate::protocol::cobs::{self, FrameAccumulator};
 use crate::protocol::{
-    self, calibrate_mode, capabilities, frame, msg_type, role_flags, Ack, AckReason, AckResult,
-    CalResult, CalResultCode, ClockSyncReply, Config, FaultEvent, Hello, HostMsg, McuMsg,
-    SetPosition, Status, CAL_REASON_LEN, MAX_ENCODED_LEN, PROTOCOL_VERSION,
+    self, calibrate_mode, capabilities, frame, fw_absolute, msg_type, role_flags, Ack, AckReason,
+    AckResult, CalResult, CalResultCode, ClockSyncReply, Config, FaultEvent, Hello, HostMsg,
+    Limits, McuMsg, SetLimits, SetPosition, Status, CAL_REASON_LEN, MAX_ENCODED_LEN,
+    PROTOCOL_VERSION,
 };
 use crate::types::{status_flags, Counts, DeviceId, FaultCode, McuState};
 
@@ -294,6 +295,31 @@ struct CalRun {
     outcome: Option<(CalResultCode, [u8; CAL_REASON_LEN])>,
 }
 
+/// Position-loop tuning as the firmware holds it (SET_LIMITS content).
+/// Defaults are the firmware's `config.h` values before any SET_LIMITS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimTuning {
+    pub duty_max_percent: u8,
+    pub duty_min_percent: u8,
+    pub kp_percent_per_100: u8,
+    pub ff_count_s_per_percent: u16,
+    pub deadband_count: u16,
+    pub deadband_out_count: u16,
+}
+
+impl Default for SimTuning {
+    fn default() -> Self {
+        Self {
+            duty_max_percent: 20,
+            duty_min_percent: 7,
+            kp_percent_per_100: 2,
+            ff_count_s_per_percent: 100,
+            deadband_count: 10,
+            deadband_out_count: 20,
+        }
+    }
+}
+
 /// Pure model of one axis MCU. Time is injected as `now_us` (any monotonic
 /// microsecond clock); calls with an older `now_us` do not move time back.
 #[derive(Debug, Clone)]
@@ -314,6 +340,10 @@ pub struct SimMcu {
 
     config: Option<Config>,
     referenced: bool,
+    /// SET_LIMITS state (firmware defaults until the first one).
+    tuning: SimTuning,
+    /// A LIMITS reply is owed after the ACK of an accepted SET_LIMITS.
+    limits_reply_due: bool,
 
     // Timers (absolute now_us).
     arming_started_us: u64,
@@ -375,6 +405,8 @@ impl SimMcu {
             last_host_fault_code: None,
             config: None,
             referenced: params.start_referenced,
+            tuning: SimTuning::default(),
+            limits_reply_due: false,
             arming_started_us: 0,
             disarming_started_us: 0,
             stopping_started_us: 0,
@@ -491,6 +523,11 @@ impl SimMcu {
     pub fn selected_axis(&self) -> u8 {
         self.selected_axis
     }
+    /// Position-loop tuning in effect (SET_LIMITS, clamped).
+    pub fn tuning(&self) -> SimTuning {
+        self.tuning
+    }
+
     pub fn config(&self) -> Option<&Config> {
         self.config.as_ref()
     }
@@ -736,6 +773,13 @@ impl SimMcu {
             } => self.command(msg, request_id, msg_type::SET_REFERENCE, now, |s, _| {
                 s.on_set_reference(reference_count)
             }),
+            HostMsg::SetLimits(l) => {
+                self.command(msg, l.request_id, msg_type::SET_LIMITS, now, |s, _| s.on_set_limits(&l));
+                // After the ACK (protocol: ACK first, then one LIMITS).
+                if std::mem::take(&mut self.limits_reply_due) {
+                    self.push_limits();
+                }
+            }
             HostMsg::Calibrate { request_id, mode, .. } => {
                 self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
                     s.on_calibrate(mode, now)
@@ -804,7 +848,7 @@ impl SimMcu {
             device_id: self.params.device_id,
             boot_id: self.boot_id,
             fw_version: self.params.fw_version,
-            capabilities: capabilities::POSITION_MODE,
+            capabilities: capabilities::POSITION_MODE | capabilities::LIMITS,
             calibration_hash: self.config.map_or(0, |c| c.calibration_hash),
         }));
     }
@@ -839,8 +883,52 @@ impl SimMcu {
             // seq is monotonic per epoch: a new epoch restarts it.
             self.last_rx_seq = 0;
         }
-        self.config = Some(*c);
+        // Firmware absolute ceilings (design 2026-11-01 §4.4): clamp, never reject.
+        self.config = Some(Config {
+            max_vel_count_s: c.max_vel_count_s.min(fw_absolute::MAX_VEL_COUNT_S),
+            max_acc_count_s2: c.max_acc_count_s2.min(fw_absolute::MAX_ACC_COUNT_S2),
+            ..*c
+        });
         Ok(())
+    }
+
+    /// SET_LIMITS (design §4.2): any state; invalid combinations are
+    /// INVALID_PARAM; duty values above the absolute ceiling are clamped.
+    fn on_set_limits(&mut self, l: &SetLimits) -> Result<(), AckReason> {
+        if l.duty_max_percent == 0
+            || l.duty_min_percent > l.duty_max_percent
+            || l.ff_count_s_per_percent == 0
+            || l.deadband_out_count < l.deadband_count
+        {
+            return Err(AckReason::InvalidParam);
+        }
+        let duty_max = l.duty_max_percent.min(fw_absolute::DUTY_MAX_PERCENT);
+        self.tuning = SimTuning {
+            duty_max_percent: duty_max,
+            duty_min_percent: l.duty_min_percent.min(duty_max),
+            kp_percent_per_100: l.kp_percent_per_100,
+            ff_count_s_per_percent: l.ff_count_s_per_percent,
+            deadband_count: l.deadband_count,
+            deadband_out_count: l.deadband_out_count,
+        };
+        self.limits_reply_due = true;
+        Ok(())
+    }
+
+    fn push_limits(&mut self) {
+        let t = self.tuning;
+        self.push(McuMsg::Limits(Limits {
+            boot_id: self.boot_id,
+            duty_max_percent: t.duty_max_percent,
+            duty_min_percent: t.duty_min_percent,
+            kp_percent_per_100: t.kp_percent_per_100,
+            abs_duty_max_percent: fw_absolute::DUTY_MAX_PERCENT,
+            ff_count_s_per_percent: t.ff_count_s_per_percent,
+            deadband_count: t.deadband_count,
+            deadband_out_count: t.deadband_out_count,
+            abs_max_vel_count_s: fw_absolute::MAX_VEL_COUNT_S,
+            abs_max_acc_count_s2: fw_absolute::MAX_ACC_COUNT_S2,
+        }));
     }
 
     /// ARM_PREPARE: DISARMED + CONFIGURED + REFERENCED + epoch → ARMING.
@@ -1405,8 +1493,10 @@ impl SimMcu {
                 self.setpoint_vel = v;
             }
             McuState::Stopping => {
-                // Decelerate at the CONFIG acceleration limit, no target.
-                let dv = cfg.max_acc_count_s2 as f64 * dt;
+                // Decelerate at the last applied frame's acceleration limit
+                // (design 2026-11-01 §4.4: CONFIG carries the absolute ceiling).
+                let amax = if self.frame_max_acc > 0.0 { self.frame_max_acc } else { cfg.max_acc_count_s2 as f64 };
+                let dv = amax * dt;
                 let v = self.setpoint_vel;
                 let v = if v.abs() <= dv {
                     0.0

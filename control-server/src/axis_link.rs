@@ -611,6 +611,10 @@ impl Link {
                 axis: claimed.axis,
                 result,
             },
+            Ok(McuMsg::Limits(limits)) => LinkEvent::Limits {
+                axis: claimed.axis,
+                limits,
+            },
             Ok(McuMsg::Hello(h)) => {
                 if h.device_id != claimed.hello.device_id {
                     return Err(ReadEnd::Disconnected(format!(

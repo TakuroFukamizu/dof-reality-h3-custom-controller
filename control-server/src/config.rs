@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Upper bound for every `*_ms` setting (1 h). Larger values are typos and
 /// would overflow `Instant + Duration`.
@@ -40,6 +40,10 @@ pub struct Config {
     pub timing: TimingConfig,
     #[serde(default)]
     pub game: GameConfig,
+    /// Motion limits: the PC-side current set's initial values plus the
+    /// values distributed to the MCUs (design 2026-11-01 §2).
+    #[serde(default)]
+    pub limits: LimitsConfig,
     pub backend: BackendConfig,
     /// The only axis whose MCU drives the shared main-power relay (G2).
     pub power_controller_axis: AxisId,
@@ -133,9 +137,6 @@ impl Default for TimingConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GameConfig {
-    /// Max effective gain allowed by this machine profile. The old UI max 0.6 is
-    /// NOT a validated limit for the new rig.
-    pub max_gain: f64,
     /// When false, a pose without `frame_seq` is rejected. When true it is accepted
     /// and freshness is "timer only" (cannot detect a frozen game loop).
     pub allow_missing_frame_seq: bool,
@@ -151,12 +152,60 @@ pub struct GameConfig {
 impl Default for GameConfig {
     fn default() -> Self {
         Self {
-            max_gain: 0.35,
             allow_missing_frame_seq: false,
             clamp_out_of_range: true,
             virtual_min: 0.0,
             virtual_max: 1023.0,
             center_speed_fraction: 0.25,
+        }
+    }
+}
+
+/// `[limits]`: one set for all three axes. The first four are the runtime
+/// set's initial values (changed by WS `limits` / `POST /v1/limits`, reset
+/// on `POST /v1/session`); the rest are distributed to the MCUs (SET_LIMITS,
+/// CONFIG) and not changeable at runtime. Every value is an estimate not yet
+/// verified on the rig (`docs/control-server/limits.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsConfig {
+    /// Gain ceiling for the game (≤ 1.0; 0.5 keeps a full pitch+roll inside
+    /// virtual 0..=1023).
+    pub max_gain: f64,
+    pub max_vel_count_s: u32,
+    pub max_acc_count_s2: u32,
+    /// Position-loop duty cap sent to the MCUs (clamped there to the
+    /// firmware's absolute ceiling).
+    pub duty_max_percent: u8,
+    /// Smallest non-zero duty the loop commands (the firmware default 7 %
+    /// made slow motion step).
+    pub duty_min_percent: u8,
+    pub kp_percent_per_100: u8,
+    /// Feed-forward: trajectory speed [count/s] ÷ this = duty [%].
+    pub ff_count_s_per_percent: u16,
+    pub deadband_count: u16,
+    pub deadband_out_count: u16,
+    /// Protection thresholds (CONFIG).
+    pub following_error_limit_count: u32,
+    /// Must be ≥ 1.5 × `max_vel_count_s`; also caps runtime velocity
+    /// requests at `overspeed / 1.5`.
+    pub overspeed_count_s: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_gain: 0.5,
+            max_vel_count_s: 3000,
+            max_acc_count_s2: 15000,
+            duty_max_percent: 40,
+            duty_min_percent: 3,
+            kp_percent_per_100: 2,
+            ff_count_s_per_percent: 100,
+            deadband_count: 10,
+            deadband_out_count: 20,
+            following_error_limit_count: 800,
+            overspeed_count_s: 9000,
         }
     }
 }
@@ -261,10 +310,6 @@ pub struct AxisConfig {
     pub soft_min_count: i32,
     pub soft_max_count: i32,
     pub decel_zone_count: i32,
-    pub max_vel_count_s: u32,
-    pub max_acc_count_s2: u32,
-    pub following_error_limit_count: u32,
-    pub overspeed_count_s: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -292,8 +337,8 @@ impl Config {
 
     /// Structural validation. Must reject: wrong schema_version; not exactly one
     /// axis per AxisId 1..=3; duplicate device_id; non-loopback bind without
-    /// allow_non_loopback; max_gain outside 0..=1; virtual_min/max outside
-    /// 0..=1023 or min >= max; timing values of 0; per-axis calibration
+    /// allow_non_loopback; virtual_min/max outside 0..=1023 or min >= max;
+    /// timing values of 0; `[limits]` rules (below); per-axis calibration
     /// invariants (see `crate::calibration::AxisCalibration::validate`).
     ///
     /// All-zero device_ids (`DeviceId::is_unassigned`) mean "no cross-check"
@@ -420,9 +465,6 @@ impl Config {
 
         // Game.
         let g = &self.game;
-        if !(g.max_gain.is_finite() && (0.0..=1.0).contains(&g.max_gain)) {
-            errs.push(format!("game.max_gain must be within 0..=1, got {}", g.max_gain));
-        }
         let vrange = VIRTUAL_MIN..=VIRTUAL_MAX;
         if !vrange.contains(&g.virtual_min) {
             errs.push(format!("game.virtual_min must be within 0..=1023, got {}", g.virtual_min));
@@ -438,6 +480,48 @@ impl Config {
         }
         if !(g.center_speed_fraction > 0.0 && g.center_speed_fraction <= 1.0) {
             errs.push(format!("game.center_speed_fraction must be within (0, 1], got {}", g.center_speed_fraction));
+        }
+
+        // Limits (design 2026-11-01 §2).
+        let l = &self.limits;
+        if !(l.max_gain.is_finite() && l.max_gain > 0.0 && l.max_gain <= 1.0) {
+            errs.push(format!("limits.max_gain must be within (0, 1], got {}", l.max_gain));
+        }
+        for (name, v) in [
+            ("limits.max_vel_count_s", l.max_vel_count_s),
+            ("limits.max_acc_count_s2", l.max_acc_count_s2),
+            ("limits.following_error_limit_count", l.following_error_limit_count),
+            ("limits.overspeed_count_s", l.overspeed_count_s),
+        ] {
+            if v == 0 {
+                errs.push(format!("{name} must be > 0"));
+            }
+        }
+        if !(1..=100).contains(&l.duty_max_percent) {
+            errs.push(format!("limits.duty_max_percent must be within 1..=100, got {}", l.duty_max_percent));
+        }
+        if l.duty_min_percent > l.duty_max_percent {
+            errs.push(format!(
+                "limits.duty_min_percent ({}) must be <= limits.duty_max_percent ({})",
+                l.duty_min_percent, l.duty_max_percent
+            ));
+        }
+        if l.ff_count_s_per_percent == 0 {
+            errs.push("limits.ff_count_s_per_percent must be > 0".into());
+        }
+        if l.deadband_out_count < l.deadband_count {
+            errs.push(format!(
+                "limits.deadband_out_count ({}) must be >= limits.deadband_count ({})",
+                l.deadband_out_count, l.deadband_count
+            ));
+        }
+        if f64::from(l.overspeed_count_s) < crate::limits::OVERSPEED_MARGIN * f64::from(l.max_vel_count_s) {
+            errs.push(format!(
+                "limits.overspeed_count_s ({}) must be >= {} x limits.max_vel_count_s ({})",
+                l.overspeed_count_s,
+                crate::limits::OVERSPEED_MARGIN,
+                l.max_vel_count_s
+            ));
         }
 
         // Backend.

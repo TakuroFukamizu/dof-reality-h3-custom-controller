@@ -85,11 +85,12 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::calibration_export::{self, AxisExport};
 use crate::config::{bounded_ms, Config};
+use crate::limits::{self as motion_limits, Ceilings, LimitsPatch, MotionLimits, PatchError, SharedLimits};
 use crate::protocol::CalResultCode;
 use crate::session::{AckMsg, AcceptedPose, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
 use crate::supervisor::{AdminCmd, AdminError, AdminOk, StatusSnapshot};
 use crate::telemetry::{lock_events, shared_event_log, SharedEventLog};
-use crate::types::{AxisId, Counts};
+use crate::types::{AxisId, Counts, LimitReason};
 
 /// How long an admin request may wait for the control loop (→ 503).
 pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -155,6 +156,9 @@ pub struct AppState {
 
 struct Inner {
     cfg: Arc<Config>,
+    /// Requested motion limits shared with the control loop (design
+    /// 2026-11-01 §5.2). Reset to `cfg.limits` on every new session.
+    limits: SharedLimits,
     session: Arc<Mutex<PoseIntake>>,
     pose_tx: Arc<watch::Sender<Option<AcceptedPose>>>,
     admin_tx: mpsc::Sender<AdminRequest>,
@@ -176,11 +180,62 @@ impl AppState {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let bucket = Mutex::new(TokenBucket::new(cfg.server.admin_rate_limit_per_s, Instant::now()));
+        let limits = motion_limits::shared(MotionLimits::from_config(&cfg.limits));
         Self {
-            inner: Arc::new(Inner { cfg, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
+            inner: Arc::new(Inner { cfg, limits, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
             events: shared_event_log(Instant::now()),
             config_path: None,
         }
+    }
+
+    /// Share the requested motion limits with the control loop (the server
+    /// passes the same `Arc` to both). Without it the state keeps a private
+    /// copy (tests of the API alone).
+    pub fn with_limits(self, limits: SharedLimits) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| Inner {
+            cfg: arc.cfg.clone(),
+            limits: arc.limits.clone(),
+            session: arc.session.clone(),
+            pose_tx: arc.pose_tx.clone(),
+            admin_tx: arc.admin_tx.clone(),
+            status_rx: arc.status_rx.clone(),
+            admin_token: arc.admin_token.clone(),
+            bucket: Mutex::new(TokenBucket::new(arc.cfg.server.admin_rate_limit_per_s, Instant::now())),
+            shutdown_rx: arc.shutdown_rx.clone(),
+        });
+        Self { inner: Arc::new(Inner { limits, ..inner }), ..self }
+    }
+
+    /// The `[limits]` values (what a new session resets to).
+    fn limits_defaults(&self) -> MotionLimits {
+        MotionLimits::from_config(&self.inner.cfg.limits)
+    }
+
+    /// Ceilings as the control loop last published them (fallback constants
+    /// before the first LIMITS from an axis).
+    fn ceilings(&self) -> Ceilings {
+        self.inner.status_rx.borrow().motion_limits.ceiling
+    }
+
+    /// The gain ceiling in effect for pose / gain messages.
+    fn current_max_gain(&self) -> f64 {
+        motion_limits::clamp(&motion_limits::read(&self.inner.limits), &self.ceilings()).0.max_gain
+    }
+
+    /// `GET /v1/limits` body (also the `POST` answer): the requested set and
+    /// what it clamps to right now.
+    fn limits_view(&self) -> Value {
+        let requested = motion_limits::read(&self.inner.limits);
+        let ceiling = self.ceilings();
+        let (effective, limited) = motion_limits::clamp(&requested, &ceiling);
+        json!({
+            "ok": true,
+            "effective": effective,
+            "requested": requested,
+            "ceiling": ceiling,
+            "defaults": self.limits_defaults(),
+            "limited": limited,
+        })
     }
 
     /// Where the running config was read from: `POST /v1/calibration/export`
@@ -213,6 +268,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/fault/reset", post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)))
         .route("/v1/center", post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)))
         .route("/v1/reference", post(reference))
+        .route("/v1/limits", post(set_limits))
         .route("/v1/calibrate", post(calibrate))
         .route("/v1/calibration/export", post(calibration_export))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
@@ -230,6 +286,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/session", post(new_session))
         .route("/v1/motion", get(motion))
         .route("/v1/status", get(status))
+        .route("/v1/limits", get(get_limits))
         .route("/v1/events", get(events))
         .route("/v1/stop", post(|s: State<AppState>| admin_simple(s, AdminCmd::Stop)))
         .merge(admin)
@@ -597,22 +654,58 @@ fn write_export(
 
 async fn new_session(State(st): State<AppState>) -> Response {
     let cfg = &st.inner.cfg;
+    let defaults = st.limits_defaults();
     let id = {
         let mut s = st.session();
         let id = s.new_session();
         // Under the lock: no pose of the old session can land after this.
         st.inner.pose_tx.send_replace(None);
+        // A new session starts from the configured limits (design §5.2).
+        motion_limits::write(&st.inner.limits, defaults);
         id
     };
     tracing::info!("new game session issued");
     Json(json!({
         "source_session": id,
         "protocol": PROTOCOL_VERSION,
-        "max_gain": cfg.game.max_gain,
+        "max_gain": st.current_max_gain(),
         "source_freshness_ms": cfg.timing.source_freshness_ms,
         "require_frame_seq": !cfg.game.allow_missing_frame_seq,
     }))
     .into_response()
+}
+
+/// `GET /v1/limits`: the shared motion limits (design 2026-11-01 §5.3).
+async fn get_limits(State(st): State<AppState>) -> Response {
+    if !loop_alive(&st) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+    }
+    Json(st.limits_view()).into_response()
+}
+
+/// `POST /v1/limits` (admin): apply a [`LimitsPatch`] to the requested set.
+/// Values above the ceilings are clamped (reported in `limited`), invalid
+/// ones are 400.
+async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
+    if !loop_alive(&st) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+    }
+    let Ok(patch) = serde_json::from_slice::<LimitsPatch>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    match apply_limits_patch(&st, &patch) {
+        Ok(()) => Json(st.limits_view()).into_response(),
+        Err(PatchError::NonFinite) => error(StatusCode::BAD_REQUEST, "non_finite"),
+        Err(PatchError::OutOfRange) => error(StatusCode::BAD_REQUEST, "out_of_range"),
+    }
+}
+
+/// Replace the present fields of the shared requested set.
+fn apply_limits_patch(st: &AppState, patch: &LimitsPatch) -> Result<(), PatchError> {
+    let mut guard = st.inner.limits.lock().unwrap_or_else(|e| e.into_inner());
+    let next = patch.apply(*guard)?;
+    *guard = next;
+    Ok(())
 }
 
 /// False once the control loop has ended (its status sender is gone).
@@ -742,22 +835,42 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
     };
     let seq = msg.seq();
     let mut s = st.session();
-    let msg_session = match &msg {
-        ClientMsg::Pose(p) => p.source_session.as_str(),
-        ClientMsg::Gain(g) => g.source_session.as_str(),
-    };
-    if pinned.is_some_and(|p| p != msg_session) {
+    if pinned.is_some_and(|p| p != msg.source_session()) {
         return AckMsg::rejected(Some(seq), RejectReason::StaleSession, false);
     }
     if !st.inner.status_rx.borrow().axis_conflict.is_empty() {
         // Not handed to the intake: no pose stored, no freshness extension.
         return AckMsg::rejected(Some(seq), RejectReason::AxisConflict, s.is_fresh(recv_at));
     }
+    if let ClientMsg::Limits(l) = &msg {
+        // Header rules, then the patch; the seq is consumed only on success.
+        // Freshness is never extended by a limits message.
+        let ceiling = st.ceilings();
+        let r = s.accept_limits(l, || {
+            apply_limits_patch(st, &l.patch).map_err(|e| match e {
+                PatchError::NonFinite => RejectReason::NonFinite,
+                PatchError::OutOfRange => RejectReason::OutOfRange,
+            })?;
+            Ok(motion_limits::clamp(&motion_limits::read(&st.inner.limits), &ceiling))
+        });
+        return match r {
+            Ok((effective, limited)) => {
+                let reasons = if limited.is_empty() { Vec::new() } else { vec![LimitReason::CeilingClamped] };
+                AckMsg::accepted_limits(seq, effective, reasons, s.is_fresh(recv_at))
+            }
+            Err(r) => {
+                let fresh = r != RejectReason::StaleSession && s.is_fresh(recv_at);
+                AckMsg::rejected(Some(seq), r, fresh)
+            }
+        };
+    }
+    let max_gain = st.current_max_gain();
     let result = match &msg {
         ClientMsg::Pose(p) => s
-            .accept_pose(p, recv_at, &cfg.game, cfg.timing.source_freshness_ms)
+            .accept_pose(p, recv_at, &cfg.game, max_gain, cfg.timing.source_freshness_ms)
             .map(|a| (a.checked.effective_gain, a.checked.limits.clone(), Some(a))),
-        ClientMsg::Gain(g) => s.accept_gain(g, &cfg.game).map(|u| (u.effective_gain, u.limits, u.pose)),
+        ClientMsg::Gain(g) => s.accept_gain(g, &cfg.game, max_gain).map(|u| (u.effective_gain, u.limits, u.pose)),
+        ClientMsg::Limits(_) => unreachable!("handled above"),
     };
     match result {
         Ok((gain, limits, pose)) => {

@@ -1,6 +1,6 @@
 //! config: loading and structural validation.
 
-use h3cs::config::{BackendConfig, Config, ConfigError};
+use h3cs::config::{BackendConfig, Config, ConfigError, LimitsConfig};
 use h3cs::types::{AxisId, DeviceId};
 use std::path::Path;
 
@@ -115,16 +115,60 @@ fn non_loopback_bind_rejected_unless_allowed() {
 
 #[test]
 fn max_gain_bounds() {
-    for bad in [1.5, -0.01, f64::NAN, f64::INFINITY] {
+    for bad in [1.5, 0.0, -0.01, f64::NAN, f64::INFINITY] {
         let mut cfg = sim();
-        cfg.game.max_gain = bad;
-        assert_invalid(&cfg, "game.max_gain");
+        cfg.limits.max_gain = bad;
+        assert_invalid(&cfg, "limits.max_gain");
     }
-    for ok in [0.0, 1.0, 0.6] {
+    for ok in [0.1, 1.0, 0.6] {
         let mut cfg = sim();
-        cfg.game.max_gain = ok;
+        cfg.limits.max_gain = ok;
         cfg.validate().unwrap();
     }
+}
+
+#[test]
+fn limits_rules() {
+    type Case = (fn(&mut Config), &'static str);
+    let cases: &[Case] = &[
+        (|c| c.limits.max_vel_count_s = 0, "limits.max_vel_count_s"),
+        (|c| c.limits.max_acc_count_s2 = 0, "limits.max_acc_count_s2"),
+        (|c| c.limits.following_error_limit_count = 0, "limits.following_error_limit_count"),
+        (|c| c.limits.overspeed_count_s = 0, "limits.overspeed_count_s"),
+        (|c| c.limits.duty_max_percent = 0, "limits.duty_max_percent"),
+        (|c| c.limits.duty_max_percent = 101, "limits.duty_max_percent"),
+        (|c| c.limits.duty_min_percent = 50, "limits.duty_min_percent"),
+        (|c| c.limits.ff_count_s_per_percent = 0, "limits.ff_count_s_per_percent"),
+        (|c| c.limits.deadband_out_count = 5, "limits.deadband_out_count"),
+        // overspeed must be >= 1.5 x max_vel (3000 -> 4500)
+        (|c| c.limits.overspeed_count_s = 4499, "limits.overspeed_count_s"),
+    ];
+    for (mutate, needle) in cases {
+        let mut cfg = sim();
+        mutate(&mut cfg);
+        assert_invalid(&cfg, needle);
+    }
+    let mut cfg = sim();
+    cfg.limits.overspeed_count_s = 4500;
+    cfg.validate().unwrap();
+    // Defaults are the documented initial values.
+    let d = LimitsConfig::default();
+    assert_eq!((d.max_gain, d.max_vel_count_s, d.max_acc_count_s2, d.duty_max_percent), (0.5, 3000, 15000, 40));
+    assert_eq!((d.duty_min_percent, d.kp_percent_per_100, d.ff_count_s_per_percent), (3, 2, 100));
+    assert_eq!((d.deadband_count, d.deadband_out_count), (10, 20));
+    assert_eq!((d.following_error_limit_count, d.overspeed_count_s), (800, 9000));
+}
+
+#[test]
+fn schema_1_files_with_per_axis_limits_are_rejected() {
+    // An old (schema 1) file: `[game].max_gain` and per-axis limits are unknown fields now.
+    let text = std::fs::read_to_string(SIM).unwrap();
+    let old = text.replacen("schema_version = 2", "schema_version = 1", 1);
+    assert!(matches!(Config::from_toml_str(&old), Err(ConfigError::Invalid(_))));
+    let with_axis_limit = text.replacen("decel_zone_count = 300", "decel_zone_count = 300\nmax_vel_count_s = 600", 1);
+    assert!(matches!(Config::from_toml_str(&with_axis_limit), Err(ConfigError::Parse(_))));
+    let with_game_gain = text.replacen("clamp_out_of_range = true", "clamp_out_of_range = true\nmax_gain = 0.35", 1);
+    assert!(matches!(Config::from_toml_str(&with_game_gain), Err(ConfigError::Parse(_))));
 }
 
 #[test]
@@ -211,8 +255,8 @@ fn server_and_backend_zero_values_rejected() {
 #[test]
 fn schema_version_and_rig_id() {
     let mut cfg = sim();
-    cfg.schema_version = 2;
-    assert_invalid(&cfg, "schema_version must be 1");
+    cfg.schema_version = 1;
+    assert_invalid(&cfg, "schema_version must be 2");
     let mut cfg = sim();
     cfg.rig_id = " ".into();
     assert_invalid(&cfg, "rig_id");
@@ -247,28 +291,18 @@ fn non_monotonic_points_rejected() {
 }
 
 #[test]
-fn per_axis_limit_invariants_rejected() {
-    let mut cfg = sim();
-    cfg.axes[0].max_vel_count_s = 4000; // overspeed 3500
-    assert_invalid(&cfg, "overspeed_count_s");
-    let mut cfg = sim();
-    cfg.axes[1].max_acc_count_s2 = 0;
-    assert_invalid(&cfg, "max_acc_count_s2");
-}
-
-#[test]
 fn multiple_errors_are_all_reported() {
     let mut cfg = sim();
-    cfg.game.max_gain = 2.0;
+    cfg.limits.max_gain = 2.0;
     cfg.timing.stop_hold_ms = 0;
     let m = invalid(&cfg);
-    assert!(m.contains("game.max_gain") && m.contains("timing.stop_hold_ms"), "{m}");
+    assert!(m.contains("limits.max_gain") && m.contains("timing.stop_hold_ms"), "{m}");
 }
 
 #[test]
 fn from_toml_str_runs_validation() {
     let text = std::fs::read_to_string(SIM).unwrap();
-    let bad = text.replacen("max_gain = 0.35", "max_gain = 1.5", 1);
+    let bad = text.replacen("max_gain = 0.5", "max_gain = 1.5", 1);
     assert!(matches!(Config::from_toml_str(&bad), Err(ConfigError::Invalid(_))));
     let bad = text.replacen("bind = \"127.0.0.1:8892\"", "bind = \"0.0.0.0:8892\"", 1);
     assert!(matches!(Config::from_toml_str(&bad), Err(ConfigError::Invalid(_))));

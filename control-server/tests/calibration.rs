@@ -21,10 +21,6 @@ fn inc() -> AxisCalibration {
         soft_min_count: -1200,
         soft_max_count: 2700,
         decel_zone_count: 300,
-        max_vel_count_s: 2000,
-        max_acc_count_s2: 8000,
-        following_error_limit_count: 400,
-        overspeed_count_s: 3500,
         operator_marked_valid: true,
     }
 }
@@ -148,11 +144,6 @@ fn rejects_invalid_calibrations_naming_the_field() {
         (AxisCalibration { soft_max_count: 3200, ..base.clone() }, "soft_max_count"),
         (AxisCalibration { mechanical_min_count: 5000, ..base.clone() }, "mechanical_min_count"),
         (AxisCalibration { soft_min_count: 3000, soft_max_count: 2000, ..base.clone() }, "soft_min_count"),
-        (AxisCalibration { max_vel_count_s: 0, ..base.clone() }, "max_vel_count_s"),
-        (AxisCalibration { max_acc_count_s2: 0, ..base.clone() }, "max_acc_count_s2"),
-        (AxisCalibration { following_error_limit_count: 0, ..base.clone() }, "following_error_limit_count"),
-        (AxisCalibration { overspeed_count_s: 0, ..base.clone() }, "overspeed_count_s"),
-        (AxisCalibration { max_vel_count_s: 3500, ..base.clone() }, "overspeed_count_s"),
     ];
     for (cal, needle) in cases {
         let msg = invalid_msg(cal.clone());
@@ -179,7 +170,7 @@ fn extreme_values_do_not_overflow() {
 
 #[test]
 fn error_display_names_axis() {
-    let e = AxisCalibration { max_vel_count_s: 0, ..dec() }.validate().unwrap_err();
+    let e = AxisCalibration { decel_zone_count: -1, ..dec() }.validate().unwrap_err();
     assert!(e.to_string().starts_with("axis2: "), "{e}");
 }
 
@@ -188,11 +179,11 @@ fn error_display_names_axis() {
 #[test]
 fn hash_golden_values_for_sim_config() {
     // Expected values computed independently with Python zlib.crc32 over the
-    // documented layout (u32 len | rig_id | u8 axis | 3×i32 | 5×i32 | 4×u32, LE).
+    // documented layout (u32 len | rig_id | u8 axis | 3×i32 | 5×i32, LE; geometry only).
     let cfg = Config::from_toml_str(SIM_TOML).unwrap();
     let cals = from_config(&cfg);
     let got: Vec<u32> = cals.iter().map(|c| calibration_hash(&cfg.rig_id, c)).collect();
-    assert_eq!(got, vec![0x4aa5_8a3e, 0x5e15_2394, 0xd14d_0c87]);
+    assert_eq!(got, vec![0x2c2a_144a, 0xf84d_5380, 0xcebf_c373]);
 }
 
 #[test]
@@ -211,10 +202,6 @@ fn hash_is_stable_and_changes_with_every_hashed_field() {
         AxisCalibration { soft_min_count: -1201, ..base.clone() },
         AxisCalibration { soft_max_count: 2701, ..base.clone() },
         AxisCalibration { decel_zone_count: 301, ..base.clone() },
-        AxisCalibration { max_vel_count_s: 2001, ..base.clone() },
-        AxisCalibration { max_acc_count_s2: 8001, ..base.clone() },
-        AxisCalibration { following_error_limit_count: 401, ..base.clone() },
-        AxisCalibration { overspeed_count_s: 3501, ..base.clone() },
     ];
     for v in &variants {
         assert_ne!(calibration_hash("rig", v), h0, "{v:?}");
@@ -259,7 +246,7 @@ fn from_config_indexes_by_axis_id_and_copies_fields() {
         assert_eq!(cal, &AxisCalibration::from_config(a));
         assert_eq!(cal.count_at, [a.count_at_virtual_0, a.count_at_virtual_512, a.count_at_virtual_1023]);
         assert_eq!(cal.soft_min_count, a.soft_min_count);
-        assert_eq!(cal.overspeed_count_s, a.overspeed_count_s);
+        assert_eq!(cal.decel_zone_count, a.decel_zone_count);
         assert_eq!(cal.operator_marked_valid, a.calibration_valid);
     }
 }

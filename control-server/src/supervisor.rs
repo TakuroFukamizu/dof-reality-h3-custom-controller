@@ -114,11 +114,14 @@ use tokio::time::Instant;
 
 use crate::calibration::{self, AxisCalibration};
 use crate::compat;
-use crate::config::{Config, GameConfig, TimingConfig};
+use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
+use crate::limits::{
+    self as motion_limits, Ceilings, FwAbsolute, FwTuning, LimitedField, MotionLimits, MotionLimitsSnapshot,
+};
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
     self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
-    CalResultCode, FaultEvent, Hello, HostMsg, SetPosition, Status,
+    CalResultCode, FaultEvent, Hello, HostMsg, Limits, SetPosition, Status,
 };
 use crate::session::AcceptedPose;
 use crate::types::{
@@ -140,6 +143,8 @@ pub const ACK_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const CONFIG_RETRY: Duration = Duration::from_millis(1000);
 /// A FAULT_RESET that leads nowhere is abandoned after this.
 pub const FAULT_RESET_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Re-send a rejected / unanswered SET_LIMITS at most this often.
+pub const LIMITS_RETRY: Duration = Duration::from_millis(1000);
 /// Center move is complete within this many counts of neutral (at zero velocity).
 pub const CENTER_TOLERANCE_COUNT: f64 = 1.0;
 /// Units remembered for re-reference detection (`device_id → last axis`).
@@ -212,6 +217,12 @@ pub enum LinkEvent {
     CalResult {
         axis: AxisId,
         result: CalResult,
+    },
+    /// Tuning in effect and the firmware's absolute ceilings, after a
+    /// SET_LIMITS (design 2026-11-01 §4.3).
+    Limits {
+        axis: AxisId,
+        limits: Limits,
     },
     /// Link lost (port closed, STATUS silent past the deadline, write error).
     Disconnected {
@@ -377,6 +388,10 @@ pub struct AxisSnapshot {
     pub decode_errors: u64,
     /// Latest end-stop calibration result of this boot (DESIGN.md §11).
     pub calibration: Option<CalibrationResult>,
+    /// Position-loop tuning the MCU reported (LIMITS), with its absolute
+    /// ceilings. `None` until the first SET_LIMITS of this connection was
+    /// answered.
+    pub fw_limits: Option<Limits>,
 }
 
 /// GET /v1/status body (DESIGN.md §7.2). `session` and `telemetry` are filled
@@ -408,6 +423,8 @@ pub struct StatusSnapshot {
     pub measured_angles: Option<serde_json::Value>,
     pub physical_estop: &'static str,
     pub telemetry: Option<serde_json::Value>,
+    /// The shared motion limits (design 2026-11-01 §5.4).
+    pub motion_limits: MotionLimitsSnapshot,
 }
 
 // ------------------------------------------------------------------ internals
@@ -426,6 +443,7 @@ enum Purpose {
     HostFault,
     Calibrate,
     CalibrateCancel,
+    SetLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -529,9 +547,28 @@ struct AxisTrack {
     calibrate_rejected: Option<AckReason>,
     /// Latest CAL_RESULT of the current boot.
     calibration: Option<CalibrationResult>,
+    /// Last LIMITS of this connection.
+    fw_limits: Option<Limits>,
+    /// Tuning the MCU ACKed (SET_LIMITS) in this connection.
+    limits_acked: Option<FwTuning>,
+    /// SET_LIMITS sent and not yet answered.
+    limits_inflight: Option<FwTuning>,
+    limits_rejected: Option<AckReason>,
+    limits_retry_at: Option<Instant>,
 }
 
 impl AxisTrack {
+    /// HELLO says the firmware speaks SET_LIMITS / LIMITS.
+    fn supports_limits(&self) -> bool {
+        self.hello.is_some_and(|h| h.capabilities & capabilities::LIMITS != 0)
+    }
+    fn clear_limits(&mut self) {
+        self.fw_limits = None;
+        self.limits_acked = None;
+        self.limits_inflight = None;
+        self.limits_rejected = None;
+        self.limits_retry_at = None;
+    }
     fn mcu_state(&self) -> Option<McuState> {
         self.status.and_then(|s| McuState::from_u8(s.mcu_state))
     }
@@ -597,6 +634,12 @@ struct DriveView {
 pub struct Supervisor {
     timing: TimingConfig,
     game: GameConfig,
+    limits_cfg: LimitsConfig,
+    /// What the API asked for (shared set, before the ceilings).
+    requested_limits: MotionLimits,
+    /// `requested_limits` clamped to the current ceilings.
+    effective_limits: MotionLimits,
+    limited: Vec<LimitedField>,
     names: [String; AXIS_COUNT],
     device_ids: [DeviceId; AXIS_COUNT],
     operator_valid: [bool; AXIS_COUNT],
@@ -671,9 +714,16 @@ impl Supervisor {
         let cal_error = std::array::from_fn(|i| cal[i].validate().err().map(|e| e.to_string()));
         let hashes = std::array::from_fn(|i| calibration::calibration_hash(&cfg.rig_id, &cal[i]));
         let neutral: [Counts; AXIS_COUNT] = std::array::from_fn(|i| cal[i].neutral_count());
+        let requested_limits = MotionLimits::from_config(&cfg.limits);
+        let (effective_limits, limited) =
+            motion_limits::clamp(&requested_limits, &Ceilings::fallback(cfg.limits.overspeed_count_s));
         Self {
             timing: cfg.timing.clone(),
             game: cfg.game.clone(),
+            limits_cfg: cfg.limits.clone(),
+            requested_limits,
+            effective_limits,
+            limited,
             names,
             device_ids,
             operator_valid,
@@ -896,6 +946,14 @@ impl Supervisor {
                 if h.capabilities & capabilities::POSITION_MODE == 0 {
                     b.push(format!("no_position_mode: axis{n}"));
                 }
+                if h.capabilities & capabilities::LIMITS == 0 {
+                    b.push(format!(
+                        "firmware_limits_unsupported: axis{n} firmware has no SET_LIMITS (reflash with the current v1 firmware)"
+                    ));
+                }
+            }
+            if let Some(r) = t.limits_rejected {
+                b.push(format!("limits_rejected: axis{n} SET_LIMITS rejected ({r:?})"));
             }
             let Some(s) = t.status else {
                 b.push(format!("no_status: axis{n}"));
@@ -978,6 +1036,7 @@ impl Supervisor {
             LinkEvent::Ack { axis, ack } => self.on_ack(axis.index(), ack, now),
             LinkEvent::FaultEvent { axis, ev } => self.on_fault_event(axis.index(), ev, now),
             LinkEvent::CalResult { axis, result } => self.on_cal_result(axis.index(), result, now),
+            LinkEvent::Limits { axis, limits } => self.on_limits(axis.index(), limits, now),
             LinkEvent::Disconnected { axis, reason } => {
                 self.on_disconnected(axis.index(), reason, now)
             }
@@ -1033,6 +1092,7 @@ impl Supervisor {
             period
         };
 
+        self.recompute_limits();
         self.last_pose = pose.cloned();
         self.requested = match pose {
             Some(p) => RequestView {
@@ -1045,6 +1105,7 @@ impl Supervisor {
         };
 
         self.advance(now);
+        self.reconcile_limits(now);
         self.check_status_age(now);
         self.check_frame_skew(now);
 
@@ -1190,6 +1251,7 @@ impl Supervisor {
                     stale_drop_count: s.map(|s| s.stale_drop_count),
                     decode_errors: t.decode_errors,
                     calibration: t.calibration.clone(),
+                    fw_limits: t.fw_limits,
                 }
             })
             .collect();
@@ -1216,7 +1278,99 @@ impl Supervisor {
             measured_angles: None,
             physical_estop: "not_monitored",
             telemetry: None,
+            motion_limits: self.motion_limits_snapshot(),
         }
+    }
+
+    // ------------------------------------------------------------ motion limits
+
+    /// Replace the requested shared set (the control loop forwards the
+    /// API's value every tick). Takes effect at the next `tick`.
+    pub fn set_requested_limits(&mut self, requested: MotionLimits) {
+        self.requested_limits = requested;
+    }
+
+    /// The set in effect (requested, clamped to the ceilings).
+    pub fn effective_limits(&self) -> MotionLimits {
+        self.effective_limits
+    }
+
+    /// Ceilings the requested set is clamped to: the minimum of the absolute
+    /// ceilings the connected axes reported (LIMITS; the firmware fallback
+    /// constants until the first report) and `overspeed / 1.5`.
+    pub fn ceilings(&self) -> Ceilings {
+        let reported = self
+            .axes
+            .iter()
+            .filter(|t| t.connected)
+            .filter_map(|t| t.fw_limits.as_ref())
+            .map(FwAbsolute::from_limits)
+            .reduce(FwAbsolute::min);
+        match reported {
+            Some(a) => Ceilings::from_absolute(a, self.limits_cfg.overspeed_count_s),
+            None => Ceilings::fallback(self.limits_cfg.overspeed_count_s),
+        }
+    }
+
+    pub fn motion_limits_snapshot(&self) -> MotionLimitsSnapshot {
+        MotionLimitsSnapshot {
+            effective: self.effective_limits,
+            requested: self.requested_limits,
+            ceiling: self.ceilings(),
+            defaults: MotionLimits::from_config(&self.limits_cfg),
+            limited: self.limited.clone(),
+        }
+    }
+
+    fn recompute_limits(&mut self) {
+        let (e, l) = motion_limits::clamp(&self.requested_limits, &self.ceilings());
+        self.effective_limits = e;
+        self.limited = l;
+    }
+
+    /// The SET_LIMITS content for the current effective set.
+    fn desired_tuning(&self) -> FwTuning {
+        FwTuning::new(&self.limits_cfg, &self.effective_limits)
+    }
+
+    /// Send SET_LIMITS to every connected axis whose ACKed tuning differs from
+    /// the desired one: once per change, one outstanding per axis, not to a
+    /// faulted MCU (it would answer FAULT_ACTIVE), not while the rig is
+    /// latched (HOST_FAULT first).
+    fn reconcile_limits(&mut self, now: Instant) {
+        if matches!(self.phase, Phase::Fault { .. }) {
+            return;
+        }
+        let want = self.desired_tuning();
+        for i in 0..AXIS_COUNT {
+            let t = &self.axes[i];
+            let due = t.connected
+                && t.supports_limits()
+                && t.status.is_some()
+                && t.status_fault().is_none()
+                && t.host_fault_confirmed()
+                && t.limits_inflight.is_none()
+                && t.limits_acked != Some(want)
+                && t.limits_retry_at.is_none_or(|at| now >= at);
+            if due {
+                let id = self.take_request_id();
+                self.axes[i].limits_inflight = Some(want);
+                self.axes[i].limits_retry_at = None;
+                self.push_msg(i, HostMsg::SetLimits(want.to_msg(id)), Purpose::SetLimits, now);
+            }
+        }
+    }
+
+    fn on_limits(&mut self, i: usize, limits: Limits, now: Instant) {
+        let Some(axis) = AxisId::from_index(i) else {
+            return;
+        };
+        if !self.axes[i].connected {
+            return;
+        }
+        self.axes[i].fw_limits = Some(limits);
+        self.event(now, "limits", serde_json::json!({"axis": axis, "limits": limits}));
+        self.recompute_limits();
     }
 
     // ------------------------------------------------------------ link events
@@ -1548,6 +1702,7 @@ impl Supervisor {
         t.configured_epoch = None;
         t.config_rejected = None;
         t.group_ok = false;
+        t.clear_limits();
         self.pending.retain(|_, p| p.axis != i);
         if let Some(q) = self.outbox.get_mut(i) {
             q.clear();
@@ -1658,6 +1813,11 @@ impl Supervisor {
                             self.stale_refs.remove(&(h.device_id, b));
                         }
                     }
+                    Purpose::SetLimits => {
+                        let t = &mut self.axes[i];
+                        t.limits_acked = t.limits_inflight.take();
+                        t.limits_rejected = None;
+                    }
                     _ => {}
                 }
             }
@@ -1683,6 +1843,12 @@ impl Supervisor {
         let detail = Some(format!("axis{} {name} rejected: {reason:?}", axis.get()));
         match p.purpose {
             Purpose::Sync => self.axes[i].config_rejected = Some(reason),
+            Purpose::SetLimits => {
+                let t = &mut self.axes[i];
+                t.limits_inflight = None;
+                t.limits_rejected = Some(reason);
+                t.limits_retry_at = Some(now + LIMITS_RETRY);
+            }
             Purpose::ArmConfig | Purpose::ArmPrepare => {
                 if current_group && matches!(self.phase, Phase::Arming { .. }) {
                     self.latch(RigFault::ArmTimeout, detail, now);
@@ -2634,11 +2800,14 @@ impl Supervisor {
         limits
     }
 
+    /// Planner limits: the shared effective set (the same for every axis),
+    /// scaled by `fraction` (center moves).
     fn axis_limits(&self, fraction: f64) -> [AxisLimits; AXIS_COUNT] {
-        self.cal.each_ref().map(|c| AxisLimits {
-            max_vel_count_s: f64::from(c.max_vel_count_s) * fraction,
-            max_acc_count_s2: f64::from(c.max_acc_count_s2) * fraction,
-        })
+        let e = &self.effective_limits;
+        [AxisLimits {
+            max_vel_count_s: f64::from(e.max_vel_count_s) * fraction,
+            max_acc_count_s2: f64::from(e.max_acc_count_s2) * fraction,
+        }; AXIS_COUNT]
     }
 
     fn build_set_position(&mut self, drive_limits: &[LimitReason]) -> [SetPosition; AXIS_COUNT] {
@@ -2697,6 +2866,18 @@ impl Supervisor {
             return;
         };
         let id = self.take_request_id();
+        // CONFIG carries the absolute ceilings (the axis's own report, else the
+        // firmware fallback): the per-frame SET_POSITION values are the real
+        // limit (design 2026-11-01 §1). The MCU clamps these to its constants.
+        let abs = self.axes[i]
+            .fw_limits
+            .as_ref()
+            .map(FwAbsolute::from_limits)
+            .unwrap_or(FwAbsolute {
+                duty_max_percent: protocol::fw_absolute::DUTY_MAX_PERCENT,
+                max_vel_count_s: protocol::fw_absolute::MAX_VEL_COUNT_S,
+                max_acc_count_s2: protocol::fw_absolute::MAX_ACC_COUNT_S2,
+            });
         let c = &self.cal[i];
         let msg = HostMsg::Config(protocol::Config {
             request_id: id,
@@ -2704,10 +2885,10 @@ impl Supervisor {
             calibration_hash: self.hashes[i],
             soft_min_count: c.soft_min_count,
             soft_max_count: c.soft_max_count,
-            max_vel_count_s: c.max_vel_count_s,
-            max_acc_count_s2: c.max_acc_count_s2,
-            following_error_limit_count: c.following_error_limit_count,
-            overspeed_count_s: c.overspeed_count_s,
+            max_vel_count_s: abs.max_vel_count_s,
+            max_acc_count_s2: abs.max_acc_count_s2,
+            following_error_limit_count: self.limits_cfg.following_error_limit_count,
+            overspeed_count_s: self.limits_cfg.overspeed_count_s,
             command_timeout_ms: self.timing.mcu_command_timeout_ms,
             stop_timeout_ms: self.timing.mcu_stop_timeout_ms,
             role_flags: if axis == self.power_axis {
@@ -2786,6 +2967,12 @@ impl Supervisor {
                     .is_some_and(|t| t.host_fault_req == Some(id) && !t.in_conflict());
                 if unconfirmed && matches!(self.phase, Phase::Fault { .. }) {
                     self.send_host_fault(p.axis, now);
+                }
+                if p.purpose == Purpose::SetLimits {
+                    if let Some(t) = self.axes.get_mut(p.axis) {
+                        t.limits_inflight = None;
+                        t.limits_retry_at = Some(now + LIMITS_RETRY);
+                    }
                 }
                 // An unanswered CALIBRATE(1) must not leave the axis "pending"
                 // forever (no calibrate, no CONFIG retry, cancels on every Stop).
@@ -2916,6 +3103,7 @@ fn request_id_of(m: &HostMsg) -> Option<u32> {
         | HostMsg::SetReference { request_id, .. }
         | HostMsg::Calibrate { request_id, .. } => Some(request_id),
         HostMsg::Config(c) => Some(c.request_id),
+        HostMsg::SetLimits(l) => Some(l.request_id),
         HostMsg::SetPosition(_) => None,
     }
 }
@@ -2935,6 +3123,7 @@ fn msg_name(t: u8) -> &'static str {
         HOST_FAULT => "HOST_FAULT",
         SET_REFERENCE => "SET_REFERENCE",
         CALIBRATE => "CALIBRATE",
+        SET_LIMITS => "SET_LIMITS",
         _ => "UNKNOWN",
     }
 }

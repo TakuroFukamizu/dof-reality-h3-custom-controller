@@ -52,6 +52,7 @@ use crate::api::{self, lock, AdminRequest, AppState};
 use crate::axis_link::{self, LinkHandle, LinkSendError};
 use crate::config::{BackendConfig, Config, ConfigError, SerialBackendConfig};
 use crate::protocol::HostMsg;
+use crate::limits::{self as motion_limits, MotionLimits, SharedLimits};
 use crate::session::{AcceptedPose, PoseIntake};
 use crate::sim_axis::{sim_pair, SimHandle, SimParams};
 use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput};
@@ -182,6 +183,7 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
     let (done_tx, done_rx) = watch::channel(false);
     let done_tx = Arc::new(done_tx);
     let session = Arc::new(Mutex::new(PoseIntake::new()));
+    let limits = motion_limits::shared(MotionLimits::from_config(&cfg.limits));
 
     let sup = Supervisor::new(&cfg);
     tracing::info!(session_epoch = sup.session_epoch(), "supervisor ready");
@@ -248,6 +250,7 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
         admin_rx,
         pose_rx,
         session: session.clone(),
+        limits: limits.clone(),
         status_tx,
         telemetry: Telemetry::with_event_log(event_log.clone()),
         telemetry_summary: None,
@@ -275,6 +278,7 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
         admin_token.clone(),
         shutdown_rx.clone(),
     )
+    .with_limits(limits)
     .with_event_log(event_log)
     .with_config_path(opts.config_path.clone());
     let app = api::router(state);
@@ -361,6 +365,8 @@ struct ControlLoop {
     admin_rx: mpsc::Receiver<AdminRequest>,
     pose_rx: watch::Receiver<Option<AcceptedPose>>,
     session: Arc<Mutex<PoseIntake>>,
+    /// Requested motion limits (written by the API).
+    limits: SharedLimits,
     status_tx: watch::Sender<Arc<StatusSnapshot>>,
     telemetry: Telemetry,
     telemetry_summary: Option<serde_json::Value>,
@@ -440,6 +446,7 @@ impl ControlLoop {
         }
 
         let dt_s = dt.map_or(self.period, |d| d.min(2 * self.period)).as_secs_f64();
+        self.sup.set_requested_limits(motion_limits::read(&self.limits));
         let out = self.sup.tick(now, dt_s, pose.as_ref());
         self.dispatch(out, now);
         self.record_telemetry(now, dt);

@@ -37,7 +37,7 @@ fn sim(srv: &h3cs::server::RunningServer, axis: u8) -> &SimHandle {
 
 /// Where each axis must end up for `POSE` (same path as the supervisor).
 fn expected_counts(cfg: &Config) -> [Counts; 3] {
-    let checked = compat::check_pose(POSE, GAIN, cfg.game.max_gain, cfg.game.clamp_out_of_range).unwrap();
+    let checked = compat::check_pose(POSE, GAIN, cfg.limits.max_gain, cfg.game.clamp_out_of_range).unwrap();
     let (virt, _) = compat::saturate(
         compat::mix(checked.pose, checked.effective_gain),
         cfg.game.virtual_min,

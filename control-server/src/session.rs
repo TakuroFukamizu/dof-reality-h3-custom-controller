@@ -12,6 +12,7 @@ use tokio::time::Instant;
 
 use crate::compat::{self, CheckedPose, PoseError};
 use crate::config::GameConfig;
+use crate::limits::{LimitsPatch, MotionLimits};
 use crate::types::{LimitReason, Pose};
 
 /// Game API protocol version.
@@ -27,6 +28,8 @@ pub const SESSION_PREFIX_LEN: usize = 8;
 pub enum ClientMsg {
     Pose(PoseMsg),
     Gain(GainMsg),
+    /// Runtime motion limits (design 2026-11-01 §5.3). Never extends freshness.
+    Limits(LimitsMsg),
 }
 
 impl ClientMsg {
@@ -39,6 +42,15 @@ impl ClientMsg {
         match self {
             ClientMsg::Pose(p) => p.seq,
             ClientMsg::Gain(g) => g.seq,
+            ClientMsg::Limits(l) => l.seq,
+        }
+    }
+
+    pub fn source_session(&self) -> &str {
+        match self {
+            ClientMsg::Pose(p) => &p.source_session,
+            ClientMsg::Gain(g) => &g.source_session,
+            ClientMsg::Limits(l) => &l.source_session,
         }
     }
 }
@@ -72,6 +84,17 @@ pub struct GainMsg {
     pub source_session: String,
     pub seq: u64,
     pub gain: f64,
+}
+
+/// `{"type":"limits", ...}`: the present fields of the patch replace the
+/// current requested set (§5.3). Header rules as for pose / gain.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LimitsMsg {
+    pub protocol: u32,
+    pub source_session: String,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub patch: LimitsPatch,
 }
 
 /// Why a client message was not accepted (ack `reason`).
@@ -115,14 +138,49 @@ pub struct AckMsg {
     pub limits: Vec<LimitReason>,
     /// Whether the session's latest pose is fresh after handling this message.
     pub fresh: bool,
+    /// Accepted `limits` message: the set in effect after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_limits: Option<MotionLimits>,
 }
 
 impl AckMsg {
     pub fn accepted(seq: u64, effective_gain: f64, limits: Vec<LimitReason>, fresh: bool) -> Self {
-        Self { kind: "ack", seq: Some(seq), accepted: true, reason: None, effective_gain: Some(effective_gain), limits, fresh }
+        Self {
+            kind: "ack",
+            seq: Some(seq),
+            accepted: true,
+            reason: None,
+            effective_gain: Some(effective_gain),
+            limits,
+            fresh,
+            effective_limits: None,
+        }
+    }
+    /// Ack of an accepted `limits` message: `effective_gain` is the new gain
+    /// ceiling (what the next pose's gain is clamped to).
+    pub fn accepted_limits(seq: u64, effective: MotionLimits, limits: Vec<LimitReason>, fresh: bool) -> Self {
+        Self {
+            kind: "ack",
+            seq: Some(seq),
+            accepted: true,
+            reason: None,
+            effective_gain: Some(effective.max_gain),
+            limits,
+            fresh,
+            effective_limits: Some(effective),
+        }
     }
     pub fn rejected(seq: Option<u64>, reason: RejectReason, fresh: bool) -> Self {
-        Self { kind: "ack", seq, accepted: false, reason: Some(reason), effective_gain: None, limits: Vec::new(), fresh }
+        Self {
+            kind: "ack",
+            seq,
+            accepted: false,
+            reason: Some(reason),
+            effective_gain: None,
+            limits: Vec::new(),
+            fresh,
+            effective_limits: None,
+        }
     }
 }
 
@@ -236,23 +294,53 @@ impl PoseIntake {
     }
 
     /// Dispatch a parsed client message. Gain-only messages return the latest
-    /// pose with the new gain, or `None` if there is no pose yet.
-    pub fn accept(&mut self, msg: &ClientMsg, recv_at: Instant, cfg: &GameConfig, source_freshness_ms: u64)
-        -> Result<Option<AcceptedPose>, RejectReason> {
+    /// pose with the new gain, or `None` if there is no pose yet; a `limits`
+    /// message only consumes its seq here (the caller applies the patch).
+    /// `max_gain` is the current effective gain ceiling (`limits.rs`).
+    pub fn accept(
+        &mut self,
+        msg: &ClientMsg,
+        recv_at: Instant,
+        cfg: &GameConfig,
+        max_gain: f64,
+        source_freshness_ms: u64,
+    ) -> Result<Option<AcceptedPose>, RejectReason> {
         match msg {
-            ClientMsg::Pose(p) => self.accept_pose(p, recv_at, cfg, source_freshness_ms).map(Some),
-            ClientMsg::Gain(g) => self.accept_gain(g, cfg).map(|u| u.pose),
+            ClientMsg::Pose(p) => self.accept_pose(p, recv_at, cfg, max_gain, source_freshness_ms).map(Some),
+            ClientMsg::Gain(g) => self.accept_gain(g, cfg, max_gain).map(|u| u.pose),
+            ClientMsg::Limits(l) => self.accept_limits(l, || Ok(())).map(|()| None),
         }
     }
 
+    /// A `limits` message: header rules (protocol, session, seq), then
+    /// `apply` (the caller's patch application). The seq is consumed only
+    /// when both succeed. The latest pose and its freshness are untouched
+    /// (the new gain ceiling applies from the next pose / gain message).
+    pub fn accept_limits<T>(
+        &mut self,
+        msg: &LimitsMsg,
+        apply: impl FnOnce() -> Result<T, RejectReason>,
+    ) -> Result<T, RejectReason> {
+        self.check_header(msg.protocol, &msg.source_session, msg.seq)?;
+        let out = apply()?;
+        self.last_seq = Some(msg.seq);
+        Ok(out)
+    }
+
     /// Apply the §3 pose rules in order. State changes only on acceptance.
-    pub fn accept_pose(&mut self, msg: &PoseMsg, recv_at: Instant, cfg: &GameConfig, source_freshness_ms: u64)
-        -> Result<AcceptedPose, RejectReason> {
+    pub fn accept_pose(
+        &mut self,
+        msg: &PoseMsg,
+        recv_at: Instant,
+        cfg: &GameConfig,
+        max_gain: f64,
+        source_freshness_ms: u64,
+    ) -> Result<AcceptedPose, RejectReason> {
         self.check_header(msg.protocol, &msg.source_session, msg.seq)?;
         if !msg.source_age_ms.is_finite() {
             return Err(RejectReason::NonFinite);
         }
-        let checked = compat::check_pose(msg.pose(), msg.gain, cfg.max_gain, cfg.clamp_out_of_range)
+        let checked = compat::check_pose(msg.pose(), msg.gain, max_gain, cfg.clamp_out_of_range)
             .map_err(map_pose_error)?;
         if msg.source_age_ms < 0.0 {
             return Err(RejectReason::InvalidAge);
@@ -301,13 +389,13 @@ impl PoseIntake {
 
     /// Gain-only update: re-checks the latest pose with the new gain and
     /// never touches its freshness.
-    pub fn accept_gain(&mut self, msg: &GainMsg, cfg: &GameConfig) -> Result<GainUpdate, RejectReason> {
+    pub fn accept_gain(&mut self, msg: &GainMsg, cfg: &GameConfig, max_gain: f64) -> Result<GainUpdate, RejectReason> {
         self.check_header(msg.protocol, &msg.source_session, msg.seq)?;
-        let gain_only = compat::check_pose(Pose::ZERO, msg.gain, cfg.max_gain, cfg.clamp_out_of_range)
+        let gain_only = compat::check_pose(Pose::ZERO, msg.gain, max_gain, cfg.clamp_out_of_range)
             .map_err(map_pose_error)?;
         let pose = match &self.latest {
             Some(prev) => {
-                let checked = compat::check_pose(prev.pose, msg.gain, cfg.max_gain, cfg.clamp_out_of_range)
+                let checked = compat::check_pose(prev.pose, msg.gain, max_gain, cfg.clamp_out_of_range)
                     .map_err(map_pose_error)?;
                 Some(AcceptedPose { requested_gain: msg.gain, checked, ..prev.clone() })
             }

@@ -145,6 +145,9 @@ pub enum LimitReason {
     AccelerationLimited,
     /// Target count was clamped to the axis operational soft limits.
     SoftLimited,
+    /// A requested motion limit (WS `limits` / `POST /v1/limits`) exceeded a
+    /// ceiling and was reduced (design 2026-11-01 §5.3).
+    CeilingClamped,
 }
 
 /// Whole-rig state (server side), architecture §10.

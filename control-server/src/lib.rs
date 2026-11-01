@@ -5,6 +5,7 @@ pub mod calibration;
 pub mod calibration_export;
 pub mod compat;
 pub mod config;
+pub mod limits;
 pub mod planner;
 pub mod protocol;
 pub mod server;

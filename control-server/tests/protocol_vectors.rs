@@ -269,6 +269,37 @@ fn vectors() -> Vec<Vector> {
             frame_hex: "01 87 1C 00 EF CD AB 89 00 03 00 00 AF 15 00 00 D7 0A 00 00 01 00 00 00 6F 6B 00 00 00 00 00 00 7A C9",
             wire_hex: "04 01 87 1C 05 EF CD AB 89 02 03 01 03 AF 15 01 03 D7 0A 01 02 01 01 01 03 6F 6B 01 01 01 01 01 03 7A C9 00",
         },
+        Vector {
+            title: "SET_LIMITS",
+            msg: Msg::Host(HostMsg::SetLimits(SetLimits {
+                request_id: 13,
+                duty_max_percent: 40,
+                duty_min_percent: 3,
+                kp_percent_per_100: 2,
+                ff_count_s_per_percent: 100,
+                deadband_count: 10,
+                deadband_out_count: 20,
+            })),
+            frame_hex: "01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 00 00 40 08",
+            wire_hex: "04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 01 01 03 40 08 00",
+        },
+        Vector {
+            title: "LIMITS",
+            msg: Msg::Mcu(McuMsg::Limits(Limits {
+                boot_id: BOOT_ID,
+                duty_max_percent: 40,
+                duty_min_percent: 3,
+                kp_percent_per_100: 2,
+                abs_duty_max_percent: 60,
+                ff_count_s_per_percent: 100,
+                deadband_count: 10,
+                deadband_out_count: 20,
+                abs_max_vel_count_s: 6000,
+                abs_max_acc_count_s2: 40000,
+            })),
+            frame_hex: "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB",
+            wire_hex: "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00",
+        },
     ]
 }
 

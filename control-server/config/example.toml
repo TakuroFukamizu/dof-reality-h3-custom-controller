@@ -5,7 +5,7 @@
 # !!! 軸 2・3 の値は未測定の仮値。軸 1 の値をコピーしない（architecture.md §6）。
 # !!! calibration_valid = false のあいだは ARM できない。
 
-schema_version = 1
+schema_version = 2
 rig_id = "h3-bench-01"
 
 # 主電源リレー（DC_STOP1 緑, G2）を操作する唯一の軸
@@ -34,12 +34,28 @@ hello_retry_ms = 200
 hello_timeout_ms = 2000
 
 [game]
-max_gain = 0.35                  # 新装置で検証済みの上限ではない。旧 UI の 0.6 を採用しない
 allow_missing_frame_seq = false  # 有人運転では frame_seq 必須
 clamp_out_of_range = true
 virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25
+
+[limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証の見積もり
+# 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）。
+# 上限はファームの絶対上限（HELLO 後の LIMITS で申告。Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0
+max_gain = 0.5                   # pitch と roll を同時に振り切っても仮想 0〜1023 で飽和しない最大値
+max_vel_count_s = 3000           # 7.5 回転/s。上限はさらに overspeed_count_s / 1.5 で頭打ち
+max_acc_count_s2 = 15000         # 0 → 3000 count/s に 0.2 s
+duty_max_percent = 40            # 位置ループの Duty 上限（ファームへ SET_LIMITS で配る）
+# 初期値だけ（SET_LIMITS で配る。実行時には変えない）
+duty_min_percent = 3             # 旧ファームの 7 % では低速が段付きになった（仮説）
+kp_percent_per_100 = 2           # 誤差 100 count あたり 2 %
+ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
+deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
+deadband_out_count = 20          # 同（出る側）
+# 保護（CONFIG で配る。実行時には変えない）
+following_error_limit_count = 800
+overspeed_count_s = 9000         # ≥ 1.5 × max_vel_count_s（検査される）。1.5 × ファーム絶対上限 6000
 
 [backend]
 kind = "serial"
@@ -61,10 +77,6 @@ mechanical_max_count = 2814
 soft_min_count = -2300
 soft_max_count = 2300
 decel_zone_count = 300
-max_vel_count_s = 2000
-max_acc_count_s2 = 8000
-following_error_limit_count = 400
-overspeed_count_s = 3500
 
 [[axis]]
 axis_id = 2
@@ -80,10 +92,6 @@ mechanical_max_count = 1000
 soft_min_count = -600
 soft_max_count = 600
 decel_zone_count = 300
-max_vel_count_s = 1000
-max_acc_count_s2 = 4000
-following_error_limit_count = 300
-overspeed_count_s = 2000
 
 [[axis]]
 axis_id = 3
@@ -99,7 +107,3 @@ mechanical_max_count = 1000
 soft_min_count = -600
 soft_max_count = 600
 decel_zone_count = 300
-max_vel_count_s = 1000
-max_acc_count_s2 = 4000
-following_error_limit_count = 300
-overspeed_count_s = 2000
