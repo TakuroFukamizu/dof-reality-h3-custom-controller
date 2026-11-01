@@ -1075,7 +1075,7 @@ class V1Axis {
     cal_phase_started_us_ = now;
   }
 
-  // CALIBRATE(0) / DISARM による中止。AutoMachine が動いていれば stop を渡して "stop" で止め、まだなら直接終了手順へ。
+  // POWER_HOLD の終わり（CALIBRATE(0)・DISARM・期限）。CAL_RESULT は校正終了時に送った 1 回だけで、ここでは送らない。
   void end_power_hold() {
     cal_phase_ = CalPhase::Idle;
     cal_keep_power_ = false;
@@ -1083,7 +1083,11 @@ class V1Axis {
     hold_here();
   }
 
+  // CALIBRATE(0) / DISARM による中止。AutoMachine が動いていれば stop を渡して "stop" で止め、まだなら直接終了手順へ。
+  // PC が止めた校正は KEEP_POWER 付きでも POWER_HOLD に入らず DISARMED まで行く（protocol.md §4 の mode 0。
+  // PC は中止で主電源の解放予約を消すので、ここで保持に入ると期限まで CALIBRATING に留まってしまう）。
   void cal_cancel(uint64_t now) {
+    cal_keep_power_ = false;
     if (cal_phase_ == CalPhase::PowerHold) { end_power_hold(); return; }
     if (cal_phase_ == CalPhase::Shutdown || cal_phase_ == CalPhase::Idle) return;  // 既に終わりかけ
     if (cal_phase_ == CalPhase::Running) {
