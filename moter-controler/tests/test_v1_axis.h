@@ -2050,16 +2050,16 @@ inline void test_calibration_success_on_power_axis() {
   CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
   h.idle(10);
   CHECK(h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
-  // BRAKE_RELEASE_WAIT_MS（300）の後に端当てが始まる: P 端向き = Duty +HOME_DUTY
+  // BRAKE_RELEASE_WAIT_MS（300）の後に端当てが始まる: P 端向き = Duty +V1_CAL_HOME_DUTY
   h.idle(290);
   CHECK(h.ax.duty_percent() == 0);
   h.idle(10);
-  CHECK(h.ax.duty_percent() == HOME_DUTY);
+  CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY);
   CHECK(h.ax.cal_live_step() == v1::cal_step::TO_P);
   const v1::Status running = h.status();
   CHECK(running.mcu_state == st::CALIBRATING && (running.flags & fl::BRAKE_RELEASE_CMD) != 0 &&
         (running.flags & fl::POWER_ON_CMD) != 0 && running.fault_code == fc::NONE);
-  CHECK(running.pwm_permille == -HOME_DUTY * 10);  // sign +1: Duty + はカウント減
+  CHECK(running.pwm_permille == -V1_CAL_HOME_DUTY * 10);  // sign +1: Duty + はカウント減
   // 端当て → N 端 → 中立 → 終了手順 → DISARMED
   CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
   CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
@@ -2104,7 +2104,7 @@ inline void test_calibration_negative_sign_plant_reports_negative_n_end() {
   Harness h(2, 1, 300, false);
   h.plant_sign = -1;
   h.start_calibration_and_reach_running();
-  CHECK(h.ax.duty_percent() == HOME_DUTY);  // 端当ての Duty は機構の符号に依らず +（P 端向き）
+  CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY);  // 端当ての Duty は機構の符号に依らず +（P 端向き）
   CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
   const std::vector<v1::CalResult> res = h.cal_results();
   CHECK(res.size() == 1 && res[0].result == v1::cal_result::OK);
@@ -2161,7 +2161,7 @@ inline void test_calibration_fails_on_stall_before_min_travel() {
   CHECK(!h.ax.referenced());
   CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
   // 開始猶予 300 + 無パルス 200 → 退避（反対向き）→ 猶予 300 + 無パルス 200 → 失敗
-  CHECK(h.run_until([&] { return h.ax.duty_percent() == -HOME_DUTY; }, 1000));
+  CHECK(h.run_until([&] { return h.ax.duty_percent() == -V1_CAL_HOME_DUTY; }, 1000));
   CHECK(h.ax.state() == st::CALIBRATING && strcmp(h.ax.cal_live_reason(), "retreat") == 0);
   CHECK(h.run_until([&] { return !h.ax.brake_release_cmd(); }, 1000));
   CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() == 0);  // 終了手順: ブレーキ給電 OFF、PWM 0、主電源はまだ ON
@@ -2227,7 +2227,7 @@ inline void test_calibrate_cancel_before_and_during_motion() {
     const size_t from = h.out.size();
     h.start_calibration_and_reach_running();
     h.idle(500);  // P 端へ動いている途中
-    CHECK(h.ax.duty_percent() == HOME_DUTY && h.raw < 0 && h.raw > h.end_lo);
+    CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY && h.raw < 0 && h.raw > h.end_lo);
     const int64_t at_cancel = h.raw;
     const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(0, h.next_rid()));
     // ACK の時点でブレーキ給電 OFF・PWM 0（ACK の後の STATUS がそれを示す）
@@ -2368,7 +2368,7 @@ inline void test_disarm_cancels_calibration() {
   h.start_calibration_and_reach_running();
   CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_N; }, 10000));
   h.idle(300);
-  CHECK(h.ax.duty_percent() == -HOME_DUTY);  // N 端向き（校正中は保存ストロークを信じず低速）
+  CHECK(h.ax.duty_percent() == -V1_CAL_HOME_DUTY);  // N 端向き（校正中は保存ストロークを信じず低速）
   Harness::accepted(h.disarm());
   CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
   h.idle(400);

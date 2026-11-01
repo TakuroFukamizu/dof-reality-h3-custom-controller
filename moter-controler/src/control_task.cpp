@@ -112,7 +112,14 @@ void task_main(void*) {
     machine.tick(ai);
 
     // 手動速度は、自動移動中でなくても無パルス／遅すぎで 0 にラッチする（センサー断線のまま動かさない）。
+#if MC_NO_MANUAL_GUARD
+    // 試験専用（env:m5stack-cores3-noguard）: フィードバックセンサーを無視して手動速度をそのまま出す。
+    // センサー断線でも止まらないので、機構の切り分け以外では使わない。
+    const int manual_out = machine.active() ? 0 : in.manual_speed;
+    (void)manual_guard;
+#else
     const int manual_out = manual_guard.tick(now, raw, machine.active() ? 0 : in.manual_speed, in.relay_live);
+#endif
     const int out = machine.active() ? machine.duty_signed : manual_out;
     motor_output_write(out);
 
@@ -253,6 +260,7 @@ V1Axis g_axis;  // 大きいのでタスクのスタックではなく静的領�
 V1Inputs g_v1_in;
 V1Snapshot g_v1_snap;
 int8_t g_signs[4] = {1, 1, 1, 1};
+MotorProfile g_profiles[4];  // NVS の各系統のプロファイル（校正の端当てで行程の見積もりに使う。校正成功で更新）
 uint8_t g_selected = 1;
 
 int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
@@ -270,6 +278,7 @@ void v1_task_main(void*) {
   id.device_id = v1_link_device_id();
   id.boot_id = v1_link_boot_id();
   g_axis.begin(id, g_selected, g_signs[g_selected], static_cast<uint64_t>(esp_timer_get_time()), encoder_count());
+  g_axis.set_profile_hint(g_profiles[g_selected]);
 
   TickType_t last_wake = xTaskGetTickCount();
   uint32_t ticks = 0;
@@ -309,6 +318,7 @@ void v1_task_main(void*) {
     if (in.select_pulse) {
       if (g_axis.select_axis(in.select_axis, now)) {
         g_axis.set_sign(g_signs[in.select_axis]);
+        g_axis.set_profile_hint(g_profiles[in.select_axis]);
       }
     }
 
@@ -319,7 +329,11 @@ void v1_task_main(void*) {
     //（Preferences の書き込みは数十 ms 止まることがあり、5 ms の制御タスクでは CONTROL_OVERRUN になる）。
     if (g_axis.profile_dirty()) {
       const MotorProfile& p = g_axis.dirty_profile();
-      if (profile_motor_ok(p.motor)) g_signs[p.motor] = p.sign < 0 ? -1 : 1;
+      if (profile_motor_ok(p.motor)) {
+        g_signs[p.motor] = p.sign < 0 ? -1 : 1;
+        g_profiles[p.motor] = p;
+        if (p.motor == g_axis.selected_axis()) g_axis.set_profile_hint(p);
+      }
     }
 
     // outbox → 送信キュー。順序を保つ: 満杯なら STATUS は捨て（次の周期で送る）、それ以外は保留して次の周期に再試行。
@@ -384,8 +398,11 @@ void v1_task_main(void*) {
 
 }  // namespace
 
-void control_v1_begin(const int8_t signs[4], uint8_t selected_axis) {
-  for (int i = 0; i < 4; ++i) g_signs[i] = signs[i] < 0 ? -1 : 1;
+void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis) {
+  for (int i = 0; i < 4; ++i) {
+    g_profiles[i] = profiles[i];
+    g_signs[i] = profiles[i].sign < 0 ? -1 : 1;
+  }
   g_selected = (selected_axis >= 1 && selected_axis <= 3) ? selected_axis : 1;
   g_v1_snap.selected_axis = g_selected;
   g_v1_snap.state = 0;  // BOOT（タスクが begin するまで）

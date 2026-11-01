@@ -12,6 +12,7 @@
 #include <atomic>
 #include <string.h>
 
+#include "usb_diag.h"
 #include "v1_axis.h"  // v1_device_id_from_mac
 
 void v1_link_poll();
@@ -69,6 +70,7 @@ void v1_link_poll() {
   while (budget-- > 0 && Serial.available() > 0) {
     const int c = Serial.read();
     if (c < 0) break;
+    usb_diag_note_rx(1);
     if (g_split.push(static_cast<uint8_t>(c))) {
       V1RxFrame f;
       f.len = static_cast<uint16_t>(g_split.len);
@@ -87,7 +89,8 @@ void v1_link_poll() {
   V1TxFrame t;
   for (int i = 0; i < kTxFramesPerPoll; ++i) {
     if (xQueueReceive(g_tx, &t, 0) != pdTRUE) break;
-    Serial.write(t.data, t.len);
+    const size_t written = Serial.write(t.data, t.len);
+    usb_diag_note_tx(t.len, written);  // 20 ms の tx timeout で途中まで（フレーム欠損）になった回数を数える
   }
 }
 
