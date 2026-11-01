@@ -211,7 +211,7 @@ e2e の主な値（模擬軸、1 回分。推定値の目安で、保証値で�
 | 制御 tick の周期（目標 10 ms） | p50 10.0 ms、p99 11.1 ms、max 16.4 ms（overrun 1 回 / 2240 tick） |
 | 3 軸の frame skew | p99 1 フレーム、max 1 フレーム |
 | ゲーム停止（最後に frame_seq が進んだ POST）→ STOPPING | 264 ms（`source_freshness_ms` 250。status の poll 10 ms 分の誤差を含む） |
-| STOPPING → BRAKED_DISARMED | 1057 ms（`stop_hold_ms` 1000 を含む） |
+| STOPPING → BRAKED_DISARMED | 1057 ms（`stop_hold_ms` 1000 を含む）。実測の静止判定（`rest_dwell_ms` 200、Issue #15 H1）を入れた後は、鮮度切れからの停止で 1051 ms（止まっていた軸は dwell が済んでいる）、走行中の `POST /v1/stop` で 1252 ms（減速の末尾に dwell が足される）。[runs/e2e_sim_20261102-013725](runs/e2e_sim_20261102-013725/summary.md) |
 | 管理者 FAULT → 全軸 FAULT | 21 ms |
 
 値は [runs/e2e_sim_20261030-120325/summary.md](runs/e2e_sim_20261030-120325/summary.md)（Python 3.14）のもの。

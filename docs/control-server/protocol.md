@@ -210,7 +210,7 @@ ACTIVE / STOPPING --DISARM--> (減速停止) → DISARMING → DISARMED
 DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中止、DISARM)--> DISARMED   （§1.2）
 ```
 
-- 停止確認 = 軌道（STATUS の `target_count`）の速度が 0 になったこと。
+- 停止確認 = **軌道（STATUS の `target_count`）の速度が 0 になり、かつ実測で静止していること**。MCU の STOPPING → HOLDING は軌道の速度 0 で進む（HOLDING = 目標が止まった、であって機構が止まったではない）。PC はその上で、STATUS の実測値 `|velocity_count_s| ≤ [timing].rest_velocity_count_s`（既定 50）かつ `|following_error_count| ≤ [timing].rest_error_count`（既定 50、`[limits].deadband_out_count` 以上）が `[timing].rest_dwell_ms`（既定 200）続いた軸だけを「静止」とみなし、全軸が静止するまで保持からブレーキ（DISARM）へ進まない。中立への移動（`/v1/center`）の後の整定も同じ条件。`[timing].stop_settle_timeout_ms` 内に静止しない軸があれば PC は FAULT（`StopTimeout`、detail にその軸の実測の速度と追従誤差）にする。2026-11-01 の実機では、自重のかかった軸が HOLDING のまま数百 count 手前で止まっていた。ファームの `finish_stop` に同じ実測条件を足すのは別途（Issue #15 H1）。
 - 上の図にない命令と状態の組み合わせ（HOLDING での CONTROLLED_STOP、DISARMED での DISARM など）は §4 の表のとおり何もせず ACCEPTED。
 - USB 再接続・CDC の再オープンで自動 ARM・自動 START しない。NVS に ARM 状態を保存しない。
 - DISARM による減速（ACTIVE / STOPPING からの DISARM）は lease の対象外。PC が SET_POSITION を止めても COMMAND_TIMEOUT にせず、停止後 DISARMING → DISARMED へ進む（`stop_timeout_ms` を超えたら STOP_TIMEOUT）。
@@ -232,7 +232,8 @@ DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中�
 | HELLO_REQ の再送 / 打ち切り | 200ms / 2000ms | どの状態（BOOT を含む）でも HELLO を返す |
 | ARM 全体（CONFIG〜全軸 HOLDING）・START の確認 | 5000ms | `POWER_SETTLE_MS + BRAKE_RELEASE_WAIT_MS` はこれより十分短くする |
 | 減速 → HOLDING、DISARM → DISARMED | 3000ms | 減速時間と `BRAKE_APPLY_WAIT_MS` の和はこれより短くする |
-| 停止後の保持 → DISARM | 1000ms | PC 側。全軸 HOLDING を確認してからこの時間保持し、DISARM を送る |
+| 停止後の保持 → DISARM | 1000ms | PC 側。全軸 HOLDING **と実測の静止**（下の行）を確認してからこの時間保持し、全軸が静止したままなら DISARM を送る（保持中に動いた軸があれば、静止に戻るのをさらに `stop_settle_timeout_ms` 待ってから FAULT） |
+| 実測の静止（`rest_velocity_count_s` / `rest_error_count` / `rest_dwell_ms`） | 50 count/s / 50 count / 200ms | PC 側（§5 の停止確認）。STATUS の `|velocity_count_s|` と `|following_error_count|` が両方とも閾値以下の状態が `rest_dwell_ms` 続いた軸を静止とみなす。`rest_error_count` は `[limits].deadband_out_count` 以上、`rest_dwell_ms` は `stop_settle_timeout_ms` 未満 |
 
 いずれもベンチ用の候補値で、実機の停止距離・揺れ・PC 負荷を見て確定する（ACK の応答期限以外は `config/*.toml` の `timing` で変更）。
 

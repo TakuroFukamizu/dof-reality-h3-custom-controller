@@ -703,6 +703,8 @@ def _summary(st: dict) -> str:
             " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
         if a.get("reference_stale"):
             lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
+        if a.get("calibration_stale"):
+            lines.append("        calibration_stale: recalibrated; export the result and restart the server with it before ARM")
     return "\n".join(lines)
 
 
