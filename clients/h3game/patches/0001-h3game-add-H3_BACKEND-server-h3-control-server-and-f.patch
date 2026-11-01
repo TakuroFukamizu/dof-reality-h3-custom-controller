@@ -1,4 +1,4 @@
-From f17941b999bfed357c2364bd739aafc8863a9009 Mon Sep 17 00:00:00 2001
+From d09c19cf3fa482ba400c6f3554d7fded6e0411ed Mon Sep 17 00:00:00 2001
 From: Takuro Fukamizu <takuro.f.1987@gmail.com>
 Date: Fri, 30 Oct 2026 09:57:21 +0900
 Subject: [PATCH] h3game: add H3_BACKEND=server (h3-control-server) and
@@ -56,10 +56,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Ku3d95v3E4cEBdkTwSXWsv
 ---
  h3game/bridge.py            |  43 +-
- h3game/h3_motion_client.py  | 762 ++++++++++++++++++++++++++++++++++++
+ h3game/h3_motion_client.py  | 764 ++++++++++++++++++++++++++++++++++++
  h3game/h3_server_backend.py | 291 ++++++++++++++
  h3game/web/index.html       |  14 +-
- 4 files changed, 1100 insertions(+), 10 deletions(-)
+ 4 files changed, 1102 insertions(+), 10 deletions(-)
  create mode 100644 h3game/h3_motion_client.py
  create mode 100644 h3game/h3_server_backend.py
 
@@ -173,10 +173,10 @@ index 807b4d9..8f51d92 100644
 +        if backend: backend.close()   # 席は止めない(指令が途切れればサーバーが止める)
 diff --git a/h3game/h3_motion_client.py b/h3game/h3_motion_client.py
 new file mode 100644
-index 0000000..83cd734
+index 0000000..ff89f14
 --- /dev/null
 +++ b/h3game/h3_motion_client.py
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,764 @@
 +# Copy of clients/python/h3_motion_client.py in dof-reality-h3-custom-controller
 +# (canonical source). Edit there and copy here; do not change this copy alone.
 +"""Game-side client for h3-control-server (DESIGN.md §7, §8).
@@ -914,6 +914,8 @@ index 0000000..83cd734
 +            " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
 +        if a.get("reference_stale"):
 +            lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
++        if a.get("calibration_stale"):
++            lines.append("        calibration_stale: recalibrated; export the result and restart the server with it before ARM")
 +    return "\n".join(lines)
 +
 +
