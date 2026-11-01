@@ -3801,6 +3801,85 @@ inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
   CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 600 * MS);
 }
 
+// PR #33 Codex P1: 遅い軌道（25 count/s）に 8 count 遅れて付いていく（100 ms に 2〜3 count）だけでは動き出しパルスを打たない。
+// 軌道が速い（300 count/s）のに軸が止まったまま |誤差| が増え続ければ 200 ms の窓の後に打つ（合成が 90 を超えていればその値）。
+inline void test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;  // プラントはテストが手で動かす
+  h.pos_max_vel = 25;
+  const int32_t start = h.ax.actual_count();
+  int brk_ticks = 0;
+  uint64_t next_move = h.now + 320 * MS;  // 8 count 遅れてから 40 ms に 1 count（25 count/s）で付いていく
+  for (int i = 0; i < 200; ++i) {  // 2 s
+    h.drive(10, start + 2000);
+    if (h.now >= next_move) {
+      h.raw += 1;
+      next_move += 40 * MS;
+    }
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) ++brk_ticks;
+  }
+  CHECK(h.ax.state() == st::ACTIVE && brk_ticks == 0 && h.ax.breakaway_pulses() == 0);
+  const int64_t lag = static_cast<int64_t>(h.ax.target_count()) - h.ax.actual_count();
+  CHECK(lag >= 5 && lag <= 12);  // 遅れは保たれている（対象外なのは遅れが小さいからではない）
+  // 速い軌道で止まったまま: 200 ms の窓の後にパルス
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 300;
+  const int32_t gstart = g.ax.actual_count();
+  g.drive(150, gstart + 2000);  // 加速 15 ms の後 300 count/s。150 ms では窓（200 ms）の途中
+  CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().mode == V1DutyMode::MOVE && !g.ax.breakaway_active());
+  g.drive(100, gstart + 2000);  // 250 ms
+  CHECK(g.ax.duty_terms().mode == V1DutyMode::BRK && g.ax.breakaway_active() && g.ax.duty_permille() <= -90);
+}
+
+// PR #33 Codex P2: 静止 2 s の監視は「誤差の向きへ 3 count 進んだ」ときだけ時計を戻す。自重で目標から離れる動きでは戻さず、
+// 2 s で ENCODER_FAULT。従来経路（directional = false）は向きを問わない（既存テストのまま）。
+inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10（上へ）
+  h.step();
+  const uint64_t t0 = h.now;
+  while (h.now - t0 < 1900 * MS) {
+    h.drive(150, h.ax.target_count());
+    h.raw -= 3;  // 150 ms ごとに目標から 3 count 離れる（従来の向きを問わない判定なら時計が戻っていた）
+  }
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(200, h.ax.target_count());
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT && h.now - t0 <= 2300 * MS);
+  // 誤差の向きへ 3 count 進めば時計は戻る
+  Harness g;
+  g.ax.tuning = r6_tuning(2);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 30;
+  g.step();
+  const uint64_t gt0 = g.now;
+  while (g.now - gt0 < 2500 * MS) {
+    g.drive(150, g.ax.target_count());
+    g.raw += 3;
+  }
+  CHECK(g.ax.state() == st::HOLDING && g.ax.fault_code() == 0);
+}
+
 // SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
 inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
   V1Tuning a = r6_tuning(6, 20);
@@ -3914,6 +3993,8 @@ inline void run_all() {
   test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse();
   test_r6_following_error_and_moving_stall_fault_unchanged();
   test_r6_set_limits_ff_and_floor_fields_are_ignored();
+  test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall();
+  test_r6_stall_watchdog_ignores_motion_away_from_target();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

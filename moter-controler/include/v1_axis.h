@@ -76,6 +76,9 @@ struct V1Tuning {
   uint32_t breakaway_pulse_ms = V1_BREAKAWAY_PULSE_MS;
   int32_t breakaway_min_move = V1_BREAKAWAY_MIN_MOVE;
   int breakaway_max_pulses = V1_BREAKAWAY_MAX_PULSES;
+  int32_t breakaway_moving_min_traj_count_s = V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S;  // 走行中に打つ条件（Codex P1）
+  int32_t breakaway_moving_max_vel_count_s = V1_BREAKAWAY_MOVING_MAX_VEL_COUNT_S;
+  uint32_t breakaway_moving_window_ms = V1_BREAKAWAY_MOVING_WINDOW_MS;
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
@@ -699,6 +702,8 @@ class V1Axis {
   int brk_pulses_ = 0;               // 進まないまま打ったパルスの数
   uint64_t brk_phase_start_us_ = 0;  // 窓／パルスの開始
   int64_t brk_anchor_raw_ = 0;       // 窓／パルスの開始時のカウント
+  bool brk_moving_ = false;          // 軌道が動いている要求（窓 breakaway_moving_window_ms、|誤差| の増加を要する）
+  int64_t brk_err_anchor_abs_ = 0;   // 窓の開始時の |誤差|（走行中: 増えていなければ打たない）
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
@@ -1616,6 +1621,8 @@ class V1Axis {
     brk_exhausted_ = false;
     brk_dir_ = 0;
     brk_pulses_ = 0;
+    brk_moving_ = false;
+    brk_err_anchor_abs_ = 0;
   }
 
   // 動き出しパルス（Issue #25 r6。床の唯一の例外）。Duty を計算する前に呼ぶ。true ならこの tick は v1_duty_command が
@@ -1629,18 +1636,29 @@ class V1Axis {
     if (!tuning.ff_directional || tuning.breakaway_window_ms == 0) { reset_breakaway(); return false; }
     const int64_t err_abs = err < 0 ? -err : err;
     int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
-    if (setpoint_vel_ != 0.0) {
+    const bool traj_moving = setpoint_vel_ != 0.0;
+    if (traj_moving) {
       const int traj_dir = setpoint_vel_ > 0.0 ? 1 : -1;
       if (traj_dir != dir) dir = 0;  // 軌道より先行: 対象外
+      // 走行中（PR #33 Codex P1）: 軌道が速い（≥ moving_min_traj）のに軸が止まっている（実測 |v| ≤ moving_max_vel）ときだけ対象。
+      // 遅い軌道に普通に遅れている（30 count/s ≈ 3 count/100 ms）だけでは打たない。実測速度は 100 ms 窓（最長 100 ms 古い）。
+      const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+      const int32_t v_abs = velocity_ < 0 ? -velocity_ : velocity_;
+      if (traj_abs < static_cast<double>(tuning.breakaway_moving_min_traj_count_s) ||
+          v_abs > tuning.breakaway_moving_max_vel_count_s) {
+        dir = 0;
+      }
     }
     const bool demand = dir != 0 && err_abs > tuning.hold_exit && brake_release_cmd_ && !duty_state_.in_band;
     if (!demand) { reset_breakaway(); return false; }
-    if (!brk_running_ || dir != brk_dir_) {
+    if (!brk_running_ || dir != brk_dir_ || traj_moving != brk_moving_) {
       reset_breakaway();
       brk_running_ = true;
       brk_dir_ = dir;
+      brk_moving_ = traj_moving;
       brk_phase_start_us_ = now;
       brk_anchor_raw_ = raw_;
+      brk_err_anchor_abs_ = err_abs;
       return false;
     }
     const int64_t progress = static_cast<int64_t>(dir) * (raw_ - brk_anchor_raw_);
@@ -1650,6 +1668,7 @@ class V1Axis {
       brk_pulses_ = 0;
       brk_phase_start_us_ = now;
       brk_anchor_raw_ = raw_;
+      brk_err_anchor_abs_ = err_abs;
       return false;
     }
     if (brk_exhausted_) return false;
@@ -1661,14 +1680,23 @@ class V1Axis {
         if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
         brk_phase_start_us_ = now;
         brk_anchor_raw_ = raw_;
+        brk_err_anchor_abs_ = err_abs;
         return false;
       }
       return true;
     }
-    if (elapsed >= ms_to_us(tuning.breakaway_window_ms)) {
+    const uint32_t window_ms = traj_moving ? tuning.breakaway_moving_window_ms : tuning.breakaway_window_ms;
+    if (elapsed >= ms_to_us(window_ms)) {
+      if (traj_moving && err_abs <= brk_err_anchor_abs_) {
+        brk_phase_start_us_ = now;  // 走行中で |誤差| が増えていない: 打たずに窓を取り直す
+        brk_anchor_raw_ = raw_;
+        brk_err_anchor_abs_ = err_abs;
+        return false;
+      }
       brk_active_ = true;
       brk_phase_start_us_ = now;
       brk_anchor_raw_ = raw_;
+      brk_err_anchor_abs_ = err_abs;
       return true;
     }
     return false;
@@ -1716,7 +1744,10 @@ class V1Axis {
   void update_stall_boost(uint64_t now) {
     if (!boost_eligible_ || !boost_window_running_) return;
     const int64_t moved = raw_ - boost_anchor_raw_;
-    if ((moved < 0 ? -moved : moved) >= tuning.stall_boost_min_move) {
+    // r6（PR #33 Codex P2）: 「動いた」は誤差の向きへの進みだけ（自重で目標から離れても時計は戻さない）。従来経路は向きを問わない
+    const int64_t moved_fwd = tuning.ff_directional ? static_cast<int64_t>(boost_err_sign_) * moved
+                                                    : (moved < 0 ? -moved : moved);
+    if (moved_fwd >= tuning.stall_boost_min_move) {
       boost_window_start_us_ = now;  // 動いている: 窓と時間の起点を取り直す
       boost_active_since_us_ = now;
       boost_anchor_raw_ = raw_;
