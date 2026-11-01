@@ -108,7 +108,7 @@ name = "右手前リフト (motor #1)"
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
 count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 2775     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
-count_at_virtual_1023 = 5251    # = soft_max_count
+count_at_virtual_1023 = 5401    # = soft_max_count
 mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
 mechanical_max_count = 5551     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
 soft_min_count = 150            # mechanical_min + decel_zone
@@ -126,7 +126,7 @@ name = "左リフト (motor #2)"
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
 count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 2731     # = stroke / 2
-count_at_virtual_1023 = 5162
+count_at_virtual_1023 = 5312    # = soft_max_count
 mechanical_min_count = 0
 mechanical_max_count = 5462
 soft_min_count = 150            # mechanical_min + decel_zone
@@ -146,7 +146,7 @@ name = "後部ヨー (motor #3)"
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
 count_at_virtual_0 = 150        # = soft_min_count
 count_at_virtual_512 = 3069     # = stroke / 2（2026-10-31 の校正 6138 / 3069。10-26 は 6159 / 3079）
-count_at_virtual_1023 = 5838
+count_at_virtual_1023 = 5988    # = soft_max_count
 mechanical_min_count = 0
 mechanical_max_count = 6138     # 2026-10-31 の CAL。校正ごとに ±20 程度ぶれる
 soft_min_count = 150            # mechanical_min + decel_zone
