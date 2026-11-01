@@ -47,6 +47,12 @@ center_speed_fraction = 0.25
 # many counts of neutral (>= limits.deadband_out_count). A lagging axis past
 # timing.center_reach_timeout_ms latches a fault instead of a false "center_reached".
 center_tolerance_count = 50
+# Rig orientation: how the game's pitch / roll / yaw map onto the mixer (operator
+# setting, decided by the orientation check; the game never needs to know).
+swap_pitch_roll = false
+invert_pitch = false
+invert_roll = false
+invert_yaw = false
 # START (game) is refused (409 pose_not_near_hold) when the fresh pose would move any
 # axis farther than this many counts from where it is held: a forgotten tab streaming
 # an extreme pose must not launch the seat at START. Have the game at neutral first.

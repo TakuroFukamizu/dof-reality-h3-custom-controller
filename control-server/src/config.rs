@@ -171,6 +171,14 @@ pub struct GameConfig {
     /// (`limits.deadband_out_count`) with margin; 2026-11-01 a lagging axis was
     /// declared centered 280 counts short because only the setpoint was checked.
     pub center_tolerance_count: u32,
+    /// Rig orientation (compat::Orientation): the game sends pitch / roll / yaw
+    /// in its own sense; these map them onto this rig's mixer inputs. The
+    /// operator sets them after the orientation check (hardware-bringup.md §7);
+    /// the game never needs to know. Rebuilt H3 2026-11-02: swap_pitch_roll = true.
+    pub swap_pitch_roll: bool,
+    pub invert_pitch: bool,
+    pub invert_roll: bool,
+    pub invert_yaw: bool,
     /// START (game) is refused (`pose_not_near_hold`) when the fresh pose
     /// would command any axis farther than this from where it is held: a
     /// forgotten tab streaming an extreme pose must not launch the seat at
@@ -178,6 +186,17 @@ pub struct GameConfig {
     /// pressed. Measured in counts along the same path as tracking
     /// (mix → saturate → calibration → soft limits).
     pub start_max_offset_count: u32,
+}
+
+impl GameConfig {
+    pub fn orientation(&self) -> crate::compat::Orientation {
+        crate::compat::Orientation {
+            swap_pitch_roll: self.swap_pitch_roll,
+            invert_pitch: self.invert_pitch,
+            invert_roll: self.invert_roll,
+            invert_yaw: self.invert_yaw,
+        }
+    }
 }
 
 impl Default for GameConfig {
@@ -189,6 +208,10 @@ impl Default for GameConfig {
             virtual_max: 1023.0,
             center_speed_fraction: 0.25,
             center_tolerance_count: 50,
+            swap_pitch_roll: false,
+            invert_pitch: false,
+            invert_roll: false,
+            invert_yaw: false,
             start_max_offset_count: 300,
         }
     }

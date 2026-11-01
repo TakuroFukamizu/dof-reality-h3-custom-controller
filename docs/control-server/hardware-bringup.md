@@ -332,7 +332,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 3. 送信開始（`0 0 1 0.05`） → `/v1/arm` → `/v1/start`。#3 の目標が `count_at_virtual_512 + 0.05 × 511 × (5560/1023) ≈ +139 count` へ動く。**向きを記録する**（右か左か）。#1 / #2 は動かない。
 4. 送信停止。`0 0 -1 0.05` で反対へ。
 5. 同様に `1 1 0 0.05`（#1 だけ、roll + pitch = 2 なので約 +250 count）、`-1 1 0 0.05`（#2 だけ）。それぞれ **上がったか下がったか** を記録。
-6. ゲームの意図（`pitch +` で前が上がるのか、`roll +` で右が上がるのか、`yaw +` で右へ向くのか）と比べ、逆な軸は §5.3 の方法で `count_at_virtual_0 / 1023` を入れ替える → サーバー再起動 → §5.1 → この節をやり直す。
+6. ゲームの意図（`pitch +` で前が上がるのか、`roll +` で右が上がるのか、`yaw +` で右へ向くのか）と比べる。混合式は h3game のまま（`roll` = #1・#2 同方向、`pitch` = #1・#2 逆方向）なので、**前後と左右が入れ替わっていれば `[game].swap_pitch_roll = true`**、向きだけ逆なら `invert_pitch` / `invert_roll` / `invert_yaw`（いずれもゲーム側の軸の意味で指定。ゲームは変えない）。1 軸だけ逆（そのモーターの配線・符号）なら §5.3 の方法で `count_at_virtual_0 / 1023` を入れ替える。どれもサーバー再起動 → §5.1 → この節をやり直す。組み直した H3 は 2026-11-02 に `swap_pitch_roll = true` と判明（ジョイスティックの前後で左右に傾いた）。
 7. 1 軸ずつ通ったら gain 0.10、0.15 で同じ Pose。`max_gain`（0.15 にしてある）を超える値は `effective_gain` が 0.15 に制限される（`limits` に `gain_limited`）。
 8. 各回、status の `following_error_count`（`following_error_limit_count` に近づくと FAULT）、`velocity_count_s`（`max_vel_count_s` 以下）、`telemetry.tick_dt_ms.p99`（10 ms 前後）を控える。
 9. 向きが 3 軸とも合ったら、limits.md §4 の手順で `duty_min` → 速度・加速度 → Duty 上限の順に上げる（試験ページの「動きの制限」か `POST /v1/limits`。サーバーを再起動せずに変えられる）。

@@ -3010,7 +3010,7 @@ impl Supervisor {
 
     // ------------------------------------------------------------ drive
 
-    /// pose → mix → saturate → virtual_to_count → clamp_soft → step_track.
+    /// pose → orient → mix → saturate → virtual_to_count → clamp_soft → step_track.
     fn track_game(&mut self, pose: &AcceptedPose, dt: f64) -> Vec<LimitReason> {
         let (targets, virt, mut limits) = self.pose_targets(&pose.checked);
         let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
@@ -3027,7 +3027,8 @@ impl Supervisor {
         &self,
         checked: &compat::CheckedPose,
     ) -> ([f64; AXIS_COUNT], [f64; AXIS_COUNT], Vec<LimitReason>) {
-        let mixed = compat::mix(checked.pose, checked.effective_gain);
+        let oriented = compat::orient(checked.pose, self.game.orientation());
+        let mixed = compat::mix(oriented, checked.effective_gain);
         let (virt, saturated) = compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
         let mut limits = Vec::new();
         if saturated {

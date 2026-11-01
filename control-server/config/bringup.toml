@@ -57,6 +57,12 @@ virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
 center_tolerance_count = 50      # 中立到達は全軸の「実位置」がこの範囲に入って初めて成立（deadband_out 20 以上）。11-01 に #2 が 280 count 手前で「到達」になったため
+# 機構の向き（hardware-bringup.md §7 の向きの確認で決める。ゲーム側は pitch / roll をゲームの意味のまま送る）。
+# 混合式は h3game のまま: roll = #1・#2 同方向、pitch = #1・#2 逆方向。組み直した H3 では同方向が前後の傾きだったので入れ替える（2026-11-02 実機）。
+swap_pitch_roll = true
+invert_pitch = false             # 前に倒して前が下がらなければ true
+invert_roll = false              # 右に倒して右が下がらなければ true
+invert_yaw = false
 start_max_offset_count = 300     # START 時の姿勢が保持位置からこの count を超えて離れる軸があれば 409 pose_not_near_hold（忘れたタブの極端な姿勢で START 直後に飛ばないため）。ゲームを中立にしてから START
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
