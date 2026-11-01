@@ -9,6 +9,7 @@
 | [architecture.md](architecture.md) | 元の計画（互換契約・責任分界・状態と安全契約・導入順序） |
 | [protocol.md](protocol.md) | PC ⇄ CoreS3 の USB プロトコル v1（規範。CoreS3 ファームはこれに合わせる） |
 | [testing.md](testing.md) | 試験の一覧・未試験の範囲・最新の結果 |
+| [hardware-bringup.md](hardware-bringup.md) | 実機 bring-up 手順（CoreS3 ×3 を初めてつないで 3 軸を動かすまで。設定は `control-server/config/bringup.toml`） |
 | [`control-server/DESIGN.md`](../../control-server/DESIGN.md) | 実装設計（API・状態機械・JSON の形） |
 | [`clients/python/README.md`](../../clients/python/README.md) | Game API の Python クライアント |
 | [`clients/h3game/README.md`](../../clients/h3game/README.md) | h3game へのパッチと bridge 用バックエンド層 |
@@ -62,6 +63,8 @@ cargo clippy --all-targets
 H3CS_ADMIN_TOKEN=secret ./target/debug/h3-control-server --config config/sim.toml
 H3CS_ADMIN_TOKEN=secret ./target/debug/h3-control-server --config config/sim.toml --bind 127.0.0.1:18892
 ```
+
+試験ページ（オペレーター用、DESIGN.md §7.4）: サーバーを起動して、同じ PC のブラウザーで **<http://127.0.0.1:8892/>**（`--bind` を変えたらそのアドレス。`localhost` でもよい）を開く。管理トークン欄に `H3CS_ADMIN_TOKEN` の値を入れると、状態（`rig_state`・blockers・fault・3 系統の表）、イベントの末尾、ARM / START / STOP / DISARM / CENTER / FAULT / FAULT RESET / 軸ごとの REFERENCE、スライダーによる姿勢送信（50 Hz、タブが隠れると止まる）が使える。読み込んだだけでは何もしない。ページは LAN からは開けない（loopback だけ）。ブラウザーが同一 origin の POST / WS に付ける `Origin`（`http://127.0.0.1:8892` など、Host が loopback で一致するもの）は `allowed_origins` に無くても通る。他の origin の扱い（403）と `Origin` 無しのクライアントの扱いは変わらない（DESIGN.md §7.4）。
 
 Python の試験（リポジトリ直下で。結合試験は `cargo build` 済みのバイナリを使い、なければ skip）:
 

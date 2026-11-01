@@ -12,7 +12,7 @@ DOF Reality H3 のオリジナル制御基板が故障したため、制御部�
 | --- | --- |
 | [h3-original/](h3-original/README.md) | DOF Reality H3 の既存構成・実装の調査結果。電源基板、制御基板、モータードライバと Protection Board、モーターとフィードバックセンサー、ブレーキ、故障診断の経緯 |
 | [cores3-controller/](cores3-controller/README.md) | 作成中の M5Stack CoreS3 による 3 系統独立制御系の設計。全体アーキテクチャ、ハードウェア配線と GPIO 割当、ファームウェア設計、安全設計、進捗と未確定事項 |
-| [control-server/](control-server/README.md) | PC 側コントロールサーバー h3-control-server。計画（architecture.md）、PC ⇄ CoreS3 USB プロトコル v1（protocol.md）、使い方・試験・e2e 記録。PC 側は実装済み・模擬軸でのみ試験済み |
+| [control-server/](control-server/README.md) | PC 側コントロールサーバー h3-control-server。計画（architecture.md）、PC ⇄ CoreS3 USB プロトコル v1（protocol.md）、使い方・試験・e2e 記録、実機 bring-up 手順（[hardware-bringup.md](control-server/hardware-bringup.md)）。PC 側は実装済み・模擬軸でのみ試験済み |
 
 ## 関連するコード
 
