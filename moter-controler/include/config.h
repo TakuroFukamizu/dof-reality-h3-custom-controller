@@ -182,6 +182,39 @@ constexpr int32_t V1_ASSIST_RELEASE_MOVE = 3;        // ON の後、これ以上
 #endif
 constexpr int32_t V1_SETTLED_MEAS_VEL_COUNT_S = 10;
 constexpr uint32_t V1_SETTLED_MS = 200;
+// Issue #25 r6（2026-11-02、Codex 設計コンサル）: 方向別 FF ＋ PI、走行中の床なし。既定 1。-DV1_FF_DIRECTIONAL=0 で r5 までの
+// 経路（v/ff の FF、床 E、補助 T、不感帯 10/20、Ki 0.1）に戻る（ホストテストはこの 0 で従来の経路を検証し、r6 は明示的に ON にして検証する）。
+// ON のとき SET_LIMITS の ff_count_s_per_percent / duty_min / deadband / deadband_out は受理・LIMITS で返すが位置ループでは使わない。
+#ifndef V1_FF_DIRECTIONAL
+#define V1_FF_DIRECTIONAL 1
+#endif
+// 方向別 FF: d = 軌道速度の向き（「上」= カウント増）、w = min(|v| / V1_FF_TAPER_COUNT_S, 1)、u_ff = w × a_d + b_d × v [permille]、
+// v = 0 なら 0。a は符号付きの切片（下向きは負の値のまま足す）、b は permille / (count/s)。
+// 実測（11-02、#1、r3、一定速度ランプの定常区間の平均 Duty）: 上 99→5.6 %、198→6.2、413→8.9、593→10.5 / 下 −99→−1.8、−198→−2.5、
+// −397→−5.3、−592→−7.1。直線回帰: 上 u ≈ 4.6 % + 0.0099 %·v、下 u ≈ −0.74 % + 0.0107 %·v（重力バイアス ≈ +1.9 %、クーロン ≈ 2.7 %）。
+constexpr int V1_FF_A_UP_PERMILLE = 46;                        // 上向き（カウント増）の切片 4.6 %
+constexpr double V1_FF_B_UP_PERMILLE_PER_COUNT_S = 0.10;       // 上向きの傾き 1.0 % / 100 count/s
+constexpr int V1_FF_A_DOWN_PERMILLE = -7;                      // 下向き（カウント減）の符号付き切片 −0.7 %
+constexpr double V1_FF_B_DOWN_PERMILLE_PER_COUNT_S = 0.107;    // 下向きの傾き 1.07 % / 100 count/s
+constexpr int32_t V1_FF_TAPER_COUNT_S = 30;                    // 反転時に切片を一気に反転させないテーパ幅 [count/s]
+// PI: Kp は SET_LIMITS（bringup 6 %/100 count）。Ki は r6 で 0.02 %/(count·s) = 0.2 permille/(count·s)。|I| ≤ V1_I_MAX_PERMILLE、
+// |dI/dt| ≤ V1_I_RATE_PERMILLE_PER_S（上と同じ 30 / 10）。アンチワインドアップは「duty_max で飽和した向きへ積み増さない」だけ
+//（床・符号不一致の抑制は無い。軌道より先行して逆向きに補正するのは正当）。動き出しパルス中と保持中は凍結、保持に入ったら 0。
+constexpr double V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S = 0.2;
+// 保持: 軌道完了（軌道速度 0）かつ |誤差| ≤ V1_HOLD_ENTER_COUNT かつ |実測速度| ≤ V1_SETTLED_MEAS_VEL_COUNT_S が V1_SETTLED_MS
+// 続いたら入る（I と出力を 0。#1 は中立付近で自己保持する）。|誤差| > V1_HOLD_EXIT_COUNT か軌道が動けば出る。10/20 の不感帯に代わる。
+constexpr int32_t V1_HOLD_ENTER_COUNT = 2;
+constexpr int32_t V1_HOLD_EXIT_COUNT = 4;
+// 動き出しパルス（床の唯一の例外）: |誤差| > V1_HOLD_EXIT_COUNT の要求が続いていて、V1_BREAKAWAY_WINDOW_MS の間に指令の向きへ
+// V1_BREAKAWAY_MIN_MOVE 未満しか進まなければ、指令の向きに V1_BREAKAWAY_UP/DOWN_PERMILLE（実測の動き出し Duty。合成がそれ以上なら合成）を
+// V1_BREAKAWAY_PULSE_MS または 3 count 進むまで出す。進まないままのパルスは V1_BREAKAWAY_MAX_PULSES で打ち切り（連打しない）、
+// あとは静止 2 s の監視（ENCODER_FAULT）に任せる。パルスは監視の時計を戻さない。
+constexpr int V1_BREAKAWAY_UP_PERMILLE = 90;       // 上向き（カウント増）9 %
+constexpr int V1_BREAKAWAY_DOWN_PERMILLE = 60;     // 下向き（カウント減）6 %
+constexpr uint32_t V1_BREAKAWAY_WINDOW_MS = 100;   // 「進まない」を判定する窓
+constexpr uint32_t V1_BREAKAWAY_PULSE_MS = 100;    // パルスの長さの上限
+constexpr int32_t V1_BREAKAWAY_MIN_MOVE = 3;       // 窓／パルスの間にこれ以上進めば「進んだ」
+constexpr int V1_BREAKAWAY_MAX_PULSES = 5;         // 進まないまま打てるパルスの数
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

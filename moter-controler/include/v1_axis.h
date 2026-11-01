@@ -60,7 +60,34 @@ struct V1Tuning {
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
   uint32_t status_period_ms = 20;
   uint32_t velocity_window_ms = 100;
+  // Issue #25 r6（config.h V1_FF_DIRECTIONAL）: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス。
+  // directional = false なら r5 までの経路（上の床 E・補助 T・不感帯 deadband/deadband_out・Ki 0.1）。
+  bool ff_directional = V1_FF_DIRECTIONAL != 0;
+  int ff_a_up_permille = V1_FF_A_UP_PERMILLE;
+  double ff_b_up_permille_per_count_s = V1_FF_B_UP_PERMILLE_PER_COUNT_S;
+  int ff_a_down_permille = V1_FF_A_DOWN_PERMILLE;  // 符号付き（負）
+  double ff_b_down_permille_per_count_s = V1_FF_B_DOWN_PERMILLE_PER_COUNT_S;
+  int32_t ff_taper_count_s = V1_FF_TAPER_COUNT_S;
+  int32_t hold_enter = V1_HOLD_ENTER_COUNT;   // 保持に入る |誤差|（r6）
+  int32_t hold_exit = V1_HOLD_EXIT_COUNT;     // 保持から出る |誤差|（r6）
+  int breakaway_up_permille = V1_BREAKAWAY_UP_PERMILLE;
+  int breakaway_down_permille = V1_BREAKAWAY_DOWN_PERMILLE;
+  uint32_t breakaway_window_ms = V1_BREAKAWAY_WINDOW_MS;  // 0 で動き出しパルス無効
+  uint32_t breakaway_pulse_ms = V1_BREAKAWAY_PULSE_MS;
+  int32_t breakaway_min_move = V1_BREAKAWAY_MIN_MOVE;
+  int breakaway_max_pulses = V1_BREAKAWAY_MAX_PULSES;
+
+  // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
+  explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
+    if (directional) ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
+  }
+  // 静止の帯の入口／出口（r6 は hold_enter / hold_exit、従来は deadband / deadband_out）。v1_duty_command・整定判定・静止監視で共用
+  int32_t band_enter() const { return ff_directional ? hold_enter : deadband; }
+  int32_t band_exit() const { return ff_directional ? hold_exit : deadband_out; }
 };
+
+// 位置ループの状態の表示用（Issue #25 r6）。MOVE = 追従／補正（FF + P + I）、HOLD = 保持（出力 0）、BRK = 動き出しパルス
+enum class V1DutyMode : uint8_t { MOVE = 0, HOLD = 1, BRK = 2 };
 
 // 位置ループの各項の計器（Issue #25 手順 8。画面に出す。STATUS には載せない）。符号はカウントが増える向きが正。
 // 単位は permille（0.1 %）: ff_permille = 軌道速度 / ff × 10、p_permille = 誤差 × kp / 100 × 10（どちらも四捨五入）。
@@ -74,6 +101,7 @@ struct V1DutyTerms {
   int16_t i_permille = 0;      // 積分項（Issue #25 手順 9「F」）。この tick の出力に入った値（四捨五入）
   bool assist_on = false;      // 追従中の動き出し補助（Issue #25 手順 9「T」）が床を掛けている
   int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
+  V1DutyMode mode = V1DutyMode::MOVE;  // r6 の状態（HOLD は in_band と同じ。BRK は動き出しパルスがこの tick の出力を決めた）
 };
 
 inline int16_t v1_clamp_i16(double v) {
@@ -117,6 +145,88 @@ struct V1DutyState {
 // assist = 追従中の動き出し補助（Issue #25 手順 9「T」。V1Axis の update_track_assist が立てる）: この tick だけ、床の適用状態
 // （st.floor_on）に依らず床（duty_min ＋ boost）を掛ける。st.floor_on には書かない（E のヒステリシスに残さない）。合成が軌道速度と
 // 同じ向きのときだけ（軌道と逆向きに押し当てない）。合成 0 なら何もしない。
+// Issue #25 r6: 方向別 FF [permille]。d = 向き（カウント増が「上」）、w = min(|v| / taper, 1)、u = w × a_d + b_d × v。v = 0 なら 0。
+// a_down は符号付き（負）の切片なのでそのまま足す（下向きの v は負で b × v も負）。
+inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
+  if (vel == 0.0) return 0.0;
+  const double v_abs = vel < 0.0 ? -vel : vel;
+  const double taper = t.ff_taper_count_s > 0 ? static_cast<double>(t.ff_taper_count_s) : 1.0;
+  double w = v_abs / taper;
+  if (w > 1.0) w = 1.0;
+  if (vel > 0.0) return w * t.ff_a_up_permille + t.ff_b_up_permille_per_count_s * vel;
+  return w * t.ff_a_down_permille + t.ff_b_down_permille_per_count_s * vel;
+}
+
+// Issue #25 r6 の位置ループ（t.ff_directional のとき v1_duty_command がここへ来る）。
+// 1. 保持（st.in_band）: 軌道速度 0 で、中なら |誤差| ≤ hold_exit の間とどまり、外なら |誤差| ≤ hold_enter かつ settle_ok
+//   （V1Axis が「軌道完了・|誤差| ≤ hold_enter・|実測速度| ≤ 10 が 200 ms」で立てる）で入る。入ったら I = 0、出力 0（積まない）。
+// 2. 走行／補正: u = FF（方向別）+ P + I。床は無い（1〜5 % の生の値がそのまま出る）。|u| は duty_max で 1 回だけ飽和、四捨五入は 1 回。
+// 3. 動き出しパルス（breakaway。V1Axis の update_breakaway が立てる）: 向きは u の向き（u = 0 なら誤差の向き）、|出力| = max(|u|, 方向別の
+//    動き出し Duty)、duty_max 以内。この tick は I を凍結。
+// 4. 積分: dI = Ki × err × dt を |dI| ≤ rate × dt に制限。飽和（|u| ≥ duty_max）していて dI が u と同じ向きなら積まない（それ以外は
+//    常に積む。戻す向きは飽和中も許す）。|I| ≤ i_max。
+inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
+                                       double dt_s, bool settle_ok, bool breakaway) {
+  const int64_t err_abs = err < 0 ? -err : err;
+  const long duty_max_pm = v1_permille(t.duty_max);
+  st.floor_on = false;
+  if (vel == 0.0) {
+    if (st.in_band) {
+      if (err_abs > t.hold_exit) st.in_band = false;
+    } else if (err_abs <= t.hold_enter && settle_ok) {
+      st.in_band = true;
+      st.i_pm = 0.0;  // 保持に入ったら I を捨てる（#1 は中立付近で自己保持する。出力 0）
+    }
+  } else {
+    st.in_band = false;
+  }
+  if (st.in_band) {
+    o.in_band = true;
+    o.mode = V1DutyMode::HOLD;
+    o.cmd_permille = 0;
+    return 0;
+  }
+  const double p_pm = static_cast<double>(err * t.kp_percent_per_100) * V1_PERMILLE_PER_PERCENT / 100.0;
+  const double ff_pm = v1_ff_directional_pm(vel, t);
+  o.p_permille = v1_clamp_i16(p_pm);
+  o.ff_permille = v1_clamp_i16(ff_pm);
+  o.i_permille = v1_clamp_i16(st.i_pm);
+  const double u_raw = ff_pm + p_pm + st.i_pm;
+  const long u = lround(u_raw);  // 四捨五入は 1 回
+  const bool saturated = (u >= duty_max_pm) || (u <= -duty_max_pm);
+  long mag = u < 0 ? -u : u;
+  if (mag > duty_max_pm) mag = duty_max_pm;
+  int dir = u > 0 ? 1 : (u < 0 ? -1 : 0);
+  if (dir == 0) dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
+  if (breakaway && dir != 0) {
+    long brk = dir > 0 ? t.breakaway_up_permille : t.breakaway_down_permille;
+    if (brk < 0) brk = -brk;
+    if (brk > duty_max_pm) brk = duty_max_pm;
+    if (mag < brk) mag = brk;
+    o.mode = V1DutyMode::BRK;
+  } else {
+    o.mode = V1DutyMode::MOVE;
+  }
+  const int out = static_cast<int>(dir * mag);
+  o.cmd_permille = static_cast<int16_t>(out);
+  // 積分の更新（次の tick のため）。パルス中は凍結
+  if (dt_s > 0.0 && t.ki_permille_per_count_s > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
+    double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+    const double di_max = static_cast<double>(t.i_rate_permille_per_s) * dt_s;
+    if (di > di_max) di = di_max;
+    if (di < -di_max) di = -di_max;
+    const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
+    const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
+    if (!deeper || unwinding) {
+      st.i_pm += di;
+      const double i_max = static_cast<double>(t.i_max_permille);
+      if (st.i_pm > i_max) st.i_pm = i_max;
+      if (st.i_pm < -i_max) st.i_pm = -i_max;
+    }
+  }
+  return out;
+}
+
 inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
                            V1DutyTerms* terms = nullptr, double dt_s = 0.0, bool settle_ok = true,
                            bool assist = false) {
@@ -125,12 +235,15 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
   o = V1DutyTerms{};
   o.vel_count_s = v1_clamp_i16(vel);
   o.boost_permille = static_cast<int16_t>(boost_permille);
+  // Issue #25 r6: 方向別 FF ＋ PI、床なし。boost は使わず、assist は動き出しパルス（V1Axis::update_breakaway）の意味になる
+  if (t.ff_directional) return v1_duty_command_directional(err, vel, st, t, o, dt_s, settle_ok, assist);
   const int64_t err_abs = err < 0 ? -err : err;
   const long duty_max_pm = v1_permille(t.duty_max);
   // 不感帯の中: 出力は I（保持バイアス）だけ。積まない。
   auto hold_output = [&]() -> int {
     st.floor_on = false;
     o.in_band = true;
+    o.mode = V1DutyMode::HOLD;
     long i_out = lround(st.i_pm);
     if (i_out > duty_max_pm) i_out = duty_max_pm;
     if (i_out < -duty_max_pm) i_out = -duty_max_pm;
@@ -442,6 +555,9 @@ class V1Axis {
   int stall_boost_permille() const { return stall_boost_; }
   // 積分項（Issue #25 手順 9「F」）の現在値 [permille]（四捨五入前の値を丸めたもの）。画面の計器行 `I`。STATUS には載せない
   int integral_permille() const { return static_cast<int>(lround(duty_state_.i_pm)); }
+  // 動き出しパルス（Issue #25 r6）: 進まないまま打った数と、いま出しているか（画面・テスト用）
+  int breakaway_pulses() const { return brk_pulses_; }
+  bool breakaway_active() const { return brk_active_; }
   // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
   const V1DutyTerms& duty_terms() const { return terms_; }
   // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
@@ -570,6 +686,14 @@ class V1Axis {
   uint64_t assist_window_start_us_ = 0;
   int64_t assist_anchor_raw_ = 0;       // 窓の開始時（ON の後は ON 時）のカウント
   int64_t assist_err_anchor_abs_ = 0;   // 窓の開始時の |誤差|（増え続けていることの基準）
+  // 動き出しパルス（Issue #25 r6。update_breakaway）
+  bool brk_active_ = false;          // パルスを出している
+  bool brk_running_ = false;         // 要求が続いていて窓／パルスを数えている
+  bool brk_exhausted_ = false;       // 進まないまま max_pulses 打った（要求が続く間は打たない。進めば戻る）
+  int brk_dir_ = 0;                  // 要求の向き（+1 = カウント増）
+  int brk_pulses_ = 0;               // 進まないまま打ったパルスの数
+  uint64_t brk_phase_start_us_ = 0;  // 窓／パルスの開始
+  int64_t brk_anchor_raw_ = 0;       // 窓／パルスの開始時のカウント
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
@@ -1371,6 +1495,7 @@ class V1Axis {
       duty_state_ = V1DutyState{};
       settle_dwell_us_ = 0;
       reset_track_assist();
+      reset_breakaway();
       reset_stall_boost();
       terms_ = V1DutyTerms{};
       return;
@@ -1382,7 +1507,7 @@ class V1Axis {
     const uint64_t dt_cap_us = ms_to_us(tuning.overrun_ms);
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
     const bool settle_ok = update_settle_dwell(err, dt_us);
-    const bool assist = update_track_assist(err, now);
+    const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
     const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
                                     assist);  // カウント増の向きが正 [permille]
     const int mag = cmd < 0 ? -cmd : cmd;
@@ -1431,7 +1556,7 @@ class V1Axis {
     if (tuning.settled_ms == 0) { settle_dwell_us_ = 0; return true; }
     const int64_t err_abs = err < 0 ? -err : err;
     const int32_t v_abs = velocity_ < 0 ? -velocity_ : velocity_;
-    const bool cond = setpoint_vel_ == 0.0 && err_abs <= tuning.deadband && v_abs <= tuning.settled_meas_vel;
+    const bool cond = setpoint_vel_ == 0.0 && err_abs <= tuning.band_enter() && v_abs <= tuning.settled_meas_vel;  // r6 は hold_enter（2）
     if (!cond) { settle_dwell_us_ = 0; return false; }
     settle_dwell_us_ += dt_us;
     return settle_dwell_us_ >= ms_to_us(tuning.settled_ms);
@@ -1452,7 +1577,7 @@ class V1Axis {
   // しきい値 max(10 %, duty_max × 75 %) には届かない（FF + P がそこまで出ていれば従来どおり無パルス判定が回る）。
   // FOLLOWING_ERROR の判定（check_motion_faults）は触らない。
   bool update_track_assist(int64_t err, uint64_t now) {
-    if (tuning.assist_ms == 0) { reset_track_assist(); return false; }
+    if (tuning.assist_ms == 0 || tuning.ff_directional) { reset_track_assist(); return false; }  // r6 は update_breakaway
     const double sv_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
     const bool traj_moving = sv_abs > static_cast<double>(tuning.assist_vel) && brake_release_cmd_;
     const int64_t moved = raw_ - assist_anchor_raw_;
@@ -1480,6 +1605,70 @@ class V1Axis {
     return false;
   }
 
+  void reset_breakaway() {
+    brk_active_ = false;
+    brk_running_ = false;
+    brk_exhausted_ = false;
+    brk_dir_ = 0;
+    brk_pulses_ = 0;
+  }
+
+  // 動き出しパルス（Issue #25 r6。床の唯一の例外）。Duty を計算する前に呼ぶ。true ならこの tick は v1_duty_command が
+  // 方向別の動き出し Duty（breakaway_up/down）を |合成| との大きい方で出す。
+  // 要求: ブレーキ解除指令中・保持の外で |誤差| > hold_exit。向きは誤差の向き（軌道が動いていれば軌道の向きで、誤差が軌道と逆
+  //（先行）なら対象外: 先行している軸を蹴らない）。進み = 向きへの符号付きカウント（自重で下がりながら上を要求されていれば進みではない）。
+  // 窓 breakaway_window_ms で進みが breakaway_min_move 未満 → パルス ON。パルスは進みが min_move 以上か breakaway_pulse_ms で終わる。
+  // 進まずに終わったパルスを数え、breakaway_max_pulses に達したら要求が続く間は打たない（静止 2 s の監視 ENCODER_FAULT に任せる）。
+  // 進めば数を 0 に戻す。停止ブーストの監視の時計（boost_active_since_us_）には触らない。
+  bool update_breakaway(int64_t err, uint64_t now) {
+    if (!tuning.ff_directional || tuning.breakaway_window_ms == 0) { reset_breakaway(); return false; }
+    const int64_t err_abs = err < 0 ? -err : err;
+    int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
+    if (setpoint_vel_ != 0.0) {
+      const int traj_dir = setpoint_vel_ > 0.0 ? 1 : -1;
+      if (traj_dir != dir) dir = 0;  // 軌道より先行: 対象外
+    }
+    const bool demand = dir != 0 && err_abs > tuning.hold_exit && brake_release_cmd_ && !duty_state_.in_band;
+    if (!demand) { reset_breakaway(); return false; }
+    if (!brk_running_ || dir != brk_dir_) {
+      reset_breakaway();
+      brk_running_ = true;
+      brk_dir_ = dir;
+      brk_phase_start_us_ = now;
+      brk_anchor_raw_ = raw_;
+      return false;
+    }
+    const int64_t progress = static_cast<int64_t>(dir) * (raw_ - brk_anchor_raw_);
+    if (progress >= tuning.breakaway_min_move) {
+      brk_active_ = false;  // 進んだ: 窓を取り直し、数も戻す
+      brk_exhausted_ = false;
+      brk_pulses_ = 0;
+      brk_phase_start_us_ = now;
+      brk_anchor_raw_ = raw_;
+      return false;
+    }
+    if (brk_exhausted_) return false;
+    const uint64_t elapsed = now - brk_phase_start_us_;
+    if (brk_active_) {
+      if (elapsed >= ms_to_us(tuning.breakaway_pulse_ms)) {
+        brk_active_ = false;  // 進まずに終わった
+        ++brk_pulses_;
+        if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
+        brk_phase_start_us_ = now;
+        brk_anchor_raw_ = raw_;
+        return false;
+      }
+      return true;
+    }
+    if (elapsed >= ms_to_us(tuning.breakaway_window_ms)) {
+      brk_active_ = true;
+      brk_phase_start_us_ = now;
+      brk_anchor_raw_ = raw_;
+      return true;
+    }
+    return false;
+  }
+
   void reset_stall_boost() {
     stall_boost_ = 0;
     boost_eligible_ = false;
@@ -1497,7 +1686,7 @@ class V1Axis {
   void stall_boost_gate(int64_t err, uint64_t now) {
     if (tuning.stall_boost_ms == 0) { reset_stall_boost(); return; }
     const int64_t err_abs = err < 0 ? -err : err;
-    const bool eligible = setpoint_vel_ == 0.0 && err_abs > tuning.deadband_out && brake_release_cmd_;
+    const bool eligible = setpoint_vel_ == 0.0 && err_abs > tuning.band_exit() && brake_release_cmd_;  // r6 は hold_exit（4）
     if (!eligible) { reset_stall_boost(); return; }
     const int8_t err_sign = err > 0 ? 1 : -1;
     if (!boost_eligible_ || err_sign != boost_err_sign_) {
@@ -1530,10 +1719,17 @@ class V1Axis {
     }
     const int max_boost = tuning.duty_max > tuning.duty_min ? v1_permille(tuning.duty_max - tuning.duty_min) : 0;
     if (stall_boost_ > max_boost) stall_boost_ = max_boost;  // SET_LIMITS で上限が下がった
-    if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;
-    const bool at_cap = stall_boost_ >= max_boost;
     const bool timed_out = tuning.stall_boost_max_ms != 0 &&
                            now - boost_active_since_us_ >= ms_to_us(tuning.stall_boost_max_ms);
+    if (tuning.ff_directional) {
+      // Issue #25 r6: 床が無いので上乗せもしない。静止 2 s の監視（対象のまま stall_boost_min_move 未満しか進まない →
+      // ENCODER_FAULT）だけを残す。時計を戻すのは上の「動いた」だけで、動き出しパルス（update_breakaway）は戻さない。
+      stall_boost_ = 0;
+      if (timed_out && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
+      return;
+    }
+    if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;
+    const bool at_cap = stall_boost_ >= max_boost;
     if (at_cap || timed_out) {
       if (!encoder_fault_check_disabled()) {
         latch_fault(v1::fault::ENCODER_FAULT, now);  // 出力 0・ブレーキ作動・主電源 OFF 指令。reset_stall_boost は次の update_duty で

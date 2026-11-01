@@ -3475,6 +3475,350 @@ inline void test_integral_does_not_flip_floor_direction_when_stationary() {
   CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost_permille() == 20);
 }
 
+
+// ---- Issue #25 r6: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス（config.h V1_FF_DIRECTIONAL） ----------------
+// ホストテストは -DV1_FF_DIRECTIONAL=0 で組む（run_tests.sh）ので、既定の V1Tuning は従来の経路。r6 は V1Tuning(true) で選ぶ。
+
+inline V1Tuning r6_tuning(int kp = 6, int duty_max = 20) {
+  V1Tuning t(true);
+  t.kp_percent_per_100 = kp;
+  t.duty_min = 9;
+  t.duty_max = duty_max;
+  return t;
+}
+
+// 方向別 FF の値（実測 11-02: 上 46 + 0.10 v、下 −7 + 0.107 v [permille]）とテーパ（|v| < 30 で切片を w = |v|/30 倍）。
+// 旧 ff_count_s_per_percent は無視する。
+inline void test_r6_ff_directional_values_and_taper() {
+  CHECK(V1Tuning{}.ff_directional == (V1_FF_DIRECTIONAL != 0));  // 既定はコンパイルスイッチ（テストは 0 で組む）
+  CHECK(!V1Tuning{}.ff_directional && fabs(V1Tuning{}.ki_permille_per_count_s - (V1_INTEGRAL ? V1_KI_PERMILLE_PER_COUNT_S : 0.0)) < 1e-12);
+  V1Tuning t = r6_tuning();
+  CHECK(t.ff_directional && fabs(t.ki_permille_per_count_s - 0.2) < 1e-12);  // Ki 0.02 %/(count·s)
+  CHECK(t.ff_a_up_permille == 46 && t.ff_a_down_permille == -7 && t.ff_taper_count_s == 30);
+  CHECK(fabs(t.ff_b_up_permille_per_count_s - 0.10) < 1e-12 && fabs(t.ff_b_down_permille_per_count_s - 0.107) < 1e-12);
+  CHECK(v1_ff_directional_pm(0.0, t) == 0.0);
+  CHECK(fabs(v1_ff_directional_pm(300.0, t) - 76.0) < 1e-9);     // 46 + 30
+  CHECK(fabs(v1_ff_directional_pm(-300.0, t) + 39.1) < 1e-9);    // −7 − 32.1
+  CHECK(fabs(v1_ff_directional_pm(600.0, t) - 106.0) < 1e-9);    // 46 + 60
+  CHECK(fabs(v1_ff_directional_pm(-600.0, t) + 71.2) < 1e-9);    // −7 − 64.2
+  CHECK(fabs(v1_ff_directional_pm(30.0, t) - 49.0) < 1e-9);      // w = 1 ちょうど
+  CHECK(fabs(v1_ff_directional_pm(-30.0, t) + 10.21) < 1e-9);
+  CHECK(fabs(v1_ff_directional_pm(15.0, t) - 24.5) < 1e-9);      // w = 0.5: 23 + 1.5
+  CHECK(fabs(v1_ff_directional_pm(-15.0, t) + 5.105) < 1e-9);    // −3.5 − 1.605
+  CHECK(fabs(v1_ff_directional_pm(3.0, t) - 4.9) < 1e-9);        // w = 0.1: 4.6 + 0.3
+  // v1_duty_command 経由（誤差 0、I 0）: FF がそのまま出る（床なし、四捨五入 1 回）
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(0, 300.0, st, t, 0, &o) == 76 && o.ff_permille == 76 && o.mode == V1DutyMode::MOVE && !o.floor_on);
+  CHECK(v1_duty_command(0, -300.0, st, t, 0, &o) == -39 && o.ff_permille == -39);
+  CHECK(v1_duty_command(0, 600.0, st, t, 0, &o) == 106);
+  CHECK(v1_duty_command(0, -600.0, st, t, 0, &o) == -71);
+  CHECK(v1_duty_command(0, 15.0, st, t, 0, &o) == 25);   // 24.5 → 25（0 から遠い側）
+  CHECK(v1_duty_command(0, -15.0, st, t, 0, &o) == -5);
+  // 旧 ff は無視（1 にしても同じ）。boost・assist=false も無関係
+  t.ff_count_s_per_percent = 1;
+  CHECK(v1_duty_command(0, 300.0, st, t, 50, &o) == 76 && o.boost_permille == 50);
+  // 係数を変えれば追従する（コンサルの更新に備える）
+  t.ff_a_up_permille = 60;
+  t.ff_b_up_permille_per_count_s = 0.03;
+  CHECK(v1_duty_command(0, 300.0, st, t, 0, &o) == 69);  // 60 + 9
+}
+
+// 走行中に床は無い: 1〜5 % の生の FF + P + I がそのまま出る。duty_min 9 は関係しない。
+inline void test_r6_no_floor_while_moving() {
+  V1Tuning t = r6_tuning();  // kp 6、duty_min 9、duty_max 20
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(0, 15.0, st, t, 0, &o) == 25 && !o.floor_on && o.mode == V1DutyMode::MOVE);  // 2.5 %
+  CHECK(v1_duty_command(3, 0.0, st, t, 0, &o, 0.0, false) == 2 && o.p_permille == 2 && !o.in_band);  // P 1.8 → 2（0.2 %）
+  CHECK(v1_duty_command(10, 0.0, st, t, 0, &o, 0.0, false) == 6);   // 誤差 10 → 0.6 %（旧: 不感帯で 0 か床 9 %）
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o) == 15 && !o.floor_on);  // 誤差 25 → 1.5 %（旧: 床 ON で 90）
+  CHECK(v1_duty_command(-25, 0.0, st, t, 0, &o) == -15);
+  // 軌道と逆向きの誤差（先行）: 合成は生のまま（符号不一致の抑制なし）。誤差 −50・軌道 +300 → FF 76 + P −30 = 46
+  CHECK(v1_duty_command(-50, 300.0, st, t, 0, &o) == 46);
+  // 上限は duty_max で 1 回だけ飽和
+  CHECK(v1_duty_command(300, 600.0, st, t, 0, &o) == 200);   // 106 + 180 → 200
+  CHECK(v1_duty_command(-300, -600.0, st, t, 0, &o) == -200);
+}
+
+// PI: Ki 0.2 permille/(count·s)、|I| ≤ 30、|dI/dt| ≤ 10/s。アンチワインドアップは「飽和した向きへ積み増さない」だけ。
+// 符号不一致の抑制は無い（先行して逆向きに補正するのは正当）。戻す向きは飽和中も許す。
+inline void test_r6_pi_anti_windup_at_duty_max() {
+  V1Tuning t = r6_tuning();  // kp 6、duty_max 20
+  V1DutyState st;
+  // 誤差 400 静止: P 240 → 200 で飽和。I は 2 s 経っても 0
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005) == 200);
+  CHECK(st.i_pm == 0.0);
+  // 誤差 30: P 18（飽和しない）→ 0.2 × 30 × 0.005 = 0.03 / tick、1 s で 6 → 出力 24
+  for (int i = 0; i < 200; ++i) v1_duty_command(30, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 6.0) < 1e-9);
+  V1DutyTerms o;
+  CHECK(v1_duty_command(30, 0.0, st, t, 0, &o) == 24 && o.i_permille == 6 && o.p_permille == 18);
+  // 変化率の上限: 誤差 400 で duty_max 60（飽和しない）→ 0.4 / tick が 0.05 / tick に → 1 s で 10。上限 30
+  V1Tuning t60 = r6_tuning(6, 60);
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st2, t60, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 10.0) < 1e-9);
+  for (int i = 0; i < 1000; ++i) v1_duty_command(400, 0.0, st2, t60, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 30.0) < 1e-9);
+  // 戻す向きは飽和中も許す: I +30 のまま誤差 −400（飽和 −200）→ I は 1 s で 10 減る
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(-400, 0.0, st2, t, 0, nullptr, 0.005) == -200);
+  CHECK(fabs(st2.i_pm - 20.0) < 1e-9);
+  // 0 を越えて負（飽和した向きへ積み増す）には行かない
+  for (int i = 0; i < 1000; ++i) v1_duty_command(-400, 0.0, st2, t, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm) < 1e-9);
+  // 符号不一致でも積む: 誤差 +50・軌道 −600（FF −71 + P 30 = −41）→ I は正に育つ（旧 E の抑制は無い）
+  V1DutyState st3;
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(50, -600.0, st3, t, 0, nullptr, 0.005) < 0);
+  CHECK(fabs(st3.i_pm - 10.0) < 1e-9);  // 0.2 × 50 × 0.005 = 0.05 / tick（変化率の上限ちょうど）× 200
+  // I は小数のまま持ち、出力は 1 回だけ四捨五入: I 0.6 + P 0 → 1
+  V1DutyState st4;
+  st4.i_pm = 0.6;
+  CHECK(v1_duty_command(0, 0.0, st4, t, 0, &o, 0.0, false) == 1 && o.i_permille == 1);
+}
+
+// 保持: 軌道速度 0・|誤差| ≤ 2・settle_ok で入る（I と出力を 0）。|誤差| ≤ 4 の間とどまり、> 4 か軌道が動けば出る。
+// settle_ok = false（整定の 200 ms がまだ）なら |誤差| ≤ 2 でも入らず生の P + I。
+inline void test_r6_hold_entry_exit_and_zeroing() {
+  V1Tuning t = r6_tuning();
+  V1DutyState st;
+  st.i_pm = 12.0;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005, false) == 13 && !o.in_band && o.mode == V1DutyMode::MOVE);  // P 1.2 + I 12
+  CHECK(v1_duty_command(3, 0.0, st, t, 0, &o, 0.005, true) != 0 && !o.in_band);  // 3 > 2: 入らない
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005, true) == 0 && o.in_band && o.mode == V1DutyMode::HOLD);
+  CHECK(st.i_pm == 0.0 && o.i_permille == 0 && !o.floor_on);
+  CHECK(v1_duty_command(4, 0.0, st, t, 0, &o, 0.005) == 0 && o.in_band);   // 出口 4 まではとどまる（settle_ok は見ない）
+  CHECK(v1_duty_command(-4, 0.0, st, t, 0, &o, 0.005, false) == 0 && o.in_band);
+  CHECK(st.i_pm == 0.0);  // 保持中は積まない
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 3 && !o.in_band && o.mode == V1DutyMode::MOVE);  // 5 > 4: 出る、P 3
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005) == 0 && o.in_band);  // 再び入る
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.005) == 56 && !o.in_band);  // 軌道が動けば出る（FF 46 + 10）
+  // 従来の deadband / deadband_out（10 / 20）は r6 では使わない
+  CHECK(v1_duty_command(8, 0.0, st, t, 0, &o, 0.005) == 5 && !o.in_band);
+}
+
+// 動き出しパルス（v1_duty_command 側）: breakaway = true のとき、合成の向き（0 なら誤差の向き）に方向別の動き出し Duty と
+// |合成| の大きい方。duty_max 以内。I は凍結。
+inline void test_r6_breakaway_pulse_output() {
+  V1Tuning t = r6_tuning();
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005, true, true) == 90 && o.mode == V1DutyMode::BRK && !o.floor_on);
+  CHECK(st.i_pm == 0.0);  // 凍結
+  CHECK(v1_duty_command(-5, 0.0, st, t, 0, &o, 0.005, true, true) == -60 && o.mode == V1DutyMode::BRK);
+  CHECK(v1_duty_command(300, 0.0, st, t, 0, &o, 0.0, true, true) == 180);  // 合成 180 > 90 → 合成
+  CHECK(v1_duty_command(0, 0.0, st, t, 0, &o, 0.0, false, true) == 0 && o.mode == V1DutyMode::MOVE);  // 向きが無い
+  st.i_pm = -20.0;  // I が逆向きでも合成の向き（P 3 − 20 = −17 → 下向き → −60）
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == -60);
+  st.i_pm = 0.0;
+  t.duty_max = 5;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 50);  // duty_max で頭打ち
+  t.breakaway_up_permille = 120;
+  t.duty_max = 20;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 120);
+}
+
+// 軸を通して: 保持に入るのは「軌道完了・|誤差| ≤ 2・|実測速度| ≤ 10 が 200 ms」。入れば出力 0・I 0。|誤差| 3〜4 ではとどまり、5 で出る。
+inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0 && h.ax.duty_terms().in_band);
+  h.stall = true;
+  h.raw += 3;  // 誤差 −3
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+  h.raw += 2;  // 誤差 −5 → 出る。P = −1 permille（kp 2）→ duty +1（sign 1）
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == 1 && !h.ax.duty_terms().in_band);
+  // 戻る（誤差 −2）: 実測速度（100 ms 窓、最長 200 ms 古い）が ≤ 10 になってから 200 ms → 入るまで最長 400 ms。50 ms では入らない
+  h.raw -= 3;
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.duty_terms().in_band);  // P −0.4 → 0 だが保持ではない
+  h.drive(450, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);
+  CHECK(h.ax.state() == st::HOLDING);
+}
+
+// 軸を通して: 静止で |誤差| 10 のまま進まない → 100 ms 後に動き出しパルス（上 90 → duty −90）を 100 ms、進まなければ 100 ms 空けて
+// 次のパルス。5 回で打ち切り。パルスは静止 2 s の監視の時計を戻さず、2 s で ENCODER_FAULT。
+inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10（上へ）
+  h.step();     // 対象になる（窓の開始・監視の起点）
+  const uint64_t t0 = h.now;
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == -2);  // 生の P 2
+  h.drive(90, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active());
+  h.drive(20, h.ax.target_count());  // 110 ms: パルス ON
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == -90 && h.ax.breakaway_active());
+  h.drive(80, h.ax.target_count());  // 190 ms: まだパルス
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK);
+  h.drive(30, h.ax.target_count());  // 220 ms: 終わって 1 回目を数えた。生の P に戻る
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == -2 && h.ax.breakaway_pulses() == 1);
+  // 5 回まで（1 回目は上で観測済み）。1.1 s 時点で 5 回、以後は打たない
+  int brk_ticks = 0;
+  while (h.now - t0 < 1900 * MS) {
+    h.drive(10, h.ax.target_count());
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) ++brk_ticks;
+  }
+  CHECK(h.ax.breakaway_pulses() == 5 && !h.ax.breakaway_active());
+  CHECK(brk_ticks >= 36 && brk_ticks <= 44);  // 残り 4 回 × 100 ms = 400 ms ≈ 40 回（10 ms 刻みの観測）
+  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_permille() <= -2 && h.ax.duty_permille() >= -5);  // 生の P 2 ＋ 育った I（≤ 3）
+  h.drive(120, h.ax.target_count());  // 2 s
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0 && h.ax.breakaway_pulses() == 0);
+  CHECK(h.now - t0 <= 2100 * MS);
+}
+
+// パルス中に 3 count 進めば次の tick で解除され、数は 0 に戻る。下向きの要求は −60（duty +60）。
+// パルスを切った構成（breakaway_window_ms = 0）でも 2 s の監視はそのまま。
+inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw += 10;  // 誤差 −10（下へ）
+  h.step();
+  h.drive(110, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == 60);
+  h.raw -= 3;  // 下へ 3 進んだ
+  h.drive(10, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active() && h.ax.breakaway_pulses() == 0);
+  CHECK(h.ax.duty_permille() > 0 && h.ax.duty_permille() < 10);  // 生の P（誤差 −7 → −1.4 → −1 → duty +1）
+  // 自重で逆へ動くのは「進み」ではない: 上の要求（誤差 +10）でカウントが下がっても窓は取り直されずパルスが出る
+  Harness g;
+  g.ax.tuning = r6_tuning(2);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 10;
+  g.step();
+  g.raw -= 5;  // 逆向きに 5
+  g.drive(110, g.ax.target_count());
+  CHECK(g.ax.duty_terms().mode == V1DutyMode::BRK && g.ax.duty_permille() == -90);
+  // パルス無効でも監視は 2 s
+  Harness k;
+  k.ax.tuning = r6_tuning(2);
+  k.ax.tuning.breakaway_window_ms = 0;
+  Harness::accepted(k.config_with(c));
+  k.reach_holding_from_configured();
+  k.stall = true;
+  k.raw -= 10;
+  k.step();
+  const uint64_t t0 = k.now;
+  k.drive(1900, k.ax.target_count());
+  CHECK(k.ax.state() == st::HOLDING && k.ax.duty_terms().mode == V1DutyMode::MOVE && k.ax.breakaway_pulses() == 0);
+  k.drive(120, k.ax.target_count());
+  CHECK(k.ax.state() == st::FAULT && k.ax.fault_code() == fc::ENCODER_FAULT && k.now - t0 <= 2100 * MS);
+}
+
+// 追従（プラントが付いてくる）では床もパルスも出ず、出力は FF（300 count/s 上り → 76）± 小さい P + I。到着後に保持。
+inline void test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.pos_max_vel = 300;
+  const int32_t start = h.ax.actual_count();
+  bool any_brk = false, any_floor = false;
+  int min_mag = 1000, max_mag = 0;
+  for (int i = 0; i < 100; ++i) {  // 1 s: 加速 15 ms の後 300 count/s で約 290 count
+    h.drive(10, start + 2000);
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) any_brk = true;
+    if (h.ax.duty_terms().floor_on) any_floor = true;
+    if (i >= 5) {
+      const int mag = -h.ax.duty_permille();  // 上り（カウント増）は sign 1 で負
+      if (mag < min_mag) min_mag = mag;
+      if (mag > max_mag) max_mag = mag;
+    }
+  }
+  CHECK(!any_brk && !any_floor && h.ax.state() == st::ACTIVE);
+  CHECK(min_mag >= 70 && max_mag <= 85);  // FF 76（旧: 床 90 か生の 30）
+  CHECK(h.ax.actual_count() - start > 250);
+  // 下り: FF −39 → duty +39 前後
+  h.drive(1000, start);
+  CHECK(h.ax.duty_permille() >= 33 && h.ax.duty_permille() <= 46 && h.ax.duty_terms().mode == V1DutyMode::MOVE);
+  // 到着して止まれば保持（出力 0）
+  h.drive(1500, start);
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+}
+
+// 保護は変わらない: 600 count/s で止まったままなら FOLLOWING_ERROR 400 は約 0.7 s。kp 6 / duty_max 20 なら FF 106 + P が 15 %
+// に届いた所から 200 ms の無パルスで ENCODER_FAULT（動き出しパルス 90 は 15 % 未満で判定に入らない）。
+inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2, 40);  // duty_max 40 → 無パルスのしきい値 30 %。FF 106 + P 80 = 186 はそれ未満なので FOLLOWING_ERROR 側
+  v1::Config c = base_config();
+  c.following_error_limit_count = 400;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 600;
+  const int32_t start = h.ax.actual_count();
+  const uint64_t t0 = h.now;
+  for (int i = 0; i < 100 && h.ax.state() != st::FAULT; ++i) h.drive(10, start + 5000);
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::FOLLOWING_ERROR && h.now - t0 <= 1000 * MS);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  v1::Config c2 = base_config();
+  c2.following_error_limit_count = 100000;
+  Harness::accepted(g.config_with(c2));
+  Harness::accepted(g.set_limits(20, 9, 6, 100, 10, 20));  // ff 100 は受理されるが無視
+  CHECK(g.ax.tuning.ff_count_s_per_percent == 100 && g.ax.tuning.ff_directional);
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 600;
+  const int32_t gstart = g.ax.actual_count();
+  const uint64_t gt0 = g.now;
+  g.drive(60, gstart + 5000);
+  CHECK(g.ax.duty_permille() <= -106 && g.ax.state() == st::ACTIVE);  // FF 106 ＋ P
+  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 600 * MS);
+}
+
+// SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
+inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
+  V1Tuning a = r6_tuning(6, 20);
+  V1Tuning b = a;
+  b.ff_count_s_per_percent = 50;
+  b.duty_min = 3;
+  b.deadband = 1;
+  b.deadband_out = 2;
+  V1DutyState sa, sb;
+  for (int err = -60; err <= 60; err += 7) {
+    for (double v : {0.0, 20.0, -200.0, 600.0}) {
+      CHECK(v1_duty_command(err, v, sa, a, 0, nullptr, 0.005, false) == v1_duty_command(err, v, sb, b, 0, nullptr, 0.005, false));
+    }
+  }
+  b.kp_percent_per_100 = 12;
+  CHECK(v1_duty_command(50, 0.0, sa, a, 0, nullptr, 0.0, false) != v1_duty_command(50, 0.0, sb, b, 0, nullptr, 0.0, false));
+  b.kp_percent_per_100 = 6;
+  b.duty_max = 5;
+  CHECK(v1_duty_command(0, 600.0, sa, a, 0, nullptr, 0.0, false) == 106 && v1_duty_command(0, 600.0, sb, b, 0, nullptr, 0.0, false) == 50);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -3556,6 +3900,17 @@ inline void run_all() {
   test_track_assist_triggers_after_150ms_and_releases_on_motion();
   test_track_assist_requires_trajectory_speed_and_can_be_disabled();
   test_track_assist_does_not_block_following_error_or_moving_stall_fault();
+  test_r6_ff_directional_values_and_taper();
+  test_r6_no_floor_while_moving();
+  test_r6_pi_anti_windup_at_duty_max();
+  test_r6_hold_entry_exit_and_zeroing();
+  test_r6_breakaway_pulse_output();
+  test_r6_axis_hold_requires_dwell_and_holds_to_4();
+  test_r6_breakaway_pulses_then_stall_watchdog_at_2s();
+  test_r6_breakaway_releases_on_progress_and_down_direction();
+  test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse();
+  test_r6_following_error_and_moving_stall_fault_unchanged();
+  test_r6_set_limits_ff_and_floor_fields_are_ignored();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();
