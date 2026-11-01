@@ -249,6 +249,26 @@ fn vectors() -> Vec<Vector> {
             frame_hex: "01 86 08 00 EF CD AB 89 02 01 01 00 32 C1",
             wire_hex: "04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00",
         },
+        Vector {
+            title: "CALIBRATE",
+            msg: Msg::Host(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START }),
+            frame_hex: "01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F",
+            wire_hex: "04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00",
+        },
+        Vector {
+            title: "CAL_RESULT",
+            msg: Msg::Mcu(McuMsg::CalResult(CalResult {
+                boot_id: BOOT_ID,
+                result: CalResultCode::Ok,
+                step: 3,
+                n_end_count: 5551,
+                neutral_count: 2775,
+                sign: 1,
+                reason: CalResult::reason_bytes("ok"),
+            })),
+            frame_hex: "01 87 1C 00 EF CD AB 89 00 03 00 00 AF 15 00 00 D7 0A 00 00 01 00 00 00 6F 6B 00 00 00 00 00 00 7A C9",
+            wire_hex: "04 01 87 1C 05 EF CD AB 89 02 03 01 03 AF 15 01 03 D7 0A 01 02 01 01 01 03 6F 6B 01 01 01 01 01 03 7A C9 00",
+        },
     ]
 }
 
@@ -270,7 +290,7 @@ fn markdown() -> String {
     s.push_str(
         "`frame` は COBS 前のフレーム（header + payload + crc）、`wire` は COBS 符号化して区切り `0x00` を付けた USB 上のバイト列。\
          いずれも 16 進・空白区切り。「値」は各フィールドの値（JSON、フィールドはレイアウト順、数値は 10 進。\
-         `device_id` は 16 桁 hex、`fault_code` / `result` / `reason` は名前で表記）。\n",
+         `device_id` は 16 桁 hex、`fault_code` / `result` / `reason` は名前で表記。CAL_RESULT の `reason` は NUL を除いた ASCII 文字列）。\n",
     );
     for (i, v) in vectors().iter().enumerate() {
         let f = frame_bytes(&v.msg);

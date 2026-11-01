@@ -52,6 +52,10 @@ link_latency_ms = 1
 # device_id は照合にだけ使う、protocol.md §1.1）。false にすると 0 を名乗り、
 # device_id だけで割り当てる旧経路の試験になる。
 report_selected_axis = true
+# 模擬機構の端（起動時の座標）。プラントはこれを越えない。校正（POST /v1/calibrate）は
+# end_min_count を P 端として端当てし、P 端 = 0 に基準を取り直す（n_end_count = max − min）。
+end_min_count = -3000
+end_max_count = 3000
 
 [[axis]]
 axis_id = 1

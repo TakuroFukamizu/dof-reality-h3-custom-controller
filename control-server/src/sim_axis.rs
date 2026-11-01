@@ -114,6 +114,32 @@
 //! (the PC never writes to a conflicted axis). `reboot` keeps
 //! the selection (NVS).
 //!
+//! # End-stop calibration (protocol.md §1.2, DESIGN.md §11)
+//!
+//! The simulated mechanism has end stops at `SimParams::end_min_count` /
+//! `end_max_count` (in the unit's current count coordinate; they move with
+//! every reference change so the mechanism never moves by a SET_REFERENCE).
+//! The plant can never pass them: the position clamps and the velocity reads 0
+//! while pushing against one. CALIBRATE(1), DISARMED only, runs:
+//! main power on (role bit) → settle (`arming_delay_ms / 2`) → brake release
+//! → wait (`arming_delay_ms / 2`) → move to the **P end** → move to the N end
+//! → move to the neutral (midpoint) → shutdown (brake applied,
+//! `disarming_delay_ms`) → CAL_RESULT → STATUS(DISARMED). The P end of the
+//! simulator is the end at the **minimal count** (`end_min_count`), i.e. the
+//! unit has sign +1: `n_end_count = end_max − end_min > 0`, `neutral_count =
+//! n_end_count / 2`, `sign = 1`, `reason = "ok"`, `step = 3`. On success the
+//! unit re-references itself so that the P end reads 0 and sets
+//! POSITION_REFERENCED. CALIBRATE(0) / DISARM cancel (`CANCELLED`, reason
+//! `stop`), the injected failure (`set_calibration_failure`) and a stalled
+//! plant (`set_stall`) fail (`FAILED`, reason `stall` / the injected one); both
+//! clear POSITION_REFERENCED and end in DISARMED. HOST_FAULT (and
+//! `force_fault`) during a calibration sends CAL_RESULT(`FAILED`, reason
+//! `fault`) and then latches FAULT as usual. SET_POSITION is dropped without
+//! being counted while CALIBRATING; CONFIG / ARM_PREPARE / START /
+//! SET_REFERENCE / FAULT_RESET are `BAD_STATE`; CONTROLLED_STOP is the usual
+//! no-op. No motion fault check runs during a calibration (the mechanism goes
+//! past the soft window to the mechanical ends by design).
+//!
 //! # STATUS
 //!
 //! Sent every `status_period_ms` (from [`SimMcu::tick`]) and immediately whenever
@@ -143,9 +169,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::config::SimBackendConfig;
 use crate::protocol::cobs::{self, FrameAccumulator};
 use crate::protocol::{
-    self, capabilities, frame, msg_type, role_flags, Ack, AckReason, AckResult, ClockSyncReply,
-    Config, FaultEvent, Hello, HostMsg, McuMsg, SetPosition, Status, MAX_ENCODED_LEN,
-    PROTOCOL_VERSION,
+    self, calibrate_mode, capabilities, frame, msg_type, role_flags, Ack, AckReason, AckResult,
+    CalResult, CalResultCode, ClockSyncReply, Config, FaultEvent, Hello, HostMsg, McuMsg,
+    SetPosition, Status, CAL_REASON_LEN, MAX_ENCODED_LEN, PROTOCOL_VERSION,
 };
 use crate::types::{status_flags, Counts, DeviceId, FaultCode, McuState};
 
@@ -179,6 +205,10 @@ pub struct SimParams {
     pub initial_count: Counts,
     /// One-way link latency applied by the async runner (both directions).
     pub link_latency_ms: u64,
+    /// Mechanical end stops of the simulated mechanism in the boot coordinate
+    /// (the plant cannot pass them). `end_min_count` is the calibration's P end.
+    pub end_min_count: Counts,
+    pub end_max_count: Counts,
 }
 
 impl Default for SimParams {
@@ -195,6 +225,8 @@ impl Default for SimParams {
             disarming_delay_ms: 30,
             initial_count: 0,
             link_latency_ms: 0,
+            end_min_count: -3000,
+            end_max_count: 3000,
         }
     }
 }
@@ -215,6 +247,8 @@ impl SimParams {
             plant_max_vel_count_s: cfg.plant_max_vel_count_s,
             status_period_ms: cfg.status_period_ms,
             link_latency_ms: cfg.link_latency_ms,
+            end_min_count: cfg.end_min_count,
+            end_max_count: cfg.end_max_count,
             ..Self::default()
         }
     }
@@ -229,6 +263,35 @@ enum StopKind {
     Disarm,
     /// Fault that decelerates first (COMMAND_TIMEOUT) → FAULT(code).
     Fault(FaultCode),
+}
+
+/// Phase of a running end-stop calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalPhase {
+    /// Main power commanded on; waiting for it to settle.
+    PowerSettle,
+    /// Brake release commanded; waiting for it.
+    BrakeRelease,
+    ToP,
+    ToN,
+    ToNeutral,
+    /// Brake applied; waiting before PWM 0 / power off → CAL_RESULT → DISARMED.
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+struct CalRun {
+    phase: CalPhase,
+    phase_started_us: u64,
+    /// CAL_RESULT `step` (1 = to P end, 2 = to N end, 3 = to neutral).
+    step: u8,
+    /// Move target of the current phase (beyond the stop for the end moves).
+    target: f64,
+    /// Positions (current coordinate) where the ends were found.
+    at_p: Option<f64>,
+    at_n: Option<f64>,
+    /// Outcome, set when the shutdown starts.
+    outcome: Option<(CalResultCode, [u8; CAL_REASON_LEN])>,
 }
 
 /// Pure model of one axis MCU. Time is injected as `now_us` (any monotonic
@@ -270,6 +333,9 @@ pub struct SimMcu {
     // Motion (counts, count/s).
     actual: f64,
     actual_vel: f64,
+    /// End stops in the current coordinate (shifted with every reference change).
+    end_min: f64,
+    end_max: f64,
     setpoint: f64,
     setpoint_vel: f64,
     control_target: f64,
@@ -284,6 +350,10 @@ pub struct SimMcu {
     drop_rx: bool,
     freeze_tx: bool,
     fault_cause_present: bool,
+    /// The next calibration fails at its first move with this reason.
+    cal_failure: Option<[u8; CAL_REASON_LEN]>,
+
+    cal: Option<CalRun>,
 
     outbox: Vec<McuMsg>,
     next_status_us: Option<u64>,
@@ -292,7 +362,8 @@ pub struct SimMcu {
 
 impl SimMcu {
     pub fn new(params: SimParams) -> Self {
-        let actual = params.initial_count as f64;
+        let actual = (params.initial_count as f64)
+            .clamp(params.end_min_count as f64, params.end_max_count as f64);
         Self {
             boot_id: params.boot_id,
             selected_axis: params.selected_axis,
@@ -317,6 +388,8 @@ impl SimMcu {
             stale_drop_count: 0,
             actual,
             actual_vel: 0.0,
+            end_min: params.end_min_count as f64,
+            end_max: params.end_max_count as f64,
             setpoint: actual,
             setpoint_vel: 0.0,
             control_target: actual,
@@ -327,6 +400,8 @@ impl SimMcu {
             drop_rx: false,
             freeze_tx: false,
             fault_cause_present: false,
+            cal_failure: None,
+            cal: None,
             outbox: Vec::new(),
             next_status_us: None,
             last_status_key: None,
@@ -450,6 +525,14 @@ impl SimMcu {
     pub fn params(&self) -> &SimParams {
         &self.params
     }
+    /// End stops in the current count coordinate (min, max).
+    pub fn end_counts(&self) -> (Counts, Counts) {
+        (to_count(self.end_min), to_count(self.end_max))
+    }
+    /// An end-stop calibration is running (state CALIBRATING).
+    pub fn is_calibrating(&self) -> bool {
+        self.cal.is_some()
+    }
 
     /// STATUS as it would be sent now.
     pub fn status(&self) -> Status {
@@ -484,9 +567,15 @@ impl SimMcu {
     pub fn set_stall(&mut self, stall: bool) {
         self.stall = stall;
     }
-    /// External disturbance: move the actual position by `delta` counts.
+    /// External disturbance: move the actual position by `delta` counts
+    /// (never past the end stops).
     pub fn nudge_actual(&mut self, delta: Counts) {
-        self.actual += delta as f64;
+        self.actual = (self.actual + delta as f64).clamp(self.end_min, self.end_max);
+    }
+    /// The next calibration fails at its first move with `reason` (ASCII,
+    /// truncated to 8 bytes), as a stalled / too slow unit would.
+    pub fn set_calibration_failure(&mut self, reason: Option<&str>) {
+        self.cal_failure = reason.map(CalResult::reason_bytes);
     }
     /// Latch `code` now (FAULT_EVENT goes out with the next handle/tick).
     pub fn force_fault(&mut self, code: FaultCode) {
@@ -526,6 +615,10 @@ impl SimMcu {
         } else {
             0.0
         };
+        // The mechanism does not move on a reset: the end stops follow the
+        // new coordinate.
+        fresh.end_min = self.end_min + (pos - self.actual);
+        fresh.end_max = self.end_max + (pos - self.actual);
         fresh.actual = pos;
         fresh.setpoint = pos;
         fresh.control_target = pos;
@@ -643,6 +736,11 @@ impl SimMcu {
             } => self.command(msg, request_id, msg_type::SET_REFERENCE, now, |s, _| {
                 s.on_set_reference(reference_count)
             }),
+            HostMsg::Calibrate { request_id, mode } => {
+                self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
+                    s.on_calibrate(mode, now)
+                })
+            }
         }
     }
 
@@ -796,6 +894,10 @@ impl SimMcu {
 
     /// SET_POSITION: no ACK. Staleness → drop; valid → lease; ACTIVE → apply.
     fn on_set_position(&mut self, m: &SetPosition, now: u64) {
+        if self.state == McuState::Calibrating {
+            // Dropped without being counted (protocol.md §1.2).
+            return;
+        }
         let Some(cfg) = self.config else {
             self.stale_drop_count = self.stale_drop_count.saturating_add(1);
             return;
@@ -840,6 +942,8 @@ impl SimMcu {
             McuState::Arming | McuState::Holding => self.enter_disarming(now),
             McuState::Active => self.begin_stop(StopKind::Disarm, now),
             McuState::Stopping => self.stop_kind = StopKind::Disarm,
+            // DISARM is the cancel of a running calibration (protocol.md §1.2).
+            McuState::Calibrating => self.cancel_calibration(now),
             // Unreachable through `command` (fault gate), kept for completeness.
             McuState::Fault => return Err(AckReason::FaultActive),
         }
@@ -887,10 +991,201 @@ impl SimMcu {
         if self.state != McuState::Disarmed {
             return Err(AckReason::BadState);
         }
-        self.actual = reference_count as f64;
+        self.shift_coordinate(reference_count as f64 - self.actual);
         self.hold_here();
         self.referenced = true;
         Ok(())
+    }
+
+    /// Re-define the count coordinate: everything that is a position moves by
+    /// `delta`, the mechanism itself does not.
+    fn shift_coordinate(&mut self, delta: f64) {
+        self.actual += delta;
+        self.setpoint += delta;
+        self.control_target += delta;
+        self.end_min += delta;
+        self.end_max += delta;
+    }
+
+    /// CALIBRATE: `mode` 1 starts (DISARMED only), 0 cancels (no-op unless
+    /// CALIBRATING), anything else is INVALID_PARAM (protocol.md §4).
+    fn on_calibrate(&mut self, mode: u8, now: u64) -> Result<(), AckReason> {
+        match mode {
+            calibrate_mode::START => {
+                if self.state != McuState::Disarmed {
+                    return Err(AckReason::BadState);
+                }
+                // Power on command (role bit, see `flags`), brake still applied.
+                self.state = McuState::Calibrating;
+                self.brake_release_cmd = false;
+                self.hold_here();
+                self.cal = Some(CalRun {
+                    phase: CalPhase::PowerSettle,
+                    phase_started_us: now,
+                    step: 0,
+                    target: self.actual,
+                    at_p: None,
+                    at_n: None,
+                    outcome: None,
+                });
+                Ok(())
+            }
+            calibrate_mode::CANCEL => {
+                if self.state == McuState::Calibrating {
+                    self.cancel_calibration(now);
+                }
+                Ok(())
+            }
+            _ => Err(AckReason::InvalidParam),
+        }
+    }
+
+    fn cancel_calibration(&mut self, now: u64) {
+        self.end_calibration(CalResultCode::Cancelled, "stop", now);
+    }
+
+    /// Stop moving and begin the shutdown sequence with this outcome (unless
+    /// the calibration is already shutting down).
+    fn end_calibration(&mut self, result: CalResultCode, reason: &str, now: u64) {
+        let Some(run) = self.cal.as_mut() else { return };
+        if run.phase == CalPhase::Shutdown {
+            return;
+        }
+        run.phase = CalPhase::Shutdown;
+        run.phase_started_us = now;
+        run.outcome = Some((result, CalResult::reason_bytes(reason)));
+        self.brake_release_cmd = false;
+        self.actual_vel = 0.0;
+        self.setpoint = self.actual;
+        self.control_target = self.actual;
+    }
+
+    /// One substep of a running calibration (state CALIBRATING).
+    fn cal_step(&mut self, now: u64, dt: f64) {
+        let settle = self.params.arming_delay_ms * 1_000 / 2;
+        let Some(run) = self.cal.as_mut() else { return };
+        let elapsed = now.saturating_sub(run.phase_started_us);
+        match run.phase {
+            CalPhase::PowerSettle => {
+                if elapsed >= settle {
+                    run.phase = CalPhase::BrakeRelease;
+                    run.phase_started_us = now;
+                    self.brake_release_cmd = true;
+                }
+            }
+            CalPhase::BrakeRelease => {
+                if elapsed >= settle {
+                    run.phase = CalPhase::ToP;
+                    run.phase_started_us = now;
+                    run.step = 1;
+                    // Push toward the stop: the plant clamps there.
+                    run.target = self.end_min - 1.0e6;
+                }
+            }
+            CalPhase::ToP | CalPhase::ToN | CalPhase::ToNeutral => {
+                if let Some(reason) = self.cal_failure.take() {
+                    let reason = reason_text(&reason);
+                    self.end_calibration(CalResultCode::Failed, &reason, now);
+                    return;
+                }
+                if self.stall || dt <= 0.0 {
+                    // No pulses while driving: auto_move's `stall`.
+                    self.end_calibration(CalResultCode::Failed, "stall", now);
+                    return;
+                }
+                let max_step = self.params.plant_max_vel_count_s.max(0.0) * dt;
+                let before = self.actual;
+                let delta = (run.target - before).clamp(-max_step, max_step);
+                // Land exactly on a reachable target (no float residue that
+                // would keep the neutral move going forever).
+                let after = if (run.target - before).abs() <= max_step {
+                    run.target
+                } else {
+                    before + delta
+                }
+                .clamp(self.end_min, self.end_max);
+                self.actual = after;
+                self.actual_vel = (after - before) / dt;
+                self.setpoint = after;
+                self.control_target = after;
+                let moved = after != before;
+                match run.phase {
+                    CalPhase::ToP if !moved => {
+                        run.at_p = Some(after);
+                        run.phase = CalPhase::ToN;
+                        run.phase_started_us = now;
+                        run.step = 2;
+                        run.target = self.end_max + 1.0e6;
+                    }
+                    CalPhase::ToN if !moved => {
+                        run.at_n = Some(after);
+                        run.phase = CalPhase::ToNeutral;
+                        run.phase_started_us = now;
+                        run.step = 3;
+                        let p = run.at_p.unwrap_or(after);
+                        run.target = (p + after) / 2.0;
+                    }
+                    CalPhase::ToNeutral if after == run.target => {
+                        self.end_calibration(CalResultCode::Ok, "ok", now);
+                    }
+                    _ => {}
+                }
+            }
+            CalPhase::Shutdown => {
+                if elapsed >= self.params.disarming_delay_ms * 1_000 {
+                    self.finish_calibration();
+                }
+            }
+        }
+    }
+
+    /// Shutdown done: CAL_RESULT, then (on success) the P end becomes 0 and
+    /// POSITION_REFERENCED is set; then DISARMED (its STATUS follows the
+    /// CAL_RESULT because the state key changes here).
+    fn finish_calibration(&mut self) {
+        let Some(run) = self.cal.take() else { return };
+        let (result, reason) = run
+            .outcome
+            .unwrap_or((CalResultCode::Failed, CalResult::reason_bytes("timeout")));
+        let (n_end, neutral) = match (result, run.at_p, run.at_n) {
+            (CalResultCode::Ok, Some(p), Some(n)) => (n - p, (n - p) / 2.0),
+            _ => (0.0, 0.0),
+        };
+        self.push(McuMsg::CalResult(CalResult {
+            boot_id: self.boot_id,
+            result,
+            step: run.step,
+            n_end_count: to_count(n_end),
+            neutral_count: to_count(neutral),
+            sign: 1,
+            reason,
+        }));
+        if result == CalResultCode::Ok {
+            if let Some(p) = run.at_p {
+                self.shift_coordinate(-p);
+            }
+            self.referenced = true;
+        } else {
+            self.referenced = false;
+        }
+        self.state = McuState::Disarmed;
+        self.brake_release_cmd = false;
+        self.hold_here();
+    }
+
+    /// CAL_RESULT(FAILED, `fault`) when a fault latch interrupts a calibration.
+    fn abort_calibration_for_fault(&mut self) {
+        let Some(run) = self.cal.take() else { return };
+        self.push(McuMsg::CalResult(CalResult {
+            boot_id: self.boot_id,
+            result: CalResultCode::Failed,
+            step: run.step,
+            n_end_count: 0,
+            neutral_count: 0,
+            sign: 1,
+            reason: CalResult::reason_bytes("fault"),
+        }));
+        self.referenced = false;
     }
 
     // ------------------------------------------------------------------
@@ -940,6 +1235,7 @@ impl SimMcu {
         if self.state == McuState::Fault {
             return;
         }
+        self.abort_calibration_for_fault();
         let before = self.state;
         self.state = McuState::Fault;
         self.fault_code = code;
@@ -1008,7 +1304,9 @@ impl SimMcu {
 
     fn step(&mut self, now: u64, dt: f64) {
         self.check_timers(now);
-        if self.position_control_on(now) {
+        if self.state == McuState::Calibrating {
+            self.cal_step(now, dt);
+        } else if self.position_control_on(now) {
             self.update_setpoint(dt);
             self.update_plant(dt);
             self.check_motion_faults(now);
@@ -1131,8 +1429,9 @@ impl SimMcu {
         }
         let max_step = self.params.plant_max_vel_count_s.max(0.0) * dt;
         let delta = (self.setpoint - self.actual).clamp(-max_step, max_step);
-        self.actual += delta;
-        self.actual_vel = delta / dt;
+        let after = (self.actual + delta).clamp(self.end_min, self.end_max);
+        self.actual_vel = (after - self.actual) / dt;
+        self.actual = after;
     }
 
     fn check_motion_faults(&mut self, now: u64) {
@@ -1164,6 +1463,7 @@ impl SimMcu {
                 | McuState::Active
                 | McuState::Stopping
                 | McuState::Disarming
+                | McuState::Calibrating
         );
         if power_controller {
             f |= status_flags::POWER_CONTROLLER;
@@ -1185,6 +1485,15 @@ impl SimMcu {
 
     fn pwm_permille(&self) -> i16 {
         let now = self.now_us.unwrap_or(0);
+        if self.state == McuState::Calibrating {
+            // Open-loop drive toward the stops: feed-forward only.
+            let ff = if self.params.plant_max_vel_count_s > 0.0 {
+                1000.0 * self.actual_vel / self.params.plant_max_vel_count_s
+            } else {
+                0.0
+            };
+            return ff.clamp(-1000.0, 1000.0).round() as i16;
+        }
         if !self.position_control_on(now) {
             return 0;
         }
@@ -1241,6 +1550,11 @@ impl SimMcu {
             self.push(McuMsg::Status(s));
         }
     }
+}
+
+/// `reason` bytes as text (up to the first NUL).
+fn reason_text(r: &[u8; CAL_REASON_LEN]) -> String {
+    CalResult { reason: *r, ..CalResult::EMPTY }.reason_str()
 }
 
 /// Encoder count from an f64 position (saturating, NaN → 0).
@@ -1316,6 +1630,9 @@ pub struct SimSnapshot {
     pub last_applied_frame: u32,
     pub stale_drop_count: u16,
     pub rx_error_count: u16,
+    /// End stops in the current count coordinate.
+    pub end_min_count: Counts,
+    pub end_max_count: Counts,
 }
 
 /// Control handle of a simulated axis task. Dropping it stops the task.
@@ -1346,6 +1663,8 @@ impl SimHandle {
             last_applied_frame: m.last_applied_frame(),
             stale_drop_count: m.stale_drop_count(),
             rx_error_count: m.rx_error_count(),
+            end_min_count: m.end_counts().0,
+            end_max_count: m.end_counts().1,
         }
     }
     /// Run `f` with the model locked (do not block inside).
@@ -1369,6 +1688,10 @@ impl SimHandle {
     }
     pub fn set_fault_cause_present(&self, present: bool) {
         self.shared.lock().set_fault_cause_present(present);
+    }
+    /// The next calibration fails at its first move with `reason`.
+    pub fn set_calibration_failure(&self, reason: Option<&str>) {
+        self.shared.lock().set_calibration_failure(reason);
     }
     pub fn reboot(&self, new_boot_id: u32) {
         self.shared.lock().reboot(new_boot_id);

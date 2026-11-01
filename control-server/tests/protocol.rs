@@ -101,7 +101,7 @@ const ALL_FAULTS: [FaultCode; 14] = [
 ];
 
 fn rand_host(r: &mut Rng) -> HostMsg {
-    match r.below(11) {
+    match r.below(12) {
         0 => HostMsg::HelloReq {
             request_id: r.edgy_u32(),
         },
@@ -156,9 +156,13 @@ fn rand_host(r: &mut Rng) -> HostMsg {
             request_id: r.edgy_u32(),
             fault_code: ALL_FAULTS[r.below(ALL_FAULTS.len() as u64) as usize],
         },
-        _ => HostMsg::SetReference {
+        10 => HostMsg::SetReference {
             request_id: r.edgy_u32(),
             reference_count: r.edgy_i32(),
+        },
+        _ => HostMsg::Calibrate {
+            request_id: r.edgy_u32(),
+            mode: r.u8(),
         },
     }
 }
@@ -179,8 +183,10 @@ const ALL_REASONS: [AckReason; 8] = [
     AckReason::FaultCausePresent,
 ];
 
+const ALL_CAL_RESULTS: [CalResultCode; 3] = [CalResultCode::Ok, CalResultCode::Failed, CalResultCode::Cancelled];
+
 fn rand_mcu(r: &mut Rng) -> McuMsg {
-    match r.below(6) {
+    match r.below(7) {
         0 => McuMsg::Hello(Hello {
             request_id: r.edgy_u32(),
             protocol_version: r.u8(),
@@ -230,12 +236,28 @@ fn rand_mcu(r: &mut Rng) -> McuMsg {
             mcu_rx_us: r.edgy_u64(),
             mcu_tx_us: r.edgy_u64(),
         }),
-        _ => McuMsg::AxisSelect(AxisSelect {
+        5 => McuMsg::AxisSelect(AxisSelect {
             boot_id: r.edgy_u32(),
             selected_axis: r.u8(),
             prev_selected_axis: r.u8(),
             mcu_state: r.u8(),
         }),
+        _ => {
+            let mut reason = [0u8; CAL_REASON_LEN];
+            let n = r.below(CAL_REASON_LEN as u64 + 1) as usize;
+            for b in reason.iter_mut().take(n) {
+                *b = b'a' + (r.u8() % 26);
+            }
+            McuMsg::CalResult(CalResult {
+                boot_id: r.edgy_u32(),
+                result: ALL_CAL_RESULTS[r.below(3) as usize],
+                step: r.u8(),
+                n_end_count: r.edgy_i32(),
+                neutral_count: r.edgy_i32(),
+                sign: r.u8() as i8,
+                reason,
+            })
+        }
     }
 }
 
@@ -709,8 +731,8 @@ fn unknown_type_rejected_including_cross_direction() {
         Err(DecodeError::UnknownType(0x00))
     );
     assert_eq!(
-        McuMsg::decode_payload(0x87, &[]),
-        Err(DecodeError::UnknownType(0x87))
+        McuMsg::decode_payload(0x88, &[]),
+        Err(DecodeError::UnknownType(0x88))
     );
 }
 
@@ -729,6 +751,7 @@ fn payload_length_tables_match_spec() {
         (CLOCK_SYNC, 12),
         (HOST_FAULT, 8),
         (SET_REFERENCE, 8),
+        (CALIBRATE, 8),
     ];
     let mcu = [
         (HELLO, 32),
@@ -737,6 +760,7 @@ fn payload_length_tables_match_spec() {
         (FAULT_EVENT, 20),
         (CLOCK_SYNC_REPLY, 28),
         (AXIS_SELECT, 8),
+        (CAL_RESULT, 28),
     ];
     let mut n_host = 0;
     let mut n_mcu = 0;
@@ -924,6 +948,72 @@ fn axis_select_layout_and_length() {
 }
 
 #[test]
+fn calibrate_layout_and_length() {
+    // protocol §4: 0x0C, 8 bytes: u32 request_id / u8 mode / u8 reserved / u16 reserved.
+    assert_eq!(host_payload_len(msg_type::CALIBRATE), Some(8));
+    let m = HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START };
+    assert_eq!(m.msg_type(), 0x0C);
+    assert_eq!(m.encode_payload(), [7, 0, 0, 0, 1, 0, 0, 0]);
+    host_rt(m);
+    host_rt(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::CANCEL });
+    // Reserved bytes are ignored on decode; wrong length is rejected.
+    assert_eq!(
+        HostMsg::decode_payload(msg_type::CALIBRATE, &[7, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC]),
+        Ok(HostMsg::Calibrate { request_id: 7, mode: 0 })
+    );
+    assert!(matches!(
+        HostMsg::decode_payload(msg_type::CALIBRATE, &[0u8; 4]),
+        Err(DecodeError::BadPayloadLen { msg_type: 0x0C, expected: 8, got: 4 })
+    ));
+}
+
+#[test]
+fn cal_result_layout_reason_padding_and_unknown_result() {
+    // protocol §4: 0x87, 28 bytes: u32 boot_id / u8 result / u8 step / u16 reserved /
+    // i32 n_end_count / i32 neutral_count / i8 sign / u8 reserved / u16 reserved / u8[8] reason.
+    assert_eq!(mcu_payload_len(msg_type::CAL_RESULT), Some(28));
+    let m = McuMsg::CalResult(CalResult {
+        boot_id: 0x89AB_CDEF,
+        result: CalResultCode::Failed,
+        step: 2,
+        n_end_count: -5551,
+        neutral_count: -2775,
+        sign: -1,
+        reason: CalResult::reason_bytes("stall"),
+    });
+    assert_eq!(m.msg_type(), 0x87);
+    let p = m.encode_payload();
+    assert_eq!(&p[..4], &[0xEF, 0xCD, 0xAB, 0x89]);
+    assert_eq!(&p[4..8], &[1, 2, 0, 0]);
+    assert_eq!(&p[8..12], &(-5551i32).to_le_bytes());
+    assert_eq!(&p[12..16], &(-2775i32).to_le_bytes());
+    assert_eq!(&p[16..20], &[0xFF, 0, 0, 0]);
+    assert_eq!(&p[20..], b"stall\0\0\0");
+    mcu_rt(m);
+    let McuMsg::CalResult(c) = m else { unreachable!() };
+    assert_eq!(c.reason_str(), "stall");
+    // reason_bytes truncates to 8 and never pads with anything but NUL.
+    assert_eq!(&CalResult::reason_bytes("timeout_long"), b"timeout_");
+    assert_eq!(CalResult { reason: [b'o', b'k', 0, 0, 0, 0, 0, 0], ..CalResult::EMPTY }.reason_str(), "ok");
+    // An unknown result code is a decode error (the frame is discarded).
+    let mut bad = p.clone();
+    bad[4] = 3;
+    assert_eq!(
+        McuMsg::decode_payload(msg_type::CAL_RESULT, &bad),
+        Err(DecodeError::BadField("cal_result.result"))
+    );
+    // Reserved bytes are ignored on decode.
+    let mut res = p.clone();
+    res[6] = 0xAA;
+    res[17] = 0xBB;
+    assert_eq!(McuMsg::decode_payload(msg_type::CAL_RESULT, &res), Ok(m));
+    assert!(matches!(
+        McuMsg::decode_payload(msg_type::CAL_RESULT, &[0u8; 27]),
+        Err(DecodeError::BadPayloadLen { msg_type: 0x87, expected: 28, got: 27 })
+    ));
+}
+
+#[test]
 fn status_selected_axis_is_byte_13_and_old_frames_decode_as_zero() {
     let McuMsg::Status(s) = sample_status() else { unreachable!() };
     let m = McuMsg::Status(Status { selected_axis: 3, ..s });
@@ -995,6 +1085,10 @@ fn round_trip_every_host_message_edge_values() {
             HostMsg::SetReference {
                 request_id: u,
                 reference_count: i,
+            },
+            HostMsg::Calibrate {
+                request_id: u,
+                mode: h as u8,
             },
         ];
         for m in msgs {
@@ -1081,6 +1175,17 @@ fn round_trip_every_mcu_message_edge_values() {
             prev_selected_axis: b.wrapping_sub(1),
             mcu_state: b,
         }));
+        for result in ALL_CAL_RESULTS {
+            mcu_rt(McuMsg::CalResult(CalResult {
+                boot_id: u,
+                result,
+                step: b,
+                n_end_count: i,
+                neutral_count: i,
+                sign: b as i8,
+                reason: [b; CAL_REASON_LEN],
+            }));
+        }
     }
 }
 

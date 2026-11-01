@@ -1,6 +1,6 @@
 //! types: AxisId index conversions, FaultCode wire / JSON names.
 
-use h3cs::types::{AxisId, FaultCode, AXIS_COUNT};
+use h3cs::types::{AxisId, FaultCode, McuState, AXIS_COUNT};
 
 #[test]
 fn from_index_round_trips_valid_indices() {
@@ -41,4 +41,17 @@ fn fault_code_json_names_are_screaming_snake_case() {
     assert_eq!(serde_json::from_value::<FaultCode>("LOCAL_ESTOP".into()).unwrap(), FaultCode::LocalEstop);
     assert_eq!(serde_json::to_value(FaultCode::HostFault).unwrap(), "HOST_FAULT");
     assert_eq!(serde_json::to_value(FaultCode::None).unwrap(), "NONE");
+}
+
+#[test]
+fn mcu_state_calibrating_is_8() {
+    // protocol.md §3.1: 0..=8 are defined; CALIBRATING = 8.
+    for v in 0..=8u8 {
+        let s = McuState::from_u8(v).expect("defined");
+        assert_eq!(s as u8, v);
+    }
+    assert_eq!(McuState::from_u8(8), Some(McuState::Calibrating));
+    assert_eq!(McuState::from_u8(9), None);
+    assert_eq!(serde_json::to_value(McuState::Calibrating).unwrap(), "CALIBRATING");
+    assert_eq!(serde_json::from_value::<McuState>("CALIBRATING".into()).unwrap(), McuState::Calibrating);
 }

@@ -238,7 +238,7 @@ DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中�
 `control-server/tests/protocol_vectors.rs` が下記と同じバイト列を検査する。CoreS3 側の単体テストでも同じ値を使う。
 
 <!-- VECTORS:BEGIN -->
-`frame` は COBS 前のフレーム（header + payload + crc）、`wire` は COBS 符号化して区切り `0x00` を付けた USB 上のバイト列。いずれも 16 進・空白区切り。「値」は各フィールドの値（JSON、フィールドはレイアウト順、数値は 10 進。`device_id` は 16 桁 hex、`fault_code` / `result` / `reason` は名前で表記）。
+`frame` は COBS 前のフレーム（header + payload + crc）、`wire` は COBS 符号化して区切り `0x00` を付けた USB 上のバイト列。いずれも 16 進・空白区切り。「値」は各フィールドの値（JSON、フィールドはレイアウト順、数値は 10 進。`device_id` は 16 桁 hex、`fault_code` / `result` / `reason` は名前で表記。CAL_RESULT の `reason` は NUL を除いた ASCII 文字列）。
 
 ### 7.1 HELLO_REQ（`0x01`、PC → MCU）
 
@@ -400,5 +400,23 @@ wire  (36 byte): 04 01 85 1C 02 09 01 01 04 40 42 0F 01 01 01 01 04 40 4B 4C 01 
 ```text
 frame (14 byte): 01 86 08 00 EF CD AB 89 02 01 01 00 32 C1
 wire  (16 byte): 04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00
+```
+
+### 7.19 CALIBRATE（`0x0C`、PC → MCU）
+
+値: `{"request_id":7,"mode":1}`
+
+```text
+frame (14 byte): 01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F
+wire  (16 byte): 04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00
+```
+
+### 7.20 CAL_RESULT（`0x87`、MCU → PC）
+
+値: `{"boot_id":2309737967,"result":"OK","step":3,"n_end_count":5551,"neutral_count":2775,"sign":1,"reason":"ok"}`
+
+```text
+frame (34 byte): 01 87 1C 00 EF CD AB 89 00 03 00 00 AF 15 00 00 D7 0A 00 00 01 00 00 00 6F 6B 00 00 00 00 00 00 7A C9
+wire  (36 byte): 04 01 87 1C 05 EF CD AB 89 02 03 01 03 AF 15 01 03 D7 0A 01 02 01 01 01 03 6F 6B 01 01 01 01 01 03 7A C9 00
 ```
 <!-- VECTORS:END -->

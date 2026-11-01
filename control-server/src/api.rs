@@ -50,6 +50,17 @@
 //!   what keeps DNS rebinding out (`Host: evil.example:8892` with
 //!   `Origin: http://evil.example:8892` still gets 403); every other foreign
 //!   Origin is refused as before, and requests without Origin are unchanged.
+//! - Calibration (DESIGN.md §11): `POST /v1/calibrate` (token, rate limited;
+//!   body `{"axes":[1,2,3]}` optional, empty = all) and
+//!   `POST /v1/calibrate/cancel` (token, not rate limited: it only stops
+//!   motion) are plain admin commands. `POST /v1/calibration/export` (token,
+//!   rate limited) writes `<rig_id>.calibration-<YYYYmmdd-HHMMSS>.toml` next
+//!   to the server's config file from the latest status snapshot
+//!   ([`crate::calibration_export`]): 409 `no_calibration_result` without an
+//!   OK result, 409 `exists` instead of overwriting, 500 `no_config_path`
+//!   when the server was not started from a file, 500 `invalid_result` when
+//!   the produced file does not validate (nothing is written then). None of
+//!   the three is in [`lan_allowed`].
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -72,7 +83,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::calibration_export::{self, AxisExport};
 use crate::config::{bounded_ms, Config};
+use crate::protocol::CalResultCode;
 use crate::session::{AckMsg, AcceptedPose, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
 use crate::supervisor::{AdminCmd, AdminError, AdminOk, StatusSnapshot};
 use crate::telemetry::{lock_events, shared_event_log, SharedEventLog};
@@ -136,6 +149,8 @@ pub fn ws_hard_limit(max_body_bytes: usize) -> usize {
 pub struct AppState {
     inner: Arc<Inner>,
     events: SharedEventLog,
+    /// The config file the server was started from (export target directory).
+    config_path: Option<Arc<std::path::PathBuf>>,
 }
 
 struct Inner {
@@ -164,7 +179,14 @@ impl AppState {
         Self {
             inner: Arc::new(Inner { cfg, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
             events: shared_event_log(Instant::now()),
+            config_path: None,
         }
+    }
+
+    /// Where the running config was read from: `POST /v1/calibration/export`
+    /// writes next to it. Without it the export answers 500 `no_config_path`.
+    pub fn with_config_path(self, path: Option<std::path::PathBuf>) -> Self {
+        Self { config_path: path.map(Arc::new), ..self }
     }
 
     /// Serve `GET /v1/events` from this log (the control loop's). Without it
@@ -191,11 +213,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/fault/reset", post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)))
         .route("/v1/center", post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)))
         .route("/v1/reference", post(reference))
+        .route("/v1/calibrate", post(calibrate))
+        .route("/v1/calibration/export", post(calibration_export))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
     // Safety direction: token, but never rate limited.
     let admin = Router::new()
         .route("/v1/disarm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Disarm)))
         .route("/v1/fault", post(fault))
+        .route("/v1/calibrate/cancel", post(|s: State<AppState>| admin_simple(s, AdminCmd::CalibrateCancel)))
         .merge(limited)
         // Outermost: auth before the rate limit.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -462,6 +487,110 @@ pub fn fault_note(body: &[u8]) -> String {
 
 async fn fault(State(st): State<AppState>, body: Bytes) -> Response {
     send_admin(&st, AdminCmd::Fault { note: fault_note(&body) }).await
+}
+
+// ------------------------------------------------------------------ calibration
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalibrateBody {
+    #[serde(default)]
+    axes: Vec<u8>,
+}
+
+/// `POST /v1/calibrate` with an optional `{"axes":[…]}` body (empty = all axes).
+async fn calibrate(State(st): State<AppState>, body: Bytes) -> Response {
+    let axes = if body.iter().all(u8::is_ascii_whitespace) {
+        Vec::new()
+    } else {
+        let Ok(b) = serde_json::from_slice::<CalibrateBody>(&body) else {
+            return error(StatusCode::BAD_REQUEST, "bad_request");
+        };
+        let mut axes = Vec::with_capacity(b.axes.len());
+        for a in b.axes {
+            let Some(id) = AxisId::new(a) else {
+                return error(StatusCode::BAD_REQUEST, "bad_axis");
+            };
+            axes.push(id);
+        }
+        axes
+    };
+    send_admin(&st, AdminCmd::Calibrate { axes }).await
+}
+
+fn error_detail(code: StatusCode, err: &str, detail: String) -> Response {
+    (code, Json(json!({"ok": false, "error": err, "detail": detail}))).into_response()
+}
+
+/// `POST /v1/calibration/export`: see the module docs and
+/// [`crate::calibration_export`].
+async fn calibration_export(State(st): State<AppState>) -> Response {
+    if !loop_alive(&st) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+    }
+    let Some(path) = st.config_path.as_ref().map(|p| p.to_path_buf()) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no_config_path");
+    };
+    let cfg = st.inner.cfg.clone();
+    let snap = st.inner.status_rx.borrow().clone();
+    let mut axes: Vec<AxisExport> = Vec::new();
+    for a in &snap.axes {
+        let Some(r) = a.calibration.as_ref().filter(|r| r.result == CalResultCode::Ok) else { continue };
+        let Some(ac) = cfg.axis(a.axis_id) else { continue };
+        match calibration_export::derive(a.axis_id, r.device_id, ac.decel_zone_count, r) {
+            Ok(e) => axes.push(e),
+            Err(e) => return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e),
+        }
+    }
+    if axes.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "no_calibration_result", "blockers": ["no_calibration_result: no axis has an OK CAL_RESULT in this boot"]})),
+        )
+            .into_response();
+    }
+    // File I/O off the async executor.
+    let rig_id = cfg.rig_id.clone();
+    let result = tokio::task::spawn_blocking(move || write_export(&path, &rig_id, &axes)).await;
+    match result {
+        Ok(Ok((written, axes))) => {
+            tracing::info!(path = %written.display(), "calibration exported");
+            Json(json!({"ok": true, "path": written, "axes": axes})).into_response()
+        }
+        Ok(Err((code, err, detail))) => error_detail(code, err, detail),
+        Err(e) => error_detail(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e.to_string()),
+    }
+}
+
+type ExportError = (StatusCode, &'static str, String);
+
+fn write_export(
+    config_path: &std::path::Path,
+    rig_id: &str,
+    axes: &[AxisExport],
+) -> Result<(std::path::PathBuf, Vec<AxisExport>), ExportError> {
+    let text = std::fs::read_to_string(config_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "config_read_failed", format!("{}: {e}", config_path.display())))?;
+    let rewrite = calibration_export::rewrite_toml(&text, axes)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "rewrite_failed", e))?;
+    let ts = calibration_export::utc_timestamp(std::time::SystemTime::now());
+    let head = calibration_export::header(&ts, &config_path.display().to_string(), axes, &rewrite.replaced);
+    let full = format!("{head}{}", rewrite.text);
+    Config::from_toml_str(&full).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e.to_string()))?;
+    let dir = config_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let out = dir.join(calibration_export::file_name(rig_id, &ts));
+    let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&out) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err((StatusCode::CONFLICT, "exists", out.display().to_string()))
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "write_failed", format!("{}: {e}", out.display()))),
+    };
+    use std::io::Write as _;
+    f.write_all(full.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "write_failed", format!("{}: {e}", out.display())))?;
+    Ok((out, axes.to_vec()))
 }
 
 // ------------------------------------------------------------------ game

@@ -316,6 +316,23 @@ fn huge_timing_values_rejected() {
 }
 
 #[test]
+fn sim_backend_end_stops_default_and_are_ordered() {
+    let BackendConfig::Sim(b) = sim().backend else { panic!("sim backend") };
+    assert_eq!((b.end_min_count, b.end_max_count), (-3000, 3000));
+    let text = std::fs::read_to_string(SIM).unwrap();
+    assert!(text.contains("end_min_count = -3000") && text.contains("end_max_count = 3000"), "sim.toml documents the keys");
+    let omitted = text.replace("end_min_count = -3000", "").replace("end_max_count = 3000", "");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else { panic!("sim backend") };
+    assert_eq!((b.end_min_count, b.end_max_count), (-3000, 3000));
+    let narrow = text.replace("end_min_count = -3000", "end_min_count = -500").replace("end_max_count = 3000", "end_max_count = 500");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&narrow).unwrap().backend else { panic!("sim backend") };
+    assert_eq!((b.end_min_count, b.end_max_count), (-500, 500));
+    let inverted = text.replace("end_min_count = -3000", "end_min_count = 3000");
+    let err = Config::from_toml_str(&inverted).unwrap_err().to_string();
+    assert!(err.contains("backend.end_min_count (3000) must be < backend.end_max_count (3000)"), "{err}");
+}
+
+#[test]
 fn sim_backend_report_selected_axis_defaults_to_true() {
     let BackendConfig::Sim(b) = sim().backend else { panic!("sim backend") };
     assert!(b.report_selected_axis);

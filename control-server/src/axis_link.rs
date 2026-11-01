@@ -607,6 +607,10 @@ impl Link {
                 axis: claimed.axis,
                 ev,
             },
+            Ok(McuMsg::CalResult(result)) => LinkEvent::CalResult {
+                axis: claimed.axis,
+                result,
+            },
             Ok(McuMsg::Hello(h)) => {
                 if h.device_id != claimed.hello.device_id {
                     return Err(ReadEnd::Disconnected(format!(

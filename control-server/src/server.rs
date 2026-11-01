@@ -77,6 +77,9 @@ pub struct ServerOptions {
     pub admin_token: Option<String>,
     /// Overrides `server.bind` (same loopback rule).
     pub bind_override: Option<SocketAddr>,
+    /// The file `cfg` was read from; `POST /v1/calibration/export` writes
+    /// next to it (refused with 500 `no_config_path` when unset).
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,7 +275,8 @@ pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
         admin_token.clone(),
         shutdown_rx.clone(),
     )
-    .with_event_log(event_log);
+    .with_event_log(event_log)
+    .with_config_path(opts.config_path.clone());
     let app = api::router(state);
     let http = {
         let mut sd = shutdown_rx.clone();
@@ -595,9 +599,10 @@ fn shutting_down_error() -> AdminError {
 fn route_event(sup: &Supervisor, port: String, ev: LinkEvent) -> Option<LinkEvent> {
     let is_primary = |axis: AxisId| sup.axis_port(axis) == Some(port.as_str());
     match ev {
-        LinkEvent::Status { axis, .. } | LinkEvent::Ack { axis, .. } | LinkEvent::FaultEvent { axis, .. } => {
-            is_primary(axis).then_some(ev)
-        }
+        LinkEvent::Status { axis, .. }
+        | LinkEvent::Ack { axis, .. }
+        | LinkEvent::FaultEvent { axis, .. }
+        | LinkEvent::CalResult { axis, .. } => is_primary(axis).then_some(ev),
         LinkEvent::Disconnected { axis, .. } if !is_primary(axis) => Some(LinkEvent::PortClosed { port }),
         ev => Some(ev),
     }
