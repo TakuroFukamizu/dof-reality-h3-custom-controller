@@ -426,7 +426,8 @@
     set(c[14], fmt(a.following_error_count), 'num');
     set(c[15], fmt(a.pwm_permille), 'num');
     set(c[16], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : a.status_age_ms.toFixed(0) + ' ms', 'num');
-    set(c[17], a.reference_stale ? '要再基準化' : '—', a.reference_stale ? 'bad' : '');
+    const stale = [a.reference_stale ? '要再基準化' : '', a.calibration_stale ? '再校正済み（export→再起動）' : ''].filter(Boolean);
+    set(c[17], stale.join(' / ') || '—', stale.length ? 'bad' : '');
     set(c[18], calText(a), calClass(a));
   }
   function calText(a) {
