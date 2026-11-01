@@ -34,9 +34,9 @@ CoreS3 は「USB JTAG/serial debug unit」（VID:PID 303a:1001）で、SER= が 
 
 | 個体（eFuse MAC。呼び名は先頭 2 オクテット） | 画面 `dev` / status `device_id` | 過去の記録 |
 | --- | --- | --- |
-| `1C:DB` = `1C:DB:D4:BA:8D:58` | `dev 8D58` / `51311cdbd4ba8d58` | 2026-10-31 に #1 を校正（読み値 stroke 5551 / neutral 2775 / sign +1。記録には 5553 / 2776 もあり、CAL ごとに ±20 程度ぶれる）。17:19 のホットプラグ直後、USB には見えるがシリアルに応答しない状態になり、リセットで復帰。Base15 構成での最新の動作確認はこの個体 |
-| `68:EE` = `68:EE:8F:D8:42:F0` | `dev 42F0` / `513168ee8fd842f0` | 2026-10-31 に #2 を校正（stroke 5462 / neutral 2731 / sign +1） |
-| `30:ED` = `30:ED:A0:0B:20:40` | `dev 2040` / `513130eda00b2040` | 2026-10-25 に #3 を校正（stroke 6160 / neutral 3080 / sign +1、スロット #3）。10-31 の再校正 6138 / 3069 は同じ個体の **スロット #2** に入っている（§2 で `UNCAL` してから系統を選ぶ）。10-31 午前に 2 回、USB には見えるがシリアルに応答しない状態になりリセットで復帰（同日の 3 系統運転では、ポートを閉じて開き直しても 6 回とも固まらなかった。「ホストがポートを閉じると固まる」説の証拠は無い） |
+| `1C:DB` = `1C:DB:D4:BA:8D:58` | `dev 8D58` / `51311cdbd4ba8d58` | 2026-11-01 に v1 の `/v1/calibrate` で #1 を校正（5551 / 2775、OK）。2026-10-31 に #1 を校正（読み値 stroke 5551 / neutral 2775 / sign +1。記録には 5553 / 2776 もあり、CAL ごとに ±20 程度ぶれる）。17:19 のホットプラグ直後、USB には見えるがシリアルに応答しない状態になり、リセットで復帰。Base15 構成での最新の動作確認はこの個体 |
+| `68:EE` = `68:EE:8F:D8:42:F0` | `dev 42F0` / `513168ee8fd842f0` | 2026-11-01 に従来 env の CAL で 5463 / 2731、v1 の `/v1/calibrate` で行程 5463（中立で失敗、電源）。2026-10-31 に #2 を校正（stroke 5462 / neutral 2731 / sign +1） |
+| `30:ED` = `30:ED:A0:0B:20:40` | `dev 2040` / `513130eda00b2040` | 2026-11-01 に v1 の `/v1/calibrate` で行程 6138（中立で失敗、電源）。2026-10-25 に #3 を校正（stroke 6160 / neutral 3080 / sign +1、スロット #3）。10-31 の再校正 6138 / 3069 は同じ個体の **スロット #2** に入っている（§2 で `UNCAL` してから系統を選ぶ）。10-31 午前に 2 回、USB には見えるがシリアルに応答しない状態になりリセットで復帰（同日の 3 系統運転では、ポートを閉じて開き直しても 6 回とも固まらなかった。「ホストがポートを閉じると固まる」説の証拠は無い） |
 | `48:27` = `48:27:E2:66:B0:68` | `dev B068` / `51314827e266b068` | 記録なし（未校正） |
 
 この表の呼び名（`1C:DB` など）は MAC の **先頭** 2 オクテット。v1 ファームの画面の `dev XXXX` は MAC の **末尾** 2 オクテット、status の `device_id` は `5131` + MAC を表記順に並べた 12 桁（小文字 hex）。`ioreg` / `pio device list` の SER= と全桁で突き合わせる。
@@ -101,7 +101,7 @@ $EDITOR config/bringup.toml                               # backend.ports を §
 `check-config` の期待出力: `OK (rig_id h3-bringup-01, ...)`、3 軸の `calibration_hash`、`static ARM blockers:` に `calibration_invalid: axisN calibration_valid = false` が 3 行。これ以外の阻害要因や `invalid config:` が出たら直す。
 
 ```sh
-export H3CS_ADMIN_TOKEN=$(openssl rand -hex 16)           # このシェルと、管理 curl を打つシェルで同じ値に
+# 管理トークンは既定で不要（server.require_admin_token = false、loopback 専用）。要るなら require_admin_token = true にして export H3CS_ADMIN_TOKEN=... とする
 mkdir -p ../docs/control-server/runs/bringup_$(date +%Y%m%d)
 RUST_LOG=info caffeinate -dims ./target/debug/h3-control-server --config config/bringup.toml \
   2> >(tee -a ../docs/control-server/runs/bringup_$(date +%Y%m%d)/server.log >&2)
@@ -111,7 +111,7 @@ RUST_LOG=info caffeinate -dims ./target/debug/h3-control-server --config config/
 - 別のシェルで:
 
 ```sh
-URL=http://127.0.0.1:8892; AUTH="Authorization: Bearer $H3CS_ADMIN_TOKEN"
+URL=http://127.0.0.1:8892; AUTH="Content-Type: application/json"   # トークンを要るようにしたときは "Authorization: Bearer $H3CS_ADMIN_TOKEN"
 curl -s $URL/v1/status | python3 -m json.tool
 REPO/clients/python/.venv/bin/python REPO/clients/python/h3_motion_client.py status     # 要約表示（--json で全部）
 ```
@@ -397,7 +397,8 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 | `fault.kind = "axis_disconnected"` / `"axis_rebooted"` / `"axis_changed"` | 駆動中に軸が切れた / `boot_id` が変わった / 担当個体の系統が変わった | USB・給電。`axis_changed` は駆動中に画面をタップした（DISARMED 以外では MCU が無視するはずなので、起きたらファームの不具合）。再基準化から |
 | `fault.kind = "axis_state_mismatch"` | ACK の後の STATUS が遷移前の状態だった（例: ARM_PREPARE の ACK の後に DISARMED） | ファームの ACK → STATUS の順序の不具合（protocol.md §1）。PC 側では直せない。`events` を保存して報告 |
 | `fault.kind = "frame_skew"` | 3 軸の `last_applied_frame` の差が 5 を超えた | 1 軸だけ SET_POSITION を取りこぼしている。その軸の `stale_drop_count` / `rx_error_count`、USB ハブ |
-| HTTP 401 / 403 | トークン無し・不一致 / Origin 違反 | `H3CS_ADMIN_TOKEN` が起動時と同じか。curl は Origin を付けないので 403 はブラウザー側 |
+| HTTP 401 / 403 | トークン無し・不一致（`require_admin_token = true` のときだけ） / Origin 違反 | `H3CS_ADMIN_TOKEN` が起動時と同じか。curl は Origin を付けないので 403 はブラウザー側 |
+| 3 台とも USB に見えるのに HELLO にも書き込み（esptool）にも答えない | USB-JTAG が固まっている。Base15 の DC を切っても USB ハブの VBUS で CoreS3 は動き続け、再起動しない（`ioreg -p IOUSB -l -w0 \| grep sessionID` が変わらない） | **ハブの上流 USB ケーブルを抜き差し**（または各 USB を抜き差し）して再列挙させる。2026-11-01 に 2 台同時に起きた（[runs/hw_20261101.md](runs/hw_20261101.md)） |
 | HTTP 409 `no_fresh_pose` | START に新鮮な Pose が無い | `bringup_pose.py` が動いているか、`session.fresh`。`frame_seq` の無い Pose は拒否（`allow_missing_frame_seq = false`） |
 | HTTP 409 `not_holding` / `not_disarmed`（`blockers` に `rig_state: <状態>`） | その状態では受けない命令（例: READY_TO_ARM で start、ACTIVE で center、HOLDING 中に reference） | 順序: arm → start。center は HOLDING で、reference は全軸 DISARMED で |
 | HTTP 429 | 管理 API の rate limit（20 回/秒） | status のポーリングは `GET /v1/status`（認証なし・対象外）で |

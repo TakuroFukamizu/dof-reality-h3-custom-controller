@@ -10,6 +10,7 @@
 | [protocol.md](protocol.md) | PC ⇄ CoreS3 の USB プロトコル v1（規範。CoreS3 ファームはこれに合わせる） |
 | [testing.md](testing.md) | 試験の一覧・未試験の範囲・最新の結果 |
 | [hardware-bringup.md](hardware-bringup.md) | 実機 bring-up 手順（CoreS3 ×3 を初めてつないで 3 軸を動かすまで。設定は `control-server/config/bringup.toml`） |
+| [game-integration.md](game-integration.md) | ゲーム（h3game）実装者向けの入口。実機なしで動かす手順、ゲームがやること・やらないこと、画面に出す状態、変えてはいけないこと |
 | [`control-server/DESIGN.md`](../../control-server/DESIGN.md) | 実装設計（API・状態機械・JSON の形） |
 | [`clients/python/README.md`](../../clients/python/README.md) | Game API の Python クライアント |
 | [`clients/h3game/README.md`](../../clients/h3game/README.md) | h3game へのパッチと bridge 用バックエンド層 |
@@ -41,10 +42,10 @@ sim backend では 3 台の CoreS3 の代わりに `control-server/src/sim_axis.
 | 区分 | 項目 |
 | --- | --- |
 | 確定（実装・試験済み） | Game API と管理 API（DESIGN.md §7）。混合式は h3_direct.py と同じ（段階 1 の表と一致）。接続・再接続・サーバー終了で中央復帰・ARM・START をしない。ゲーム入力の鮮度は `frame_seq` が進んだときだけ延長。走行中に session が変わると必ず停止。停止・FAULT を後から来た Pose で上書きしない。いずれも **模擬軸での確認** |
-| 確定（実装済み・実機未確認） | USB プロトコル v1 の PC 側（エンコード・デコード・テストベクタ）。serial backend（HELLO / STATUS の `selected_axis`＝MCU で選択した系統で軸を割り当て、設定の `device_id` は照合用。protocol.md §1.1、DESIGN.md §10） |
+| 確定（実機で確認、2026-11-01。[runs/hw_20261101.md](runs/hw_20261101.md)） | USB プロトコル v1 の PC 側と CoreS3 ファーム（`moter-controler` の env `m5stack-cores3-v1`）: HELLO による `selected_axis` の割当（3 台）、CONFIG / SET_REFERENCE、ARM_PREPARE → HOLDING（ブレーキ解除後の保持）、DISARM、校正 `POST /v1/calibrate`（#1 は完走。#2 / #3 は電源担当軸が先に主電源を切って中立で失敗 → `KEEP_POWER` を追加、実機は未試験）。serial backend の DTR、`sim_axes` |
 | 推定 | 模擬軸での遅延（[runs/](runs/) の値: Pose 受信→tick 取り込み p99 約 10 ms、tick 周期 p99 約 11 ms）は macOS・無負荷での値。実機・高負荷・Windows で同じとは限らない |
-| 未確定 | 軸 2・3 の校正値（`config/*.toml` の値は仮値）。軸 1 の向き。`max_gain` 0.35、`source_freshness_ms` 250、`mcu_command_timeout_ms` 100 などの期限（ベンチ用の候補値。実機の停止距離・揺れで決める） |
-| 未実装 | CoreS3 ファームウェア（下の「CoreS3 側でやること」）。CLOCK_SYNC と `apply_at_us`（v1 は 0 固定）。実測角度（`measured_angles` は常に null）。物理非常停止の監視（`physical_estop: "not_monitored"`）。サーバー側の JSONL 記録（`telemetry.rs` に記録器はあるが設定・配線していない。`recorder_dropped` は常に 0。障害前後の経過はメモリ上のリング `GET /v1/events` と標準エラーのログで見る。サーバーを再起動すると消える）。telemetry の一部（計画 §8・§11）: SET_POSITION 送信→MCU 適用の遅延、source age の分布、キュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質は測っていない（サーバー受信→MCU 適用 p99 20 ms の目標は評価できない） |
+| 未確定 | START → ACTIVE の追従（START の `BAD_STATE` は直したが、再試験前に USB 無応答が起きた）。位置制御の定数（フィードフォワード・KP・Duty 上限、仮値）。仮想 0→1023 の向き。`max_gain` 0.35 / bring-up 0.15、`source_freshness_ms` 250、bring-up の `set_position_valid_for_ms` 100・`mcu_command_timeout_ms` 200（USB の揺らぎから置いた値）。校正値は当日実測（#1 5551 / 2775、#2 5463 / 2731、#3 6138 / 3069。CAL ごとに ±20）。USB 無応答（10/31 に 3 回、11/1 に 2 台同時）の原因 |
+| 未実装 | CLOCK_SYNC と `apply_at_us`（v1 は 0 固定）。実測角度（`measured_angles` は常に null）。物理非常停止の監視（`physical_estop: "not_monitored"`）。サーバー側の JSONL 記録（`telemetry.rs` に記録器はあるが設定・配線していない。`recorder_dropped` は常に 0。障害前後の経過はメモリ上のリング `GET /v1/events` と標準エラーのログで見る。サーバーを再起動すると消える）。telemetry の一部（計画 §8・§11）: SET_POSITION 送信→MCU 適用の遅延、source age の分布、キュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質は測っていない（サーバー受信→MCU 適用 p99 20 ms の目標は評価できない） |
 
 ## ビルド・起動・試験
 
@@ -95,12 +96,16 @@ control-server/scripts/e2e_sim.sh --out /tmp/e2e  # 記録先を変える
 - bind は既定で loopback だけ。`server.allow_non_loopback = true` でも LAN の相手に開くのは `GET /v1/status` と `POST /v1/stop` だけ。
 - `power_controller_axis` の軸だけが主電源（G2）を操作する。各軸の STATUS の `POWER_CONTROLLER` がこの設定と違えば ARM しない（`power_role_mismatch`）。
 
+- `[backend] sim_axes = [3]`（serial backend）: 実機が足りないとき、その軸を模擬軸で埋める（`sim:3` として接続・基準済みで現れ、目標に完全に追従する）。その軸の `ports` は書かない。実機を戻したら消す。
+- `[server] require_admin_token`: 既定 `false`（下の「管理操作」）。
+
 ## 管理操作（curl）
 
+管理トークンは **既定で不要**（`server.require_admin_token = false`。bind が loopback のときだけ許される。LAN に開く `allow_non_loopback = true` では `true` が必須）。必要にするときは `require_admin_token = true` にして `export H3CS_ADMIN_TOKEN=...`、`AUTH="Authorization: Bearer $H3CS_ADMIN_TOKEN"` とし、下の `-H "$AUTH"` を付ける。`GET /v1/status` の `admin_token_required` で分かる（テストページはこれを見てトークン欄を無効にする）。
+
 ```sh
-export H3CS_ADMIN_TOKEN=secret
 URL=http://127.0.0.1:8892
-AUTH="Authorization: Bearer $H3CS_ADMIN_TOKEN"
+AUTH="Content-Type: application/json"   # トークン不要のときはこのままでよい（require_admin_token = true なら Bearer に置き換える）
 
 curl -s $URL/v1/status | python3 -m json.tool      # 状態（認証なし）
 curl -s "$URL/v1/events?n=50" | python3 -m json.tool   # 直近のイベント（障害前後の経過。認証なし・loopback だけ。?after=<id> で続きだけ）
@@ -121,7 +126,7 @@ curl -sX POST -H "$AUTH" $URL/v1/calibration/export # OK の結果を設定フ�
 - 校正（DESIGN.md §11、protocol.md §1.2）: MCU が自分で P 端 → N 端 → 中立と端当てし、CAL_RESULT を返す。status の `axes[].mcu_state` が `CALIBRATING`、終わると `axes[].calibration`（`result` / `reason` / `n_end_count` / `neutral_count` / `sign`）と `referenced = true`（P 端 = 0 の基準を MCU が作る。/v1/reference は不要）。校正中は ARM / START / CENTER / REFERENCE が 409 `calibrating`。`export` は、OK の結果がある軸の `mechanical_* / soft_* / count_at_virtual_* / device_id` を入れ替えた **設定ファイルの複製** を `--config` と同じディレクトリに `<rig_id>.calibration-<YYYYmmdd-HHMMSS>.toml`（時刻は UTC）として書く。`calibration_valid` は false のままなので、値を確認して true にし、そのファイルで起動し直す（hardware-bringup.md §5）。同名があれば 409 `exists`、OK の結果が無ければ 409 `no_calibration_result`。
 
 - 成功は 200 `{"ok":true,"rig_state":...}`、拒否は 409 `{"ok":false,"error":"<code>","blockers":[...]}`。`blockers` は `"<code>: <detail>"`。
-- 系統の割当（DESIGN.md §10）は status で見る: 最上位 `axis_conflict`（2 台以上が選んでいる軸の一覧。空なら競合なし）、各軸の `device_id`（接続中の個体）・`expected_device_id`（設定値、0 = 照合なし）・`assignment`（`"selected"`＝MCU の選択 / `"config"`＝`device_id` だけで決まった / null）・`claimants`（この軸を名乗るポートと個体。競合中は 2 つ以上）・`reference_stale`。blockers の code は `axis_conflict` / `axis_device_mismatch` / `reference_stale`。競合中は arm / start / center が 409 `axis_conflict`、WS の pose / gain も ack `reason: "axis_conflict"` で拒否（鮮度は延びない）。
+- 系統の割当（DESIGN.md §10）は status で見る: 最上位 `axis_conflict`（2 台以上が選んでいる軸の一覧。空なら競合なし）、各軸の `device_id`（接続中の個体）・`expected_device_id`（設定値、0 = 照合なし）・`assignment`（`"selected"`＝MCU の選択 / `"config"`＝`device_id` だけで決まった / null）・`claimants`（この軸を名乗るポートと個体。競合中は 2 つ以上）・`reference_stale`。blockers の code は `axis_conflict` / `axis_device_mismatch` / `reference_stale`。各軸の `decode_errors` は PC 側で復号に失敗したフレーム数（USB の品質。0 が正常）。競合中は arm / start / center が 409 `axis_conflict`、WS の pose / gain も ack `reason: "axis_conflict"` で拒否（鮮度は延びない）。
 - 503 `control_loop_unavailable`: 制御ループが 1 秒以内に答えなかった。arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は**実行されたかもしれない**（ループが追いつけば実行する）。いずれも status で確かめる。`GET /v1/status` は制御ループが終わっている（落ちた）とき 503。終了処理（SIGTERM など）が始まると新しい接続は受け付けず、503 ではなく接続拒否になる（確定: sim で ARM 中に SIGTERM、5 ms ごとの status は全て接続拒否）。終了処理の直前に受け付けた要求に 503 が返ることはありうる（推定、未観測）。
 - 管理 API は rate limit（既定 20 回/秒）。stop / disarm / fault は対象外。
 - FAULT になったら `fault`・`fault_history`（status）に加えて `GET /v1/events` で直前の経過（ARM・START・軸の接続・ACK の拒否や期限切れ・状態遷移）と、その後の状態遷移を見る。リングは 512 件（古いものから上書き、`dropped` に数える）。制御ループが落ちた後も読める。同じイベントは標準エラーにも info で出る。

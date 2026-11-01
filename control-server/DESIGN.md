@@ -126,7 +126,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 ## 7. API（JSON は Python クライアントと共有の契約）
 
-既定 `127.0.0.1:8892`。Origin ヘッダーがあれば `allowed_origins` に含まれるか、§7.4 の「自分自身の origin」であること（どちらでもなければ 403）。本文は `max_body_bytes` まで。管理 API は `Authorization: Bearer <token>`（トークンは `admin_token_env` の環境変数、未設定なら起動時に生成して標準エラーへ 1 回出す）。
+既定 `127.0.0.1:8892`。Origin ヘッダーがあれば `allowed_origins` に含まれるか、§7.4 の「自分自身の origin」であること（どちらでもなければ 403）。本文は `max_body_bytes` まで。管理 API は `Authorization: Bearer <token>`（トークンは `admin_token_env` の環境変数、未設定なら起動時に生成して標準エラーへ 1 回出す）。 `server.require_admin_token = false`（既定。loopback 専用）のときは管理 API にトークンを要求しない（`admin_token` は空文字、`GET /v1/status` と WS の status に `admin_token_required: false`）。`allow_non_loopback` のときは `true` が必須（config の検証）。
 
 - loopback 以外への bind は既定で拒否。`server.allow_non_loopback = true` で許可できるが、そのときも **loopback 以外の相手には `GET /v1/status` と `POST /v1/stop` だけ**を開く（他は 403 `loopback_only`。相手アドレス不明も拒否）。Game 入力（session / motion）と管理トークンは LAN を通らない（計画 §11「LAN の観戦通信に駆動権限を付けない」）。
 - 管理 API の rate limit は `admin_rate_limit_per_s`（トークン検査の後）。`/v1/stop`・`/v1/disarm`・`/v1/fault` は rate limit の対象外（安全側の操作を拒まない）。
@@ -187,6 +187,8 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 
 ### 7.2 StatusSnapshot
+
+各軸の `decode_errors`（u64）: そのポートから来たフレームのうち PC 側で復号に失敗した数（COBS / CRC / 長さ。サーバー起動からの累計）。USB の品質の指標で、0 が正常。
 
 ```json
 {
@@ -311,6 +313,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 - `SimParams.selected_axis`。`SimMcu::select_axis(new, now_us) -> Vec<McuMsg>`: DISARMED 以外では何もしない（`select_axis_unchecked` はテスト用に規則違反を起こす）。切り替えで CONFIGURED / POSITION_REFERENCED / calibration_hash を消し、AXIS_SELECT を返し、以後の STATUS / HELLO に新しい値を載せる。`SimHandle::select_axis` / `select_axis_unchecked`。規則違反（DISARMED 以外）の切り替えでは制限値と lease を保つ（POSITION_REFERENCED だけ消す）ので、PC が書かなくなった個体は COMMAND_TIMEOUT で FAULT になる（protocol.md §1.1 の要求。`tests/server.rs` で確認）。
 - `[backend] kind = "sim"` に `report_selected_axis = true`（既定 true）。true なら各模擬軸の `selected_axis` = その軸番号（割当は選択で決まり、`device_id` は照合に使われる）。false なら 0（設定の `device_id` だけで決まる旧経路の試験用）。模擬軸の device_id は設定値、設定が 0（照合なし）なら `5131000000000000 + 軸番号`（個体は必ず device_id を持つ）。
+- serial backend の `[backend] sim_axes`: 列挙した軸は実機の代わりに模擬軸（`sim:<軸>`）で埋める（実機が足りない bring-up 用。模擬軸を先に識別するので、同じ系統を名乗る実機は競合になる）。
 - server.rs の「primary でないポートの Status / Ack / FaultEvent を捨てる」判定は `Supervisor::axis_port` のままでよい（競合中は `None` なので全部落ちる）。`Disconnected` が primary 以外から来たら `PortClosed` に変換する既存処理で claimants から外す。
 
 ## 11. 校正（protocol.md §1.2）

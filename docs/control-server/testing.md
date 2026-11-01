@@ -84,7 +84,22 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 - **telemetry の不足**（計画 §8・§11 との差。未実装）: SET_POSITION の送信→MCU 適用の遅延、ゲーム側の source age の分布、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。§8 のベンチ目標（サーバー受信→MCU 適用 p99 20 ms）は今の telemetry では評価できない。ファイルへの JSONL 記録も未配線（イベントはメモリ上のリング `GET /v1/events` と標準エラーだけ）。
 - **CoreS3 側の規則への適合**: ACK と STATUS の順序（protocol.md §1）、ACTIVE 以外での停止命令の扱い、CONFIG の検査範囲などは、PC が依存していることを模擬軸の試験で確かめただけ。実ファームウェアがそうなっているかは CoreS3 側の実装・試験で確かめる。
 
-## 最新の結果（2026-11-01、CoreS3 v1 ファームのレビュー修正後）
+## 最新の結果（2026-11-01 夕方、トークン既定・`sim_axes`・USB 方式の戻し・ファームの KEEP_POWER の後）
+
+実機の記録は [runs/hw_20261101.md](runs/hw_20261101.md)。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 390 passed、0 failed、1 ignored（校正 386 ＋ `admin_routes_need_no_token_by_default`・`serial_backend_sim_axes_stand_in_for_missing_units`・`non_loopback_bind_requires_admin_token`・`serial_sim_axes_validation`） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| `clients/python/tests` / `clients/h3game/tests` | 34 OK / 50 OK（校正の取り込み時に実行） |
+| `e2e_sim.sh` | PASS、120 / 120（校正のサーバー側を取り込んだ直後に scratch へ出力。`runs/` には残していない） |
+| `moter-controler/tests/run_tests.sh` | 5364 passed、0 failed（CHECK の数。KEEP_POWER の 9 本を追加。前回 2720） |
+| `pio run` | `m5stack-cores3-v1` と `m5stack-cores3` を SUCCESS で確認（他の 4 env は前回のまま） |
+
+この回の変更: `server.require_admin_token`（既定 false）、`[backend] sim_axes`、status の `decode_errors`、テストページのタブ非表示停止の撤去、v1 ファームの USB を loop() 方式に戻し（専用タスクは CRC 不一致・USB 無応答を起こした）、校正の `KEEP_POWER`（ファーム側。サーバー側は別途）。
+
+## 2026-11-01 の結果（2026-11-01、CoreS3 v1 ファームのレビュー修正後）
 
 環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、Python 3.14.4 ＋ websockets 17（`clients/python/.venv`）、PlatformIO（`~/.platformio/penv/bin/pio`、espressif32@6.12.0、Arduino core 2.0.17）、Apple clang（`c++ -std=c++17`）。
 
