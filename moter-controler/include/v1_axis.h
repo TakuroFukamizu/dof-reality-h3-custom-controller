@@ -161,8 +161,8 @@ inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
 // 1. 保持（st.in_band）: 軌道速度 0 で、中なら |誤差| ≤ hold_exit の間とどまり、外なら |誤差| ≤ hold_enter かつ settle_ok
 //   （V1Axis が「軌道完了・|誤差| ≤ hold_enter・|実測速度| ≤ 10 が 200 ms」で立てる）で入る。入ったら I = 0、出力 0（積まない）。
 // 2. 走行／補正: u = FF（方向別）+ P + I。床は無い（1〜5 % の生の値がそのまま出る）。|u| は duty_max で 1 回だけ飽和、四捨五入は 1 回。
-// 3. 動き出しパルス（breakaway。V1Axis の update_breakaway が立てる）: 向きは u の向き（u = 0 なら誤差の向き）、|出力| = max(|u|, 方向別の
-//    動き出し Duty)、duty_max 以内。この tick は I を凍結。
+// 3. 動き出しパルス（breakaway。V1Axis の update_breakaway が立てる）: 向きは誤差の向き（update_breakaway と同じ。古い I で u が
+//    逆を向いていても目標から離れる側へ蹴らない）、|出力| = max(u が同じ向きなら |u|, 方向別の動き出し Duty)、duty_max 以内。この tick は I を凍結。
 // 4. 積分: dI = Ki × err × dt を |dI| ≤ rate × dt に制限。飽和（|u| ≥ duty_max）していて dI が u と同じ向きなら積まない（それ以外は
 //    常に積む。戻す向きは飽和中も許す）。|I| ≤ i_max。
 inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
@@ -197,11 +197,16 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   long mag = u < 0 ? -u : u;
   if (mag > duty_max_pm) mag = duty_max_pm;
   int dir = u > 0 ? 1 : (u < 0 ? -1 : 0);
-  if (dir == 0) dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
-  if (breakaway && dir != 0) {
+  const int err_dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
+  if (breakaway && err_dir != 0) {
+    // パルスの向きは常に誤差の向き（update_breakaway が進みを数える向きと同じ）。古い I で合成が逆を向いていても目標から
+    // 離れる側へ蹴らない。|出力| = max(合成が同じ向きならその大きさ, 方向別の動き出し Duty)、duty_max 以内
+    dir = err_dir;
     long brk = dir > 0 ? t.breakaway_up_permille : t.breakaway_down_permille;
     if (brk < 0) brk = -brk;
     if (brk > duty_max_pm) brk = duty_max_pm;
+    const bool u_same_dir = u != 0 && ((u > 0) == (dir > 0));
+    if (!u_same_dir) mag = 0;
     if (mag < brk) mag = brk;
     o.mode = V1DutyMode::BRK;
   } else {

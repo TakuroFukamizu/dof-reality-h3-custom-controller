@@ -3598,8 +3598,8 @@ inline void test_r6_hold_entry_exit_and_zeroing() {
   CHECK(v1_duty_command(8, 0.0, st, t, 0, &o, 0.005) == 5 && !o.in_band);
 }
 
-// 動き出しパルス（v1_duty_command 側）: breakaway = true のとき、合成の向き（0 なら誤差の向き）に方向別の動き出し Duty と
-// |合成| の大きい方。duty_max 以内。I は凍結。
+// 動き出しパルス（v1_duty_command 側）: breakaway = true のとき、誤差の向きに方向別の動き出し Duty と |合成|（同じ向きのとき）の
+// 大きい方。duty_max 以内。I は凍結。
 inline void test_r6_breakaway_pulse_output() {
   V1Tuning t = r6_tuning();
   V1DutyState st;
@@ -3609,8 +3609,11 @@ inline void test_r6_breakaway_pulse_output() {
   CHECK(v1_duty_command(-5, 0.0, st, t, 0, &o, 0.005, true, true) == -60 && o.mode == V1DutyMode::BRK);
   CHECK(v1_duty_command(300, 0.0, st, t, 0, &o, 0.0, true, true) == 180);  // 合成 180 > 90 → 合成
   CHECK(v1_duty_command(0, 0.0, st, t, 0, &o, 0.0, false, true) == 0 && o.mode == V1DutyMode::MOVE);  // 向きが無い
-  st.i_pm = -20.0;  // I が逆向きでも合成の向き（P 3 − 20 = −17 → 下向き → −60）
-  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == -60);
+  st.i_pm = -20.0;  // 古い I で合成が逆（P 3 − 20 = −17）でも、パルスは誤差の向き（上 +90。目標から離れる側へ蹴らない）
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 90);
+  st.i_pm = 20.0;   // 合成が同じ向きで大きければ合成（P 3 + 20 = 23 < 90 → 90。誤差 300: 180 + 20 = 200 → 上限 200）
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 90);
+  CHECK(v1_duty_command(300, 0.0, st, t, 0, &o, 0.0, true, true) == 200);
   st.i_pm = 0.0;
   t.duty_max = 5;
   CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 50);  // duty_max で頭打ち

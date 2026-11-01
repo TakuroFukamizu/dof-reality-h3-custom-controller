@@ -1321,6 +1321,7 @@ void renderV1() {
   // F = 床の適用状態（1 = ON。Issue #25 手順 8 c）、A = 追従中の動き出し補助（1 = 床を掛けている。Issue #25 手順 9「T」）、
   // B = 停止ブーストの上乗せ、
   // O = 実際に出している値（pwm_permille）。通常 ≤ 50 文字（6 px × 53 = 318 < 320。超えれば切れる）
+  // Issue #25 r6（V1_FF_DIRECTIONAL）: `FF +76 P +12 I +8 V +300 MOVE O +96`。F / A / B の代わりに状態 MOVE / HOLD / BRK。FF は方向別
   {
     const V1DutyTerms& tm = vsnap.terms;
     char terms_text[64];
