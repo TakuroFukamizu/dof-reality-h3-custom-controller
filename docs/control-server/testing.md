@@ -84,7 +84,21 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 - **telemetry の不足**（計画 §8・§11 との差。未実装）: SET_POSITION の送信→MCU 適用の遅延、ゲーム側の source age の分布、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。§8 のベンチ目標（サーバー受信→MCU 適用 p99 20 ms）は今の telemetry では評価できない。ファイルへの JSONL 記録も未配線（イベントはメモリ上のリング `GET /v1/events` と標準エラーだけ）。
 - **CoreS3 側の規則への適合**: ACK と STATUS の順序（protocol.md §1）、ACTIVE 以外での停止命令の扱い、CONFIG の検査範囲などは、PC が依存していることを模擬軸の試験で確かめただけ。実ファームウェアがそうなっているかは CoreS3 側の実装・試験で確かめる。
 
-## 最新の結果（2026-11-01 夕方、トークン既定・`sim_axes`・USB 方式の戻し・ファームの KEEP_POWER の後）
+## 2026-11-02 の結果（Issue #15: ゲーム経路の制限値の上限・模擬軸の開け直し・StartTimeout）
+
+環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、Python 3.14.4 ＋ websockets 17（`clients/python/.venv`）。サーバーだけの変更（ファームは触っていない）。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 438 passed、0 failed、1 ignored（この PR で 5 本追加: `limits.rs` 2・`supervisor.rs` 2・`server.rs` 1。WS の limits 試験は操作者の上限で書き直し） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| `clients/python/tests` | Ran 36、OK（`test_against_server.py` の limits 試験を `operator_limited` に書き直し） |
+| `clients/h3game/tests` | Ran 51、OK（`H3GAME_SRC` に既存のクローン。パッチの `h3_motion_client.py` の複製は docstring だけ更新） |
+| `e2e_sim.sh` | PASS、チェック 120 / 120（`--out` を作業用ディレクトリにしたので `runs/` には置いていない。e2e は limits を送らないので操作者の上限は通らない） |
+
+変えたこと: WS `limits` で書いた項目は `[limits]` の初期値を超えない（`operator_limited`、status / `GET/POST /v1/limits` に `operator_max` / `game_fields`、limits.md §1）、模擬軸のポートもリンクが閉じたら `SERIAL_RETRY` 後に同じ `SimMcu` へ開け直す（`sim_port_task`、DESIGN.md §10.3）、START が確認できないときの FAULT を `StartTimeout { axis }` にして detail に `ack_timeout: …` か未到達の状態を書く（DESIGN.md §5 / §7.2）。
+
+## 2026-11-01 夕方の結果（トークン既定・`sim_axes`・USB 方式の戻し・ファームの KEEP_POWER の後）
 
 実機の記録は [runs/hw_20261101.md](runs/hw_20261101.md)。
 
