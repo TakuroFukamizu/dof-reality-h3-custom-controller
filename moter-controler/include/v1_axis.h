@@ -82,9 +82,9 @@ struct V1DutyState {
 // 床・上限を掛ける（5.3 % は 53 permille として出る）。
 // 1. 静止の不感帯: 目標が止まっている（vel = 0）ときだけ、入る側 deadband / 出る側 deadband_out のヒステリシスで Duty 0
 //   （到達帯の縁での往復を防ぐ。不感帯の中では床の状態も OFF に戻す）。
-// 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成の向きが P（誤差）の向きと違えば即 OFF。|誤差| > deadband_out なら
-//    ON。|誤差| ≤ floor_off（15）なら OFF。その間（15 < |誤差| ≤ 20）は前の状態を保つ。誤差 0 は「向きの判定が無い」ので
-//    |誤差| ≤ floor_off の側で OFF（軌道だけが動いている立ち上がりは生の FF）。
+// 2. 床の適用状態（Issue #25 手順 8 c「E」、st.floor_on）: 合成の向きが P の向きと違えば（P = 0 のときも）即 OFF。
+//    |誤差| ≤ min(floor_off（15）, deadband_out − 1) なら OFF。|誤差| > deadband_out なら ON。その間（既定 15 < |誤差| ≤ 20）は
+//    前の状態を保つ。誤差 0（P = 0）は向きが無いので OFF（軌道だけが動いている立ち上がりは生の FF）。kp = 0 なら常に OFF。
 // 3. ON なら |合成| を 床（duty_min × 10 ＋ boost_permille。duty_max × 10 を超えない）まで持ち上げる。OFF なら生の合成のまま
 //   （0 に置き換えない。旧 Issue #15 M1 の 0 置換はこれに代わる。「誤差と逆向きに床を掛けない」規則は向きの条件として残る）。
 // 4. |合成| は duty_max × 10 で飽和。
@@ -116,14 +116,15 @@ inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tun
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
   const long cmd = lround(p_pm + ff_pm);  // 四捨五入（0.5 は 0 から遠い側）。以後は整数の permille
-  // 床の適用状態（ヒステリシス）。合成が 0 なら向きが無いので OFF
-  const bool sign_match = cmd != 0 && err != 0 && (cmd < 0) == (err < 0);
-  if (!sign_match) {
+  // 床の適用状態（ヒステリシス）。向きは P と合成で比べる（kp = 0 なら P = 0 で向きが無く、FF だけに床を掛けない。
+  // Codex レビュー P2-1）。合成が 0 でも OFF。OFF のしきい値は min(floor_off, deadband_out − 1): SET_LIMITS で
+  // deadband_out ≤ floor_off にされても ON（> deadband_out）と OFF の領域が重ならない（Codex レビュー P2-2）
+  const bool sign_match = cmd != 0 && p_pm != 0.0 && (cmd < 0) == (p_pm < 0.0);
+  const int32_t floor_off = t.floor_off < t.deadband_out ? t.floor_off : t.deadband_out - 1;
+  if (!sign_match || err_abs <= floor_off) {
     st.floor_on = false;
   } else if (err_abs > t.deadband_out) {
     st.floor_on = true;
-  } else if (err_abs <= t.floor_off) {
-    st.floor_on = false;
   }
   o.floor_on = st.floor_on;
   if (cmd == 0) return 0;

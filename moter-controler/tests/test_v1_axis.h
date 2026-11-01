@@ -1765,6 +1765,50 @@ inline void test_duty_command_floor_gate_with_hysteresis() {
   CHECK(!o.floor_on && o.p_permille == 30 && o.ff_permille == -60 && o.cmd_permille == -30 && o.boost_permille == 20);
 }
 
+// Codex レビュー（PR #28）P2: (1) 向きは P と比べる。kp = 0（SET_LIMITS で受理される）なら P = 0 で床は決して ON にならず、
+// FF だけが床まで持ち上がらない。(2) OFF のしきい値は min(15, deadband_out − 1): deadband_out < 15 でも ON と OFF の領域が重ならない。
+inline void test_duty_command_floor_requires_p_and_respects_small_deadband_out() {
+  V1Tuning t;  // kp 2、ff 100、下限 7、上限 20、deadband 10 / 20
+  t.kp_percent_per_100 = 0;
+  V1DutyState st;
+  // err 21・vel 300: FF 30、P 0 → 床 OFF → 生の 30（旧: 誤差の向きと一致とみなして 70）
+  CHECK(v1_duty_command(21, 300.0, st, t) == 30 && !st.floor_on);
+  CHECK(v1_duty_command(500, 300.0, st, t) == 30 && !st.floor_on);
+  CHECK(v1_duty_command(-500, -300.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(500, 0.0, st, t) == 0 && !st.floor_on);  // 静止で kp 0 → 出力 0
+  // kp を戻せば従来どおり
+  t.kp_percent_per_100 = 2;
+  CHECK(v1_duty_command(21, 300.0, st, t) == 70 && st.floor_on);
+  // deadband_out 12（deadband 10）: ON は > 12、OFF は ≤ 11（min(15, 12 − 1)）。14 は ON の履歴を保つ、ON 無しなら OFF のまま
+  t.deadband_out = 12;
+  CHECK(v1_duty_command(14, 0.0, st, t) == 70 && st.floor_on);  // 直前の ON を保つ（12 ≥ 14 ではないので ON の条件は満たさないが OFF にもならない）
+  CHECK(v1_duty_command(11, 0.0, st, t) == 2 && !st.floor_on);  // ≤ 11 → OFF → 生の P 2.2 → 2
+  CHECK(v1_duty_command(12, 0.0, st, t) == 2 && !st.floor_on);  // OFF の履歴なので OFF のまま
+  CHECK(v1_duty_command(13, 0.0, st, t) == 70 && st.floor_on);  // > 12 → ON
+  CHECK(v1_duty_command(12, 0.0, st, t) == 70 && st.floor_on);  // 1 count のヒステリシス
+  CHECK(v1_duty_command(11, 0.0, st, t) == 2 && !st.floor_on);
+  // deadband_out 16: OFF は ≤ 15（既定の floor_off のまま）
+  t.deadband_out = 16;
+  CHECK(v1_duty_command(17, 0.0, st, t) == 70 && st.floor_on);
+  CHECK(v1_duty_command(16, 0.0, st, t) == 70 && st.floor_on);
+  CHECK(v1_duty_command(15, 0.0, st, t) == 3 && !st.floor_on);
+  // 軸を通して: SET_LIMITS kp 0・deadband_out 12 を受理し、追従中の FF だけ（max_vel 300 → 30 permille）に床が掛からない
+  Harness h;
+  v1::Config c = base_config();
+  c.max_vel_count_s = 300;
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(20, 7, 0, 100, 10, 12));
+  CHECK(h.ax.tuning.kp_percent_per_100 == 0 && h.ax.tuning.deadband_out == 12);
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.plant_vel = 100.0;  // プラントが遅く誤差が増えても（P 0）床は掛からない
+  h.drive(600, 5000);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.following_error_count() < -20);
+  CHECK(h.ax.pwm_permille() == 30 && !h.ax.duty_terms().floor_on && h.ax.duty_terms().p_permille == 0);
+}
+
 // 軸を通した E: 追従中（誤差が小さい）は床ではなく生の FF が出る。静止の残り誤差 15 では床 OFF で生の P、25 で床 ON。
 inline void test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis() {
   Harness h;
@@ -3099,6 +3143,7 @@ inline void run_all() {
   test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits();
   test_duty_command_floor_gate_with_hysteresis();
   test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis();
+  test_duty_command_floor_requires_p_and_respects_small_deadband_out();
   test_encoder_fault_threshold_follows_duty_max();
   test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault();
   test_device_id_packs_mac_in_printed_order();
