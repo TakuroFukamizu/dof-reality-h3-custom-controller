@@ -92,8 +92,29 @@
 //!   the power axis, the other targets are cancelled at once. A CALIBRATE(1)
 //!   whose ACK never comes ([`ACK_TIMEOUT`]) is forgotten the same way (no
 //!   blocker; the power axis unanswered also cancels the others).
+//! - **Power hold (`KEEP_POWER`, protocol §4 CALIBRATE)**: when the targets
+//!   include any axis besides the power axis, the power axis gets
+//!   CALIBRATE(1, `KEEP_POWER`) and the others CALIBRATE(1, 0). The power axis
+//!   then stays CALIBRATING (POWER_HOLD, main power on) after its own
+//!   CAL_RESULT. The supervisor releases it — CALIBRATE(0), event
+//!   `cal_power_release` — once the power axis has reported its CAL_RESULT
+//!   **and** every other target is out of its calibration: CAL_RESULT seen,
+//!   or a STATUS after the ACK that is not CALIBRATING (lost CAL_RESULT), or
+//!   CALIBRATE rejected / unanswered, or disconnected. Waiting for the power
+//!   axis's own result matters: a CALIBRATE(0) while it is still moving would
+//!   cancel its calibration. A cancel (`CalibrateCancel` / `Stop`) reaches a
+//!   POWER_HOLD axis like any CALIBRATING one; a cancel during the run ends in
+//!   POWER_HOLD too (protocol: "成功・失敗・中止を問わず"), so the release
+//!   follows once the results are in. If the power axis drops out while the
+//!   others calibrate (disconnect, reboot, CALIBRATE rejected / unanswered)
+//!   the others are cancelled (`calibrate_cancelled`); a FAULT of the power
+//!   axis latches the rig, whose HOST_FAULT already stops every axis. The
+//!   power axis alone as target gets `flags = 0` (no hold). The firmware's
+//!   own hold timeout (120 s) is the backstop when the release cannot be
+//!   sent. While in POWER_HOLD the blocker `calibrating: axisN` stays and the
+//!   snapshot keeps the CAL_RESULT (nothing replaces it).
 //! - `CalibrateCancel` and `Stop` send CALIBRATE(0) to every axis that is
-//!   CALIBRATING or whose CALIBRATE(1) is outstanding.
+//!   CALIBRATING (POWER_HOLD included) or whose CALIBRATE(1) is outstanding.
 //! - While any axis is CALIBRATING the rig stays Idle (CALIBRATION_REQUIRED
 //!   through the blocker `calibrating: axisN`); `Arm` / `Start` / `Center` /
 //!   `Reference` are refused with `calibrating`. Nothing is sent to the axis
@@ -117,7 +138,8 @@ use crate::compat;
 use crate::config::{Config, GameConfig, TimingConfig};
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
-    self, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
+    self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult,
+    CalResult,
     CalResultCode, FaultEvent, Hello, HostMsg, SetPosition, Status,
 };
 use crate::session::AcceptedPose;
@@ -592,6 +614,16 @@ struct DriveView {
     limits: Vec<LimitReason>,
 }
 
+/// A multi-axis calibration whose power axis was started with `KEEP_POWER`
+/// (module docs, "Power hold").
+#[derive(Debug, Clone)]
+struct PowerHold {
+    /// Targets other than the power axis (indices).
+    others: Vec<usize>,
+    /// The power axis reported its CAL_RESULT this run (it is in POWER_HOLD).
+    power_done: bool,
+}
+
 /// The rig state machine. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
@@ -614,6 +646,8 @@ pub struct Supervisor {
     /// Units (device_id, boot_id) that changed axis under one boot and were
     /// not re-referenced by this server since.
     stale_refs: BTreeSet<(DeviceId, BootId)>,
+    /// Calibration in flight with the power axis holding the main power.
+    power_hold: Option<PowerHold>,
 
     phase: Phase,
     planner: Planner,
@@ -683,6 +717,7 @@ impl Supervisor {
             host_decode_errors: 0,
             last_assignment: BTreeMap::new(),
             stale_refs: BTreeSet::new(),
+            power_hold: None,
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             planner_settled: false,
@@ -1372,6 +1407,9 @@ impl Supervisor {
                 "selected_axis": hello.selected_axis, "device_id": hello.device_id,
                 "hash_match": hello.calibration_hash == self.hashes[i], "rebooted": rebooted}),
         );
+        if rebooted && axis == self.power_axis {
+            self.power_axis_lost("power axis rebooted", now);
+        }
         if rebooted && self.is_armed() {
             self.latch(
                 RigFault::AxisRebooted { axis },
@@ -1436,6 +1474,9 @@ impl Supervisor {
                 "axis_rebooted",
                 serde_json::json!({"axis": axis, "boot_id": status.boot_id}),
             );
+            if axis == self.power_axis {
+                self.power_axis_lost("power axis rebooted", now);
+            }
             if self.is_armed() {
                 self.latch(
                     RigFault::AxisRebooted { axis },
@@ -1493,6 +1534,11 @@ impl Supervisor {
         t.cal_ack_ev = None;
         t.calibrate_rejected = None;
         t.calibration = Some(record);
+        if axis == self.power_axis {
+            if let Some(h) = self.power_hold.as_mut() {
+                h.power_done = true;
+            }
+        }
         if r.result == CalResultCode::Ok {
             // The unit established its own reference (P end = 0): no longer
             // stale, whatever axis change preceded it.
@@ -1520,6 +1566,9 @@ impl Supervisor {
             "disconnected",
             serde_json::json!({"axis": axis, "reason": reason}),
         );
+        if axis == self.power_axis {
+            self.power_axis_lost("power axis disconnected", now);
+        }
         if self.is_armed() {
             let fault = if reason.starts_with(crate::axis_link::reason::AXIS_CHANGED) {
                 RigFault::AxisChanged { axis }
@@ -1718,6 +1767,7 @@ impl Supervisor {
                 if axis == self.power_axis {
                     // Without the power axis the others have no 24 V: cancel
                     // them rather than let them fail one by one.
+                    self.power_hold = None;
                     let cancelled = self.send_calibrate_cancel(now);
                     if !cancelled.is_empty() {
                         self.event(
@@ -1828,14 +1878,25 @@ impl Supervisor {
         if !not_disarmed.is_empty() {
             return Err(AdminError::new(admin_error::MCU_NOT_DISARMED, not_disarmed));
         }
+        // The power axis keeps the main power on for the others (KEEP_POWER);
+        // alone it needs no hold.
+        let keep_power = targets.iter().any(|a| *a != self.power_axis);
+        let mut flags_log = serde_json::Map::new();
         for a in &targets {
             let i = a.index();
+            let flags = if keep_power && *a == self.power_axis {
+                calibrate_flags::KEEP_POWER
+            } else {
+                0
+            };
+            flags_log.insert(a.to_string(), serde_json::json!(flags));
             let id = self.take_request_id();
             self.push_msg(
                 i,
                 HostMsg::Calibrate {
                     request_id: id,
                     mode: calibrate_mode::START,
+                    flags,
                 },
                 Purpose::Calibrate,
                 now,
@@ -1845,8 +1906,77 @@ impl Supervisor {
             t.cal_ack_ev = None;
             t.calibrate_rejected = None;
         }
-        self.event(now, "calibrate", serde_json::json!({"axes": targets}));
+        self.power_hold = keep_power.then(|| PowerHold {
+            others: targets
+                .iter()
+                .filter(|a| **a != self.power_axis)
+                .map(|a| a.index())
+                .collect(),
+            power_done: false,
+        });
+        self.event(
+            now,
+            "calibrate",
+            serde_json::json!({"axes": targets, "keep_power": keep_power, "flags": flags_log}),
+        );
         Ok(None)
+    }
+
+    /// Release the power axis from POWER_HOLD (CALIBRATE(0)) once it has
+    /// reported its CAL_RESULT and every other target is out of its
+    /// calibration (module docs, "Power hold"). Drops a hold whose power axis
+    /// is no longer calibrating (it went DISARMED by itself).
+    fn check_power_release(&mut self, now: Instant) {
+        let Some(h) = &self.power_hold else {
+            return;
+        };
+        let pi = self.power_axis.index();
+        if !self.axes[pi].cancel_target() {
+            self.power_hold = None;
+            return;
+        }
+        if !h.power_done {
+            return;
+        }
+        let out = |t: &AxisTrack| !t.connected || !(t.cal_pending || t.calibrating());
+        if !h.others.iter().all(|&i| out(&self.axes[i])) {
+            return;
+        }
+        let others: Vec<AxisId> = h.others.iter().filter_map(|&i| AxisId::from_index(i)).collect();
+        self.power_hold = None;
+        let id = self.take_request_id();
+        self.push_msg(
+            pi,
+            HostMsg::Calibrate {
+                request_id: id,
+                mode: calibrate_mode::CANCEL,
+                flags: 0,
+            },
+            Purpose::CalibrateCancel,
+            now,
+        );
+        self.event(
+            now,
+            "cal_power_release",
+            serde_json::json!({"axis": self.power_axis, "after": others}),
+        );
+    }
+
+    /// The power axis dropped out of a held calibration (`reason`): the other
+    /// targets lose the 24 V, so cancel them rather than let them fail one by
+    /// one. No-op without a hold (nothing else was calibrating with it).
+    fn power_axis_lost(&mut self, reason: &str, now: Instant) {
+        if self.power_hold.take().is_none() {
+            return;
+        }
+        let cancelled = self.send_calibrate_cancel(now);
+        if !cancelled.is_empty() {
+            self.event(
+                now,
+                "calibrate_cancelled",
+                serde_json::json!({"axes": cancelled, "because": reason}),
+            );
+        }
     }
 
     fn cmd_calibrate_cancel(&mut self, now: Instant) -> Option<String> {
@@ -1879,11 +2009,21 @@ impl Supervisor {
                 HostMsg::Calibrate {
                     request_id: id,
                     mode: calibrate_mode::CANCEL,
+                    flags: 0,
                 },
                 Purpose::CalibrateCancel,
                 now,
             );
             out.push(axis);
+        }
+        // CALIBRATE(0) to a power axis already in POWER_HOLD is its release.
+        if out.contains(&self.power_axis) && self.power_hold.as_ref().is_some_and(|h| h.power_done) {
+            self.power_hold = None;
+            self.event(
+                now,
+                "cal_power_release",
+                serde_json::json!({"axis": self.power_axis, "after": "cancel"}),
+            );
         }
         out
     }
@@ -2152,6 +2292,7 @@ impl Supervisor {
     /// Event- and time-driven transitions that need no planner step.
     fn advance(&mut self, now: Instant) {
         self.expire_pending(now);
+        self.check_power_release(now);
         let all_ok = self.axes.iter().all(|t| t.group_ok);
         let all_in = |s: McuState| {
             self.axes
@@ -2422,6 +2563,7 @@ impl Supervisor {
         self.fault = Some(fault);
         self.drive.limits.clear();
         self.phase = Phase::Fault { reset: None };
+        self.power_hold = None;
         self.group = None;
         self.planner.clear();
         self.planner_settled = false;
@@ -2756,6 +2898,7 @@ impl Supervisor {
                         t.cal_ack_ev = None;
                     }
                     if AxisId::from_index(p.axis) == Some(self.power_axis) {
+                        self.power_hold = None;
                         let cancelled = self.send_calibrate_cancel(now);
                         if !cancelled.is_empty() {
                             self.event(

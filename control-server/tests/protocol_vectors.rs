@@ -251,9 +251,13 @@ fn vectors() -> Vec<Vector> {
         },
         Vector {
             title: "CALIBRATE",
-            msg: Msg::Host(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START }),
-            frame_hex: "01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F",
-            wire_hex: "04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00",
+            msg: Msg::Host(HostMsg::Calibrate {
+                request_id: 7,
+                mode: calibrate_mode::START,
+                flags: calibrate_flags::KEEP_POWER,
+            }),
+            frame_hex: "01 0C 08 00 07 00 00 00 01 01 00 00 92 B8",
+            wire_hex: "04 01 0C 08 02 07 01 01 03 01 01 01 03 92 B8 00",
         },
         Vector {
             title: "CAL_RESULT",

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use h3cs::protocol::cobs::FrameAccumulator;
 use h3cs::protocol::{
-    decode_mcu_frame, msg_type, role_flags, Ack, AckReason, AckResult, CalResult, CalResultCode,
-    Config, HostMsg, McuMsg, SetPosition, Status, MAX_ENCODED_LEN,
+    calibrate_flags, decode_mcu_frame, msg_type, role_flags, Ack, AckReason, AckResult, CalResult,
+    CalResultCode, Config, HostMsg, McuMsg, SetPosition, Status, MAX_ENCODED_LEN,
 };
 use h3cs::sim_axis::{sim_pair, SimMcu, SimParams, DEDUPE_DEPTH};
 use h3cs::types::{status_flags, FaultCode, McuState};
@@ -1943,8 +1943,11 @@ fn cal_results(out: &[McuMsg]) -> Vec<CalResult> {
 
 impl Harness {
     fn calibrate(&mut self, mode: u8) -> Ack {
+        self.calibrate_flags(mode, 0)
+    }
+    fn calibrate_flags(&mut self, mode: u8, flags: u8) -> Ack {
         let r = self.next_rid();
-        self.cmd(HostMsg::Calibrate { request_id: r, mode })
+        self.cmd(HostMsg::Calibrate { request_id: r, mode, flags })
     }
     /// Unreferenced unit with the default ±3000 end stops, CONFIG accepted
     /// (so the power role is known).
@@ -2040,7 +2043,7 @@ fn calibrate_is_disarmed_only_and_mode_is_checked() {
     assert_eq!(h.state(), McuState::Calibrating);
     // Same message again is a resend: DUPLICATE, still calibrating.
     let rid = h.rid;
-    assert_eq!(h.cmd(HostMsg::Calibrate { request_id: rid, mode: 1 }).result, AckResult::Duplicate);
+    assert_eq!(h.cmd(HostMsg::Calibrate { request_id: rid, mode: 1, flags: 0 }).result, AckResult::Duplicate);
     assert_eq!(h.state(), McuState::Calibrating);
 }
 
@@ -2190,4 +2193,184 @@ fn plant_never_passes_the_end_stops_and_the_stops_follow_every_reference() {
     assert_eq!(h.start().result, AckResult::Accepted);
     h.drive(100, 2000);
     assert!(h.sim.actual_count() <= 100, "{}", h.sim.actual_count());
+}
+
+// ---------- KEEP_POWER / POWER_HOLD (protocol.md §4 CALIBRATE, DESIGN.md §11) ----------
+
+impl Harness {
+    /// Idle until the first CAL_RESULT is out (panics after `max_ms`).
+    fn run_to_cal_result(&mut self, max_ms: u64) {
+        for _ in 0..max_ms {
+            self.idle(1);
+            if !cal_results(&self.out).is_empty() {
+                return;
+            }
+        }
+        panic!("no CAL_RESULT within {max_ms} ms (state {:?})", self.state());
+    }
+}
+
+/// CALIBRATE(1, KEEP_POWER) on a power-role unit, run to its (OK) result.
+fn power_hold_after_ok(h: &mut Harness) {
+    assert_eq!(h.calibrate_flags(1, calibrate_flags::KEEP_POWER).result, AckResult::Accepted);
+    h.run_to_cal_result(6000);
+    h.idle(50);
+    let r = cal_results(&h.out);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].result, CalResultCode::Ok);
+    assert_eq!(r[0].step, 3, "no step 4: POWER_HOLD shows in STATUS, not in CAL_RESULT");
+}
+
+#[test]
+fn keep_power_holds_the_main_power_after_the_result_until_calibrate_0() {
+    let mut h = Harness::uncalibrated();
+    power_hold_after_ok(&mut h);
+    assert_eq!(h.state(), McuState::Calibrating, "POWER_HOLD is still CALIBRATING");
+    assert!(h.sim.is_calibrating() && h.sim.is_power_holding());
+    let s = h.sim.status();
+    assert_ne!(s.flags & status_flags::POWER_ON_CMD, 0, "main power kept on");
+    assert_eq!(s.flags & status_flags::BRAKE_RELEASE_CMD, 0, "brake applied");
+    assert_eq!(s.pwm_permille, 0);
+    assert_ne!(s.flags & status_flags::POSITION_REFERENCED, 0);
+    assert_eq!(h.sim.end_counts(), (0, 6000), "P end = 0 already");
+    assert_eq!(h.sim.actual_count(), 3000);
+    // The hold outlasts a long idle (default timeout 120 s) and refuses what
+    // a running calibration refuses.
+    h.idle(5000);
+    assert_eq!(h.state(), McuState::Calibrating);
+    assert_eq!(h.config().reason, AckReason::BadState);
+    assert_eq!(h.arm().reason, AckReason::BadState);
+    assert_eq!(h.calibrate(1).reason, AckReason::BadState);
+    assert_eq!(cal_results(&h.out).len(), 1);
+    // CALIBRATE(0): power off → DISARMED at once, no second CAL_RESULT, the
+    // reference stays.
+    h.out.clear();
+    assert_eq!(h.calibrate(0).result, AckResult::Accepted);
+    assert_eq!(h.state(), McuState::Disarmed);
+    assert!(!h.sim.is_calibrating() && !h.sim.is_power_holding());
+    assert!(cal_results(&h.out).is_empty(), "no second CAL_RESULT");
+    assert!(h.sim.is_referenced());
+    let last = h.statuses().last().copied().unwrap();
+    assert_eq!(last.mcu_state, McuState::Disarmed as u8);
+    assert_eq!(last.flags & (status_flags::POWER_ON_CMD | status_flags::BRAKE_RELEASE_CMD), 0);
+    assert_ne!(last.flags & status_flags::POSITION_REFERENCED, 0);
+    assert_eq!(h.sim.end_counts(), (0, 6000));
+    // Reserved flag bits alone do not hold (bit0 is the only one defined).
+    h.idle(10);
+    h.out.clear();
+    assert_eq!(h.calibrate_flags(1, 0xFE).result, AckResult::Accepted);
+    h.run_to_cal_result(6000);
+    h.idle(50);
+    assert_eq!(h.state(), McuState::Disarmed, "unknown bits ignored: no hold");
+    assert!(!h.sim.is_power_holding());
+}
+
+#[test]
+fn keep_power_hold_ends_by_disarm_or_timeout_without_a_second_result() {
+    // DISARM is the cancel of a running calibration: in POWER_HOLD it releases.
+    let mut h = Harness::uncalibrated();
+    power_hold_after_ok(&mut h);
+    h.out.clear();
+    assert_eq!(h.disarm().result, AckResult::Accepted);
+    assert_eq!(h.state(), McuState::Disarmed);
+    assert!(cal_results(&h.out).is_empty());
+    assert!(h.sim.is_referenced());
+
+    // The unit's own timeout (`cal_power_hold_timeout_ms`) is the backstop.
+    let mut h = Harness::new(SimParams {
+        start_referenced: false,
+        cal_power_hold_timeout_ms: 500,
+        ..SimParams::default()
+    });
+    assert_eq!(h.config().result, AckResult::Accepted);
+    h.out.clear();
+    power_hold_after_ok(&mut h);
+    h.idle(400);
+    assert_eq!(h.state(), McuState::Calibrating, "held: 450 ms < 500 ms");
+    assert!(h.sim.is_power_holding());
+    h.idle(100);
+    assert_eq!(h.state(), McuState::Disarmed, "timeout: power off → DISARMED");
+    assert!(!h.sim.is_power_holding());
+    assert_eq!(cal_results(&h.out).len(), 1, "still one CAL_RESULT");
+    assert!(h.sim.is_referenced());
+    let last = h.statuses().last().copied().unwrap();
+    assert_eq!(last.mcu_state, McuState::Disarmed as u8);
+    assert_eq!(last.flags & status_flags::POWER_ON_CMD, 0);
+}
+
+#[test]
+fn keep_power_is_ignored_without_the_power_role() {
+    let mut h = Harness::new(SimParams { start_referenced: false, ..SimParams::default() });
+    assert_eq!(h.config_with(Config { role_flags: 0, ..config(EPOCH) }).result, AckResult::Accepted);
+    h.out.clear();
+    assert_eq!(h.calibrate_flags(1, calibrate_flags::KEEP_POWER).result, AckResult::Accepted);
+    h.run_to_cal_result(6000);
+    h.idle(50);
+    assert_eq!(h.state(), McuState::Disarmed, "a non-power unit ends DISARMED as usual");
+    assert!(!h.sim.is_power_holding());
+    let r = cal_results(&h.out);
+    assert_eq!((r.len(), r[0].result), (1, CalResultCode::Ok));
+    assert!(
+        h.statuses().iter().all(|s| s.flags & status_flags::POWER_ON_CMD == 0),
+        "never commands power"
+    );
+    assert!(h.sim.is_referenced());
+}
+
+#[test]
+fn cancel_or_failure_during_a_keep_power_run_still_ends_in_power_hold() {
+    // "成功・失敗・中止を問わず": the power stays on for the other axes' own
+    // shutdown; the next CALIBRATE(0) (the supervisor's release) switches it off.
+    let mut h = Harness::uncalibrated();
+    assert_eq!(h.calibrate_flags(1, calibrate_flags::KEEP_POWER).result, AckResult::Accepted);
+    h.idle(200);
+    assert_eq!(h.calibrate(0).result, AckResult::Accepted);
+    h.idle(100);
+    let r = cal_results(&h.out);
+    assert_eq!(r.len(), 1);
+    assert_eq!((r[0].result, r[0].reason_str().as_str()), (CalResultCode::Cancelled, "stop"));
+    assert_eq!(h.state(), McuState::Calibrating);
+    assert!(h.sim.is_power_holding());
+    assert_ne!(h.sim.status().flags & status_flags::POWER_ON_CMD, 0);
+    assert!(!h.sim.is_referenced(), "a cancelled calibration drops the reference");
+    h.out.clear();
+    assert_eq!(h.calibrate(0).result, AckResult::Accepted);
+    assert_eq!(h.state(), McuState::Disarmed);
+    assert!(cal_results(&h.out).is_empty());
+    assert!(!h.sim.is_referenced());
+
+    // An injected failure holds the power too.
+    let mut h = Harness::uncalibrated();
+    h.sim.set_calibration_failure(Some("slow"));
+    assert_eq!(h.calibrate_flags(1, calibrate_flags::KEEP_POWER).result, AckResult::Accepted);
+    h.run_to_cal_result(1000);
+    h.idle(10);
+    assert_eq!(cal_results(&h.out)[0].result, CalResultCode::Failed);
+    assert_eq!(h.state(), McuState::Calibrating);
+    assert!(h.sim.is_power_holding());
+}
+
+#[test]
+fn host_fault_in_power_hold_faults_without_a_second_result_and_keeps_the_reference() {
+    let mut h = Harness::uncalibrated();
+    power_hold_after_ok(&mut h);
+    h.out.clear();
+    assert_eq!(h.host_fault().result, AckResult::Accepted);
+    assert_eq!(h.state(), McuState::Fault);
+    assert_eq!(h.sim.fault_code(), FaultCode::HostFault);
+    assert!(cal_results(&h.out).is_empty(), "the result already went out");
+    assert!(!h.sim.is_calibrating());
+    let ev = h.fault_events();
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].mcu_state_before, McuState::Calibrating as u8);
+    assert!(h.sim.is_referenced(), "a fault in POWER_HOLD does not un-reference");
+    let s = h.sim.status();
+    assert_eq!(
+        s.flags & (status_flags::POWER_ON_CMD | status_flags::BRAKE_RELEASE_CMD),
+        0,
+        "FAULT: power off, brake applied"
+    );
+    assert_eq!(h.fault_reset().result, AckResult::Accepted);
+    assert_eq!(h.state(), McuState::Disarmed);
+    assert!(h.sim.is_referenced());
 }

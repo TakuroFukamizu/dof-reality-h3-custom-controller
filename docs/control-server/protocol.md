@@ -148,7 +148,7 @@ MCU は PC サーバーの再起動を知らない（USB の再オープンで�
 | `0x09` | CLOCK_SYNC | 0: u32 request_id / 4: u64 pc_time_us | 12 | CLOCK_SYNC_REPLY |
 | `0x0A` | HOST_FAULT | 0: u32 request_id / 4: u16 fault_code / 6: u16 reserved=0 | 8 | ACK（常に ACCEPTED）。どの状態でも即 FAULT ラッチ（PWM 0・ブレーキ作動）。ラッチされるコードは `HOST_FAULT`（既にラッチ済み・減速中の異常コードがあればそれを保つ）。payload の `fault_code` は記録のみ。ACK の後に送る最初の STATUS から `mcu_state = FAULT`、`fault_code ≠ NONE`（PC はこれを確認してから FAULT_RESET の送り先を決める） |
 | `0x0B` | SET_REFERENCE | 0: u32 request_id / 4: i32 reference_count | 8 | ACK。DISARMED のときだけ。現在の計数値を `reference_count` と定義し `POSITION_REFERENCED` を立てる |
-| `0x0C` | CALIBRATE | 0: u32 request_id / 4: u8 mode（1 = 開始、0 = 中止） / 5: u8 flags（bit0 = `KEEP_POWER`。電源担当軸（CONFIG の `role_flags` bit0）だけが解釈し、他の軸は無視する。bit1〜7 は予約 = 0） / 6: u16 reserved=0 | 8 | ACK。`mode = 1`: DISARMED のときだけ（それ以外 `REJECTED/BAD_STATE`）。受理で CALIBRATING（§1.2）。`KEEP_POWER` が立っていれば、校正（成功・失敗・中止を問わず）の終了手順でブレーキを作動させ PWM 0 にした後も **主電源 ON 指令を保ったまま CALIBRATING（CAL_RESULT の `step = 4` POWER_HOLD）に留まる**。`mode = 0` か `CAL_POWER_HOLD_TIMEOUT_MS`（120000、仮値）で主電源 OFF → DISARMED（このとき CAL_RESULT は送らない。結果は校正終了時に送った 1 回だけ）。`mode = 0`: CALIBRATING（POWER_HOLD を含む）なら中止して終了手順 → DISARMED、それ以外は何もせず ACCEPTED。`mode` が 0・1 以外は `REJECTED/INVALID_PARAM` |
+| `0x0C` | CALIBRATE | 0: u32 request_id / 4: u8 mode（1 = 開始、0 = 中止） / 5: u8 flags（bit0 = `KEEP_POWER`。電源担当軸（CONFIG の `role_flags` bit0）だけが解釈し、他の軸は無視する。bit1〜7 は予約 = 0） / 6: u16 reserved=0 | 8 | ACK。`mode = 1`: DISARMED のときだけ（それ以外 `REJECTED/BAD_STATE`）。受理で CALIBRATING（§1.2）。`KEEP_POWER` が立っていれば、校正（成功・失敗・中止を問わず）の終了手順でブレーキを作動させ PWM 0 にした後も **主電源 ON 指令を保ったまま CALIBRATING（POWER_HOLD。STATUS の `mcu_state = CALIBRATING` と `POWER_ON_CMD` = 1、`BRAKE_RELEASE_CMD` = 0 で分かる。CAL_RESULT の `step` は校正が終わった段階のまま）に留まる**。`mode = 0` か `CAL_POWER_HOLD_TIMEOUT_MS`（120000、仮値）で主電源 OFF → DISARMED（このとき CAL_RESULT は送らない。結果は校正終了時に送った 1 回だけ）。`mode = 0`: CALIBRATING（POWER_HOLD を含む）なら中止して終了手順 → DISARMED、それ以外は何もせず ACCEPTED。`mode` が 0・1 以外は `REJECTED/INVALID_PARAM` |
 
 管理命令の共通規則（ACK を返す命令。MCU はこの順に処理する）:
 
@@ -404,11 +404,11 @@ wire  (16 byte): 04 01 86 08 08 EF CD AB 89 02 01 01 03 32 C1 00
 
 ### 7.19 CALIBRATE（`0x0C`、PC → MCU）
 
-値: `{"request_id":7,"mode":1}`
+値: `{"request_id":7,"mode":1,"flags":1}`
 
 ```text
-frame (14 byte): 01 0C 08 00 07 00 00 00 01 00 00 00 A2 8F
-wire  (16 byte): 04 01 0C 08 02 07 01 01 02 01 01 01 03 A2 8F 00
+frame (14 byte): 01 0C 08 00 07 00 00 00 01 01 00 00 92 B8
+wire  (16 byte): 04 01 0C 08 02 07 01 01 03 01 01 01 03 92 B8 00
 ```
 
 ### 7.20 CAL_RESULT（`0x87`、MCU → PC）

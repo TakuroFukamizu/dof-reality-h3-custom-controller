@@ -917,3 +917,80 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     assert!(st.axes.iter().all(|a| a.assignment == Some("selected")));
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn keep_power_holds_the_power_axis_until_the_other_axes_finish_then_everything_disarms() {
+    use h3cs::protocol::CalResultCode::Ok;
+    let dir = std::env::temp_dir().join(format!("h3cs-server-calhold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cfg, cfg_path) = uncalibrated_cfg_file(&dir);
+    let srv = start_sim_with_path(cfg, Some(cfg_path)).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    // Axes 2 / 3 calibrate slowly (~4 s) so the power axis (~0.5 s) is done
+    // long before them — the situation of the 2026-11-01 rig run.
+    for axis in [2, 3] {
+        sim(&srv, axis).with(|m| m.set_plant_max_vel_count_s(500.0));
+    }
+    let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // The power axis's result is in while it stays CALIBRATING with the power on.
+    let snap = wait_status(&srv, 3 * S, "axis 1 in POWER_HOLD", |s| {
+        s.axes[0].calibration.as_ref().is_some_and(|c| c.result == Ok) && s.axes[0].mcu_state == Some(McuState::Calibrating)
+    })
+    .await;
+    assert_eq!(snap.axes[0].power_on_cmd, Some(true));
+    assert!(snap.axes[0].referenced);
+    assert_eq!(snap.rig_state, RigState::CalibrationRequired);
+    assert!(snap.blockers.iter().any(|b| b == "calibrating: axis1"), "{:?}", snap.blockers);
+    assert!(
+        snap.axes[1..].iter().all(|a| a.mcu_state == Some(McuState::Calibrating) && a.calibration.is_none()),
+        "{:?}",
+        snap.axes
+    );
+    let s1 = sim(&srv, 1).snapshot();
+    assert!(s1.power_hold);
+    assert_eq!((s1.end_min_count, s1.end_max_count), (0, 1000));
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json()["error"], "calibrating");
+    // The others finish → CALIBRATE(0) to axis 1 → all DISARMED and referenced.
+    let snap = wait_status(&srv, 10 * S, "all done and released", |s| {
+        s.axes.iter().all(|a| {
+            a.mcu_state == Some(McuState::Disarmed) && a.referenced && a.calibration.as_ref().is_some_and(|c| c.result == Ok)
+        })
+    })
+    .await;
+    assert!(snap.fault.is_none());
+    for a in &snap.axes {
+        assert_eq!(a.power_on_cmd, Some(false));
+        let c = a.calibration.as_ref().unwrap();
+        assert_eq!((c.n_end_count, c.neutral_count, c.step), (1000, 500, 3));
+        assert_eq!(c.device_id, a.device_id, "the result names the connected unit");
+    }
+    for (_, sim) in &srv.sims {
+        let s = sim.snapshot();
+        assert!(!s.power_hold && s.referenced);
+        assert_eq!((s.end_min_count, s.end_max_count), (0, 1000));
+    }
+    // Events: calibrate (keep_power), one cal_result per axis, the release
+    // after the last of the other two results.
+    let body = http(srv.local_addr, "GET", "/v1/events?n=500", &[], None).await.json();
+    let events = body["events"].as_array().unwrap().clone();
+    let pos = |pred: &dyn Fn(&Value) -> bool| events.iter().position(pred);
+    let cal = pos(&|e| e["kind"] == "calibrate").expect("calibrate event");
+    assert_eq!(events[cal]["detail"]["keep_power"], true, "{}", events[cal]);
+    assert_eq!(events[cal]["detail"]["flags"]["axis1"], 1, "{}", events[cal]);
+    let rel = pos(&|e| e["kind"] == "cal_power_release").expect("cal_power_release event");
+    let r1 = pos(&|e| e["kind"] == "cal_result" && e["detail"]["axis"] == 1).unwrap();
+    let r2 = pos(&|e| e["kind"] == "cal_result" && e["detail"]["axis"] == 2).unwrap();
+    let r3 = pos(&|e| e["kind"] == "cal_result" && e["detail"]["axis"] == 3).unwrap();
+    assert!(r1 < r2 && r2 < rel && r3 < rel, "{events:#?}");
+    assert_eq!(events.iter().filter(|e| e["kind"] == "cal_result").count(), 3, "none for the release");
+    // Export sees all three.
+    let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.json()["axes"].as_array().unwrap().len(), 3);
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

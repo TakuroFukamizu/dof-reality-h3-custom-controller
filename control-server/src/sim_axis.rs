@@ -140,6 +140,16 @@
 //! no-op. No motion fault check runs during a calibration (the mechanism goes
 //! past the soft window to the mechanical ends by design).
 //!
+//! `KEEP_POWER` (CALIBRATE `flags` bit0, protocol.md §4): a unit with the
+//! power role (CONFIG `role_flags` bit0) that was started with the flag does
+//! not go DISARMED after its CAL_RESULT: it stays CALIBRATING in **POWER_HOLD**
+//! (brake applied, PWM 0, `POWER_ON_CMD` kept) until CALIBRATE(0) / DISARM or
+//! `cal_power_hold_timeout_ms`, which switch the power off → DISARMED with no
+//! second CAL_RESULT. A cancel received during the run still ends in
+//! POWER_HOLD ("成功・失敗・中止を問わず"). HOST_FAULT in POWER_HOLD latches
+//! FAULT without another CAL_RESULT and keeps the reference. A unit without
+//! the power role ignores the flag.
+//!
 //! # STATUS
 //!
 //! Sent every `status_period_ms` (from [`SimMcu::tick`]) and immediately whenever
@@ -169,9 +179,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::config::SimBackendConfig;
 use crate::protocol::cobs::{self, FrameAccumulator};
 use crate::protocol::{
-    self, calibrate_mode, capabilities, frame, msg_type, role_flags, Ack, AckReason, AckResult,
-    CalResult, CalResultCode, ClockSyncReply, Config, FaultEvent, Hello, HostMsg, McuMsg,
-    SetPosition, Status, CAL_REASON_LEN, MAX_ENCODED_LEN, PROTOCOL_VERSION,
+    self, calibrate_flags, calibrate_mode, capabilities, frame, msg_type, role_flags, Ack,
+    AckReason, AckResult, CalResult, CalResultCode, ClockSyncReply, Config, FaultEvent, Hello,
+    HostMsg, McuMsg, SetPosition, Status, CAL_REASON_LEN, MAX_ENCODED_LEN, PROTOCOL_VERSION,
 };
 use crate::types::{status_flags, Counts, DeviceId, FaultCode, McuState};
 
@@ -209,6 +219,9 @@ pub struct SimParams {
     /// (the plant cannot pass them). `end_min_count` is the calibration's P end.
     pub end_min_count: Counts,
     pub end_max_count: Counts,
+    /// POWER_HOLD timeout after a `KEEP_POWER` calibration (protocol.md §4
+    /// `CAL_POWER_HOLD_TIMEOUT_MS`): the power goes off → DISARMED.
+    pub cal_power_hold_timeout_ms: u64,
 }
 
 impl Default for SimParams {
@@ -227,6 +240,7 @@ impl Default for SimParams {
             link_latency_ms: 0,
             end_min_count: -3000,
             end_max_count: 3000,
+            cal_power_hold_timeout_ms: 120_000,
         }
     }
 }
@@ -275,8 +289,12 @@ enum CalPhase {
     ToP,
     ToN,
     ToNeutral,
-    /// Brake applied; waiting before PWM 0 / power off → CAL_RESULT → DISARMED.
+    /// Brake applied; waiting before PWM 0 / power off → CAL_RESULT → DISARMED
+    /// (or → POWER_HOLD with `KEEP_POWER`).
     Shutdown,
+    /// CAL_RESULT sent; main power kept on until CALIBRATE(0) / DISARM or
+    /// `cal_power_hold_timeout_ms` (`KEEP_POWER`, power role only).
+    PowerHold,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +310,8 @@ struct CalRun {
     at_n: Option<f64>,
     /// Outcome, set when the shutdown starts.
     outcome: Option<(CalResultCode, [u8; CAL_REASON_LEN])>,
+    /// `KEEP_POWER` accepted (power role): end in POWER_HOLD, not DISARMED.
+    keep_power: bool,
 }
 
 /// Pure model of one axis MCU. Time is injected as `now_us` (any monotonic
@@ -529,9 +549,16 @@ impl SimMcu {
     pub fn end_counts(&self) -> (Counts, Counts) {
         (to_count(self.end_min), to_count(self.end_max))
     }
-    /// An end-stop calibration is running (state CALIBRATING).
+    /// An end-stop calibration is running (state CALIBRATING), POWER_HOLD included.
     pub fn is_calibrating(&self) -> bool {
         self.cal.is_some()
+    }
+    /// The calibration is over and the unit keeps the main power on
+    /// (`KEEP_POWER`, CALIBRATING / POWER_HOLD).
+    pub fn is_power_holding(&self) -> bool {
+        self.cal
+            .as_ref()
+            .is_some_and(|c| c.phase == CalPhase::PowerHold)
     }
 
     /// STATUS as it would be sent now.
@@ -566,6 +593,11 @@ impl SimMcu {
     /// Actual position stops following the setpoint (→ FOLLOWING_ERROR when moving).
     pub fn set_stall(&mut self, stall: bool) {
         self.stall = stall;
+    }
+    /// Change the plant's top speed (count/s) on the fly: a slow unit whose
+    /// calibration outlasts the others'.
+    pub fn set_plant_max_vel_count_s(&mut self, v: f64) {
+        self.params.plant_max_vel_count_s = v;
     }
     /// External disturbance: move the actual position by `delta` counts
     /// (never past the end stops).
@@ -736,11 +768,13 @@ impl SimMcu {
             } => self.command(msg, request_id, msg_type::SET_REFERENCE, now, |s, _| {
                 s.on_set_reference(reference_count)
             }),
-            HostMsg::Calibrate { request_id, mode } => {
-                self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
-                    s.on_calibrate(mode, now)
-                })
-            }
+            HostMsg::Calibrate {
+                request_id,
+                mode,
+                flags,
+            } => self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
+                s.on_calibrate(mode, flags, now)
+            }),
         }
     }
 
@@ -1008,8 +1042,9 @@ impl SimMcu {
     }
 
     /// CALIBRATE: `mode` 1 starts (DISARMED only), 0 cancels (no-op unless
-    /// CALIBRATING), anything else is INVALID_PARAM (protocol.md §4).
-    fn on_calibrate(&mut self, mode: u8, now: u64) -> Result<(), AckReason> {
+    /// CALIBRATING), anything else is INVALID_PARAM (protocol.md §4). `flags`
+    /// bit0 `KEEP_POWER` is honoured by the power role only.
+    fn on_calibrate(&mut self, mode: u8, flags: u8, now: u64) -> Result<(), AckReason> {
         match mode {
             calibrate_mode::START => {
                 if self.state != McuState::Disarmed {
@@ -1027,6 +1062,7 @@ impl SimMcu {
                     at_p: None,
                     at_n: None,
                     outcome: None,
+                    keep_power: flags & calibrate_flags::KEEP_POWER != 0 && self.power_controller(),
                 });
                 Ok(())
             }
@@ -1040,8 +1076,24 @@ impl SimMcu {
         }
     }
 
+    /// CALIBRATE(0) / DISARM while CALIBRATING: in POWER_HOLD the power goes
+    /// off at once (no second CAL_RESULT); otherwise the run is cancelled and
+    /// the shutdown sequence reports CANCELLED.
     fn cancel_calibration(&mut self, now: u64) {
-        self.end_calibration(CalResultCode::Cancelled, "stop", now);
+        if self.is_power_holding() {
+            self.release_power_hold();
+        } else {
+            self.end_calibration(CalResultCode::Cancelled, "stop", now);
+        }
+    }
+
+    /// POWER_HOLD over: main power off → DISARMED. The reference (if the
+    /// calibration succeeded) stays.
+    fn release_power_hold(&mut self) {
+        self.cal = None;
+        self.state = McuState::Disarmed;
+        self.brake_release_cmd = false;
+        self.hold_here();
     }
 
     /// Stop moving and begin the shutdown sequence with this outcome (unless
@@ -1133,7 +1185,12 @@ impl SimMcu {
             }
             CalPhase::Shutdown => {
                 if elapsed >= self.params.disarming_delay_ms * 1_000 {
-                    self.finish_calibration();
+                    self.finish_calibration(now);
+                }
+            }
+            CalPhase::PowerHold => {
+                if elapsed >= self.params.cal_power_hold_timeout_ms * 1_000 {
+                    self.release_power_hold();
                 }
             }
         }
@@ -1141,9 +1198,12 @@ impl SimMcu {
 
     /// Shutdown done: CAL_RESULT, then (on success) the P end becomes 0 and
     /// POSITION_REFERENCED is set; then DISARMED (its STATUS follows the
-    /// CAL_RESULT because the state key changes here).
-    fn finish_calibration(&mut self) {
-        let Some(run) = self.cal.take() else { return };
+    /// CAL_RESULT because the state key changes here) — or, with
+    /// `KEEP_POWER`, POWER_HOLD: still CALIBRATING with the power on.
+    fn finish_calibration(&mut self, now: u64) {
+        let Some(mut run) = self.cal.take() else {
+            return;
+        };
         let (result, reason) = run
             .outcome
             .unwrap_or((CalResultCode::Failed, CalResult::reason_bytes("timeout")));
@@ -1168,14 +1228,25 @@ impl SimMcu {
         } else {
             self.referenced = false;
         }
-        self.state = McuState::Disarmed;
         self.brake_release_cmd = false;
         self.hold_here();
+        if run.keep_power {
+            run.phase = CalPhase::PowerHold;
+            run.phase_started_us = now;
+            self.cal = Some(run);
+        } else {
+            self.state = McuState::Disarmed;
+        }
     }
 
     /// CAL_RESULT(FAILED, `fault`) when a fault latch interrupts a calibration.
+    /// In POWER_HOLD the result already went out: nothing more is reported
+    /// and the reference stays.
     fn abort_calibration_for_fault(&mut self) {
         let Some(run) = self.cal.take() else { return };
+        if run.phase == CalPhase::PowerHold {
+            return;
+        }
         self.push(McuMsg::CalResult(CalResult {
             boot_id: self.boot_id,
             result: CalResultCode::Failed,
@@ -1296,6 +1367,12 @@ impl SimMcu {
             self.state,
             McuState::Disarmed | McuState::Fault | McuState::Boot
         )
+    }
+
+    /// CONFIG gave this unit the main-power role (`role_flags` bit0).
+    fn power_controller(&self) -> bool {
+        self.config
+            .is_some_and(|c| c.role_flags & role_flags::POWER_CONTROLLER != 0)
     }
 
     fn inside_soft_window(&self, cfg: &Config) -> bool {
@@ -1453,9 +1530,7 @@ impl SimMcu {
 
     fn flags(&self) -> u16 {
         let mut f = 0;
-        let power_controller = self
-            .config
-            .is_some_and(|c| c.role_flags & role_flags::POWER_CONTROLLER != 0);
+        let power_controller = self.power_controller();
         let powered = matches!(
             self.state,
             McuState::Arming
@@ -1524,7 +1599,12 @@ impl SimMcu {
     }
 
     fn status_key(&self) -> (McuState, FaultCode, u16, u8) {
-        (self.state, self.fault_code(), self.flags(), self.selected_axis)
+        (
+            self.state,
+            self.fault_code(),
+            self.flags(),
+            self.selected_axis,
+        )
     }
 
     /// Immediate STATUS when state, fault code, flags or selected_axis changed.
@@ -1554,7 +1634,11 @@ impl SimMcu {
 
 /// `reason` bytes as text (up to the first NUL).
 fn reason_text(r: &[u8; CAL_REASON_LEN]) -> String {
-    CalResult { reason: *r, ..CalResult::EMPTY }.reason_str()
+    CalResult {
+        reason: *r,
+        ..CalResult::EMPTY
+    }
+    .reason_str()
 }
 
 /// Encoder count from an f64 position (saturating, NaN → 0).
@@ -1633,6 +1717,9 @@ pub struct SimSnapshot {
     /// End stops in the current count coordinate.
     pub end_min_count: Counts,
     pub end_max_count: Counts,
+    /// CALIBRATING with the calibration over and the main power kept on
+    /// (`KEEP_POWER`, POWER_HOLD).
+    pub power_hold: bool,
 }
 
 /// Control handle of a simulated axis task. Dropping it stops the task.
@@ -1665,6 +1752,7 @@ impl SimHandle {
             rx_error_count: m.rx_error_count(),
             end_min_count: m.end_counts().0,
             end_max_count: m.end_counts().1,
+            power_hold: m.is_power_holding(),
         }
     }
     /// Run `f` with the model locked (do not block inside).

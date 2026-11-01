@@ -354,8 +354,10 @@
     set(c[18], calText(a), calClass(a));
   }
   function calText(a) {
-    if (a.mcu_state === 'CALIBRATING') return 'CALIBRATING';
     const c = a.calibration;
+    // CALIBRATING with a result already in = the power axis holding the main
+    // power for the others (KEEP_POWER / POWER_HOLD, DESIGN.md §11).
+    if (a.mcu_state === 'CALIBRATING') return c ? 'CALIBRATING（電源保持） ' + c.result : 'CALIBRATING';
     if (!c) return '—';
     return c.result + ' (' + c.reason + ') n_end ' + fmt(c.n_end_count) + ' neutral ' + fmt(c.neutral_count) + ' sign ' + fmt(c.sign) + ' step ' + fmt(c.step);
   }
