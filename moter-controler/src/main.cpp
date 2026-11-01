@@ -1336,7 +1336,9 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
-         a.tx_dropped != b.tx_dropped || a.tx_deferred != b.tx_deferred || a.tx_stale_dropped != b.tx_stale_dropped ||
+         a.tx_dropped != b.tx_dropped ||
+         // df / old は背圧の間 poll ごとに増える（約 1 kHz）。毎回描き直すと描画自体が受信を止めるので 50 刻みで
+         (a.tx_deferred / 50) != (b.tx_deferred / 50) || (a.tx_stale_dropped / 50) != (b.tx_stale_dropped / 50) ||
          (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
          (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
          strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||

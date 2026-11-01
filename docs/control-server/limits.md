@@ -132,4 +132,6 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ## 6. 変更履歴
 
+- 2026-11-02（Issue #15 H4 / M1 / M2、ファーム。実機未検証）: 停止ブースト（`V1_STALL_BOOST_MS` 200 ms、`V1_STALL_BOOST_MIN_MOVE` 3 count。下限を 1 %/窓で `duty_max` まで）、Duty 下限を目標向きだけに（`V1_FLOOR_SIGN_GATE`、既定 1、`-D` で 0）、無パルスの ENCODER_FAULT のしきい値を `max(V1_STALL_DUTY 10, duty_max × V1_STALL_DUTY_RATIO_PERCENT 75 %)` に。`[limits]` との関係は §2.2: `duty_min ≤ kp × following_error_limit / 100 < 0.75 × duty_max` なら動けない軸は FOLLOWING_ERROR（基準が残る）。`duty_max_percent < 10` は受理されるが無パルス判定が無効（ファーム画面に警告）。
+
 - 2026-11-01: `[game].max_gain` と `[[axis]]` の `max_vel_count_s` / `max_acc_count_s2` / `following_error_limit_count` / `overspeed_count_s` を `[limits]` へ（`schema_version` 1 → 2。旧ファイルは読み込みで失敗する）。SET_LIMITS（0x0D）/ LIMITS（0x88）、capabilities bit3、WS `limits`、`GET/POST /v1/limits`、status の `motion_limits` / `axes[].fw_limits`。`calibration_hash` は幾何だけに。

@@ -64,10 +64,11 @@ MotorProfile profile_store_load(uint8_t motor, bool* invalid) {
   }
   char key[16];
   key_for(key, sizeof(key), p.motor, "prof");
-  const size_t n = g_prefs.getBytesLength(key);
-  if (n == 0) {
+  // isKey で先に有無を見る（getBytesLength は無いキーで log_e を出す。従来 env は CORE_DEBUG_LEVEL=1 でシリアルに出てしまう）
+  if (!g_prefs.isKey(key)) {
     return load_legacy(p.motor);  // 新形式の保存がまだ無い
   }
+  const size_t n = g_prefs.getBytesLength(key);
   uint8_t buf[profile_blob::SIZE];
   MotorProfile decoded;
   uint16_t seq = 0;
