@@ -65,8 +65,8 @@ max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）�
 max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
-duty_min_percent = 7             # 7 % で動くことを実測。低速の段付きが出たら 5 → 3 を試す（limits.md §4）
-kp_percent_per_100 = 2           # 誤差 100 count あたり 2 %
+duty_min_percent = 9             # 11-02 実測: 7〜8 % では自重のかかった #2 が動かず、9 % で動き出す。HOLDING 10 s でハンチングなし
+kp_percent_per_100 = 6           # 11-02: 2 だと 9 % に達する前に誤差が following_error 400 を超えて FAULT した（kp × 400 / 100 = 8 % < 9 %）
 ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
 deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
 deadband_out_count = 20          # 同（出る側）
