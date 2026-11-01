@@ -72,6 +72,13 @@ pub mod calibrate_mode {
     pub const START: u8 = 1;
 }
 
+/// CALIBRATE `flags` (protocol §4 `0x0C`).
+pub mod calibrate_flags {
+    /// The power-controller axis keeps main power after its own calibration
+    /// ends (CAL_RESULT `step` 4 = POWER_HOLD) until CALIBRATE(0).
+    pub const KEEP_POWER: u8 = 0x01;
+}
+
 /// CAL_RESULT `result` (protocol §4 `0x87`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -319,6 +326,8 @@ pub enum HostMsg {
     Calibrate {
         request_id: u32,
         mode: u8,
+        /// bit0 = `calibrate_flags::KEEP_POWER` (power-controller axis only).
+        flags: u8,
     },
 }
 
@@ -612,7 +621,7 @@ impl HostMsg {
                 request_id,
                 reference_count,
             } => w.u32(request_id).i32(reference_count),
-            HostMsg::Calibrate { request_id, mode } => w.u32(request_id).u8(mode).u8(0).u16(0),
+            HostMsg::Calibrate { request_id, mode, flags } => w.u32(request_id).u8(mode).u8(flags).u16(0),
         };
         w.finish()
     }
@@ -709,8 +718,9 @@ impl HostMsg {
                 let m = HostMsg::Calibrate {
                     request_id: r.u32()?,
                     mode: r.u8()?,
+                    flags: r.u8()?,
                 };
-                r.skip(3)?;
+                r.skip(2)?;
                 m
             }
             other => return Err(DecodeError::UnknownType(other)),

@@ -132,7 +132,12 @@ constexpr uint8_t NONE = 0;
 constexpr uint8_t TO_P = 1;
 constexpr uint8_t TO_N = 2;
 constexpr uint8_t TO_NEUTRAL = 3;
+constexpr uint8_t POWER_HOLD = 4;  // KEEP_POWER: 校正が終わって主電源だけ保っている
 }  // namespace cal_step
+
+namespace cal_flags {
+constexpr uint8_t KEEP_POWER = 0x01;
+}  // namespace cal_flags
 
 constexpr size_t CAL_REASON_LEN = 8;  // CAL_RESULT の reason（ASCII、NUL 埋め。8 文字ちょうどなら終端なし）
 
@@ -357,6 +362,7 @@ struct SetReference {
 struct Calibrate {
   uint32_t request_id;
   uint8_t mode;  // cal_mode::START / CANCEL
+  uint8_t flags;  // bit0 = KEEP_POWER（電源担当軸だけが解釈。校正が終わっても主電源を保つ）
 };
 
 struct Hello {
@@ -530,6 +536,7 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
     case msg::CALIBRATE:
       put_u32(out + 0, m.calibrate.request_id);
       put_u8(out + 4, m.calibrate.mode);
+      put_u8(out + 5, m.calibrate.flags);
       break;
     default:
       return 0;
@@ -696,6 +703,7 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
     case msg::CALIBRATE:
       out->calibrate.request_id = get_u32(p + 0);
       out->calibrate.mode = get_u8(p + 4);
+      out->calibrate.flags = get_u8(p + 5);
       break;
     default:
       return false;

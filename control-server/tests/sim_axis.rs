@@ -1944,7 +1944,7 @@ fn cal_results(out: &[McuMsg]) -> Vec<CalResult> {
 impl Harness {
     fn calibrate(&mut self, mode: u8) -> Ack {
         let r = self.next_rid();
-        self.cmd(HostMsg::Calibrate { request_id: r, mode })
+        self.cmd(HostMsg::Calibrate { request_id: r, mode, flags: 0 })
     }
     /// Unreferenced unit with the default ±3000 end stops, CONFIG accepted
     /// (so the power role is known).
@@ -2040,7 +2040,7 @@ fn calibrate_is_disarmed_only_and_mode_is_checked() {
     assert_eq!(h.state(), McuState::Calibrating);
     // Same message again is a resend: DUPLICATE, still calibrating.
     let rid = h.rid;
-    assert_eq!(h.cmd(HostMsg::Calibrate { request_id: rid, mode: 1 }).result, AckResult::Duplicate);
+    assert_eq!(h.cmd(HostMsg::Calibrate { request_id: rid, mode: 1, flags: 0 }).result, AckResult::Duplicate);
     assert_eq!(h.state(), McuState::Calibrating);
 }
 

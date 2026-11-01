@@ -129,7 +129,10 @@ class V1Axis {
   bool has_cal_result() const { return has_cal_result_; }
   const v1::CalResult& last_cal_result() const { return last_cal_result_; }
   // 校正中の段階（CALIBRATING 以外では NONE）と AutoMachine の直近の理由（"retreat" など）
-  uint8_t cal_live_step() const { return state_ == v1::state::CALIBRATING ? cal_step_code() : v1::cal_step::NONE; }
+  uint8_t cal_live_step() const {
+    if (state_ != v1::state::CALIBRATING) return v1::cal_step::NONE;
+    return cal_phase_ == CalPhase::PowerHold ? v1::cal_step::POWER_HOLD : cal_step_code();
+  }
   const char* cal_live_reason() const { return cal_.reason; }
 
   // --- 入力 ---------------------------------------------------------------
@@ -321,7 +324,7 @@ class V1Axis {
   enum class StopKind : uint8_t { Hold, Disarm, Fault };
   // 校正の段階（protocol.md §1.2 の手順）: 主電源 ON 指令 → cal_power_settle → ブレーキ解除指令 → brake_release_wait →
   // AutoMachine（Cal）→ 終了手順（ブレーキ給電 OFF → brake_apply_wait → CAL_RESULT → DISARMED）
-  enum class CalPhase : uint8_t { Idle, PowerSettle, BrakeRelease, Running, Shutdown };
+  enum class CalPhase : uint8_t { Idle, PowerSettle, BrakeRelease, Running, Shutdown, PowerHold };
 
   struct Accepted {
     uint8_t type;
@@ -394,6 +397,7 @@ class V1Axis {
   // --- 校正（CALIBRATING） ---
   AutoMachine cal_{};
   CalPhase cal_phase_ = CalPhase::Idle;
+  bool cal_keep_power_ = false;  // KEEP_POWER 付きで開始した（電源担当軸のみ有効）
   uint64_t cal_phase_started_us_ = 0;  // いまの段階に入った時刻
   v1::CalResult pending_cal_result_{};  // 終了手順の後に送る結果
   bool has_cal_result_ = false;
@@ -515,7 +519,7 @@ class V1Axis {
       case v1::msg::DISARM: return on_disarm(now);
       case v1::msg::FAULT_RESET: return on_fault_reset();
       case v1::msg::SET_REFERENCE: return on_set_reference(m.set_reference.reference_count);
-      case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, now);
+      case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, m.calibrate.flags, now);
       default: return v1::ack_reason::BAD_STATE;
     }
   }
@@ -739,7 +743,7 @@ class V1Axis {
 
   // CALIBRATE（protocol.md §4、§1.2）: mode 1 は DISARMED のときだけ（CONFIG・基準は不要）。受理で CALIBRATING。
   // mode 0 は CALIBRATING なら中止、それ以外は何もせず受理。0・1 以外は INVALID_PARAM。
-  uint16_t on_calibrate(uint8_t mode, uint64_t now) {
+  uint16_t on_calibrate(uint8_t mode, uint8_t flags, uint64_t now) {
     if (mode != v1::cal_mode::START && mode != v1::cal_mode::CANCEL) return v1::ack_reason::INVALID_PARAM;
     if (mode == v1::cal_mode::CANCEL) {
       if (state_ == v1::state::CALIBRATING) cal_cancel(now);
@@ -747,6 +751,7 @@ class V1Axis {
     }
     if (state_ != v1::state::DISARMED) return v1::ack_reason::BAD_STATE;
     if (estop_latched_) return v1::ack_reason::BAD_STATE;  // ローカル操作中（通常は FAULT 側で弾かれる）
+    cal_keep_power_ = power_controller() && (flags & v1::cal_flags::KEEP_POWER) != 0;
     state_ = v1::state::CALIBRATING;
     cal_phase_ = CalPhase::PowerSettle;  // 主電源 ON 指令（電源担当軸のみ。powered_state で立つ）
     cal_phase_started_us_ = now;
@@ -1018,10 +1023,20 @@ class V1Axis {
         duty_ = 0;  // AutoMachine の finish で既に 0。ブレーキ作動待ちの間も 0
         if (elapsed >= ms_to_us(tuning.brake_apply_wait_ms)) {
           push_cal_result();
-          cal_phase_ = CalPhase::Idle;
-          state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
-          hold_here();
+          if (cal_keep_power_) {  // 他の軸の校正が終わるまで主電源を保つ（CALIBRATE(0) か期限で DISARMED）
+            cal_phase_ = CalPhase::PowerHold;
+            cal_phase_started_us_ = now;
+            duty_ = 0;
+          } else {
+            cal_phase_ = CalPhase::Idle;
+            state_ = v1::state::DISARMED;  // ここで主電源 OFF 指令（powered_state）
+            hold_here();
+          }
         }
+        break;
+      case CalPhase::PowerHold:
+        duty_ = 0;
+        if (elapsed >= ms_to_us(CAL_POWER_HOLD_TIMEOUT_MS)) end_power_hold();
         break;
       case CalPhase::Idle: break;
     }
@@ -1061,7 +1076,15 @@ class V1Axis {
   }
 
   // CALIBRATE(0) / DISARM による中止。AutoMachine が動いていれば stop を渡して "stop" で止め、まだなら直接終了手順へ。
+  void end_power_hold() {
+    cal_phase_ = CalPhase::Idle;
+    cal_keep_power_ = false;
+    state_ = v1::state::DISARMED;  // 主電源 OFF 指令。このとき CAL_RESULT は送らない
+    hold_here();
+  }
+
   void cal_cancel(uint64_t now) {
+    if (cal_phase_ == CalPhase::PowerHold) { end_power_hold(); return; }
     if (cal_phase_ == CalPhase::Shutdown || cal_phase_ == CalPhase::Idle) return;  // 既に終わりかけ
     if (cal_phase_ == CalPhase::Running) {
       AutoInputs in = cal_inputs(now);
@@ -1079,6 +1102,10 @@ class V1Axis {
   void cal_abort_for_fault(const char* reason, uint64_t now) {
     if (cal_phase_ == CalPhase::Shutdown) {
       push_cal_result();
+      cal_phase_ = CalPhase::Idle;
+      return;
+    }
+    if (cal_phase_ == CalPhase::PowerHold) {  // 結果は送信済み。FAULT が出力を落とす
       cal_phase_ = CalPhase::Idle;
       return;
     }

@@ -2450,6 +2450,56 @@ fn calibrate_rules_power_axis_connected_disarmed_and_not_armed() {
 }
 
 #[test]
+fn calibrate_multi_axis_keeps_power_on_power_axis_then_releases_it_after_all_results() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.step();
+    let flags: Vec<(usize, u8)> = r
+        .sent_since(sent)
+        .iter()
+        .filter_map(|(i, _, m)| match m {
+            HostMsg::Calibrate { mode: 1, flags, .. } => Some((*i, *flags)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags.len(), 3, "{flags:?}");
+    for (i, f) in flags {
+        assert_eq!(f, if i == 0 { h3cs::protocol::calibrate_flags::KEEP_POWER } else { 0 }, "axis index {i}");
+    }
+    // No release while any axis is still calibrating.
+    assert!(r.run_until(300, all_calibrating));
+    let mid = r.sent.len();
+    r.run_ms(50);
+    assert!(!r.sent_since(mid).iter().any(|(_, _, m)| matches!(m, HostMsg::Calibrate { mode: 0, .. })));
+    // After every CAL_RESULT: exactly one CALIBRATE(0), to the power axis.
+    assert!(r.run_until(120_000, all_disarmed));
+    let rel: Vec<usize> = r
+        .sent_since(mid)
+        .iter()
+        .filter(|(_, _, m)| matches!(m, HostMsg::Calibrate { mode: 0, .. }))
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert_eq!(rel, vec![0]);
+}
+
+#[test]
+fn calibrate_single_axis_does_not_request_keep_power() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![ax(1)] }).unwrap();
+    r.step();
+    assert!(r
+        .sent_since(sent)
+        .iter()
+        .all(|(_, _, m)| !matches!(m, HostMsg::Calibrate { flags, .. } if *flags != 0)));
+}
+
+#[test]
 fn calibrate_cancel_and_stop_send_calibrate_0_and_result_is_cancelled() {
     let mut r = cal_rig(sim_cfg());
     r.connect_all();
@@ -2513,7 +2563,7 @@ fn calibrate_rejected_by_the_power_axis_cancels_the_others_without_fault() {
         .sent_since(sent)
         .iter()
         .find_map(|(i, _, m)| match m {
-            HostMsg::Calibrate { request_id, mode: 1 } if *i == 0 => Some(*request_id),
+            HostMsg::Calibrate { request_id, mode: 1, .. } if *i == 0 => Some(*request_id),
             _ => None,
         })
         .expect("CALIBRATE to axis 1");
