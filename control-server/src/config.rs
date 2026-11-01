@@ -110,6 +110,10 @@ pub struct TimingConfig {
     pub stop_hold_ms: u64,
     /// Max allowed spread of last_applied_frame across axes while ACTIVE.
     pub max_frame_skew: u32,
+    /// Center: once the planner is at neutral, every axis's MEASURED position must
+    /// be within `game.center_tolerance_count` of neutral within this, or the rig
+    /// faults (StopTimeout) instead of reporting `center_reached` on a lagging axis.
+    pub center_reach_timeout_ms: u64,
     /// Handshake: HELLO_REQ retry period and overall timeout per port.
     pub hello_retry_ms: u64,
     pub hello_timeout_ms: u64,
@@ -128,6 +132,7 @@ impl Default for TimingConfig {
             stop_settle_timeout_ms: 3000,
             stop_hold_ms: 1000,
             max_frame_skew: 5,
+            center_reach_timeout_ms: 5000,
             hello_retry_ms: 200,
             hello_timeout_ms: 2000,
         }
@@ -147,6 +152,11 @@ pub struct GameConfig {
     pub virtual_max: f64,
     /// Planner scale for the admin `center` move (fraction of axis max velocity).
     pub center_speed_fraction: f64,
+    /// Center is complete only when every axis's MEASURED count (STATUS.actual_count)
+    /// is within this many counts of neutral. Must cover the firmware deadband
+    /// (`limits.deadband_out_count`) with margin; 2026-11-01 a lagging axis was
+    /// declared centered 280 counts short because only the setpoint was checked.
+    pub center_tolerance_count: u32,
 }
 
 impl Default for GameConfig {
@@ -157,6 +167,7 @@ impl Default for GameConfig {
             virtual_min: 0.0,
             virtual_max: 1023.0,
             center_speed_fraction: 0.25,
+            center_tolerance_count: 50,
         }
     }
 }
@@ -423,6 +434,7 @@ impl Config {
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.max_frame_skew", u64::from(t.max_frame_skew)),
+            ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
         ] {
@@ -440,6 +452,7 @@ impl Config {
             ("timing.arm_timeout_ms", t.arm_timeout_ms),
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
+            ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
             ("server.status_period_ms", s.status_period_ms),
@@ -478,6 +491,16 @@ impl Config {
                 g.virtual_min, g.virtual_max
             ));
         }
+        if g.center_tolerance_count == 0 {
+            errs.push("game.center_tolerance_count must be > 0".into());
+        } else if u32::from(self.limits.deadband_out_count) > g.center_tolerance_count {
+            // The firmware stops correcting inside deadband_out, so a tolerance
+            // tighter than that could never be met: CENTER would always time out.
+            errs.push(format!(
+                "game.center_tolerance_count ({}) must be >= limits.deadband_out_count ({})",
+                g.center_tolerance_count, self.limits.deadband_out_count
+            ));
+        }
         if !(g.center_speed_fraction > 0.0 && g.center_speed_fraction <= 1.0) {
             errs.push(format!("game.center_speed_fraction must be within (0, 1], got {}", g.center_speed_fraction));
         }
@@ -513,6 +536,27 @@ impl Config {
             errs.push(format!(
                 "limits.deadband_out_count ({}) must be >= limits.deadband_count ({})",
                 l.deadband_out_count, l.deadband_count
+            ));
+        }
+        if l.kp_percent_per_100 == 0 {
+            // With kp = 0 the loop outputs nothing at rest (FF is zero when the
+            // trajectory stands still), so the axis cannot hold position at all.
+            errs.push("limits.kp_percent_per_100 must be > 0".into());
+        }
+        // Cross-check (2026-11-01 on hardware): the position loop's output before
+        // FOLLOWING_ERROR trips is at most kp x following_error_limit / 100 (+ FF,
+        // which is 0 against a static load). If that is below duty_min, the loop
+        // can never command more than the floor before the fault: a load that the
+        // floor cannot move is either stuck (static) or faults (moving target),
+        // with no third outcome. kp 2 x 400 / 100 = 8 % vs a measured 9 % breakaway
+        // did exactly that. duty_min_percent should be the measured breakaway duty.
+        let authority = f64::from(l.kp_percent_per_100) * f64::from(l.following_error_limit_count) / 100.0;
+        if authority < f64::from(l.duty_min_percent) {
+            errs.push(format!(
+                "limits.kp_percent_per_100 ({}) x limits.following_error_limit_count ({}) / 100 = {authority:.1} % \
+                 must be >= limits.duty_min_percent ({} %): the position loop would never exceed the duty floor \
+                 before FOLLOWING_ERROR (raise kp or following_error_limit_count, or lower duty_min)",
+                l.kp_percent_per_100, l.following_error_limit_count, l.duty_min_percent
             ));
         }
         if f64::from(l.overspeed_count_s) < crate::limits::OVERSPEED_MARGIN * f64::from(l.max_vel_count_s) {

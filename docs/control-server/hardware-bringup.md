@@ -339,7 +339,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 
 ### 7.3 `/v1/center`
 
-HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center` → `active_source = "center"`、3 軸が `count_at_virtual_512` へ `max_vel × center_speed_fraction`（0.25。`max_vel` 600 なら 150 count/s）で動き、到達で CONTROLLED_STOP → HOLDING。1 軸ずつ動かした後に中立へ戻す手段として使う。
+HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center` → `active_source = "center"`、3 軸が `count_at_virtual_512` へ `max_vel × center_speed_fraction`（0.25。`max_vel` 600 なら 150 count/s）で動き、到達（目標と**実位置**の両方が中立 ± `center_tolerance_count`）で CONTROLLED_STOP → HOLDING。実位置が `center_reach_timeout_ms`（5 s）以内に入らなければ FAULT になるので、その軸は自重に対して Duty が足りない（`duty_min` / `kp` を見直す）。1 軸ずつ動かした後に中立へ戻す手段として使う。
 
 ## 8. 3 軸
 

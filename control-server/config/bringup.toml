@@ -43,6 +43,7 @@ arm_timeout_ms = 5000
 stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 25                # USB の遅延揺らぎ（status_age 2〜80 ms）と模擬軸の混在で 7 フレームずれて FAULT になった（2026-11-01）。bring-up 用。実機 3 台で詰め直す
+center_reach_timeout_ms = 5000     # /v1/center で目標が中立に着いてから実位置が game.center_tolerance_count に入るまでの猶予。過ぎたら FAULT（StopTimeout）
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 
@@ -52,6 +53,7 @@ clamp_out_of_range = true
 virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
+center_tolerance_count = 50      # 中立到達は全軸の「実位置」がこの範囲に入って初めて成立（deadband_out 20 以上）。11-01 に #2 が 280 count 手前で「到達」になったため
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
 # !!! bring-up 用に低い値（旧 PR と同じ動き: gain 0.15、600 count/s、2000 count/s²、Duty 7〜20 %）。
