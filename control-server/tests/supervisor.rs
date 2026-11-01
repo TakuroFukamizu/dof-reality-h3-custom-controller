@@ -60,6 +60,9 @@ struct Rig {
     /// slow to answer); `release_held` delivers it later.
     hold_set_limits: [bool; 3],
     held: Vec<(usize, HostMsg)>,
+    /// The ACK of START from sim i is lost on the way back (the MCU still
+    /// applies the command).
+    drop_start_ack: [bool; 3],
 }
 
 impl Rig {
@@ -117,6 +120,7 @@ impl Rig {
             pre_tick: Vec::new(),
             hold_set_limits: [false; 3],
             held: Vec::new(),
+            drop_start_ack: [false; 3],
         }
     }
 
@@ -214,6 +218,7 @@ impl Rig {
                     }
                 }
                 McuMsg::Ack(ack) => match self.axis_of[i] {
+                    Some(_) if self.drop_start_ack[i] && ack.acked_type == msg_type::START => continue,
                     Some(axis) => LinkEvent::Ack { axis, ack },
                     None => continue,
                 },
@@ -1462,6 +1467,39 @@ fn axis_dropping_out_of_active_is_a_mismatch_fault() {
         "{:?}",
         r.sup.fault()
     );
+}
+
+/// Issue #15: a START whose ACK is lost (the MCU did start) is a
+/// `StartTimeout` naming the axis and the lost ACK, at ACK_TIMEOUT — not an
+/// `AxisStateMismatch { expected: ACTIVE, actual: ACTIVE }` 5 s later.
+#[test]
+fn start_whose_ack_is_lost_is_a_start_timeout_naming_the_axis() {
+    let mut r = Rig::new(sim_cfg());
+    r.holding();
+    r.set_game(Some((POSE_A, 0.3)));
+    r.run_ms(30);
+    r.drop_start_ack[1] = true;
+    r.admin(AdminCmd::Start).unwrap();
+    r.run_ms(100);
+    // Every MCU applied START; the rig still waits for axis 2's ACK.
+    assert_eq!(r.mcu_states(), vec![McuState::Active; 3]);
+    assert_eq!(r.sup.state(), RigState::Holding);
+    let t0 = r.now;
+    r.wait_state(RigState::FaultLatched, ACK_TIMEOUT.as_millis() as u64 + 500);
+    assert!(r.now - t0 < ACK_TIMEOUT + Duration::from_millis(300), "latched at the ACK timeout, not arm_timeout_ms");
+    assert_eq!(r.sup.fault(), Some(&RigFault::StartTimeout { axis: ax(2) }), "{:?}", r.sup.fault());
+    let snap = r.sup.snapshot(r.now);
+    let rec = snap.fault_history.last().unwrap();
+    let detail = rec.detail.as_deref().unwrap_or("");
+    assert!(detail.starts_with("ack_timeout: START on axis2"), "{detail}");
+    assert!(detail.contains("Active"), "{detail}");
+    assert!(
+        !snap.fault_history.iter().any(|f| matches!(f.fault, RigFault::AxisStateMismatch { .. })),
+        "{:?}",
+        snap.fault_history
+    );
+    // The fault stops the axes that did start.
+    assert!(r.run_until(1000, |r| r.mcu_states().iter().all(|s| *s == McuState::Fault)));
 }
 
 // ------------------------------------------------------------------ center / reference

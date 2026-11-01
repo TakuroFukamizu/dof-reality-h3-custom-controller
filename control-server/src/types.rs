@@ -303,6 +303,11 @@ pub enum RigFault {
     AxisStateMismatch { axis: AxisId, expected: McuState, actual: McuState },
     /// ARMING did not reach HOLDING on all axes in time.
     ArmTimeout,
+    /// START was not confirmed on this axis: its ACK did not arrive within
+    /// `ACK_TIMEOUT` (the detail says `ack_timeout: …` and what the MCU
+    /// reports, which may well be ACTIVE), or the axis had not reached
+    /// ACTIVE within `arm_timeout_ms` (then the detail names its state).
+    StartTimeout { axis: AxisId },
     /// STOPPING did not settle in time.
     StopTimeout,
     /// The three axes' last applied group_frame_id diverged beyond the limit.

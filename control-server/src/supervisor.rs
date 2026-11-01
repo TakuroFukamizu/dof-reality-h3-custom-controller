@@ -53,6 +53,11 @@
 //!   CONFIG outside ARMING → not a fault (blocker `not_configured`, retried);
 //!   FAULT_RESET → stays latched, blocker `fault_reset_rejected`;
 //!   SET_REFERENCE → event only. `DUPLICATE` is treated as `ACCEPTED`.
+//! - START not confirmed → `StartTimeout { axis }` (Issue #15): at
+//!   [`ACK_TIMEOUT`] when the axis's START ACK never came (detail
+//!   `ack_timeout: … (MCU reports ACTIVE)` — the MCU usually did start), or
+//!   at `arm_timeout_ms` when an axis is still not ACTIVE (detail names its
+//!   state). Never an `AxisStateMismatch { expected: ACTIVE, actual: ACTIVE }`.
 //! - FaultReset is refused synchronously when an axis is disconnected, has no
 //!   STATUS, has no STATUS processed after its HOST_FAULT ACK (event order, not
 //!   time), is still powered / decelerating with a fault, or a reset is in
@@ -2656,16 +2661,28 @@ impl Supervisor {
                         entered: now,
                     };
                 } else if elapsed(now, since) > ms(self.timing.arm_timeout_ms) {
-                    let (axis, actual) = self.first_axis_not_in(McuState::Active);
-                    self.latch(
-                        RigFault::AxisStateMismatch {
-                            axis,
-                            expected: McuState::Active,
-                            actual,
-                        },
-                        Some("START not confirmed in time".into()),
-                        now,
-                    );
+                    // Name the real cause: an axis not ACTIVE, else one whose
+                    // START ACK never came (normally caught earlier by
+                    // `expire_pending`; this is the backstop).
+                    let (axis, detail) = match self.axes.iter().position(|t| t.mcu_state() != Some(McuState::Active)) {
+                        Some(i) => (
+                            AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                            format!(
+                                "axis{} not ACTIVE within {} ms (reports {:?})",
+                                i + 1,
+                                self.timing.arm_timeout_ms,
+                                self.axes[i].mcu_state().unwrap_or(McuState::Boot)
+                            ),
+                        ),
+                        None => {
+                            let i = self.axes.iter().position(|t| !t.group_ok).unwrap_or(0);
+                            (
+                                AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                                format!("ack_timeout: START on axis{} not ACKed (MCU reports ACTIVE)", i + 1),
+                            )
+                        }
+                    };
+                    self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
                 }
             }
             Phase::Holding {
@@ -3253,6 +3270,23 @@ impl Supervisor {
                         t.limits_retry_at = Some(now + LIMITS_RETRY);
                     }
                 }
+                // A START whose ACK never came while we wait for it: the axis
+                // cannot be confirmed (the MCU may well be ACTIVE already —
+                // say so, instead of a state mismatch that names no mismatch).
+                if p.purpose == Purpose::Start
+                    && self.group == Some((Purpose::Start, p.gen))
+                    && matches!(self.phase, Phase::Holding { start: Some(_), .. })
+                {
+                    if let Some(axis) = AxisId::from_index(p.axis) {
+                        let reports = self.axes[p.axis].mcu_state().map_or("no STATUS".to_string(), |s| format!("{s:?}"));
+                        let detail = format!(
+                            "ack_timeout: START on axis{} not ACKed within {} ms (MCU reports {reports})",
+                            axis.get(),
+                            ACK_TIMEOUT.as_millis()
+                        );
+                        self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
+                    }
+                }
                 // An unanswered CALIBRATE(1) must not leave the axis "pending"
                 // forever (no calibrate, no CONFIG retry, cancels on every Stop).
                 // Treated like a rejection: the power axis unanswered cancels
@@ -3324,19 +3358,6 @@ impl Supervisor {
             self.timing.rest_error_count,
             self.timing.rest_dwell_ms
         )
-    }
-
-    fn first_axis_not_in(&self, s: McuState) -> (AxisId, McuState) {
-        for (i, t) in self.axes.iter().enumerate() {
-            let st = t.mcu_state();
-            if st != Some(s) {
-                return (
-                    AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
-                    st.unwrap_or(McuState::Boot),
-                );
-            }
-        }
-        (AxisId::ALL[0], s)
     }
 
     fn axis_calibration_valid(&self, i: usize) -> bool {
