@@ -14,6 +14,7 @@
 
 #include "usb_diag.h"
 #include "v1_axis.h"  // v1_device_id_from_mac
+#include "v1_tx_pump.h"
 
 void v1_link_poll();
 
@@ -22,7 +23,8 @@ namespace {
 constexpr UBaseType_t kRxDepth = 16;
 constexpr UBaseType_t kTxDepth = 32;
 constexpr int kRxBytesPerPoll = 2048;  // 1 周期で読む上限
-constexpr int kTxFramesPerPoll = 4;    // 1 周期で書く上限（1 フレームの write は最大 20 ms 待つ）
+constexpr int kTxFramesPerPoll = 4;    // 1 周期で書く上限。書く前に TX リングの空きを見るので write で待たない（v1_tx_pump.h。
+                                       // 旧: 空きが無いと HWCDC::write は tx timeout 20 ms × 最大 20 回 = 400 ms 待ち得た）
 constexpr uint32_t kLinkPeriodMs = 1;  // リンクタスクの周期
 
 QueueHandle_t g_rx = nullptr;
@@ -31,8 +33,23 @@ v1::FrameSplitter g_split;
 uint32_t g_oversize_seen = 0;
 std::atomic<uint32_t> g_rx_dropped{0};
 std::atomic<uint32_t> g_tx_dropped{0};
+std::atomic<uint32_t> g_tx_deferred{0};
+std::atomic<uint32_t> g_tx_stale_dropped{0};
 uint64_t g_device_id = 0;
 uint32_t g_boot_id = 0;
+v1::TxPump<V1TxFrame> g_pump;  // loop() だけが触る
+
+// Serial（HWCDC）を v1_tx_pump.h の Port にする
+struct SerialPort {
+  size_t available_for_write() {
+    const int n = Serial.availableForWrite();
+    return n > 0 ? static_cast<size_t>(n) : 0;
+  }
+  bool connected() { return static_cast<bool>(Serial); }  // isCDC_Connected()（未接続なら IN_EMPTY 割り込みを立て直す）
+  size_t write(const uint8_t* data, size_t len) { return Serial.write(data, len); }
+};
+
+bool pop_tx(V1TxFrame* out) { return xQueueReceive(g_tx, out, 0) == pdTRUE; }
 
 void link_task(void*) {
   for (;;) {
@@ -58,6 +75,7 @@ bool v1_link_begin() {
   // 状態変化で ACK と STATUS を続けて送る瞬間に PC 側で CRC 不一致、Core 1 のタスクにすると HOLDING に入って
   // 約 3 s で 2 台同時に USB が無応答（HELLO にも答えない）になった。原因未特定のため、動作実績のある
   // loop() 方式に戻し、受信の遅れは描画の間引き（100 ms に 1 回）とサーバー側の期限（valid_for 100 ms）で吸収する。
+  // 送信は書く前に空きを見てブロックしない（Issue #15 M7、v1_tx_pump.h）。
   (void)link_task;
   return true;
 }
@@ -85,13 +103,14 @@ void v1_link_poll() {
     g_oversize_seen = g_split.dropped;
   }
 
-  // 送信: 送信キュー → Serial（順序を保つため 1 本のキューだけ）
-  V1TxFrame t;
-  for (int i = 0; i < kTxFramesPerPoll; ++i) {
-    if (xQueueReceive(g_tx, &t, 0) != pdTRUE) break;
-    const size_t written = Serial.write(t.data, t.len);
-    usb_diag_note_tx(t.len, written);  // 20 ms の tx timeout で途中まで（フレーム欠損）になった回数を数える
-  }
+  // 送信: 送信キュー → Serial（順序を保つため 1 本のキューだけ）。空きが無ければ保留／STATUS は捨てる（v1_tx_pump.h）
+  SerialPort port;
+  const v1::TxPumpStats before = g_pump.stats;
+  g_pump.run(pop_tx, port, millis(), kTxFramesPerPoll, usb_diag_note_tx);
+  const v1::TxPumpStats& after = g_pump.stats;
+  if (after.deferred != before.deferred) g_tx_deferred.fetch_add(after.deferred - before.deferred);
+  const uint32_t dropped_now = (after.stale_dropped - before.stale_dropped) + (after.aged_dropped - before.aged_dropped);
+  if (dropped_now) g_tx_stale_dropped.fetch_add(dropped_now);
 }
 
 bool v1_link_rx_pop(V1RxFrame* out) {
@@ -105,6 +124,8 @@ bool v1_link_tx_push(const v1::McuMsg& m) {
   const size_t n = v1::encode_mcu_wire(m, t.data, sizeof(t.data));
   if (n == 0) return true;  // 符号化できない（起こらない）。捨てて前へ進む
   t.len = static_cast<uint16_t>(n);
+  t.type = m.type;
+  t.enqueued_ms = millis();
   if (xQueueSend(g_tx, &t, 0) != pdTRUE) {
     g_tx_dropped.fetch_add(1);
     return false;
@@ -114,6 +135,8 @@ bool v1_link_tx_push(const v1::McuMsg& m) {
 
 uint32_t v1_link_take_rx_dropped() { return g_rx_dropped.exchange(0); }
 uint32_t v1_link_tx_dropped() { return g_tx_dropped.load(); }
+uint32_t v1_link_tx_deferred() { return g_tx_deferred.load(); }
+uint32_t v1_link_tx_stale_dropped() { return g_tx_stale_dropped.load(); }
 uint64_t v1_link_device_id() { return g_device_id; }
 uint32_t v1_link_boot_id() { return g_boot_id; }
 

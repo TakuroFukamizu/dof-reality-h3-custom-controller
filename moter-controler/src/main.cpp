@@ -1260,9 +1260,11 @@ void renderV1() {
   // リンク行
   char link_text[80];
   if (vsnap.has_rx) {
-    snprintf(link_text, sizeof(link_text), "PC %lu ms前  rx_err %u  stale %u  tx_drop %lu",
+    // df = TX リングに空きが無く次の poll に回した回数、old = 古い STATUS／期限切れの保留を捨てた数（Issue #15 M7）
+    snprintf(link_text, sizeof(link_text), "PC %lums前 rx_err %u stale %u tx_drop %lu df %lu old %lu",
              static_cast<unsigned long>(vsnap.last_rx_age_ms), vsnap.rx_error_count, vsnap.stale_drop_count,
-             static_cast<unsigned long>(vsnap.tx_dropped));
+             static_cast<unsigned long>(vsnap.tx_dropped), static_cast<unsigned long>(vsnap.tx_deferred),
+             static_cast<unsigned long>(vsnap.tx_stale_dropped));
     canvas.setTextColor(vsnap.last_rx_age_ms < 500 ? kGreen : kAmber, TFT_BLACK);
   } else {
     snprintf(link_text, sizeof(link_text), "PC 未受信  rx_err %u", vsnap.rx_error_count);
@@ -1334,7 +1336,8 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
-         a.tx_dropped != b.tx_dropped || (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
+         a.tx_dropped != b.tx_dropped || a.tx_deferred != b.tx_deferred || a.tx_stale_dropped != b.tx_stale_dropped ||
+         (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
          (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
          strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||
          a.cal_result != b.cal_result || a.cal_n_end != b.cal_n_end || a.cal_neutral != b.cal_neutral ||
@@ -1357,6 +1360,9 @@ void setup() {
   // SET_POSITION は 100 Hz × 44 byte。画面の pushSprite（数十 ms）の間に HWCDC の既定 256 byte が溢れないよう広げる。
   // begin() より前でないと効かない。
   Serial.setRxBufferSize(1024);
+  // TX リングも広げる（既定 256 byte ≈ STATUS 5 本）。書く前に空きを見て入らなければ次の poll に回す（Issue #15 M7、v1_tx_pump.h）
+  // ので、広いほど PC が一瞬読まないときの保留・STATUS 捨てが減る。
+  Serial.setTxBufferSize(V1_TX_RING_BYTES);
   // USB CDC は v1 のバイナリ専用。IDF / M5Unified のログも出さない（COBS の区切り 0x00 と混ざる）。
   // M5.begin() より前に止める。Arduino core の log_e() は CORE_DEBUG_LEVEL=0（platformio.ini）でコンパイル時に消す。
   esp_log_level_set("*", ESP_LOG_NONE);

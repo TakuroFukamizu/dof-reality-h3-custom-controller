@@ -66,6 +66,8 @@ struct V1Snapshot {
   uint16_t rx_error_count = 0;
   uint16_t stale_drop_count = 0;
   uint32_t tx_dropped = 0;
+  uint32_t tx_deferred = 0;      // TX リングに空きが無く次の poll に回した回数（Issue #15 M7）
+  uint32_t tx_stale_dropped = 0; // 古い／入らない STATUS と期限切れの保留を捨てた数
   uint32_t tick_count = 0;
   uint32_t max_tick_gap_us = 0;  // 起動からの tick 間隔の最大
   uint64_t device_id = 0;

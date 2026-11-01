@@ -134,6 +134,10 @@ constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満し�
 #ifndef V1_FLOOR_SIGN_GATE
 #define V1_FLOOR_SIGN_GATE 1
 #endif
+// Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
+constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
+constexpr uint32_t V1_TX_DEFER_MAX_MS = 200;     // STATUS 以外の保留がこれを超えたら捨てる（PC の ACK 期限 1000 ms より十分短い。ここまで詰まったリンクは PC 側でも途絶）
+constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）

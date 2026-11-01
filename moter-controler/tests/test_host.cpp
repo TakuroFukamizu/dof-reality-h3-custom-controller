@@ -23,6 +23,7 @@ int g_fail = 0;
 #include "test_v1_codec.h"
 #include "test_v1_axis.h"
 #include "test_profile_blob.h"
+#include "test_v1_tx_pump.h"
 
 namespace {
 
@@ -653,6 +654,7 @@ int main() {
   v1test::run_all();
   v1axis_test::run_all();
   profile_blob_test::run_all();
+  v1txpump_test::run_all();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

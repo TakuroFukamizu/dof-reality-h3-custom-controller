@@ -369,6 +369,8 @@ void v1_task_main(void*) {
     snap.rx_error_count = g_axis.rx_error_count();
     snap.stale_drop_count = g_axis.stale_drop_count();
     snap.tx_dropped = v1_link_tx_dropped();
+    snap.tx_deferred = v1_link_tx_deferred();
+    snap.tx_stale_dropped = v1_link_tx_stale_dropped();
     ticks += 1;
     snap.tick_count = ticks;
     snap.max_tick_gap_us = max_gap_us;

@@ -63,6 +63,7 @@ frame:         header(4) payload(N) crc(2)
 - COBS の細目: 非ゼロ 254 byte の連続でデータが終わるときは末尾に空ブロック `0x01` を付けない（Wikipedia の例と同じ）。受信側は付いていても付いていなくても受け付ける。`0x00` が連続した空フレームは数えずに無視する。
 - 受信側は、CRC 不一致・`version` 不一致・未知の `msg_type`・`payload_len` が種別の定義長と異なるフレームを **破棄** し、破棄数を数える（STATUS の `rx_error_count`）。破棄したフレームに応答しない。`rx_error_count` には、v1 で扱えない `apply_at_us ≠ 0` の SET_POSITION（§4）も数える。
 - 将来の拡張でも既存種別の長さは変えない。必要なら新しい `msg_type` を足す。
+- MCU の送信はブロックしない（Issue #15 M7、ファーム `include/v1_tx_pump.h`）: USB CDC の TX リング（1024 byte）に空きが無いとき、**STATUS は捨てる**（次の 20 ms のものが新しい。積まれてから 100 ms 以上経った STATUS も送らない）、それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT）は順序を保って保留し、200 ms を超えたら捨てる。PC が読んでいない間に MCU の受信（SET_POSITION）が止まらないための規則で、PC 側の期限（ACK 1000 ms・STATUS 途絶 200 ms、§6）より短い。未接続（CDC が開いていない）ときは HWCDC の置き換え方針に任せる（従来どおり）。
 
 ## 3. 共通の値
 
