@@ -236,18 +236,36 @@ where
     }
 }
 
-/// Open a USB CDC serial port (8N1, no flow control).
+/// Open a USB CDC serial port (8N1, no flow control) and assert DTR.
 ///
-/// DTR/RTS are left as the library opens them (`dtr_on_open` unset = not
-/// touched; Linux still asserts DTR on open). The ESP32-S3 USB-Serial/JTAG
-/// and some CDC stacks reset or enter the bootloader on certain DTR/RTS
-/// transitions: this must be verified on the real CoreS3 before relying on it.
+/// The ESP32-S3 native USB CDC (Arduino `HWCDC`) only transmits while the
+/// host has asserted DTR: without it the MCU's HELLO / STATUS never arrive
+/// and the link looks dead. The library does not touch DTR on open (except
+/// Linux, which asserts it), so it is set explicitly here via
+/// [`assert_cdc_dtr`]. RTS is never written: the download-mode / reset
+/// trigger of the ESP32-S3 USB-Serial/JTAG is an RTS+DTR *sequence*, and
+/// asserting DTR alone (idempotent if already high) does not form one.
+/// Whether opening the port resets the real CoreS3 (boot_id change → FAULT)
+/// is still to be verified on hardware.
 pub async fn open_serial(
     port: &str,
     baud: u32,
 ) -> Result<tokio_serial::SerialStream, tokio_serial::Error> {
     // Exclusive access is the library default on unix (TIOCEXCL).
-    tokio_serial::SerialStream::open(&tokio_serial::new(port, baud))
+    let mut stream = tokio_serial::SerialStream::open(&tokio_serial::new(port, baud))?;
+    if let Err(e) = assert_cdc_dtr(&mut stream) {
+        // Not fatal: a driver without modem-line ioctls (or a pty) still
+        // carries data. If the MCU really needs DTR, the HELLO handshake
+        // times out and the server's reopen loop retries.
+        tracing::warn!(%port, "could not assert DTR: {e}");
+    }
+    Ok(stream)
+}
+
+/// Assert DTR on a freshly opened CDC port (see [`open_serial`]). Writes DTR
+/// only; RTS is left exactly as the driver opened it.
+pub fn assert_cdc_dtr(port: &mut dyn tokio_serial::SerialPort) -> Result<(), tokio_serial::Error> {
+    port.write_data_terminal_ready(true)
 }
 
 /// Serial port names currently present (enumeration only; nothing is opened).

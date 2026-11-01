@@ -1343,3 +1343,133 @@ async fn sim_select_axis_switches_the_link() {
     assert_eq!(link.axis(), Some(ax(3)));
     assert_eq!(sim.snapshot().selected_axis, 3);
 }
+
+// ------------------------------------------------------------------ serial open (DTR)
+
+/// Records the modem-line writes of `assert_cdc_dtr`. Nothing is opened: the
+/// real CDC port cannot be exercised in tests (never open a port here).
+#[derive(Default)]
+struct ModemLog {
+    dtr: Vec<bool>,
+    rts: Vec<bool>,
+    fail_dtr: bool,
+}
+
+impl std::io::Read for ModemLog {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+impl std::io::Write for ModemLog {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn unsupported<T>() -> tokio_serial::Result<T> {
+    Err(tokio_serial::Error::new(tokio_serial::ErrorKind::Unknown, "not a port"))
+}
+
+impl tokio_serial::SerialPort for ModemLog {
+    fn name(&self) -> Option<String> {
+        None
+    }
+    fn baud_rate(&self) -> tokio_serial::Result<u32> {
+        unsupported()
+    }
+    fn data_bits(&self) -> tokio_serial::Result<tokio_serial::DataBits> {
+        unsupported()
+    }
+    fn flow_control(&self) -> tokio_serial::Result<tokio_serial::FlowControl> {
+        unsupported()
+    }
+    fn parity(&self) -> tokio_serial::Result<tokio_serial::Parity> {
+        unsupported()
+    }
+    fn stop_bits(&self) -> tokio_serial::Result<tokio_serial::StopBits> {
+        unsupported()
+    }
+    fn timeout(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn set_baud_rate(&mut self, _: u32) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn set_data_bits(&mut self, _: tokio_serial::DataBits) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn set_flow_control(&mut self, _: tokio_serial::FlowControl) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn set_parity(&mut self, _: tokio_serial::Parity) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn set_stop_bits(&mut self, _: tokio_serial::StopBits) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn set_timeout(&mut self, _: Duration) -> tokio_serial::Result<()> {
+        unsupported()
+    }
+    fn write_request_to_send(&mut self, level: bool) -> tokio_serial::Result<()> {
+        self.rts.push(level);
+        Ok(())
+    }
+    fn write_data_terminal_ready(&mut self, level: bool) -> tokio_serial::Result<()> {
+        if self.fail_dtr {
+            return Err(tokio_serial::Error::new(tokio_serial::ErrorKind::Io(std::io::ErrorKind::Unsupported), "ENOTTY"));
+        }
+        self.dtr.push(level);
+        Ok(())
+    }
+    fn read_clear_to_send(&mut self) -> tokio_serial::Result<bool> {
+        unsupported()
+    }
+    fn read_data_set_ready(&mut self) -> tokio_serial::Result<bool> {
+        unsupported()
+    }
+    fn read_ring_indicator(&mut self) -> tokio_serial::Result<bool> {
+        unsupported()
+    }
+    fn read_carrier_detect(&mut self) -> tokio_serial::Result<bool> {
+        unsupported()
+    }
+    fn bytes_to_read(&self) -> tokio_serial::Result<u32> {
+        Ok(0)
+    }
+    fn bytes_to_write(&self) -> tokio_serial::Result<u32> {
+        Ok(0)
+    }
+    fn clear(&self, _: tokio_serial::ClearBuffer) -> tokio_serial::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> tokio_serial::Result<Box<dyn tokio_serial::SerialPort>> {
+        unsupported()
+    }
+    fn set_break(&self) -> tokio_serial::Result<()> {
+        Ok(())
+    }
+    fn clear_break(&self) -> tokio_serial::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn open_asserts_dtr_once_and_never_writes_rts() {
+    // ESP32-S3 HWCDC transmits only while DTR is asserted; RTS must stay
+    // untouched (an RTS+DTR sequence is the download-mode / reset trigger).
+    let mut log = ModemLog::default();
+    h3cs::axis_link::assert_cdc_dtr(&mut log).expect("DTR asserted");
+    assert_eq!(log.dtr, vec![true]);
+    assert!(log.rts.is_empty(), "RTS was written: {:?}", log.rts);
+}
+
+#[test]
+fn dtr_failure_is_reported_not_panicked() {
+    let mut log = ModemLog { fail_dtr: true, ..Default::default() };
+    let err = h3cs::axis_link::assert_cdc_dtr(&mut log).expect_err("driver without the ioctl");
+    assert!(err.to_string().contains("ENOTTY"), "{err}");
+    assert!(log.rts.is_empty());
+}

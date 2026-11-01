@@ -123,6 +123,128 @@ async fn foreign_origin_is_forbidden() {
 }
 
 #[tokio::test]
+async fn test_page_is_served_at_root_and_index_html() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/", "/index.html"] {
+        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert_eq!(html, api::TEST_PAGE);
+        assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
+        assert!(html.contains("h3-control-server 試験ページ") && html.contains("/v1/motion"), "{path}");
+    }
+    // No external resources: the page must work offline.
+    for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
+        assert!(!api::TEST_PAGE.contains(needle), "external resource in the page: {needle}");
+    }
+    // POST / is a known path with the wrong method.
+    let (st, body) = call(&s.app, req("POST", "/", &[], "")).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"], "method_not_allowed");
+    assert!(s.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn same_origin_loopback_requests_pass_the_origin_check() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    // The page's own origin (browser: Origin = scheme://Host) on a loopback host.
+    for (host, origin) in [
+        ("127.0.0.1:8892", "http://127.0.0.1:8892"),
+        ("localhost:8892", "http://localhost:8892"),
+        ("LOCALHOST:8892", "http://localhost:8892"),
+        ("[::1]:8892", "http://[::1]:8892"),
+        ("127.0.0.5:18892", "http://127.0.0.5:18892"),
+        ("localhost", "http://localhost"),
+    ] {
+        let (st, body) = call(&s.app, req("POST", "/v1/stop", &[("host", host), ("origin", origin)], "")).await;
+        assert_eq!(st, StatusCode::OK, "host {host} origin {origin}: {body}");
+        let (st, _) = call(&s.app, req("GET", "/v1/status", &[("host", host), ("origin", origin)], "")).await;
+        assert_eq!(st, StatusCode::OK, "host {host} origin {origin}");
+        let h = [("host", host), ("origin", origin), ("authorization", &bearer())];
+        let (st, _) = call(&s.app, req("POST", "/v1/arm", &h, "")).await;
+        assert_eq!(st, StatusCode::OK, "host {host} origin {origin}");
+    }
+    // The configured bridge origins still pass whatever the Host is.
+    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("host", "127.0.0.1:8892"), ("origin", "http://localhost:8891")], "")).await;
+    assert_eq!(st, StatusCode::OK);
+    // No Origin (curl, the Python client) is unchanged.
+    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("host", "127.0.0.1:8892")], "")).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn foreign_origins_stay_forbidden_even_when_they_match_the_host() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    let cases: [(&str, &str, &str); 9] = [
+        // DNS rebinding: a name that resolves to 127.0.0.1 is still not loopback by name.
+        ("evil.example:8892", "http://evil.example:8892", "rebinding"),
+        ("evil.example", "http://evil.example", "rebinding, no port"),
+        // Same host, different port / scheme / shape.
+        ("127.0.0.1:8892", "http://127.0.0.1:9999", "other port"),
+        ("127.0.0.1:8892", "http://127.0.0.1", "missing port"),
+        ("127.0.0.1:8892", "https://127.0.0.1:8892", "https"),
+        ("127.0.0.1:8892", "http://127.0.0.1:8892/", "trailing slash"),
+        ("127.0.0.1:8892", "http://localhost:8892", "host literal vs name"),
+        ("127.0.0.1:8892", "null", "opaque origin"),
+        ("192.168.1.10:8892", "http://192.168.1.10:8892", "LAN address"),
+    ];
+    for (host, origin, why) in cases {
+        let (st, body) = call(&s.app, req("POST", "/v1/stop", &[("host", host), ("origin", origin)], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{why}: host {host} origin {origin}");
+        assert_eq!(body["error"], "forbidden_origin", "{why}");
+        let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("host", host), ("origin", origin)], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{why} (ws)");
+    }
+    // Without a Host header the same-origin rule cannot apply.
+    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("origin", "http://127.0.0.1:8892")], "")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "no Host");
+    assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
+}
+
+#[test]
+fn same_origin_loopback_rule() {
+    use api::same_origin_loopback as same;
+    assert!(same("http://127.0.0.1:8892", Some("127.0.0.1:8892")));
+    assert!(same("http://[::1]:8892", Some("[::1]:8892")));
+    assert!(same("http://localhost:8892", Some("localhost:8892")));
+    assert!(same("http://Localhost:8892", Some("localhost:8892")));
+    assert!(!same("http://127.0.0.1:8892", None));
+    assert!(!same("http://127.0.0.1:8892", Some("")));
+    assert!(!same("http://127.0.0.1:8892", Some("127.0.0.1:8893")));
+    assert!(!same("http://evil.example:8892", Some("evil.example:8892")));
+    assert!(!same("http://10.0.0.1:8892", Some("10.0.0.1:8892")));
+    assert!(!same("https://127.0.0.1:8892", Some("127.0.0.1:8892")));
+    assert!(!same("http://127.0.0.1:8892/", Some("127.0.0.1:8892")));
+    assert!(!same("http://[::1]:8892", Some("[::1:8892")), "unterminated bracket");
+    assert!(!same("http://::1:8892", Some("::1:8892")), "unbracketed v6 is not a valid Host");
+    // IPv4-mapped loopback: canonical form is loopback.
+    assert!(same("http://[::ffff:127.0.0.1]:8892", Some("[::ffff:127.0.0.1]:8892")));
+}
+
+#[tokio::test]
+async fn same_origin_requests_keep_body_limit_and_rate_limit() {
+    let mut cfg = sim_cfg();
+    cfg.server.max_body_bytes = 64;
+    cfg.server.admin_rate_limit_per_s = 2;
+    let s = stub(cfg, Some(ok_reply));
+    let same = [("host", "127.0.0.1:8892"), ("origin", "http://127.0.0.1:8892"), ("authorization", &bearer())];
+    let big = "x".repeat(65);
+    let (st, body) = call(&s.app, req("POST", "/v1/fault", &same, &big)).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"], "body_too_large");
+    let mut codes = Vec::new();
+    for _ in 0..3 {
+        let (st, _) = call(&s.app, req("POST", "/v1/arm", &same, "")).await;
+        codes.push(st);
+    }
+    assert_eq!(codes, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+}
+
+#[tokio::test]
 async fn admin_routes_need_the_bearer_token() {
     let s = stub(sim_cfg(), Some(ok_reply));
     for path in ["/v1/arm", "/v1/start", "/v1/disarm", "/v1/fault/reset", "/v1/center", "/v1/reference", "/v1/fault"] {
@@ -560,7 +682,8 @@ async fn non_loopback_peers_get_only_status_and_stop() {
     let s = stub(cfg.clone(), Some(ok_reply));
     let app = s.app.clone().layer(MockConnectInfo(lan));
     let auth = bearer();
-    for (m, p) in [("POST", "/v1/session"), ("GET", "/v1/motion"), ("POST", "/v1/arm"), ("POST", "/v1/fault")] {
+    // The test page (it holds the admin token) is closed to the LAN too.
+    for (m, p) in [("POST", "/v1/session"), ("GET", "/v1/motion"), ("POST", "/v1/arm"), ("POST", "/v1/fault"), ("GET", "/"), ("GET", "/index.html")] {
         let (st, body) = call(&app, req(m, p, &[("authorization", &auth)], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{m} {p}");
         assert_eq!(body["error"], "loopback_only");

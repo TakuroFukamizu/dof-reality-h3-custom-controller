@@ -126,7 +126,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 ## 7. API（JSON は Python クライアントと共有の契約）
 
-既定 `127.0.0.1:8892`。Origin ヘッダーがあれば `allowed_origins` に含まれること（なければ 403）。本文は `max_body_bytes` まで。管理 API は `Authorization: Bearer <token>`（トークンは `admin_token_env` の環境変数、未設定なら起動時に生成して標準エラーへ 1 回出す）。
+既定 `127.0.0.1:8892`。Origin ヘッダーがあれば `allowed_origins` に含まれるか、§7.4 の「自分自身の origin」であること（どちらでもなければ 403）。本文は `max_body_bytes` まで。管理 API は `Authorization: Bearer <token>`（トークンは `admin_token_env` の環境変数、未設定なら起動時に生成して標準エラーへ 1 回出す）。
 
 - loopback 以外への bind は既定で拒否。`server.allow_non_loopback = true` で許可できるが、そのときも **loopback 以外の相手には `GET /v1/status` と `POST /v1/stop` だけ**を開く（他は 403 `loopback_only`。相手アドレス不明も拒否）。Game 入力（session / motion）と管理トークンは LAN を通らない（計画 §11「LAN の観戦通信に駆動権限を付けない」）。
 - 管理 API の rate limit は `admin_rate_limit_per_s`（トークン検査の後）。`/v1/stop`・`/v1/disarm`・`/v1/fault` は rate limit の対象外（安全側の操作を拒まない）。
@@ -134,6 +134,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 | API | 認証 | 内容 |
 | --- | --- | --- |
+| `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
 | `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.35, "source_freshness_ms": 250, "require_frame_seq": true}` |
 | `GET /v1/motion[?session=<id>]`（WS） | なし | §7.1。`session` は省略可（各メッセージの `source_session` で判定）。指定した場合は別セッション名のメッセージも `stale_session` |
 | `GET /v1/status` | なし | StatusSnapshot（§7.2） |
@@ -243,6 +244,16 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 制御ループが落ちた後（`GET /v1/status` が 503）も読める（落ちる前の経過を見るため）。
 - 同じイベントは標準エラーにも出る（`fault` は error、`rig_state` は "rig state" の行、他は info。`RUST_LOG` 既定 `info`）。ファイルへの JSONL 記録（`telemetry.rs` の `Recorder`）は未配線。サーバーを再起動するとリングは空になる。
 
+### 7.4 試験ページ `GET /`
+
+`control-server/static/test_page.html` を `include_str!` でバイナリに埋め込み、`GET /` と `GET /index.html` で返す（外部資源なし、オフラインで動く、日本語 UI）。実機 3 台をつないだときの手元の確認用で、ゲームの代わりではない。
+
+- 表示: `GET /v1/status` を 200 ms ごとに読み、`rig_state`・`blockers`・`fault`・`axis_conflict`・3 系統の表（接続 / port / device_id / expected / assignment / claimants / mcu_state / fault_code / flags（P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller）/ actual / target / velocity / following_error / pwm / status_age / reference_stale）。`GET /v1/events?n=50` を 1 秒ごとに読んで末尾を出す。HTTP の応答本文（エラーを含む）はすべてログ欄に出す。
+- 操作: 管理トークン欄（`sessionStorage` にだけ置く。タブを閉じると消える）、session 発行、ARM、START、**STOP（大きい赤、トークン不要）**、DISARM、CENTER、FAULT、FAULT RESET、軸ごとの REFERENCE（count 入力、既定 0、確認ダイアログ）。読み込んだだけでは何もしない（自動で session を発行・ARM・送信しない）。
+- 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
+- Origin: ブラウザーは同一 origin でも POST と WS に `Origin` を付けるので、`check_origin` は `allowed_origins` に加えて「**自分自身の origin**」を通す: `Origin` が `http://<Host ヘッダー>` と一致（大文字小文字を無視、末尾のスラッシュなし）し、かつ Host のホスト名が `localhost` または loopback の IP リテラル（`127.0.0.1`、`[::1]`、`127.x.y.z`）であること（`api::same_origin_loopback`）。loopback の条件が DNS リバインディングを塞ぐ（`Host: evil.example:8892` に `Origin: http://evil.example:8892` を付けても 403。攻撃者のページは Host をサーバーの名前にしながら Origin を自分の origin にせざるを得ないので一致しない）。他の origin の扱い、`Origin` 無し（curl・Python クライアント）の扱い、`max_body_bytes`・rate limit は変わらない。
+- LAN: `GET /` は `lan_allowed` に入れない（ページは管理トークンを扱う。トークンは LAN を通らない）。`allow_non_loopback` のときも loopback 以外からは 403 `loopback_only`。
+
 ## 8. Python クライアントと h3game アダプター
 
 - `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。
@@ -258,7 +269,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - session: 同じ frame_seq の再送で延長しない、gain だけで延長しない、古い session/seq を拒否、source_age を考慮、frame_seq なしの扱い。
 - supervisor: 接続で center しない、再接続で ARM しない、calibration_valid=false / 系統の競合（`axis_conflict`）/ 設定 device_id との不一致（`axis_device_mismatch`）/ 再基準化待ち（`reference_stale`）/ 未知の装置で ARM 拒否、競合中は CONFIG を送らず Arm・Start・Center を `axis_conflict` で拒否、駆動中の 2 台目で減速停止してから競合、駆動中の担当個体の系統変更で FAULT（`axis_changed`。切り替え先を担当していた個体にも HOST_FAULT が届いてから降格、ACK が無ければ ACK タイムアウトで降格・再送なし）、競合解消で残った個体を primary に昇格、ゲーム途絶 → 協調減速 → 保持 → ブレーキ（center しない）、STOP 後の遅れた Pose で再開しない、1 軸の異常で全軸 HOST_FAULT、駆動中の軸断・再起動で FAULT、FaultReset は原因が残れば拒否・解除後も自動 ARM しない、frame skew で FAULT、gain 上限超過の要求は effective_gain と理由を返す。
 - sim_axis: protocol §5 の全遷移、期限切れで COMMAND_TIMEOUT、epoch 不一致の拒否、request_id 重複で再実行しない。
-- api: Origin 違反 403、管理トークン無し 401、本文過大 413、WS の ack と status、stop はトークン不要、競合中は pose / gain を `axis_conflict` で拒否し鮮度を更新しない、arm / start / center は 409 `axis_conflict`。
+- api: Origin 違反 403、同一 origin（loopback の Host と一致する `Origin`）は通し、Host と一致しても loopback でない名前（DNS リバインディング）・別ポート・https・LAN アドレスは 403、Origin 無しは従来どおり、管理トークン無し 401、本文過大 413、WS の ack と status、stop はトークン不要、競合中は pose / gain を `axis_conflict` で拒否し鮮度を更新しない、arm / start / center は 409 `axis_conflict`、`GET /` と `/index.html` が試験ページ（text/html・外部資源なし・LAN からは 403・POST は 405）。
 - 結合（sim）: サーバー起動 → session → WS pose → arm/start → 追従 → pose 停止 → HOLD → BRAKED_DISARMED。USB 断（freeze_status）で FAULT。系統選択（§10）: 割当は `selected_axis` で決まりポート順に依存しない、待機中の切り替えで再割当（新しい軸の CONFIG・`reference_stale` が SET_REFERENCE まで ARM を阻む）、同じ系統を 2 台が選ぶと `axis_conflict`（ARM 409・pose 拒否・stop は受理）で片方を戻すと解消、駆動中の切り替えで FAULT_LATCHED、`report_selected_axis = false` で旧 device_id 経路。
 
 ## 10. 系統選択と軸の割当（protocol.md §1.1）

@@ -1,6 +1,6 @@
-//! types: AxisId index conversions.
+//! types: AxisId index conversions, FaultCode wire / JSON names.
 
-use h3cs::types::{AxisId, AXIS_COUNT};
+use h3cs::types::{AxisId, FaultCode, AXIS_COUNT};
 
 #[test]
 fn from_index_round_trips_valid_indices() {
@@ -17,4 +17,28 @@ fn from_index_rejects_out_of_range_without_truncation() {
     for i in [3, 4, 254, 255, 256, 257, 258, usize::MAX] {
         assert_eq!(AxisId::from_index(i), None, "index {i}");
     }
+}
+
+#[test]
+fn fault_code_wire_values_round_trip_and_local_estop_is_12() {
+    // protocol.md §3.2: 0..=12 are defined, everything else is UNKNOWN.
+    for v in 0..=12u16 {
+        let code = FaultCode::from_u16(v);
+        assert_ne!(code, FaultCode::Unknown, "value {v} is defined");
+        assert_eq!(code.to_u16(), v);
+    }
+    assert_eq!(FaultCode::from_u16(12), FaultCode::LocalEstop);
+    assert_eq!(FaultCode::LocalEstop.to_u16(), 12);
+    for v in [13u16, 100, 0xFFFE, 0xFFFF] {
+        assert_eq!(FaultCode::from_u16(v), FaultCode::Unknown, "value {v}");
+    }
+    assert_eq!(FaultCode::Unknown.to_u16(), 0xFFFF);
+}
+
+#[test]
+fn fault_code_json_names_are_screaming_snake_case() {
+    assert_eq!(serde_json::to_value(FaultCode::LocalEstop).unwrap(), "LOCAL_ESTOP");
+    assert_eq!(serde_json::from_value::<FaultCode>("LOCAL_ESTOP".into()).unwrap(), FaultCode::LocalEstop);
+    assert_eq!(serde_json::to_value(FaultCode::HostFault).unwrap(), "HOST_FAULT");
+    assert_eq!(serde_json::to_value(FaultCode::None).unwrap(), "NONE");
 }

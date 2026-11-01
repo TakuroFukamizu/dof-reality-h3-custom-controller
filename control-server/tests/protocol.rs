@@ -83,7 +83,7 @@ fn wire_to_encoded(wire: &[u8]) -> &[u8] {
     &wire[..wire.len() - 1]
 }
 
-const ALL_FAULTS: [FaultCode; 13] = [
+const ALL_FAULTS: [FaultCode; 14] = [
     FaultCode::None,
     FaultCode::CommandTimeout,
     FaultCode::FollowingError,
@@ -96,6 +96,7 @@ const ALL_FAULTS: [FaultCode; 13] = [
     FaultCode::PowerFault,
     FaultCode::HostFault,
     FaultCode::NotReferenced,
+    FaultCode::LocalEstop,
     FaultCode::Unknown,
 ];
 
@@ -788,7 +789,7 @@ fn ack_unknown_result_or_reason_is_bad_field() {
 fn unknown_fault_code_maps_to_unknown_and_state_kept_raw() {
     let mut p = sample_status().encode_payload();
     p[12] = 0xEE; // mcu_state outside the enum
-    p[14..16].copy_from_slice(&12u16.to_le_bytes()); // undefined fault code
+    p[14..16].copy_from_slice(&13u16.to_le_bytes()); // undefined fault code (12 = LOCAL_ESTOP is defined)
     match McuMsg::decode_payload(msg_type::STATUS, &p) {
         Ok(McuMsg::Status(s)) => {
             assert_eq!(s.mcu_state, 0xEE);

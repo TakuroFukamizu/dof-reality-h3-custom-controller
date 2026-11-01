@@ -223,6 +223,9 @@ pub enum FaultCode {
     PowerFault,
     HostFault,
     NotReferenced,
+    /// MCU の画面の非常停止ボタン（protocol.md §3.2 の 12）。ボタンのラッチを
+    /// 解除してから FAULT_RESET（解除前は FAULT_CAUSE_PRESENT）。
+    LocalEstop,
     Unknown,
 }
 
@@ -242,6 +245,7 @@ impl FaultCode {
             PowerFault => 9,
             HostFault => 10,
             NotReferenced => 11,
+            LocalEstop => 12,
             Unknown => 0xFFFF,
         }
     }
@@ -260,6 +264,7 @@ impl FaultCode {
             9 => PowerFault,
             10 => HostFault,
             11 => NotReferenced,
+            12 => LocalEstop,
             _ => Unknown,
         }
     }

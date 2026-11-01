@@ -87,6 +87,7 @@ PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支え�
 | 9 | `POWER_FAULT` | 電源系の異常（入力がある場合） |
 | 10 | `HOST_FAULT` | PC から FAULT を受けた |
 | 11 | `NOT_REFERENCED` | 予約（v1 では発生しない）。位置基準未確立の ARM_PREPARE は ACK `REJECTED/NOT_REFERENCED` で拒否し、DISARMED のまま |
+| 12 | `LOCAL_ESTOP` | MCU の画面の非常停止ボタン。ボタンのラッチを解除してから FAULT_RESET（解除前は FAULT_CAUSE_PRESENT） |
 | 0xFFFF | `UNKNOWN` | |
 
 - STATUS の `fault_code` が `NONE` でないのは、`FAULT` のときと、COMMAND_TIMEOUT による減速中（`mcu_state = STOPPING`、ラッチ前）のとき。後者は停止後に FAULT をラッチし、そのとき FAULT_EVENT（`mcu_state_before = STOPPING`）を送る。減速中に HOST_FAULT を受けたら減速中の異常コードのまま即ラッチする。

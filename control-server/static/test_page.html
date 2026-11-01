@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>h3-control-server 試験ページ</title>
+<!--
+  h3-control-server のオペレーター用試験ページ（DESIGN.md §7.4）。
+  サーバーが GET / で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
+  - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。
+  - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
+  - 姿勢送信は document.hidden で止まる。隠れたタブからは送らない。
+    隠れても 0（中央）を送らない: サーバーの source_freshness_ms が止める。
+  - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
+-->
+<style>
+  :root { --red: #c0392b; --green: #1e8449; --amber: #b9770e; --gray: #666; --bg: #f6f6f6; }
+  body { font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 0; padding: 12px 16px; background: var(--bg); color: #222; font-size: 14px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  h2 { font-size: 15px; margin: 16px 0 6px; border-bottom: 1px solid #ccc; padding-bottom: 2px; }
+  section { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid #888; background: #eee; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.stop { background: var(--red); color: #fff; border-color: #922b21; font-size: 22px; font-weight: bold; padding: 14px 36px; }
+  button.warn { background: #fde3c3; }
+  input[type=text], input[type=password], input[type=number] { font: inherit; padding: 4px 6px; border: 1px solid #aaa; border-radius: 4px; }
+  input[type=number] { width: 7em; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { border: 1px solid #ddd; padding: 3px 5px; text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th { background: #f0f0f0; }
+  td.num { text-align: right; }
+  .state { font-size: 26px; font-weight: bold; padding: 4px 10px; border-radius: 4px; background: #eee; display: inline-block; }
+  .state.ACTIVE, .state.HOLDING, .state.ARMING, .state.STOPPING { background: #fde3c3; color: var(--amber); }
+  .state.FAULT_LATCHED { background: var(--red); color: #fff; }
+  .state.READY_TO_ARM { background: #d5f5e3; color: var(--green); }
+  .ok { color: var(--green); } .bad { color: var(--red); font-weight: bold; } .dim { color: var(--gray); }
+  pre, .log { font-family: Menlo, Consolas, monospace; font-size: 12px; background: #fafafa; border: 1px solid #e5e5e5; padding: 6px; margin: 4px 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+  .log { max-height: 160px; }
+  label.sl { display: grid; grid-template-columns: 3.5em 1fr 4.5em; gap: 8px; align-items: center; margin: 4px 0; }
+  .banner { padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; display: none; }
+  .banner.show { display: block; }
+  .banner.bad { background: #fadbd8; color: var(--red); }
+  .banner.warn { background: #fdebd0; color: var(--amber); }
+  .small { font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>h3-control-server 試験ページ <span class="dim small" id="hostLabel"></span></h1>
+<div id="hiddenBanner" class="banner warn">タブが非表示になったため姿勢送信を停止しました。再開はボタンで。</div>
+<div id="pollBanner" class="banner bad"></div>
+
+<section>
+  <div class="row">
+    <button id="bStop" class="stop" title="POST /v1/stop（トークン不要）。物理非常停止ではない">STOP</button>
+    <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
+    <span class="dim small">sessionStorage に保存（このタブだけ）</span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する">session 発行</button>
+    <button id="bArm">ARM</button>
+    <button id="bStart">START</button>
+    <button id="bDisarm">DISARM</button>
+    <button id="bCenter">CENTER</button>
+    <button id="bFault" class="warn">FAULT</button>
+    <button id="bFaultReset">FAULT RESET</button>
+    <span id="sessionLabel" class="dim small">session: なし</span>
+  </div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">リグ状態 <span class="dim small">GET /v1/status（200 ms）</span> <span id="statusAge" class="dim small"></span></h2>
+  <div class="row">
+    <span id="rigState" class="state">—</span>
+    <span>armed: <b id="armed">—</b></span>
+    <span>active_source: <b id="activeSource">—</b></span>
+    <span>epoch: <b id="epoch">—</b></span>
+    <span>frame: <b id="frame">—</b></span>
+    <span>effective_gain: <b id="effGain">—</b></span>
+    <span>limits: <b id="limits">—</b></span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span>axis_conflict: <b id="axisConflict">—</b></span>
+    <span>session: <b id="statusSession">—</b></span>
+  </div>
+  <div style="margin-top:6px">blockers: <span id="blockers" class="dim">—</span></div>
+  <div style="margin-top:4px">fault: <span id="fault">—</span></div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">3 系統</h2>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th>軸</th><th>名前</th><th>接続</th><th>port</th><th>device_id</th><th>expected</th><th>assignment</th><th>claimants</th>
+      <th>mcu_state</th><th>fault_code</th><th>flags</th>
+      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>ref_stale</th><th>REFERENCE</th>
+    </tr></thead>
+    <tbody id="axes"></tbody>
+  </table>
+  </div>
+  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。REFERENCE は DISARMED 時だけ（現在位置を count とみなす）。</div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">姿勢送信 <span class="dim small">WS /v1/motion、50 Hz、seq / frame_seq 単調増加、source_age_ms 0</span></h2>
+  <label class="sl">pitch <input type="range" id="pitch" min="-1" max="1" step="0.01" value="0"><span id="pitchV">0.00</span></label>
+  <label class="sl">roll <input type="range" id="roll" min="-1" max="1" step="0.01" value="0"><span id="rollV">0.00</span></label>
+  <label class="sl">yaw <input type="range" id="yaw" min="-1" max="1" step="0.01" value="0"><span id="yawV">0.00</span></label>
+  <label class="sl">gain <input type="range" id="gain" min="0" max="0.35" step="0.01" value="0.2"><span id="gainV">0.20</span></label>
+  <div class="row">
+    <button id="bStream">送信開始</button>
+    <button id="bZero">スライダーを 0 に</button>
+    <span>WS: <b id="wsState">closed</b></span>
+    <span>seq: <b id="seq">0</b></span>
+    <span>max_gain: <b id="maxGain">0.35</b></span>
+  </div>
+  <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">イベント <span class="dim small">GET /v1/events?n=50（1 s）</span></h2>
+  <pre id="events">—</pre>
+</section>
+
+<section>
+  <h2 style="margin-top:0">HTTP ログ <span class="dim small">応答本文はすべて表示</span></h2>
+  <div id="httpLog" class="log"></div>
+</section>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const TOKEN_KEY = 'h3cs_admin_token';
+  const state = { session: null, maxGain: 0.35, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0, pollBusy: false, eventsBusy: false };
+
+  $('hostLabel').textContent = location.host;
+
+  // ---------------------------------------------------------------- token
+  const tokenInput = $('token');
+  tokenInput.value = sessionStorage.getItem(TOKEN_KEY) || '';
+  tokenInput.addEventListener('input', () => sessionStorage.setItem(TOKEN_KEY, tokenInput.value));
+  const token = () => tokenInput.value.trim();
+
+  // ---------------------------------------------------------------- http log
+  const httpLog = $('httpLog');
+  function log(line, bad) {
+    const d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString() + ' ' + line;
+    if (bad) d.className = 'bad';
+    httpLog.prepend(d);
+    while (httpLog.childElementCount > 60) httpLog.removeChild(httpLog.lastChild);
+  }
+
+  // Every request goes through here so every error body is shown.
+  async function call(method, path, opts) {
+    opts = opts || {};
+    const headers = {};
+    if (opts.auth) headers['Authorization'] = 'Bearer ' + token();
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    let resp, text;
+    try {
+      resp = await fetch(path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body), cache: 'no-store' });
+      text = await resp.text();
+    } catch (e) {
+      if (!opts.quiet && !opts.silent) log(method + ' ' + path + ' -> ネットワークエラー: ' + e, true);
+      throw e;
+    }
+    if (!opts.silent && (!opts.quiet || !resp.ok)) log(method + ' ' + path + ' -> ' + resp.status + ' ' + text, !resp.ok);
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { /* 本文は JSON とは限らない */ }
+    return { ok: resp.ok, status: resp.status, text, json };
+  }
+
+  // ---------------------------------------------------------------- admin buttons
+  function adminButton(id, path, opts) {
+    $(id).addEventListener('click', async () => {
+      const b = $(id);
+      b.disabled = true;
+      try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
+      b.disabled = false;
+    });
+  }
+  $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
+  adminButton('bArm', '/v1/arm', { auth: true });
+  adminButton('bStart', '/v1/start', { auth: true });
+  adminButton('bDisarm', '/v1/disarm', { auth: true });
+  adminButton('bCenter', '/v1/center', { auth: true });
+  adminButton('bFault', '/v1/fault', { auth: true, body: { note: 'test page' } });
+  adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+
+  $('bSession').addEventListener('click', async () => {
+    try {
+      const r = await call('POST', '/v1/session');
+      if (r.ok && r.json) {
+        state.session = r.json.source_session;
+        if (typeof r.json.max_gain === 'number') setMaxGain(r.json.max_gain);
+        $('sessionLabel').textContent = 'session: ' + state.session.slice(0, 8) + '… (max_gain ' + state.maxGain + ')';
+      }
+    } catch (e) { /* ログ済み */ }
+  });
+
+  function setMaxGain(g) {
+    state.maxGain = g;
+    const gain = $('gain');
+    gain.max = String(g);
+    if (parseFloat(gain.value) > g) gain.value = String(g);
+    $('maxGain').textContent = String(g);
+    $('gainV').textContent = parseFloat(gain.value).toFixed(2);
+  }
+
+  // ---------------------------------------------------------------- status
+  const fmt = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  function td(tr, text, cls) {
+    const c = document.createElement('td');
+    c.textContent = text;
+    if (cls) c.className = cls;
+    tr.appendChild(c);
+    return c;
+  }
+
+  function renderStatus(s) {
+    state.lastStatus = s;
+    const rig = $('rigState');
+    rig.textContent = s.rig_state;
+    rig.className = 'state ' + s.rig_state;
+    $('armed').textContent = fmt(s.armed);
+    $('activeSource').textContent = fmt(s.active_source);
+    $('epoch').textContent = fmt(s.session_epoch);
+    $('frame').textContent = fmt(s.group_frame_id);
+    $('effGain').textContent = fmt(s.effective_gain);
+    $('limits').textContent = (s.limits && s.limits.length) ? s.limits.join(', ') : 'なし';
+    const conflict = s.axis_conflict || [];
+    $('axisConflict').textContent = conflict.length ? conflict.join(', ') + '（競合: 入力拒否）' : 'なし';
+    $('axisConflict').className = conflict.length ? 'bad' : 'ok';
+    $('statusSession').textContent = s.session ? (fmt(s.session.source_session_prefix) + ' fresh=' + s.session.fresh + ' last_seq=' + s.session.last_seq) : 'なし';
+    const bl = $('blockers');
+    bl.textContent = (s.blockers && s.blockers.length) ? s.blockers.join(' / ') : 'なし';
+    bl.className = (s.blockers && s.blockers.length) ? 'bad' : 'ok';
+    const f = $('fault');
+    f.textContent = s.fault ? JSON.stringify(s.fault) : 'なし';
+    f.className = s.fault ? 'bad' : 'ok';
+
+    (s.axes || []).forEach((a, i) => updateAxisRow(axisRow(i, a), a));
+  }
+
+  // 軸の行は 1 回だけ作り、以後は td の中身だけ更新する（200 ms ごとに作り直すと
+  // REFERENCE の入力欄がフォーカスを失い、数字を打てない）。
+  const axisRows = [];
+  const COLS = 18; // REFERENCE 列を除く td の数
+  function axisRow(i, a) {
+    if (axisRows[i]) return axisRows[i];
+    const tr = document.createElement('tr');
+    const cells = [];
+    for (let c = 0; c < COLS; c++) cells.push(td(tr, ''));
+    const refCell = document.createElement('td');
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.value = '0'; inp.step = '1'; inp.id = 'ref' + a.axis_id;
+    const b = document.createElement('button');
+    b.textContent = 'REFERENCE';
+    b.addEventListener('click', async () => {
+      const count = parseInt(inp.value, 10);
+      if (!Number.isInteger(count)) { log('reference: count が整数ではない', true); return; }
+      if (!window.confirm('軸 ' + a.axis_id + ' の現在位置を count=' + count + ' として基準化します。DISARMED であることを確認してください。')) return;
+      try { await call('POST', '/v1/reference', { auth: true, body: { axis: a.axis_id, count } }); } catch (e) { /* ログ済み */ }
+    });
+    refCell.appendChild(inp); refCell.appendChild(document.createTextNode(' ')); refCell.appendChild(b);
+    tr.appendChild(refCell);
+    $('axes').appendChild(tr);
+    axisRows[i] = { tr, cells };
+    return axisRows[i];
+  }
+  function set(cell, text, cls) {
+    if (cell.textContent !== text) cell.textContent = text;
+    const c = cls || '';
+    if (cell.className !== c) cell.className = c;
+  }
+  function updateAxisRow(row, a) {
+    const c = row.cells;
+    const claimants = a.claimants || [];
+    set(c[0], String(a.axis_id));
+    set(c[1], a.name || '');
+    set(c[2], a.connected ? '接続' : '未接続', a.connected ? 'ok' : 'bad');
+    set(c[3], fmt(a.port));
+    set(c[4], fmt(a.device_id));
+    set(c[5], fmt(a.expected_device_id));
+    set(c[6], fmt(a.assignment));
+    set(c[7], claimants.map((x) => x.port + '(' + x.device_id + ')').join(', ') || '—', claimants.length > 1 ? 'bad' : '');
+    set(c[8], fmt(a.mcu_state), a.mcu_state === 'FAULT' ? 'bad' : '');
+    set(c[9], fmt(a.fault_code), (a.fault_code && a.fault_code !== 'NONE') ? 'bad' : '');
+    set(c[10], [a.power_on_cmd ? 'P' : '-', a.brake_release_cmd ? 'B' : '-', a.configured ? 'C' : '-', a.referenced ? 'R' : '-', a.power_controller ? 'PC' : '--'].join(' '));
+    set(c[11], fmt(a.actual_count), 'num');
+    set(c[12], fmt(a.target_count), 'num');
+    set(c[13], fmt(a.velocity_count_s), 'num');
+    set(c[14], fmt(a.following_error_count), 'num');
+    set(c[15], fmt(a.pwm_permille), 'num');
+    set(c[16], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : a.status_age_ms.toFixed(0) + ' ms', 'num');
+    set(c[17], a.reference_stale ? '要再基準化' : '—', a.reference_stale ? 'bad' : '');
+  }
+
+  // 同じエラーが続いても HTTP ログには 1 回だけ出す（バナーには常に出す）。
+  function pollError(text) {
+    const banner = $('pollBanner');
+    banner.textContent = text;
+    banner.className = 'banner bad show';
+    if (state.lastPollError !== text) { state.lastPollError = text; log(text, true); }
+  }
+  async function pollStatus() {
+    if (state.pollBusy) return;
+    state.pollBusy = true;
+    const t0 = performance.now();
+    try {
+      const r = await call('GET', '/v1/status', { silent: true });
+      if (r.ok && r.json) {
+        renderStatus(r.json);
+        $('pollBanner').className = 'banner bad';
+        state.lastPollError = null;
+        $('statusAge').textContent = '(' + (performance.now() - t0).toFixed(0) + ' ms)';
+      } else {
+        pollError('GET /v1/status -> ' + r.status + ' ' + r.text);
+      }
+    } catch (e) {
+      pollError('GET /v1/status に届かない: ' + e);
+    }
+    state.pollBusy = false;
+  }
+  setInterval(pollStatus, 200);
+  pollStatus();
+
+  // ---------------------------------------------------------------- events
+  async function pollEvents() {
+    if (state.eventsBusy) return;
+    state.eventsBusy = true;
+    try {
+      const r = await call('GET', '/v1/events?n=50', { quiet: true });
+      if (r.ok && r.json && Array.isArray(r.json.events)) {
+        const lines = r.json.events.slice().reverse().map((e) => String(e.id).padStart(5) + ' ' + Number(e.t_ms).toFixed(1).padStart(10) + ' ' + e.kind + ' ' + (e.detail === undefined ? '' : JSON.stringify(e.detail)));
+        $('events').textContent = lines.length ? lines.join('\n') : '（イベントなし）';
+      }
+    } catch (e) { /* ログ済み */ }
+    state.eventsBusy = false;
+  }
+  setInterval(pollEvents, 1000);
+  pollEvents();
+
+  // ---------------------------------------------------------------- pose streamer
+  ['pitch', 'roll', 'yaw', 'gain'].forEach((id) => {
+    $(id).addEventListener('input', () => { $(id + 'V').textContent = parseFloat($(id).value).toFixed(2); });
+  });
+  $('bZero').addEventListener('click', () => {
+    ['pitch', 'roll', 'yaw'].forEach((id) => { $(id).value = '0'; $(id + 'V').textContent = '0.00'; });
+  });
+
+  function setWsState(text, bad) {
+    $('wsState').textContent = text;
+    $('wsState').className = bad ? 'bad' : '';
+  }
+
+  function stopStream(reason) {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
+    $('bStream').textContent = '送信開始';
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
+  }
+
+  function sendPose() {
+    // 隠れたタブからは絶対に送らない（0 も送らない。サーバーの鮮度切れに任せる）。
+    if (document.hidden) { stopStream('hidden'); $('hiddenBanner').className = 'banner warn show'; return; }
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    state.seq += 1;
+    state.frameSeq += 1;
+    const msg = {
+      type: 'pose', protocol: 1, source_session: state.session,
+      seq: state.seq, frame_seq: state.frameSeq, source_age_ms: 0,
+      pitch: parseFloat($('pitch').value), roll: parseFloat($('roll').value), yaw: parseFloat($('yaw').value),
+      gain: parseFloat($('gain').value),
+    };
+    ws.send(JSON.stringify(msg));
+    $('seq').textContent = String(state.seq);
+  }
+
+  function startStream() {
+    if (!state.session) { log('姿勢送信: 先に session を発行してください', true); return; }
+    if (document.hidden) { log('姿勢送信: タブが非表示のため開始しません', true); return; }
+    $('hiddenBanner').className = 'banner warn';
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/v1/motion?session=' + encodeURIComponent(state.session));
+    state.ws = ws;
+    setWsState('connecting', false);
+    ws.onopen = () => {
+      setWsState('open', false);
+      if (state.timer) clearInterval(state.timer);
+      state.timer = setInterval(sendPose, 20);
+      $('bStream').textContent = '送信停止';
+    };
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'ack') {
+        const a = $('ack');
+        a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +
+          ' effective_gain=' + fmt(m.effective_gain) + ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし') + ' fresh=' + fmt(m.fresh);
+        a.className = m.accepted ? 'ok' : 'bad';
+      }
+    };
+    ws.onerror = () => { setWsState('error', true); };
+    ws.onclose = (ev) => {
+      if (state.ws === ws) { stopStream('close ' + ev.code); }
+    };
+  }
+
+  $('bStream').addEventListener('click', () => {
+    if (state.timer || state.ws) stopStream('operator'); else startStream();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && (state.timer || state.ws)) {
+      stopStream('hidden');
+      $('hiddenBanner').className = 'banner warn show';
+      log('タブが非表示: 姿勢送信を停止（サーバーは鮮度切れで減速停止する）', true);
+    }
+  });
+  window.addEventListener('pagehide', () => stopStream('pagehide'));
+})();
+</script>
+</body>
+</html>

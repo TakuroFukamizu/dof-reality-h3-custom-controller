@@ -676,3 +676,50 @@ async fn report_selected_axis_false_keeps_the_device_id_path() {
     assert!(has(&st.blockers, "unknown_device: device 5131000000000003 on port sim:1"), "{:?}", st.blockers);
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn local_estop_from_an_axis_is_decoded_latched_and_named_in_status() {
+    // protocol.md §3.2 code 12: the MCU's on-screen emergency stop. It is
+    // decoded from the wire, latches the rig like any other axis fault, and
+    // shows up by name in /v1/status (fault, axes[].fault_code, blockers).
+    let srv = start_sim(fast_cfg()).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    sim(&srv, 2).force_fault(FaultCode::LocalEstop);
+    let st = wait_state(&srv, RigState::FaultLatched, S).await;
+    assert_eq!(st.fault, Some(RigFault::AxisFault { axis: AxisId::new(2).unwrap(), code: FaultCode::LocalEstop }));
+    wait_status(&srv, S, "axis 2 STATUS with LOCAL_ESTOP", |s| s.axes[1].fault_code == Some(FaultCode::LocalEstop)).await;
+
+    let r = http(srv.local_addr, "GET", "/v1/status", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let body = r.json();
+    assert_eq!(body["fault"]["kind"], "axis_fault");
+    assert_eq!(body["fault"]["axis"], 2);
+    assert_eq!(body["fault"]["code"], "LOCAL_ESTOP");
+    assert_eq!(body["axes"][1]["fault_code"], "LOCAL_ESTOP");
+    let blockers: Vec<String> =
+        body["blockers"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect();
+    assert!(
+        blockers.iter().any(|b| b.starts_with("axis_fault: axis2") && b.contains("LocalEstop")),
+        "blockers name the local e-stop: {blockers:?}"
+    );
+
+    // The sim has no latched button, so the reset goes through once the
+    // HOST_FAULT round trip has settled (on the real MCU the button latch
+    // must be released first: FAULT_CAUSE_PRESENT).
+    wait_status(&srv, S, "HOST_FAULT on the other axes", |s| {
+        [0, 2].iter().all(|&i| s.axes[i].fault_code == Some(FaultCode::HostFault))
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + 2 * S;
+    loop {
+        let r = admin(srv.local_addr, "/v1/fault/reset").await;
+        if r.status == 200 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "fault reset never accepted: {r:?}");
+        assert_eq!(r.json()["error"], "axis_not_settled", "{r:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    srv.shutdown().await;
+}

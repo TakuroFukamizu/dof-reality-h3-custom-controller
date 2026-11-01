@@ -39,6 +39,17 @@
 //!   acked `axis_conflict` before it reaches [`PoseIntake`]: nothing is stored
 //!   and freshness is not extended. `/v1/arm`, `/v1/start`, `/v1/center` get
 //!   the supervisor's 409 `axis_conflict`; stop / disarm / fault are unaffected.
+//! - `GET /` and `GET /index.html` serve the embedded operator test page
+//!   ([`TEST_PAGE`], `static/test_page.html`, no external resources). It is
+//!   not in [`lan_allowed`]: the page carries the admin token, which never
+//!   travels over the LAN.
+//! - Origin check ([`check_origin`]): an `Origin` header must be in
+//!   `allowed_origins`, **or** be the page's own origin: exactly
+//!   `http://<Host header>` where the Host's hostname is `localhost` or a
+//!   loopback IP literal ([`same_origin_loopback`]). The loopback condition is
+//!   what keeps DNS rebinding out (`Host: evil.example:8892` with
+//!   `Origin: http://evil.example:8892` still gets 403); every other foreign
+//!   Origin is refused as before, and requests without Origin are unchanged.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -52,7 +63,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -71,6 +82,9 @@ use crate::types::{AxisId, Counts};
 pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Capacity of the admin command queue to the control loop.
 pub const ADMIN_QUEUE_LEN: usize = 16;
+
+/// Operator test page (DESIGN.md §7.4), embedded so the binary works offline.
+pub const TEST_PAGE: &str = include_str!("../static/test_page.html");
 
 pub type AdminReply = Result<AdminOk, AdminError>;
 /// One admin command and where to send its result.
@@ -186,6 +200,8 @@ pub fn router(state: AppState) -> Router {
         // Outermost: auth before the rate limit.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
+        .route("/", get(test_page))
+        .route("/index.html", get(test_page))
         .route("/v1/session", post(new_session))
         .route("/v1/motion", get(motion))
         .route("/v1/status", get(status))
@@ -230,11 +246,52 @@ async fn check_peer(State(st): State<AppState>, req: Request, next: Next) -> Res
     next.run(req).await
 }
 
+/// `Origin` is the test page's own origin on a loopback host: exactly
+/// `http://<host>` where `host` is the request's Host (with port) and its
+/// hostname is `localhost` or a loopback IP literal (`127.0.0.1`, `[::1]`,
+/// `127.x.y.z`). Compared case-insensitively (hostnames are), no trailing
+/// slash (browsers never send one). A Host naming any other hostname never
+/// matches, so a rebinding DNS name pointing at 127.0.0.1 gains nothing.
+pub fn same_origin_loopback(origin: &str, host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let hostname = if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]:8892` → `::1`
+        match rest.split_once(']') {
+            Some((v6, _)) => v6,
+            None => return false,
+        }
+    } else {
+        let h = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        if h.contains(':') {
+            return false; // unbracketed IPv6 is not a valid Host
+        }
+        h
+    };
+    let loopback = hostname.eq_ignore_ascii_case("localhost")
+        || hostname.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+    if !loopback {
+        return false;
+    }
+    let Some(rest) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("HTTP://")) else {
+        return false;
+    };
+    rest.eq_ignore_ascii_case(host)
+}
+
+fn request_host(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
+}
+
 async fn check_origin(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if let Some(origin) = req.headers().get(header::ORIGIN) {
-        let allowed = origin
-            .to_str()
-            .is_ok_and(|o| st.inner.cfg.server.allowed_origins.iter().any(|a| a == o));
+        let allowed = origin.to_str().is_ok_and(|o| {
+            st.inner.cfg.server.allowed_origins.iter().any(|a| a == o) || same_origin_loopback(o, request_host(&req))
+        });
         if !allowed {
             return error(StatusCode::FORBIDDEN, "forbidden_origin");
         }
@@ -312,6 +369,12 @@ impl TokenBucket {
             false
         }
     }
+}
+
+// ------------------------------------------------------------------ test page
+
+async fn test_page() -> Response {
+    ([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], Html(TEST_PAGE)).into_response()
 }
 
 // ------------------------------------------------------------------ admin
