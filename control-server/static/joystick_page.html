@@ -188,7 +188,8 @@
 
 <section>
   <h2>送信 <span class="dim small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
-  <label class="sl">gain <input type="range" id="gain" min="0" max="0.5" step="0.01" value="0.10"><span id="gainV">0.10</span></label>
+  <!-- 既定 1.0 = スティック全開でソフトリミット内の端まで。安全側の上限はサーバーの max_gain（setMaxGain でスライダーの最大に反映） -->
+  <label class="sl">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
   <div class="row">
     <button id="bStream">送信開始</button>
     <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
