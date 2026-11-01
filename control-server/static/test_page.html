@@ -9,7 +9,9 @@
   サーバーが GET / で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
   - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。
   - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
-  - 姿勢送信は document.hidden で止まる。隠れたタブからは送らない。
+  - タブが隠れても姿勢送信は止めない（運用上は別のウィンドウを前に出すことが普通）。隠れたタブでは
+    ブラウザがタイマーを 1 Hz 程度に間引くので frame_seq の進みが遅くなり、サーバー側の鮮度切れ
+    （source_freshness_ms）で減速停止する。安全はサーバーの鮮度判定に任せる。
     隠れても 0（中央）を送らない: サーバーの source_freshness_ms が止める。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
 -->
@@ -47,7 +49,6 @@
 </head>
 <body>
 <h1>h3-control-server 試験ページ <span class="dim small" id="hostLabel"></span></h1>
-<div id="hiddenBanner" class="banner warn">タブが非表示になったため姿勢送信を停止しました。再開はボタンで。</div>
 <div id="pollBanner" class="banner bad"></div>
 
 <section>
@@ -372,8 +373,6 @@
   }
 
   function sendPose() {
-    // 隠れたタブからは絶対に送らない（0 も送らない。サーバーの鮮度切れに任せる）。
-    if (document.hidden) { stopStream('hidden'); $('hiddenBanner').className = 'banner warn show'; return; }
     const ws = state.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     state.seq += 1;
@@ -390,8 +389,6 @@
 
   function startStream() {
     if (!state.session) { log('姿勢送信: 先に session を発行してください', true); return; }
-    if (document.hidden) { log('姿勢送信: タブが非表示のため開始しません', true); return; }
-    $('hiddenBanner').className = 'banner warn';
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const ws = new WebSocket(proto + location.host + '/v1/motion?session=' + encodeURIComponent(state.session));
     state.ws = ws;
@@ -422,13 +419,6 @@
     if (state.timer || state.ws) stopStream('operator'); else startStream();
   });
 
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && (state.timer || state.ws)) {
-      stopStream('hidden');
-      $('hiddenBanner').className = 'banner warn show';
-      log('タブが非表示: 姿勢送信を停止（サーバーは鮮度切れで減速停止する）', true);
-    }
-  });
   window.addEventListener('pagehide', () => stopStream('pagehide'));
 })();
 </script>

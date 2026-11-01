@@ -596,10 +596,13 @@ impl Link {
                     received_at,
                 }
             }
-            Ok(McuMsg::Ack(ack)) => LinkEvent::Ack {
-                axis: claimed.axis,
-                ack,
-            },
+            Ok(McuMsg::Ack(ack)) => {
+                tracing::debug!(port = %self.port, request_id = ack.request_id, acked_type = ack.acked_type, result = ?ack.result, reason = ?ack.reason, "ack");
+                LinkEvent::Ack {
+                    axis: claimed.axis,
+                    ack,
+                }
+            }
             Ok(McuMsg::FaultEvent(ev)) => LinkEvent::FaultEvent {
                 axis: claimed.axis,
                 ev,
@@ -641,8 +644,9 @@ impl Link {
                 return Ok(());
             }
             Ok(McuMsg::ClockSyncReply(_)) => return Ok(()),
-            Err(_) => {
+            Err(e) => {
                 self.decode.total += 1;
+                tracing::debug!(port = %self.port, len = f.len(), "decode error: {e:?}");
                 return Ok(());
             }
         };

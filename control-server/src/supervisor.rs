@@ -310,6 +310,9 @@ pub struct AxisSnapshot {
     pub status_age_ms: Option<f64>,
     pub rx_error_count: Option<u16>,
     pub stale_drop_count: Option<u16>,
+    /// PC-side frames from this axis that failed to decode (COBS / CRC /
+    /// length), cumulative since server start.
+    pub decode_errors: u64,
 }
 
 /// GET /v1/status body (DESIGN.md §7.2). `session` and `telemetry` are filled
@@ -1080,6 +1083,7 @@ impl Supervisor {
                         .map(|d| d.as_secs_f64() * 1000.0),
                     rx_error_count: s.map(|s| s.rx_error_count),
                     stale_drop_count: s.map(|s| s.stale_drop_count),
+                    decode_errors: t.decode_errors,
                 }
             })
             .collect();

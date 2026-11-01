@@ -496,7 +496,7 @@ const AXIS_KEYS: &[&str] = &[
     "reference_stale", "boot_id", "mcu_state", "fault_code", "configured",
     "referenced", "calibration_valid", "actual_count", "target_count", "velocity_count_s",
     "following_error_count", "pwm_permille", "power_on_cmd", "brake_release_cmd", "power_controller", "current_a",
-    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count",
+    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count", "decode_errors",
 ];
 const SESSION_KEYS: &[&str] = &["source_session_prefix", "fresh", "freshness_mode", "source_age_ms", "last_seq", "last_frame_seq"];
 const TELEMETRY_KEYS: &[&str] =

@@ -1233,7 +1233,8 @@ void setup() {
 
 void loop() {
   M5.update();
-  pollTouchV1();  // USB はリンクタスク（v1_link.cpp）が扱う。loop() は画面とタッチだけ
+  v1_link_poll();  // USB の受信 → 受信キュー、送信キュー → USB（描画の前後で呼び、描画中の取りこぼしを減らす）
+  pollTouchV1();
 
   if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {
     notice[0] = '\0';
@@ -1259,6 +1260,7 @@ void loop() {
     next_render_ms = millis() + 100;
     renderV1();
     ui_dirty = false;
+    v1_link_poll();
   }
 }
 

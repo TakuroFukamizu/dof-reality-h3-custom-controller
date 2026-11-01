@@ -53,8 +53,12 @@ bool v1_link_begin() {
   g_boot_id = esp_random();
   if (g_boot_id == 0) g_boot_id = 1;
   if (g_rx == nullptr || g_tx == nullptr) return false;
-  // Core 0（USB の割り込みと同じ側）、制御タスク（Core 1、優先度 5）より低く loop()（優先度 1）より高い。
-  return xTaskCreatePinnedToCore(link_task, "v1link", 4096, nullptr, 3, nullptr, 0) == pdPASS;
+  // 専用タスクは使わない（loop() から v1_link_poll() を呼ぶ）。2026-11-01 の実機: Core 0 のタスクから書くと
+  // 状態変化で ACK と STATUS を続けて送る瞬間に PC 側で CRC 不一致、Core 1 のタスクにすると HOLDING に入って
+  // 約 3 s で 2 台同時に USB が無応答（HELLO にも答えない）になった。原因未特定のため、動作実績のある
+  // loop() 方式に戻し、受信の遅れは描画の間引き（100 ms に 1 回）とサーバー側の期限（valid_for 100 ms）で吸収する。
+  (void)link_task;
+  return true;
 }
 
 void v1_link_poll() {
