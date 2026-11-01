@@ -2864,3 +2864,26 @@ fn firmware_without_limits_capability_blocks_arm_and_gets_no_set_limits() {
     let HostMsg::Config(c) = out.admin_msgs[0][0] else { panic!() };
     assert_eq!((c.max_vel_count_s, c.max_acc_count_s2), (6000, 40000));
 }
+
+#[test]
+fn limits_are_resent_after_an_mcu_reboot() {
+    let mut r = Rig::new(sim_cfg());
+    r.ready();
+    assert_eq!(r.mcus[1].tuning().duty_max_percent, 40);
+    let mark = r.sent.len();
+    // The unit reboots with the link up: firmware defaults are back (20 % / 7 %).
+    r.mcus[1].reboot(0xbeef_0002);
+    assert_eq!((r.mcus[1].tuning().duty_max_percent, r.mcus[1].tuning().duty_min_percent), (20, 7));
+    // The next STATUS (new boot_id) clears the stale LIMITS and SET_LIMITS goes
+    // out again; the sim answers within the same step, so only the end state
+    // is observable: never the old boot's LIMITS.
+    assert!(r.run_until(1500, |r| r.count(mark, msg_type::SET_LIMITS)[1] >= 1));
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.axes[1].fw_limits.is_none_or(|l| l.boot_id == 0xbeef_0002), "{:?}", snap.axes[1].fw_limits);
+    r.run_ms(50);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 1, 0]);
+    assert_eq!((r.mcus[1].tuning().duty_max_percent, r.mcus[1].tuning().duty_min_percent), (40, 3));
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[1].fw_limits.map(|l| l.boot_id), Some(0xbeef_0002));
+    assert!(!has(&r.blockers(), "limits_rejected"), "{:?}", r.blockers());
+}

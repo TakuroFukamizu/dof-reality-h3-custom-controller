@@ -209,7 +209,7 @@ P 端                                                          N 端
 - `mechanical_min/max` = 従来 env の HOME / UPPER で当てた端（10 % Duty で止まる位置。到達位置は 0〜16 / 6155〜6171 の幅でばらつく。過去の記録）。目標には使わない。
 - `soft_min/max` = 機械端から `decel_zone_count`（300）だけ内側。サーバーは `soft_min − mechanical_min ≥ decel_zone_count`（かつ `soft_min > mechanical_min`）、`mechanical_max − soft_max ≥ decel_zone_count`（かつ `soft_max < mechanical_max`）を `check-config` で検査し（bringup.toml はちょうど等号で通る）、PC も MCU も目標をここでクリップし、実位置がここを外れると `SOFT_LIMIT`。
 - `count_at_virtual_512` = stroke / 2（従来 env の `neutral` と同じ値）。仮想位置 512（Pose 0）がここ。
-- `count_at_virtual_0` / `count_at_virtual_1023` = `soft_min` / `soft_max`。仮想 0〜1023 を運用範囲いっぱいに割り当てる。実際に動く量はゲームの gain で決まる: `g = gain × 511`、`m1 = 512 + g (roll + pitch)`、`m2 = 512 + g (roll − pitch)`、`m3 = 512 + g × yaw`（architecture.md §2.2）。gain 0.15 では仮想 512 ± 77（入力 1 つのとき）→ 軸 1 で約 ±370 count（モーター約 0.9 回転、座席の角で 10 mm 前後。過去の記録 0.03 mm/count から推定）。gain の上限は `[limits].max_gain`（既定 0.5）で、向きの確認中は 0.15 に下げておく（[limits.md](limits.md) §4）。
+- `count_at_virtual_0` / `count_at_virtual_1023` = `soft_min` / `soft_max`。仮想 0〜1023 を運用範囲いっぱいに割り当てる。実際に動く量はゲームの gain で決まる: `g = gain × 511`、`m1 = 512 + g (roll + pitch)`、`m2 = 512 + g (roll − pitch)`、`m3 = 512 + g × yaw`（architecture.md §2.2）。gain 0.15 では仮想 512 ± 77（入力 1 つのとき）→ 軸 1 で約 ±370 count（モーター約 0.9 回転、座席の角で 10 mm 前後。過去の記録 0.03 mm/count から推定）。gain の上限は `[limits].max_gain`（bringup.toml は 0.15、example / sim は 0.5。[limits.md](limits.md) §4）。
 - **向き**: 仮想 0 → 1023 で座席が上がるか下がるか（ヨーは右か左か）は新しい機構で **未確認**（architecture.md §6）。bringup.toml は全軸「count 増 = 仮想位置 増」。過去の記録では #1 / #2 の N 端 = 上（P 端 = 沈み切り）、#3 の P 端 = 右端なので、この仮定のもとでは `pitch +` で #1 が上がり #2 が下がる、`roll +` で両方上がる、`yaw +` で #3 が左へ動く。ゲームの意図と逆な軸は、**その軸の `count_at_virtual_0` と `count_at_virtual_1023` の値を入れ替える**（`count_at_virtual_512` はそのまま。単調減少は許される。3 点がソフトリミット内で単調なら `check-config` が通る）。入れ替えたらサーバー再起動 → §5.1 からやり直し。
 - ストロークが記録と違った（§1.2 の `<S>` が ±30 を超える）: `mechanical_max_count = <S>`、`soft_max_count = <S> − 300`、`count_at_virtual_1023 = <S> − 300`、`count_at_virtual_512 = <S>/2` に書き直し、`check-config`。
 
@@ -221,7 +221,7 @@ P 端                                                          N 端
 
 §5.1 が 3 軸とも通り、各軸の `actual_count` が `count_at_virtual_512` ± 30、§1.2 の stroke が bringup.toml と一致、座席に人がおらず、物理非常停止を押せる人がいる。この 4 点を確認したら bringup.toml の 3 軸を `calibration_valid = true` にしてサーバーを再起動し、§5.1 をやり直す（再起動で CoreS3 がリセットされた場合に備える。`referenced` が `true` のままなら不要）。status: `rig_state = READY_TO_ARM`、`blockers = []`。
 
-`true` は「この軸でこの値を測った」という操作者の宣言で、有人運転の可否ではない。向きの確認（§7）が終わるまで `[limits].max_gain` は 0.15 に下げておく（limits.md §4 の手順 2）。
+`true` は「この軸でこの値を測った」という操作者の宣言で、有人運転の可否ではない。向きの確認（§7）が終わるまで `[limits].max_gain` は bringup.toml の 0.15 のまま（limits.md §4 の手順 2）。
 
 ## 6. 無負荷・モーター電源 OFF で ARM / START の流れ
 
@@ -306,7 +306,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 
 ## 7. 1 軸ずつ電源 ON で低ゲイン
 
-**24V を入れる前に**: 座席に人がいない、機構の可動範囲に物も人もない、物理非常停止に手が届く、§6 が通っている、`[limits]` を低い値（`max_gain 0.15`、`max_vel 600`、`max_acc 2000`、`duty_max 20`、`duty_min 7`。limits.md §4）にしてある、印の位置が §5.1 の基準と合っている。
+**24V を入れる前に**: 座席に人がいない、機構の可動範囲に物も人もない、物理非常停止に手が届く、§6 が通っている、`bringup.toml` の `[limits]` が低い値のまま（`max_gain 0.15`、`max_vel 600`、`max_acc 2000`、`duty_max 20`、`duty_min 7`。出荷時のまま。limits.md §4）、印の位置が §5.1 の基準と合っている。
 
 制約: 主電源は軸 1 の G2 が共通に入れるので、**24V を入れると 3 軸とも通電する**（safety.md「主電源リレーのインターロック」）。また、サーバーは 3 軸そろわないと ARM せず、24V の無い軸は目標が動く（中立まで数十 count 以上離れている）と `ENCODER_FAULT` になる（§6.3）ので、「2 軸を電気的に切り離して 1 軸だけ動かす」は ARM / HOLDING の確認にしか使えない。動かす確認は **3 軸とも通電したまま、Pose の選び方で 1 軸ずつ動かす**:
 

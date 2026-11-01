@@ -1515,6 +1515,9 @@ impl Supervisor {
             t.cal_pending = false;
             t.cal_ack_ev = None;
             t.calibrate_rejected = None;
+            // A new boot runs the firmware's default tuning until SET_LIMITS
+            // is ACKed again; a new link may be another unit.
+            t.clear_limits();
         }
         if rebooted || !same_unit {
             // The result belongs to the unit and its boot (protocol §1.2).
@@ -1567,6 +1570,8 @@ impl Supervisor {
             t.cal_pending = false;
             t.cal_ack_ev = None;
             t.calibrate_rejected = None;
+            // Firmware defaults again: SET_LIMITS must be re-sent (reconcile_limits).
+            t.clear_limits();
             if let Some(h) = t.hello {
                 self.stale_refs.retain(|(d, _)| *d != h.device_id);
             }

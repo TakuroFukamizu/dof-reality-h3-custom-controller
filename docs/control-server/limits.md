@@ -28,13 +28,13 @@
 
 ## 2. `[limits]` の項目と根拠
 
-`control-server/config/*.toml` の `[limits]`（`schema_version = 2`）。3 軸共通。
+`control-server/config/*.toml` の `[limits]`（`schema_version = 2`）。3 軸共通。下の初期値は `example.toml` / `sim.toml` のもの（上げ切った先の目標）。`bringup.toml` は §4 の低い値で置いてある。
 
 ### 2.1 実行時に変えられる 4 つ
 
 | 項目 | 初期値 | 上限 | 根拠 / 注意 |
 | --- | ---: | --- | --- |
-| `max_gain` | 0.5 | 1.0 | 混合式 `m = 512 + gain·511·(roll ± pitch)` で、pitch と roll を同時に振り切っても 0.5 以下なら仮想 0〜1023 で飽和しない。旧 h3game の既定 0.35 は検証値ではなかった。bring-up 期の 0.15 は向きの確認用 |
+| `max_gain` | 0.5 | 1.0 | 混合式 `m = 512 + gain·511·(roll ± pitch)` で、pitch と roll を同時に振り切っても 0.5 以下なら仮想 0〜1023 で飽和しない。旧 h3game の既定 0.35 は検証値ではなかった。`bringup.toml` は向きの確認用に 0.15 |
 | `max_vel_count_s` | 3000 | min(絶対上限 6000, `overspeed_count_s` / 1.5) | 7.5 回転/s。ストローク 5500 count を加減速込みで約 2.3 s。実測の Duty 1 % ≈ 100〜130 count/s（2026-10-31）から、フィードフォワードだけで約 30 % |
 | `max_acc_count_s2` | 15000 | 絶対上限 40000 | 0 → 3000 count/s に 0.2 s。旧値 2000 では 1.5 s かかり、30 Hz の目標変化に追いつけなかった |
 | `duty_max_percent` | 40 | 絶対上限 60 | 外挿で約 4000〜5000 count/s。max_vel 3000 に対して FF + P の余裕を残す。旧ファームは 20 % 直書き |
@@ -105,9 +105,9 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 どの値も実機未検証。以下の順で、1 軸ずつ、低い値から。前提は hardware-bringup.md §7 と同じ（座席に人がいない、可動範囲に物も人もない、物理非常停止に手が届く）。
 
 1. **ファームを焼き直す。** SET_LIMITS に対応しないファームは `firmware_limits_unsupported` で ARM できない。3 台とも `env:m5stack-cores3-v1`。
-2. **初期値を低く始める。** `bringup.toml` の `[limits]` を一時的に `max_gain 0.15、max_vel 600、max_acc 2000、duty_max 20、duty_min 7` にすれば旧 PR と同じ動きになる（ファームの絶対上限は効かない範囲）。ここで §7 の向きの確認と同じ Pose を流し、`following_error_count`・`velocity_count_s`・`pwm_permille` を控える。
+2. **低い値から始める。** `bringup.toml` の `[limits]` は低い値で置いてある（`max_gain 0.15、max_vel 600、max_acc 2000、duty_max 20、duty_min 7、following_error 400、overspeed 2000` ＝ 旧 PR と同じ動き。`example.toml` / `sim.toml` の値が上げ切った先の目標）。ここで §7 の向きの確認と同じ Pose を流し、`following_error_count`・`velocity_count_s`・`pwm_permille` を控える。
 3. **滑らかさ: `duty_min_percent` を 7 → 5 → 3。** 低速（gain 0.15、ゆっくりした pitch）で段付きが減るか、逆に停止付近でふらつかないか。ふらつくなら 5 に戻す。
-4. **速度・加速度: 試験ページか `POST /v1/limits` で `max_vel` を 600 → 1200 → 2000 → 3000、`max_acc` を 2000 → 5000 → 10000 → 15000。** 各段で `following_error_count` の最大（800 に近づいたら止める）と `pwm_permille` の最大（Duty 上限 40 % に張り付いたら速度が出ていない）を見る。FOLLOWING_ERROR が出るなら `max_vel` を下げるのが先、恒常的なら `ff_count_s_per_percent` を 100 → 80（同じ速度に多めの Duty）。
+4. **速度・加速度: 試験ページか `POST /v1/limits` で `max_vel` を 600 → 1200 → 2000 → 3000、`max_acc` を 2000 → 5000 → 10000 → 15000。** 実行時の `max_vel` の上限は `overspeed_count_s / 1.5` でも頭打ちになる（bringup.toml の 2000 なら 1333）ので、1200 を超える前に `overspeed_count_s` を上げて再起動する（3000 なら 4500 以上。保護なので実行時には変えない）。 各段で `following_error_count` の最大（800 に近づいたら止める）と `pwm_permille` の最大（Duty 上限 40 % に張り付いたら速度が出ていない）を見る。FOLLOWING_ERROR が出るなら `max_vel` を下げるのが先、恒常的なら `ff_count_s_per_percent` を 100 → 80（同じ速度に多めの Duty）。
 5. **Duty 上限: `duty_max_percent` を 20 → 30 → 40。** 速度側で頭打ちになっているときだけ上げる。モーター・MD13S の発熱、リレーの音、ブレーキ引継ぎの沈みを見る。
 6. 決めた値を `[limits]` に書いてサーバーを再起動し、§9 の記録に残す。
 
