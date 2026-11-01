@@ -55,6 +55,26 @@ uint16_t usbDiagColor(const UsbDiag& d) {
   return kGreen;
 }
 
+UsbDiag usb_diag{};
+char usb_diag_text[96] = "usb -";
+uint32_t next_usb_diag_ms = 0;
+
+// 500 ms ごとに USB-Serial/JTAG の状態を読み、行を作り直す（両 env 共通）。行が変わったら true（呼び出し側が描き直す）。
+// bus_reset_seen は、このサンプルで bus reset の回数が増えたとき true。
+bool usbDiagTick(bool* bus_reset_seen) {
+  *bus_reset_seen = false;
+  if (static_cast<int32_t>(millis() - next_usb_diag_ms) < 0) return false;
+  next_usb_diag_ms = millis() + 500;
+  const uint32_t resets_before = usb_diag.bus_resets;
+  usb_diag_sample(&usb_diag);
+  *bus_reset_seen = usb_diag.bus_resets != resets_before;
+  char text[sizeof(usb_diag_text)];
+  usb_diag_format(usb_diag, text, sizeof(text));
+  if (strcmp(text, usb_diag_text) == 0) return false;
+  snprintf(usb_diag_text, sizeof(usb_diag_text), "%s", text);
+  return true;
+}
+
 // ピンを安全側に固定してから M5 を初期化する。設定は従来 env と v1 env で同一。
 void boardBegin() {
   driveOutput(static_cast<gpio_num_t>(PIN_POWER_RELAY), relayOffLevel());
@@ -134,7 +154,6 @@ bool was_live = false;
 bool ui_dirty = true;
 ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
-uint32_t next_usb_diag_ms = 0;
 uint32_t next_enc_ms = 0;
 uint32_t last_request_seq = 0;
 uint32_t last_manual_fault_seq = 0;
@@ -161,12 +180,9 @@ void txLine(const char* line) {
   usb_diag_note_tx(len, written);
 }
 
-UsbDiag usb_diag{};
-char usb_diag_text[96] = "usb -";
-
+// USBDIAG: 画面に出ている行をそのまま返す。ここで usb_diag_sample() を呼ぶと、直後の定期サンプルと 1 ms 以内に
+// 2 回読むことになり、SOF フレーム番号が進んでいない（sof0 = 赤）と誤判定する。
 void publishUsbDiag() {
-  usb_diag_sample(&usb_diag);
-  usb_diag_format(usb_diag, usb_diag_text, sizeof(usb_diag_text));
   char line[sizeof(usb_diag_text) + 2];
   snprintf(line, sizeof(line), "%s\n", usb_diag_text);
   txLine(line);
@@ -970,18 +986,15 @@ void loop() {
     }
     reportAuto(snap);
   }
-  if (static_cast<int32_t>(millis() - next_usb_diag_ms) >= 0) {
-    // Issue #11: 500 ms ごとに USB-Serial/JTAG の状態を読む。行が変わったときだけ描き直す。bus reset はログにも残す。
-    next_usb_diag_ms = millis() + 500;
-    const uint32_t resets_before = usb_diag.bus_resets;
-    usb_diag_sample(&usb_diag);
-    char text[sizeof(usb_diag_text)];
-    usb_diag_format(usb_diag, text, sizeof(text));
-    if (strcmp(text, usb_diag_text) != 0) {
-      snprintf(usb_diag_text, sizeof(usb_diag_text), "%s", text);
+  {
+    // Issue #11: USB-Serial/JTAG の状態（500 ms ごと）。bus reset はシリアルにも出すが、直後は HWCDC が
+    // connected=false なので TX リングの置き換え経路に入り、ホストが戻る前に ENC/STAT 行に押し出されて届かないことが
+    // ある（tx! にも出ない）。確実なのは画面の br。
+    bool bus_reset_seen = false;
+    if (usbDiagTick(&bus_reset_seen)) {
       ui_dirty = true;
     }
-    if (usb_diag.bus_resets != resets_before) {
+    if (bus_reset_seen) {
       char line[80];
       snprintf(line, sizeof(line), "WARN usb_bus_reset n=%lu\n", static_cast<unsigned long>(usb_diag.bus_resets));
       txLine(line);
@@ -1008,7 +1021,6 @@ V1Snapshot vsnap;
 uint8_t saved_motor = 1;          // NVS に保存済みの系統。スナップショットの selected_axis が変わったら保存する
 bool ui_dirty = true;
 uint32_t next_snap_ms = 0;
-uint32_t next_usb_diag_ms = 0;
 uint32_t next_render_ms = 0;
 uint32_t last_press_ms = 0;
 char notice[32];
@@ -1136,9 +1148,6 @@ void pollTouchV1() {
   last_press_ms = now;
   if (const V1Button* b = hitV1(touch.x, touch.y)) onV1Button(*b);
 }
-
-UsbDiag usb_diag{};
-char usb_diag_text[96] = "usb -";
 
 void renderV1() {
   if (!sprite_ok) return;
@@ -1375,14 +1384,10 @@ void loop() {
       ui_dirty = true;
     }
   }
-  if (static_cast<int32_t>(millis() - next_usb_diag_ms) >= 0) {
-    // Issue #11: 500 ms ごとに USB-Serial/JTAG の状態を読む。行が変わったときだけ描き直す（USB には何も出さない）。
-    next_usb_diag_ms = millis() + 500;
-    usb_diag_sample(&usb_diag);
-    char text[sizeof(usb_diag_text)];
-    usb_diag_format(usb_diag, text, sizeof(text));
-    if (strcmp(text, usb_diag_text) != 0) {
-      snprintf(usb_diag_text, sizeof(usb_diag_text), "%s", text);
+  {
+    // Issue #11: USB-Serial/JTAG の状態（500 ms ごと）。v1 の USB はバイナリ専用なので bus reset はログに出さない。
+    bool bus_reset_seen = false;
+    if (usbDiagTick(&bus_reset_seen)) {
       ui_dirty = true;
     }
   }

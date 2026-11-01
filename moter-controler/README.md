@@ -44,12 +44,12 @@ G13 は CoreS3 SE 内部で I2S_DOUT（スピーカーアンプ AW88298）と共
 上から: 系統 `#n`（タップで切替。電源 OFF 時のみ）と状態 / 電源・ブレーキ（解除/作動） / センサー行（原点基準のカウント、count/s、A/B、原点・校正の有無） / 速度 −10 −1 [n] +1 +10 / 自動移動（下限へ・上限へ・中立へ・校正。#3 は右端へ・左端へ） / 停止・非常停止 / フッター（USB 診断行、DIR、ピンのレベル、行程・中立・符号）。
 
 USB 診断行（v1 env では tick 行の下。GitHub Issue #11「列挙されたまま CDC が無応答」の切り分け用。ボードをリセットせずに読む）:
-`sof1 in1 pl1 r002 e20c oa0 if1 br0 er0 tx!0 rx1234 2s`。`sof` = 500 ms の間に SOF フレーム番号が進んだ（バスが生きている）、
-`in` = その間に IN endpoint 1 への IN token が来た（ホストがこのアドレスを読みに来ている）、`pl` = HWCDC::isPlugged()、
-`r`/`e` = USB_SERIAL_JTAG の int_raw / int_ena（hex。bit2 = OUT 受信、bit3 = IN empty、bit9 = bus reset）、
+`sof1 in1 r000 e20c oa0 if1 br0 er0 tx!0 2s rx1234`。`sof` = 500 ms の間に SOF フレーム番号が進んだ（バスが生きている）、
+`in` = その間に IN endpoint 1 への IN token が来た（ホストがこのアドレスを読みに来ている）、
+`r`/`e` = USB_SERIAL_JTAG の int_raw / int_ena（hex。bit2 = OUT 受信、bit3 = IN empty、bit9 = bus reset。`r` は毎 ms 立って消える SOF bit を除く）、
 `oa` = OUT FIFO にデータが残っている（ISR が取っていない）、`if` = TX FIFO に空き、`br` = bus reset 回数、
-`er` = PID/CRC/stuff エラーの検出回数、`tx!` = Serial.write が途中で諦めた回数（HWCDC は接続判定 false のとき捨てても「全部書けた」と返すので、その破棄は数えられない。TX 側は `if` と「`rx` は増えるのにホストに届かない」で見る）、`rx` = 受信バイト数と最終受信からの秒。
-`br` は HWCDC の esp_event 経由で数える（イベントタスクが 1 本増え、RX/TX のたびに ISR から post する）。計器自体が条件を変えていないか比べるため `-DMC_USB_DIAG_BUSRESET=0` で外せる。
+`er` = PID/CRC/stuff エラーの検出回数、`tx!` = Serial.write が途中で諦めた回数（HWCDC は接続判定 false のとき捨てても「全部書けた」と返すので、その破棄は数えられない。TX 側は `if` と「`rx` は増えるのにホストに届かない」で見る）、`2s` = 最終受信からの時間（10 s 以降は `10s+` `30s+` `1m+` `5m+` の段階表示）、`rx` = 受信バイト数（100000 以上は k）。
+`br` は HWCDC の esp_event 経由で数える（イベントタスクが 1 本増え、RX/TX のたびに ISR から post する。制御タスクと同じ優先度 5 でコア固定なし。影響は v1 画面の tick gap で見える）。計器自体が条件を変えていないか比べるため `-DMC_USB_DIAG_BUSRESET=0` で外せる。イベントループの生成失敗は検出できないので、`br` が 0 のままなのは「数え始められなかった」の可能性もある。従来 env は bus reset を `WARN usb_bus_reset` でシリアルにも出すが、直後は HWCDC が未接続扱いで TX リングの置き換え経路に入り、ホストが戻る前に押し出されて届かないことがある（確実なのは画面の `br`）。
 最初の書き込みでは、ポーラを動かして緑（`sof1 in1`）、Mac 側でポートを閉じて橙（`in0`）になることを確認してから判定表を信じる（IN token ビットが NAK 応答の IN token でも立つことは未検証）。
 色: 緑 = sof と in が両方ある、橙 = SOF はあるが IN token が来ない（ポート未オープンか、ホストとデバイスのアドレス不一致）または OUT FIFO に残り、赤 = SOF が止まっている（バス停止 / suspend / PHY）。
 
