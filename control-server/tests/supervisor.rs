@@ -2513,7 +2513,7 @@ fn calibrate_rejected_by_the_power_axis_cancels_the_others_without_fault() {
         .sent_since(sent)
         .iter()
         .find_map(|(i, _, m)| match m {
-            HostMsg::Calibrate { request_id, mode: 1 } if *i == 0 => Some(*request_id),
+            HostMsg::Calibrate { request_id, mode: 1, .. } if *i == 0 => Some(*request_id),
             _ => None,
         })
         .expect("CALIBRATE to axis 1");
@@ -2675,4 +2675,278 @@ fn unanswered_calibrate_is_forgotten_after_ack_timeout_and_the_power_axis_cancel
     let (events, _) = r.sup.drain_events();
     assert!(events.iter().any(|e| e.kind == "ack_timeout"));
     assert!(events.iter().any(|e| e.kind == "calibrate_cancelled"));
+}
+
+// ---------- power hold (KEEP_POWER, DESIGN.md §11) ----------
+
+/// `cal_rig` whose axes 2 / 3 calibrate slowly (plant 200 count/s: ~10 s) so
+/// the power axis (axis 1, ~0.5 s) is done long before them.
+fn slow_others_rig() -> Rig {
+    Rig::with(sim_cfg(), |i, p| {
+        p.start_referenced = false;
+        p.end_min_count = -500;
+        p.end_max_count = 500;
+        if i != 0 {
+            p.plant_max_vel_count_s = 200.0;
+        }
+    })
+}
+
+fn power_holding(r: &Rig) -> bool {
+    r.mcus[0].is_power_holding()
+}
+
+/// CALIBRATE messages sent since `from`: (sim index, mode, flags).
+fn calibrate_msgs(r: &Rig, from: usize) -> Vec<(usize, u8, u8)> {
+    r.sent_since(from)
+        .iter()
+        .filter_map(|(i, _, m)| match m {
+            HostMsg::Calibrate { mode, flags, .. } => Some((*i, *mode, *flags)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn keep_power_goes_to_the_power_axis_and_the_release_follows_the_last_other_result() {
+    use h3cs::protocol::CalResultCode::Ok;
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.step();
+    assert_eq!(calibrate_msgs(&r, sent), vec![(0, 1, 1), (1, 1, 0), (2, 1, 0)], "KEEP_POWER only to the power axis");
+    assert!(r.run_until(300, all_calibrating));
+    // The power axis finishes first and holds the power.
+    assert!(r.run_until(3000, power_holding), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    let a1 = &snap.axes[0];
+    assert_eq!(a1.mcu_state, Some(McuState::Calibrating));
+    assert_eq!(a1.power_on_cmd, Some(true));
+    let c1 = a1.calibration.clone().expect("the result arrived at the end of the run");
+    assert_eq!((c1.result, c1.step, c1.n_end_count, c1.neutral_count), (Ok, 3, 1000, 500));
+    assert!(a1.referenced);
+    assert!(snap.axes[1].calibration.is_none() && snap.axes[2].calibration.is_none());
+    assert!(has(&r.blockers(), "calibrating: axis1"), "{:?}", r.blockers());
+    assert_eq!(r.sup.state(), RigState::CalibrationRequired);
+    assert_eq!(r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap_err().error, admin_error::CALIBRATING);
+    assert_eq!(r.admin(AdminCmd::Arm).unwrap_err().error, admin_error::CALIBRATING);
+    // No release while the others are still at it.
+    r.run_ms(2000);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1], "no CALIBRATE(0) yet");
+    assert!(r.mcus[0].is_power_holding());
+    assert_eq!(r.count(sent, msg_type::CONFIG), [0; 3], "no CONFIG to a POWER_HOLD axis");
+    assert_eq!(r.sup.snapshot(r.now).axes[0].calibration, Some(c1.clone()), "the result is kept, not replaced");
+    // The others finish → CALIBRATE(0) to the power axis → everything DISARMED.
+    assert!(r.run_until(15000, all_disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    let to_power: Vec<_> = calibrate_msgs(&r, sent).into_iter().filter(|m| m.0 == 0).collect();
+    assert_eq!(to_power, vec![(0, 1, 1), (0, 0, 0)]);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [2, 1, 1]);
+    let snap = r.sup.snapshot(r.now);
+    for a in &snap.axes {
+        assert_eq!(a.calibration.as_ref().unwrap().result, Ok);
+        assert!(a.referenced);
+        assert_eq!(a.power_on_cmd, Some(false));
+    }
+    assert_eq!(snap.axes[0].calibration, Some(c1));
+    assert!(r.sup.fault().is_none());
+    r.wait_state(RigState::ReadyToArm, 500);
+    let (events, _) = r.sup.drain_events();
+    let cal = events.iter().find(|e| e.kind == "calibrate").unwrap();
+    assert_eq!(cal.detail["keep_power"], true, "{}", cal.detail);
+    assert_eq!(cal.detail["flags"]["axis1"], 1);
+    assert_eq!(cal.detail["flags"]["axis2"], 0);
+    assert_eq!(events.iter().filter(|e| e.kind == "cal_power_release").count(), 1);
+    assert_eq!(events.iter().filter(|e| e.kind == "cal_result").count(), 3, "no result for the release");
+    // The release came after both other results.
+    let idx = |pred: &dyn Fn(&&h3cs::supervisor::SupervisorEvent) -> bool| events.iter().position(|e| pred(&e));
+    let rel = idx(&|e| e.kind == "cal_power_release").unwrap();
+    let res2 = idx(&|e| e.kind == "cal_result" && e.detail["axis"] == 2).unwrap();
+    let res3 = idx(&|e| e.kind == "cal_result" && e.detail["axis"] == 3).unwrap();
+    assert!(res2 < rel && res3 < rel, "{events:?}");
+    assert_eq!(events[rel].detail["axis"], 1);
+}
+
+#[test]
+fn power_axis_alone_calibrates_without_keep_power_or_release() {
+    let mut r = cal_rig(sim_cfg());
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![ax(1)] }).unwrap();
+    r.step();
+    assert_eq!(calibrate_msgs(&r, sent), vec![(0, 1, 0)]);
+    assert!(r.run_until(3000, |r| {
+        r.mcus[0].state() == McuState::Disarmed && r.sup.snapshot(r.now).axes[0].calibration.is_some()
+    }));
+    r.run_ms(100);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 0, 0], "no release needed");
+    assert!(!r.mcus[0].is_power_holding());
+    let (events, _) = r.sup.drain_events();
+    assert_eq!(events.iter().find(|e| e.kind == "calibrate").unwrap().detail["keep_power"], false);
+    assert!(!events.iter().any(|e| e.kind == "cal_power_release"));
+}
+
+#[test]
+fn cancel_during_power_hold_releases_the_power_axis_and_keeps_its_result() {
+    use h3cs::protocol::CalResultCode::{Cancelled, Ok};
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(3000, power_holding));
+    r.run_ms(50);
+    let c1 = r.sup.snapshot(r.now).axes[0].calibration.clone().unwrap();
+    let sent = r.sent.len();
+    r.admin(AdminCmd::CalibrateCancel).unwrap();
+    r.step();
+    assert_eq!(calibrate_msgs(&r, sent), vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)]);
+    assert!(r.run_until(1000, all_disarmed), "{:?}", r.mcu_states());
+    r.run_ms(100);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1], "the cancel was the release: no extra CALIBRATE(0)");
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[0].calibration, Some(c1), "the OK result stays");
+    assert!(snap.axes[0].referenced);
+    for a in &snap.axes[1..] {
+        assert_eq!(a.calibration.as_ref().unwrap().result, Cancelled);
+        assert!(!a.referenced);
+    }
+    assert!(!has(&r.blockers(), "calibrating"), "{:?}", r.blockers());
+    assert!(r.sup.fault().is_none());
+    let (events, _) = r.sup.drain_events();
+    assert_eq!(events.iter().filter(|e| e.kind == "cal_power_release").count(), 1);
+
+    // Stop while all three are still running: the power axis ends in
+    // POWER_HOLD with its CANCELLED result and is released once the others'
+    // results are in (a second CALIBRATE(0)).
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(300, all_calibrating));
+    r.run_ms(100);
+    let sent = r.sent.len();
+    let ok = r.sup.admin(AdminCmd::Stop, r.now).unwrap();
+    assert!(ok.note.as_deref().is_some_and(|n| n.starts_with("calibration cancelled")), "{ok:?}");
+    r.step();
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1]);
+    assert!(r.run_until(1000, all_disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [2, 1, 1], "cancel + release on the power axis");
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.axes.iter().all(|a| a.calibration.as_ref().unwrap().result == Cancelled && !a.referenced));
+    assert_eq!(snap.axes[0].power_on_cmd, Some(false));
+    let (events, _) = r.sup.drain_events();
+    assert_eq!(events.iter().filter(|e| e.kind == "cal_power_release").count(), 1);
+    let _ = Ok;
+}
+
+#[test]
+fn a_non_power_axis_dropping_out_does_not_block_the_release() {
+    use h3cs::protocol::CalResultCode::Ok;
+    // Axis 3's unit goes away mid-calibration (its CAL_RESULT will never come).
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(3000, power_holding));
+    r.disconnect(2);
+    r.run_ms(500);
+    assert!(r.mcus[0].is_power_holding(), "axis 2 is still calibrating");
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 1, 1]);
+    // Axis 2 finishes → release.
+    assert!(r.run_until(15000, |r| r.mcus[0].state() == McuState::Disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [2, 1, 1]);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[1].calibration.as_ref().unwrap().result, Ok);
+    assert!(!snap.axes[2].connected);
+    assert!(r.sup.fault().is_none());
+
+    // A rejected CALIBRATE on a non-power axis (sim 1 swallows it; the test
+    // answers REJECTED): that axis is out from the start.
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    r.mcus[1].set_drop_rx(true);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.step();
+    let rid = r
+        .sent_since(sent)
+        .iter()
+        .find_map(|(i, _, m)| match m {
+            HostMsg::Calibrate { request_id, mode: 1, .. } if *i == 1 => Some(*request_id),
+            _ => None,
+        })
+        .expect("CALIBRATE to axis 2");
+    r.pre_tick.push(LinkEvent::Ack {
+        axis: ax(2),
+        ack: Ack { request_id: rid, acked_type: msg_type::CALIBRATE, result: AckResult::Rejected, reason: AckReason::BadState },
+    });
+    r.step();
+    r.mcus[1].set_drop_rx(false);
+    assert!(r.run_until(3000, power_holding), "{:?}", r.mcu_states());
+    assert!(has(&r.blockers(), "calibrate_rejected: axis2"), "{:?}", r.blockers());
+    assert!(r.run_until(15000, |r| r.mcus[0].state() == McuState::Disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [2, 1, 1]);
+    assert_eq!(r.sup.snapshot(r.now).axes[2].calibration.as_ref().unwrap().result, Ok);
+    assert!(r.sup.fault().is_none());
+}
+
+#[test]
+fn power_axis_dropping_out_during_a_held_calibration_cancels_the_others() {
+    use h3cs::protocol::CalResultCode::{Cancelled, Failed, Ok};
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(3000, power_holding));
+    let sent = r.sent.len();
+    r.disconnect(0);
+    r.step();
+    assert_eq!(calibrate_msgs(&r, sent), vec![(1, 0, 0), (2, 0, 0)], "the others lose the 24 V: cancelled");
+    assert!(r.run_until(1000, |r| r.mcus[1].state() == McuState::Disarmed && r.mcus[2].state() == McuState::Disarmed));
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[1].calibration.as_ref().unwrap().result, Cancelled);
+    assert!(r.sup.fault().is_none(), "an idle rig does not fault on a disconnect");
+    let (events, _) = r.sup.drain_events();
+    let ev = events.iter().find(|e| e.kind == "calibrate_cancelled").unwrap();
+    assert_eq!(ev.detail["because"], "power axis disconnected");
+    assert!(!events.iter().any(|e| e.kind == "cal_power_release"));
+    // The unit comes back (same boot, still in POWER_HOLD on the MCU): the
+    // hold is the MCU's now — its timeout or a cancel ends it.
+    r.connect(0);
+    r.run_ms(50);
+    assert!(has(&r.blockers(), "calibrating: axis1"), "{:?}", r.blockers());
+    r.admin(AdminCmd::CalibrateCancel).unwrap();
+    assert!(r.run_until(500, all_disarmed), "{:?}", r.mcu_states());
+
+    // A FAULT of the power axis latches the rig: HOST_FAULT stops the others
+    // (CAL_RESULT FAILED `fault`); nothing is released.
+    let mut r = slow_others_rig();
+    r.connect_all();
+    r.run_ms(100);
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    assert!(r.run_until(3000, power_holding));
+    r.mcus[0].force_fault(FaultCode::PowerFault);
+    assert!(r.run_until(500, |r| r.sup.state() == RigState::FaultLatched));
+    assert!(
+        r.run_until(1000, |r| r.mcus[1].state() == McuState::Fault && r.mcus[2].state() == McuState::Fault),
+        "{:?}",
+        r.mcu_states()
+    );
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert_eq!(snap.axes[0].calibration.as_ref().unwrap().result, Ok, "the power axis's result stays");
+    let c2 = snap.axes[1].calibration.as_ref().unwrap();
+    assert_eq!((c2.result, c2.reason.as_str()), (Failed, "fault"));
+    let (events, _) = r.sup.drain_events();
+    assert!(!events.iter().any(|e| e.kind == "cal_power_release"));
 }

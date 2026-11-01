@@ -72,6 +72,16 @@ pub mod calibrate_mode {
     pub const START: u8 = 1;
 }
 
+/// CALIBRATE `flags` (protocol §4 `0x0C`, byte 5). Only the power-controller
+/// axis (CONFIG `role_flags` bit0) interprets them; other axes ignore them.
+/// Bits 1..7 are reserved (sent as 0, ignored on decode).
+pub mod calibrate_flags {
+    /// The power axis keeps the main power on after its own calibration
+    /// (stays CALIBRATING in POWER_HOLD) until CALIBRATE(0) or the firmware
+    /// hold timeout (protocol §1.2, DESIGN.md §11).
+    pub const KEEP_POWER: u8 = 0x01;
+}
+
 /// CAL_RESULT `result` (protocol §4 `0x87`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -315,10 +325,12 @@ pub enum HostMsg {
         reference_count: Counts,
     },
     /// Start (`mode` 1) or cancel (`mode` 0) the MCU-driven end-stop
-    /// calibration (protocol §1.2).
+    /// calibration (protocol §1.2). `flags`: [`calibrate_flags`] (decoded as
+    /// received; unknown bits are not an error).
     Calibrate {
         request_id: u32,
         mode: u8,
+        flags: u8,
     },
 }
 
@@ -612,7 +624,11 @@ impl HostMsg {
                 request_id,
                 reference_count,
             } => w.u32(request_id).i32(reference_count),
-            HostMsg::Calibrate { request_id, mode } => w.u32(request_id).u8(mode).u8(0).u16(0),
+            HostMsg::Calibrate {
+                request_id,
+                mode,
+                flags,
+            } => w.u32(request_id).u8(mode).u8(flags).u16(0),
         };
         w.finish()
     }
@@ -709,8 +725,9 @@ impl HostMsg {
                 let m = HostMsg::Calibrate {
                     request_id: r.u32()?,
                     mode: r.u8()?,
+                    flags: r.u8()?,
                 };
-                r.skip(3)?;
+                r.skip(2)?;
                 m
             }
             other => return Err(DecodeError::UnknownType(other)),

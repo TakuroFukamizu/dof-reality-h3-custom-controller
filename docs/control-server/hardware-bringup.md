@@ -165,7 +165,7 @@ v1 ファームの端当て校正（protocol.md §1.2、DESIGN.md §11）を使�
 
 1. 3 軸が接続され、全軸 `DISARMED`（status の `axes[].mcu_state`）であること。`calibration_valid = false` のままでよい（校正に CONFIG も基準も要らない）。
 2. 試験ページの「校正（3 軸）」（確認ダイアログあり）、または `curl -sX POST -H "$AUTH" $URL/v1/calibrate`。電源担当軸（系統 1）を含めないと 409 `power_axis_required`（他の軸は 24V が無く端当てに失敗する）。
-3. status: 各軸が `CALIBRATING`（blockers に `calibrating: axisN`。この間 ARM / START / CENTER / REFERENCE は 409 `calibrating`）。止めるなら「校正を中止」/ `POST /v1/calibrate/cancel` / STOP。
+3. status: 各軸が `CALIBRATING`（blockers に `calibrating: axisN`。この間 ARM / START / CENTER / REFERENCE は 409 `calibrating`）。電源担当軸は自分の校正が終わっても（`calibration` に結果が入っても）他の軸が終わるまで `CALIBRATING` のまま主電源を保つ（`KEEP_POWER`。他の軸の結果が揃うとサーバーが CALIBRATE(0) を送り DISARMED になる。2026-11-01 の実機では、これが無くて #1 が先に主電源を切り #2 / #3 が中立への移動で失敗した）。止めるなら「校正を中止」/ `POST /v1/calibrate/cancel` / STOP。
 4. 終わると各軸の `calibration` に `result`（`OK` / `FAILED` / `CANCELLED`）・`reason`・`n_end_count`（N 端の count。P 端 = 0）・`neutral_count`・`sign`。`OK` の軸は `referenced = true`（MCU が P 端 = 0 の基準を自分で作る。/v1/reference は不要）で中立に止まっている。`FAILED`（`stall` / `slow` / `travel` / `timeout` …）なら従来 env の §1.2 と同じ切り分け。
 5. 「校正結果を設定に書き出す」/ `POST /v1/calibration/export`。`bringup.toml` と同じディレクトリに `h3-bringup-01.calibration-<YYYYmmdd-HHMMSS>.toml`（UTC）が書かれる: OK の軸の `mechanical_* / soft_* / count_at_virtual_* / device_id` が結果から置き換わり、コメントと他の軸はそのまま、`calibration_valid = false` のまま、先頭に生の結果と置き換え前の値。
 6. そのファイルを見て、`n_end_count` が過去の記録（§5.3、±30）と合うこと・`sign` が §5.2 の前提と合うことを確かめ、§5.5 の手順で `calibration_valid = true` にして `--config` にそのファイルを指定して起動し直す。基準は boot ごとに消える（§5.1 の末尾）ので、再起動後は校正をやり直すか、中立で止まっていれば §5.1 の /v1/reference で `count_at_virtual_512` を入れる。
