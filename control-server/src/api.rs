@@ -90,7 +90,7 @@ use crate::protocol::CalResultCode;
 use crate::session::{AckMsg, AcceptedPose, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
 use crate::supervisor::{AdminCmd, AdminError, AdminOk, StatusSnapshot};
 use crate::telemetry::{lock_events, shared_event_log, SharedEventLog};
-use crate::types::{AxisId, Counts, LimitReason};
+use crate::types::{AxisId, Counts};
 
 /// How long an admin request may wait for the control loop (→ 503).
 pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -217,24 +217,35 @@ impl AppState {
         self.inner.status_rx.borrow().motion_limits.ceiling
     }
 
+    /// The requested set clamped as the control loop will clamp it (same
+    /// ceilings, same stop deadline).
+    fn clamped(&self) -> motion_limits::Clamped {
+        motion_limits::clamp(
+            &motion_limits::read(&self.inner.limits),
+            &self.ceilings(),
+            motion_limits::stop_deadline(&self.inner.cfg.timing),
+        )
+    }
+
     /// The gain ceiling in effect for pose / gain messages.
     fn current_max_gain(&self) -> f64 {
-        motion_limits::clamp(&motion_limits::read(&self.inner.limits), &self.ceilings()).0.max_gain
+        self.clamped().effective.max_gain
     }
 
     /// `GET /v1/limits` body (also the `POST` answer): the requested set and
-    /// what it clamps to right now.
+    /// what it clamps to right now (`effective` here is the clamped request;
+    /// whether the control loop has applied it yet is status
+    /// `motion_limits.pending`).
     fn limits_view(&self) -> Value {
-        let requested = motion_limits::read(&self.inner.limits);
-        let ceiling = self.ceilings();
-        let (effective, limited) = motion_limits::clamp(&requested, &ceiling);
+        let c = self.clamped();
         json!({
             "ok": true,
-            "effective": effective,
-            "requested": requested,
-            "ceiling": ceiling,
+            "effective": c.effective,
+            "requested": motion_limits::read(&self.inner.limits),
+            "ceiling": self.ceilings(),
             "defaults": self.limits_defaults(),
-            "limited": limited,
+            "limited": c.limited,
+            "reasons": c.reasons,
         })
     }
 
@@ -853,24 +864,24 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
     }
     if let ClientMsg::Limits(l) = &msg {
         // Header rules, then the patch; the seq is consumed only on success.
-        // Freshness is never extended by a limits message.
-        let ceiling = st.ceilings();
+        // Freshness is never extended by a limits message. The patch is
+        // applied whole before clamping, so velocity and acceleration are
+        // judged together by the stop-time rule.
         let r = s.accept_limits(l, || {
             apply_limits_patch(st, &l.patch).map_err(|e| match e {
                 PatchError::NonFinite => RejectReason::NonFinite,
                 PatchError::OutOfRange => RejectReason::OutOfRange,
             })?;
-            Ok(motion_limits::clamp(&motion_limits::read(&st.inner.limits), &ceiling))
+            Ok(st.clamped())
         });
         return match r {
-            Ok((effective, limited)) => {
+            Ok(c) => {
                 // The new gain ceiling applies to the pose being tracked now
                 // (freshness unchanged), not only to the next one.
-                if let Some(p) = s.reapply_gain_ceiling(&cfg.game, effective.max_gain) {
+                if let Some(p) = s.reapply_gain_ceiling(&cfg.game, c.effective.max_gain) {
                     st.inner.pose_tx.send_replace(Some(p));
                 }
-                let reasons = if limited.is_empty() { Vec::new() } else { vec![LimitReason::CeilingClamped] };
-                AckMsg::accepted_limits(seq, effective, reasons, s.is_fresh(recv_at))
+                AckMsg::accepted_limits(seq, c.effective, c.reasons, s.is_fresh(recv_at))
             }
             Err(r) => {
                 let fresh = r != RejectReason::StaleSession && s.is_fresh(recv_at);

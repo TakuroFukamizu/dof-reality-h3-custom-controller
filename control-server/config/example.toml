@@ -47,6 +47,10 @@ center_speed_fraction = 0.25
 # many counts of neutral (>= limits.deadband_out_count). A lagging axis past
 # timing.center_reach_timeout_ms latches a fault instead of a false "center_reached".
 center_tolerance_count = 50
+# START (game) is refused (409 pose_not_near_hold) when the fresh pose would move any
+# axis farther than this many counts from where it is held: a forgotten tab streaming
+# an extreme pose must not launch the seat at START. Have the game at neutral first.
+start_max_offset_count = 300
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証の見積もり
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）。
