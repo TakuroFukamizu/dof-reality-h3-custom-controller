@@ -114,7 +114,26 @@ constexpr int V1_DUTY_MAX = 20;                 // Duty の上限の初期値（
 constexpr int V1_ABS_DUTY_MAX = 60;                     // Duty の絶対上限 [%]
 constexpr uint32_t V1_ABS_MAX_VEL_COUNT_S = 6000;       // 速度の絶対上限 [count/s]
 constexpr uint32_t V1_ABS_MAX_ACC_COUNT_S2 = 40000;     // 加速度の絶対上限 [count/s²]
-constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty|（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）
+constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty| の下限（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）
+// Issue #15 M2: 実際のしきい値は max(V1_STALL_DUTY, duty_max × この割合)。kp を上げると数百 count の誤差だけで 10 % に届き、
+// 動けない軸（荷重）が FOLLOWING_ERROR ではなく ENCODER_FAULT になって基準を失うので、ループが上限近くまで出しているときだけ
+// 「エンコーダが死んだ」と判定する。それ未満の無パルスは FOLLOWING_ERROR（と下の停止ブースト）に任せる。
+// duty_max < V1_STALL_DUTY の SET_LIMITS は受理するが検出が無効になる（画面に警告。docs/control-server/limits.md）。
+constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
+// Issue #15 H4: 停止ブースト。位置ループに積分が無いので、目標が止まっている（軌道速度 0）のに |誤差| が不感帯の外で、
+// 下限 Duty を出してもカウントが動かない（荷重とのつり合い）状態が続くと静的誤差を詰められない。auto_move.h の neutral_boost と
+// 同じく、この時間カウントが V1_STALL_BOOST_MIN_MOVE 未満しか動かないたびに下限を 1 % ずつ上げる（上限は duty_max。超えない）。
+// 誤差が不感帯に入る・誤差の符号が反転する・軌道が動き出す・ブレーキ作動のどれかで 0 に戻す。実機 11-02: kp 6 / duty_min 9 で
+// 自重のかかった軸の動き出しは約 9 %、7〜8 % では動かない。
+constexpr uint32_t V1_STALL_BOOST_MS = 200;
+constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満しか動かなければ「動いていない」（停止中のエンコーダの ±1 のちらつきで窓を取り直さない）
+// Issue #15 M1: Duty 下限を「目標へ向かう向き」のときだけ掛ける（1）。FF（軌道速度）と P（誤差）の合成が下限未満で、かつ誤差と
+// 逆向きなら、下限まで持ち上げて目標から離れる向きに走らせるのではなく 0（惰行）にする。例: err +50（P +1 %）・vel −200
+// （FF −2 %）→ 合成 −1 % → 旧: −duty_min で目標から離れる / 新: 0。0 にすると旧動作（合成値に下限を掛ける）。実機 A/B 用に
+// -DV1_FLOOR_SIGN_GATE=0 で切れる。FF が誤差と逆を向くのが正当な場面（減速中に実位置が軌道より先行）があるかは未確定。
+#ifndef V1_FLOOR_SIGN_GATE
+#define V1_FLOOR_SIGN_GATE 1
+#endif
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）

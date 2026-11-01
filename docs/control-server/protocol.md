@@ -91,7 +91,7 @@ PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支え�
 | 2 | `FOLLOWING_ERROR` | `abs(actual_count − target_count) > following_error_limit_count`（`target_count` は STATUS と同じ、軌道上の目標）。位置制御中（ARMING のブレーキ解除以降・HOLDING・ACTIVE・STOPPING・DISARMING）だけ判定 |
 | 3 | `OVERSPEED` | `abs(velocity) > overspeed_count_s`。位置制御中（同上）だけ判定（DISARMED・FAULT で手で動かしても異常にしない） |
 | 4 | `SOFT_LIMIT` | 位置制御中に実位置が `[soft_min_count, soft_max_count]` を外れた。ARMING ではブレーキ解除の直前にも確認し、外れていればブレーキを解除せずに FAULT |
-| 5 | `ENCODER_FAULT` | PCNT 異常・計数異常 |
+| 5 | `ENCODER_FAULT` | PCNT 異常・計数異常。ファームの無パルス判定: ブレーキ解除指令中に軌道（`target_count`）が動いている間、`abs(pwm) ≥ max(V1_STALL_DUTY 10 %, duty_max × 75 %)` を 200 ms（`STALL_MS`）出してカウントが変わらない（Issue #15 M2。ループが上限近くまで出しても動かないときだけ。それ未満の無パルスは FOLLOWING_ERROR に任せる）。**動けない軸が FOLLOWING_ERROR と ENCODER_FAULT のどちらになるかは PC の `[limits]` で決まる**: `kp × following_error_limit / 100 + FF` がしきい値未満なら FOLLOWING_ERROR（基準は残る）、以上なら ENCODER_FAULT（FAULT_RESET で `POSITION_REFERENCED` が消える）。`duty_max_percent < 10` の SET_LIMITS は受理するが無パルス判定が決して成立しなくなる（画面に「無パルス検出なし」。[limits.md](limits.md) §2.2） |
 | 6 | `CONTROL_OVERRUN` | 制御周期の逸脱 |
 | 7 | `CONFIG_INVALID` | 予約（v1 では発生しない）。CONFIG 未受理の ARM_PREPARE は ACK `REJECTED/NOT_CONFIGURED` で拒否し、DISARMED のまま |
 | 8 | `STOP_TIMEOUT` | 減速停止が `stop_timeout_ms` 内に完了しない。ただし異常による減速（COMMAND_TIMEOUT）が超えたときは STOP_TIMEOUT ではなく元の異常コードでラッチする。CONTROLLED_STOP の減速中に COMMAND_TIMEOUT になった場合、`stop_timeout_ms` は最初の STOPPING 開始から数える |
@@ -217,6 +217,9 @@ DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中�
 - `valid_for_ms` の期限切れで ACTIVE → STOPPING → HOLDING に落ちた後は、遅れて届いた SET_POSITION では動き出さない。再開には START が要る。
 - ARMING の順序: PWM 0 のまま主電源 ON 指令（電源担当軸のみ）→ `POWER_SETTLE_MS` → 実位置がソフトリミット外ならブレーキを解除せず FAULT(SOFT_LIMIT) → 現在位置を保持目標にして位置制御開始 → ブレーキ解除給電 → `BRAKE_RELEASE_WAIT_MS` → HOLDING。
 - 主電源（G2）は **電源担当軸だけ** が操作する。それ以外の軸は CONFIG の `role_flags` bit0 = 0 で G2 を操作しない。
+- 位置ループ（ファーム `v1_duty_command`、`[limits]` の値で動く。[limits.md](limits.md) §2.2）: `Duty = 軌道速度 / ff + kp × 誤差 / 100`、0 でなければ `|Duty|` を `duty_min`〜`duty_max` に収める。目標が止まっているとき（軌道速度 0）だけ不感帯（入る側 `deadband` / 出る側 `deadband_out`）で Duty 0。積分は無い。2026-11-02 の Issue #15 で足した 2 つの振る舞い（いずれも実機未検証、A/B が要る）:
+  - **下限の向き（M1、`config.h` `V1_FLOOR_SIGN_GATE` = 1）**: 合成値が `duty_min` 未満のとき、合成値の向きが誤差の向きと逆なら下限まで持ち上げず 0（惰行）。例: 誤差 +50（P +3 %）・軌道速度 −600（FF −6 %）→ 合成 −3 % → 旧は −duty_min で目標から離れる向きに走った。誤差 0 は向きの一致とみなす。`-DV1_FLOOR_SIGN_GATE=0` で旧動作（合成値に下限を掛ける）。下限 ≈ 900 count/s が軌道速度を超えるときの「バースト → 停止」自体は残る（FF と P を別々にクランプするかは未確定）。
+  - **停止ブースト（H4、`V1_STALL_BOOST_MS` 200 ms）**: 軌道速度 0・誤差が不感帯の外・ブレーキ解除指令中に、下限 Duty を出しても 200 ms の間にカウントが 3 未満しか動かなければ、下限を 1 % ずつ上げる（`duty_max` を超えない。SET_LIMITS で `duty_max` が下がればそこまで）。動けば窓を取り直す（上乗せは保つ）。誤差が不感帯に入る・誤差の符号が反転する・軌道が動き出す・ブレーキ作動指令・位置制御の終了で 0 に戻す。無パルスの ENCODER_FAULT（軌道が動いている間だけ）とは排他で、誤差の上限は従来どおり FOLLOWING_ERROR が守る。上乗せの量は STATUS に載せない（空きフィールドが無い。`pwm_permille` に含まれて見える）。画面の Duty 行に `(+n)` で出す。
 
 ## 6. PC 側の期限・周期（既定値、`config/*.toml` で変更）
 

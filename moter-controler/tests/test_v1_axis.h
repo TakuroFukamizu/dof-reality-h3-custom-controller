@@ -1385,11 +1385,13 @@ inline void test_encoder_fault_on_no_pulses_while_driving() {
   h.set_position(0);
   Harness::accepted(h.start());
   h.stall = true;  // カウントが止まる
-  // 軌道が動き出した tick からフィードフォワードで |duty| ≥ 10 %（max_vel 4000 → 上限 20 %）。そこから STALL_MS（200 ms）で異常
+  // 軌道が動き出してフィードフォワードが |duty| ≥ しきい値 15 %（max(10, duty_max 20 × 75 %)。Issue #15 M2）に届いてから
+  // STALL_MS（200 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
+  CHECK(h.ax.encoder_fault_duty_threshold() == 15);
   h.drive(150, 2000);
   CHECK(h.ax.state() == st::ACTIVE);
   CHECK(h.ax.duty_percent() != 0);
-  h.drive(100, 2000);
+  h.drive(150, 2000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   CHECK(h.ax.duty_percent() == 0);
   // FAULT_RESET は通るが POSITION_REFERENCED が消える
@@ -1443,7 +1445,9 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   h.raw -= 25;  // 不感帯の出る側（20）を超える静的な誤差 → 下限 7 % の押し当て
   h.drive(400, h.ax.actual_count() + 25);  // 保持目標はそのまま（HOLDING では目標を使わない）。lease を保つ
   CHECK(h.ax.state() == st::HOLDING);
-  CHECK(h.ax.duty_percent() == 7 || h.ax.duty_percent() == -7);
+  // 動かないので停止ブースト（Issue #15 H4）が 200 ms ごとに下限を 1 % 上げる: 400 ms で 7 → 8 %（ENCODER_FAULT にはしない）
+  CHECK(h.ax.stall_boost() == 1);
+  CHECK(h.ax.duty_percent() == 8 || h.ax.duty_percent() == -8);
   CHECK(h.ax.fault_code() == fc::NONE);
   CHECK(h.ax.referenced());
   // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路）
@@ -1464,6 +1468,185 @@ inline void test_active_settled_with_residual_error_is_not_encoder_fault() {
   CHECK(h.ax.state() == st::ACTIVE);
   CHECK(h.ax.duty_percent() != 0);
   CHECK(h.ax.fault_code() == fc::NONE);
+}
+
+// Issue #15 H4: 停止ブースト。目標が止まっていて誤差が不感帯の外、下限 Duty でカウントが動かなければ 200 ms ごとに 1 % 上げ、
+// duty_max で頭打ち。動き出して不感帯に入れば 0 に戻る。
+inline void test_stall_boost_ramps_while_stuck_and_resets_in_band() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.stall_boost() == 0);
+  h.stall = true;
+  h.raw -= 25;  // 不感帯の出る側（20）を超える静的な誤差（sign +1 → duty + でカウント減なので、カウントを増やすには duty −）
+  h.step();     // 窓の開始
+  CHECK(h.ax.duty_percent() == -7 && h.ax.stall_boost() == 0);
+  h.drive(200, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 1);
+  h.step();
+  CHECK(h.ax.duty_percent() == -8);
+  h.drive(1000, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 6);
+  h.step();
+  CHECK(h.ax.duty_percent() == -13);
+  // duty_max（20）で頭打ち: 上乗せは最大 13
+  h.drive(3000, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 13);
+  h.step();
+  CHECK(h.ax.duty_percent() == -V1_DUTY_MAX);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
+  // 動き出して不感帯に入れば 0 に戻り、Duty も 0
+  h.stall = false;
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.following_error_count() == 0);
+  CHECK(h.ax.stall_boost() == 0);
+  CHECK(h.ax.duty_percent() == 0);
+}
+
+// 窓の間に stall_boost_min_move（3）以上動けば窓を取り直す（上乗せは保つ）。それ未満のちらつき（±1）では取り直さない。
+inline void test_stall_boost_window_restarts_on_motion_but_ignores_jitter() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 40;
+  h.step();
+  // ±1 のちらつき: 200 ms 経てば上がる
+  for (int i = 0; i < 40; ++i) {
+    h.raw += (i % 2 == 0) ? 1 : -1;
+    h.set_position(h.ax.actual_count());
+    h.step();
+  }
+  CHECK(h.ax.stall_boost() == 1);
+  // 3 count 動いた直後に窓を取り直す: その後 150 ms では上がらない、200 ms で上がる
+  h.raw += 3;
+  h.step();
+  h.drive(150, h.ax.actual_count());
+  CHECK(h.ax.stall_boost() == 1);
+  h.drive(60, h.ax.actual_count());
+  CHECK(h.ax.stall_boost() == 2);
+}
+
+// 誤差の符号が反転したら 0 に戻す（反対側へ上乗せを持ち越さない）
+inline void test_stall_boost_resets_on_error_sign_flip() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.drive(620, h.ax.actual_count() + 25);
+  CHECK(h.ax.stall_boost() == 3);
+  h.raw += 50;  // 誤差 +25 → −25
+  h.step();     // この tick の Duty は前の tick までの上乗せ（10 %）で反対向きに出て、評価で 0 に戻る
+  CHECK(h.ax.stall_boost() == 0);
+  CHECK(h.ax.duty_percent() == 10);
+  h.step();
+  CHECK(h.ax.duty_percent() == 7);
+}
+
+// 軌道が動いている間（FF が効く）とブレーキ作動中（DISARMING）は上乗せしない。duty_max を下げれば上乗せもそこで止まる。
+inline void test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  c.max_vel_count_s = 200;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.drive(600, 2000);  // 軌道が動く（200 count/s）。誤差は増えるが上乗せはしない
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.target_count() > 100);
+  CHECK(h.ax.stall_boost() == 0);
+  // 止めて HOLDING に戻し、残り誤差で上乗せが始まる
+  Harness::accepted(h.stop());
+  h.drive(200, h.ax.target_count());
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(620, h.ax.target_count());
+  CHECK(h.ax.stall_boost() >= 3);
+  // duty_max 10 / duty_min 7 なら上乗せは 3 まで
+  Harness::accepted(h.set_limits(10, 7, 2, 100, 10, 20));
+  h.drive(1000, h.ax.target_count());
+  CHECK(h.ax.stall_boost() == 3);
+  CHECK(h.ax.duty_percent() == 10 || h.ax.duty_percent() == -10);
+  // DISARM → ブレーキ作動指令で 0 に戻り、DISARMING 中に上がらない
+  Harness::accepted(h.disarm());
+  CHECK(h.ax.state() == st::DISARMING);
+  h.idle(250);
+  CHECK(h.ax.state() == st::DISARMING && h.ax.stall_boost() == 0);
+  h.idle(60);
+  CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
+}
+
+// Issue #15 M1: Duty 下限は「目標へ向かう向き」のときだけ。FF と P の合成が下限未満で誤差と逆向きなら 0（惰行）。
+inline void test_duty_command_floor_only_toward_target() {
+  V1Tuning t;
+  t.kp_percent_per_100 = 6;
+  t.duty_min = 9;
+  t.duty_max = 20;
+  t.floor_sign_gate = true;
+  bool band = false;
+  // Issue の例: err +50（P +3 %）・vel −200（FF −2 %）→ 合成 +1 % → 目標向き → 下限 9
+  CHECK(v1_duty_command(50, -200.0, band, t) == 9);
+  // err +50（P +3）・vel −600（FF −6）→ 合成 −3 % → 目標から離れる向き → 0（旧: −9 のバースト）
+  CHECK(v1_duty_command(50, -600.0, band, t) == 0);
+  CHECK(v1_duty_command(-50, 600.0, band, t) == 0);
+  // 合成が下限以上なら向きに関わらずそのまま（減速中に実位置が先行: P −18 + FF +2 = −16）
+  CHECK(v1_duty_command(-300, 200.0, band, t) == -16);
+  // 誤差 0 は向きの一致とみなし下限を掛ける（軌道だけが動いている立ち上がり）
+  CHECK(v1_duty_command(0, 200.0, band, t) == 9);
+  // 目標向きの小さい合成は下限（従来どおり）
+  CHECK(v1_duty_command(50, 0.0, band, t) == 9);
+  CHECK(v1_duty_command(-50, 0.0, band, t) == -9);
+  // gate を切れば旧動作（合成値に下限を掛ける）
+  t.floor_sign_gate = false;
+  CHECK(v1_duty_command(50, -600.0, band, t) == -9);
+  CHECK(v1_duty_command(-50, 600.0, band, t) == 9);
+  CHECK(v1_duty_command(-300, 200.0, band, t) == -16);
+}
+
+// Issue #15 M2: ENCODER_FAULT のしきい値は max(V1_STALL_DUTY, duty_max × 75 %)。duty_max < 10 なら検出が無効（警告）。
+inline void test_encoder_fault_threshold_follows_duty_max() {
+  Harness h;
+  CHECK(h.ax.encoder_fault_duty_threshold() == 15 && !h.ax.encoder_fault_check_disabled());  // 20 × 75 % = 15
+  Harness::accepted(h.set_limits(40, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold() == 30);
+  Harness::accepted(h.set_limits(12, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold() == 10 && !h.ax.encoder_fault_check_disabled());  // 9 → 下限 10
+  Harness::accepted(h.set_limits(8, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold() == 10 && h.ax.encoder_fault_check_disabled());   // 受理はするが検出は出ない
+}
+
+// kp 6 で動けない軸: 誤差 170 で 10 % には届くが 15 %（duty_max 20 の 75 %）には届かず、FOLLOWING_ERROR で止まる
+// （旧: 10 % + 200 ms で ENCODER_FAULT → 基準喪失）。ゆっくり動く軌道（200 count/s）に対して機構が止まったまま。
+inline void test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_vel_count_s = 200;
+  c.following_error_limit_count = 240;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(20, 9, 6, 100, 10, 20));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  // 旧しきい値 10 % には err ≈ 134（P 8 + FF 2）で届く（t ≈ 0.67 s）→ 旧なら 0.87 s で ENCODER_FAULT
+  h.drive(900, 2000);
+  CHECK(h.ax.state() == st::ACTIVE);
+  CHECK(h.ax.duty_percent() <= -10);
+  // 新しきい値 15 % には err ≈ 217（t ≈ 1.08 s）→ 1.28 s。FOLLOWING_ERROR 240 は t = 1.2 s で先に出る
+  //（SET_POSITION を送り続けて lease を保つ。止めると COMMAND_TIMEOUT が先に出る）
+  h.drive(500, 2000);
+  CHECK(h.ax.state() == st::FAULT);
+  CHECK(h.ax.fault_code() == fc::FOLLOWING_ERROR);
+  Harness::accepted(h.fault_reset());
+  CHECK(h.ax.referenced());  // FOLLOWING_ERROR では基準を保つ
 }
 
 // device_id は 0x5131 + MAC を表記順に並べたもの（画面の下 4 桁 = MAC の末尾 2 オクテット）
@@ -2574,6 +2757,13 @@ inline void run_all() {
   test_disarm_with_residual_error_reaches_disarmed_not_encoder_fault();
   test_static_hold_error_at_min_duty_is_not_encoder_fault();
   test_active_settled_with_residual_error_is_not_encoder_fault();
+  test_stall_boost_ramps_while_stuck_and_resets_in_band();
+  test_stall_boost_window_restarts_on_motion_but_ignores_jitter();
+  test_stall_boost_resets_on_error_sign_flip();
+  test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits();
+  test_duty_command_floor_only_toward_target();
+  test_encoder_fault_threshold_follows_duty_max();
+  test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

@@ -33,7 +33,11 @@ struct V1Tuning {
   int duty_min = V1_DUTY_MIN;
   int duty_max = V1_DUTY_MAX;
   int stall_duty = V1_STALL_DUTY;
+  int stall_duty_ratio_percent = V1_STALL_DUTY_RATIO_PERCENT;  // ENCODER_FAULT のしきい値 = max(stall_duty, duty_max × これ / 100)
   uint32_t stall_ms = STALL_MS;
+  uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
+  int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
+  bool floor_sign_gate = V1_FLOOR_SIGN_GATE != 0;      // Duty 下限を目標へ向かう向きだけに掛ける（Issue #15 M1）
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
@@ -47,6 +51,9 @@ struct V1Tuning {
 // フィードフォワード（vel / ff）＋比例（err × kp / 100）。目標が止まっている（vel = 0）ときだけ不感帯を使い、
 // 入る側 deadband / 出る側 deadband_out のヒステリシスで到達帯の縁での往復を防ぐ。
 // 0 でなければ |指令| を duty_min 以上 duty_max 以下に収める。
+// 下限の掛け方（Issue #15 M1、t.floor_sign_gate）: 合成値が下限未満のとき、合成値の向きが誤差の向きと逆（cmd × err < 0）なら
+// 下限まで持ち上げずに 0（惰行）。誤差 0 は「向きが一致」として扱う（旧テストの err 0・vel 600 → 下限 と同じ）。
+// gate が偽なら旧動作（合成値に下限を掛ける。目標から離れる向きの下限バーストが出る）。
 inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t) {
   const int64_t err_abs = err < 0 ? -err : err;
   if (vel == 0.0) {
@@ -64,7 +71,10 @@ inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tunin
   if (t.ff_count_s_per_percent > 0) cmd += vel / t.ff_count_s_per_percent;
   if (cmd == 0.0) return 0;
   double mag = cmd < 0 ? -cmd : cmd;
-  if (mag < t.duty_min) mag = t.duty_min;
+  if (mag < t.duty_min) {
+    if (t.floor_sign_gate && cmd * static_cast<double>(err) < 0.0) return 0;  // 目標から離れる向きには下限を掛けない
+    mag = t.duty_min;
+  }
   if (mag > t.duty_max) mag = t.duty_max;
   const int m = static_cast<int>(mag);
   return cmd < 0 ? -m : m;
@@ -295,6 +305,15 @@ class V1Axis {
   uint64_t device_id() const { return id_.device_id; }
   uint16_t last_host_fault_code() const { return last_host_fault_code_; }
   uint64_t mcu_time_us(uint64_t now_us) const { return now_us > boot_origin_us_ ? now_us - boot_origin_us_ : 0; }
+  // 停止ブースト（Issue #15 H4）: いま Duty 下限に上乗せしている %（0 = なし）。STATUS には載せない（空きフィールドが無い）。画面用
+  int stall_boost() const { return stall_boost_; }
+  // ENCODER_FAULT を判定し始める |Duty|（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100)
+  int encoder_fault_duty_threshold() const {
+    int th = tuning.duty_max * tuning.stall_duty_ratio_percent / 100;
+    return th < tuning.stall_duty ? tuning.stall_duty : th;
+  }
+  // duty_max がしきい値より低く、無パルスの ENCODER_FAULT が決して出ない（SET_LIMITS は受理するが画面で警告する）
+  bool encoder_fault_check_disabled() const { return encoder_fault_duty_threshold() > tuning.duty_max; }
 
   uint16_t flags() const {
     uint16_t f = 0;
@@ -405,6 +424,13 @@ class V1Axis {
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
   int64_t stall_last_raw_ = 0;
+
+  // 停止ブースト（Issue #15 H4）
+  int stall_boost_ = 0;              // duty_min への上乗せ %
+  bool boost_window_running_ = false;
+  int8_t boost_err_sign_ = 0;        // 直近に評価した誤差の符号（反転で 0 に戻す）
+  uint64_t boost_window_start_us_ = 0;
+  int64_t boost_anchor_raw_ = 0;     // 窓の開始時のカウント
 
   // --- 校正（CALIBRATING） ---
   AutoMachine cal_{};
@@ -1190,21 +1216,32 @@ class V1Axis {
       duty_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
       in_band_ = false;
+      reset_stall_boost();
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
-    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, tuning);  // カウント増の向きが正
+    // 停止ブースト（Issue #15 H4）: 前の tick までに積んだ上乗せを下限に足す（duty_max を超えない）
+    V1Tuning t = tuning;
+    if (stall_boost_ > 0) {
+      t.duty_min = tuning.duty_min + stall_boost_;
+      if (t.duty_min > tuning.duty_max) t.duty_min = tuning.duty_max;
+    }
+    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, t);  // カウント増の向きが正
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_ = -static_cast<int>(sign_) * cmd;
+    update_stall_boost(err, cmd, now);
 
-    // ENCODER_FAULT: |duty| ≥ stall_duty が stall_ms 続いてカウントが変わらない（manual_guard.h の無パルス判定と同じ窓）。
+    // ENCODER_FAULT: |duty| ≥ しきい値（max(stall_duty, duty_max × 75 %)。Issue #15 M2）が stall_ms 続いてカウントが
+    // 変わらない（manual_guard.h の無パルス判定と同じ窓）。
     // 窓を回すのは「ブレーキ解除指令中」かつ「軌道が動いている（setpoint_vel ≠ 0）」間だけ（設計 §3）:
     //  - ブレーキ作動指令中（DISARMING）はカウントが変わらないのが正常。残った追従誤差で窓を回すと DISARM が FAULT になる。
     //  - 目標が止まっているときの静止（荷重とのつり合いで最小 Duty では動かない）は、エンコーダの死と区別できない。
     //    この場合の誤差の上限は FOLLOWING_ERROR が守る（エンコーダが生きている前提。エンコーダが死んだまま目標が
     //    止まっている間は検出できず、目標が動けば STALL_MS で出る）。
-    if (mag >= tuning.stall_duty && brake_release_cmd_ && setpoint_vel_ != 0.0) {
+    //  - しきい値を duty_max の 75 % 以上にするのは、kp を上げたとき数百 count の誤差だけで 10 % に届き、荷重で動けない軸が
+    //    FOLLOWING_ERROR の前に ENCODER_FAULT になって基準を失うのを避けるため。上限近くまで出しても止まっているときだけ異常。
+    if (mag >= encoder_fault_duty_threshold() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
       if (!stall_running_) {
         stall_running_ = true;
         stall_start_us_ = now;
@@ -1224,6 +1261,47 @@ class V1Axis {
       }
     } else {
       stall_running_ = false;
+    }
+  }
+
+  void reset_stall_boost() {
+    stall_boost_ = 0;
+    boost_window_running_ = false;
+    boost_err_sign_ = 0;
+  }
+
+  // 停止ブースト（Issue #15 H4）。対象は「軌道が止まっている（setpoint_vel = 0）」「誤差が不感帯の外（cmd ≠ 0）」
+  // 「ブレーキ解除指令中」のとき。この状態で stall_boost_ms の窓の間にカウントが stall_boost_min_move 未満しか動かなければ
+  // 上乗せを 1 % 増やす（duty_max − duty_min で頭打ち）。動けば窓を取り直す（上乗せは保つ）。不感帯に入る（cmd = 0）・
+  // 誤差の符号が反転する・軌道が動き出す・ブレーキ作動・位置制御の終了で 0 に戻す。
+  // ENCODER_FAULT の無パルス判定（軌道が動いている間だけ）とは排他で、誤差の上限は従来どおり FOLLOWING_ERROR が守る。
+  void update_stall_boost(int64_t err, int cmd, uint64_t now) {
+    if (tuning.stall_boost_ms == 0) { reset_stall_boost(); return; }
+    const bool eligible = setpoint_vel_ == 0.0 && cmd != 0 && brake_release_cmd_;
+    const int8_t err_sign = err > 0 ? 1 : (err < 0 ? -1 : 0);
+    if (!eligible) { reset_stall_boost(); return; }
+    if (err_sign != boost_err_sign_) {
+      reset_stall_boost();
+      boost_err_sign_ = err_sign;
+    }
+    if (!boost_window_running_) {
+      boost_window_running_ = true;
+      boost_window_start_us_ = now;
+      boost_anchor_raw_ = raw_;
+      return;
+    }
+    const int64_t moved = raw_ - boost_anchor_raw_;
+    if ((moved < 0 ? -moved : moved) >= tuning.stall_boost_min_move) {
+      boost_window_start_us_ = now;  // 動いている: 窓を取り直す
+      boost_anchor_raw_ = raw_;
+      return;
+    }
+    const int max_boost = tuning.duty_max > tuning.duty_min ? tuning.duty_max - tuning.duty_min : 0;
+    if (stall_boost_ > max_boost) stall_boost_ = max_boost;  // SET_LIMITS で上限が下がった
+    if (now - boost_window_start_us_ >= ms_to_us(tuning.stall_boost_ms)) {
+      if (stall_boost_ < max_boost) stall_boost_ += 1;
+      boost_window_start_us_ = now;
+      boost_anchor_raw_ = raw_;
     }
   }
 

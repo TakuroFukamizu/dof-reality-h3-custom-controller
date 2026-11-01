@@ -1204,9 +1204,13 @@ void renderV1() {
 
   // 指令行
   canvas.setFont(&fonts::lgfxJapanGothic_16);
-  char cmd_text[64];
-  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %+d%%", vsnap.power_on_cmd ? "入" : "切",
-           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty);
+  char cmd_text[72];
+  char boost_text[12] = "";
+  if (vsnap.stall_boost > 0) {  // 停止ブースト（Issue #15 H4）: 下限への上乗せ。STATUS には出ないので画面だけ
+    snprintf(boost_text, sizeof(boost_text), "(+%d)", vsnap.stall_boost);
+  }
+  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %+d%%%s", vsnap.power_on_cmd ? "入" : "切",
+           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty, boost_text);
   canvas.setTextColor(vsnap.power_on_cmd || vsnap.brake_release_cmd ? kGreen : kOrange, TFT_BLACK);
   canvas.drawString(cmd_text, 8, 70);
 
@@ -1229,11 +1233,13 @@ void renderV1() {
   // フラグ行
   canvas.setTextDatum(middle_left);
   canvas.setFont(&fonts::lgfxJapanGothic_12);
-  char flag_text[64];
-  snprintf(flag_text, sizeof(flag_text), "%s  %s  %s", vsnap.configured ? "CONFIG 済" : "CONFIG 未",
+  char flag_text[96];
+  snprintf(flag_text, sizeof(flag_text), "%s  %s  %s%s", vsnap.configured ? "CONFIG 済" : "CONFIG 未",
            vsnap.referenced ? "基準 済" : "基準 未",
-           (vsnap.flags & v1::flags::POWER_CONTROLLER) ? "電源担当" : "電源担当なし");
-  canvas.setTextColor(vsnap.configured && vsnap.referenced ? kGreen : kAmber, TFT_BLACK);
+           (vsnap.flags & v1::flags::POWER_CONTROLLER) ? "電源担当" : "電源担当なし",
+           vsnap.encoder_fault_check_disabled ? "  無パルス検出なし" : "");  // duty_max < 10 %（Issue #15 M2）
+  canvas.setTextColor(vsnap.configured && vsnap.referenced && !vsnap.encoder_fault_check_disabled ? kGreen : kAmber,
+                      TFT_BLACK);
   canvas.drawString(flag_text, 8, 124);
 
   // リンク行
@@ -1295,7 +1301,8 @@ void renderV1() {
 bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
   return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
          a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
-         a.brake_release_cmd != b.brake_release_cmd || a.duty != b.duty || a.actual != b.actual ||
+         a.brake_release_cmd != b.brake_release_cmd || a.duty != b.duty || a.stall_boost != b.stall_boost ||
+         a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||

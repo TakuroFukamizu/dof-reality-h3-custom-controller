@@ -52,6 +52,8 @@ struct V1Snapshot {
   bool power_on_cmd = false;
   bool brake_release_cmd = false;
   int duty = 0;                  // 符号付き %
+  int stall_boost = 0;           // 停止ブースト（Issue #15 H4）で下限に上乗せしている %（0 = なし）
+  bool encoder_fault_check_disabled = false;  // duty_max がしきい値より低く無パルスの ENCODER_FAULT が出ない（Issue #15 M2）
   int32_t actual = 0;
   int32_t target = 0;
   int32_t velocity = 0;          // count/s（100 ms 窓）

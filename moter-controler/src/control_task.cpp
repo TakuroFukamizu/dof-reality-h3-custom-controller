@@ -355,6 +355,8 @@ void v1_task_main(void*) {
     snap.power_on_cmd = g_axis.power_on_cmd();
     snap.brake_release_cmd = g_axis.brake_release_cmd();
     snap.duty = g_axis.duty_percent();
+    snap.stall_boost = g_axis.stall_boost();
+    snap.encoder_fault_check_disabled = g_axis.encoder_fault_check_disabled();
     snap.actual = g_axis.actual_count();
     snap.target = g_axis.target_count();
     snap.velocity = g_axis.velocity_count_s();
