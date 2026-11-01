@@ -16,6 +16,7 @@ fn ax(n: u8) -> AxisId {
 
 fn ok(n_end: i32, neutral: i32, sign: i8) -> CalibrationResult {
     CalibrationResult {
+        device_id: DeviceId(0x5131_0000_0000_0009),
         result: CalResultCode::Ok,
         step: 3,
         n_end_count: n_end,

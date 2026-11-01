@@ -89,7 +89,9 @@
 //!   ACK is tracked. A REJECTED CALIBRATE is not a rig fault: it becomes the
 //!   blocker `calibrate_rejected: axisN …` (cleared by the next Calibrate /
 //!   CalibrateCancel, a CAL_RESULT, or the unit reconnecting) and, when it is
-//!   the power axis, the other targets are cancelled at once.
+//!   the power axis, the other targets are cancelled at once. A CALIBRATE(1)
+//!   whose ACK never comes ([`ACK_TIMEOUT`]) is forgotten the same way (no
+//!   blocker; the power axis unanswered also cancels the others).
 //! - `CalibrateCancel` and `Stop` send CALIBRATE(0) to every axis that is
 //!   CALIBRATING or whose CALIBRATE(1) is outstanding.
 //! - While any axis is CALIBRATING the rig stays Idle (CALIBRATION_REQUIRED
@@ -308,6 +310,8 @@ pub struct SupervisorEvent {
 /// Latest CAL_RESULT of an axis in its current boot (`AxisSnapshot::calibration`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CalibrationResult {
+    /// The unit that reported it (the export writes this `device_id`).
+    pub device_id: DeviceId,
     /// `OK` / `FAILED` / `CANCELLED`.
     pub result: CalResultCode,
     pub step: u8,
@@ -1465,6 +1469,7 @@ impl Supervisor {
             return;
         }
         let record = CalibrationResult {
+            device_id: self.axes[i].hello.map_or(DeviceId(0), |h| h.device_id),
             result: r.result,
             step: r.step,
             n_end_count: r.n_end_count,
@@ -2736,6 +2741,26 @@ impl Supervisor {
                     .is_some_and(|t| t.host_fault_req == Some(id) && !t.in_conflict());
                 if unconfirmed && matches!(self.phase, Phase::Fault { .. }) {
                     self.send_host_fault(p.axis, now);
+                }
+                // An unanswered CALIBRATE(1) must not leave the axis "pending"
+                // forever (no calibrate, no CONFIG retry, cancels on every Stop).
+                // Treated like a rejection: the power axis unanswered cancels
+                // the other targets.
+                if p.purpose == Purpose::Calibrate {
+                    if let Some(t) = self.axes.get_mut(p.axis) {
+                        t.cal_pending = false;
+                        t.cal_ack_ev = None;
+                    }
+                    if AxisId::from_index(p.axis) == Some(self.power_axis) {
+                        let cancelled = self.send_calibrate_cancel(now);
+                        if !cancelled.is_empty() {
+                            self.event(
+                                now,
+                                "calibrate_cancelled",
+                                serde_json::json!({"axes": cancelled, "because": "power axis did not ACK CALIBRATE"}),
+                            );
+                        }
+                    }
                 }
             }
         }

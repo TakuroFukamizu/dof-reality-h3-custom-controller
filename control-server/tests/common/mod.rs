@@ -26,8 +26,10 @@ pub fn sim_cfg() -> Config {
     Config::load(Path::new(SIM)).expect("config/sim.toml")
 }
 
+/// No config path: `POST /v1/calibration/export` answers 500 `no_config_path`
+/// (a test must never write into the repository's `config/`).
 pub async fn start_sim(cfg: Config) -> RunningServer {
-    start_sim_with_path(cfg, Some(Path::new(SIM).to_path_buf())).await
+    start_sim_with_path(cfg, None).await
 }
 
 /// Like [`start_sim`] with an explicit config path (where

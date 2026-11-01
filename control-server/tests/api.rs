@@ -953,6 +953,7 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
 
 fn cal_ok(n_end: i32) -> h3cs::supervisor::CalibrationResult {
     h3cs::supervisor::CalibrationResult {
+        device_id: h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58),
         result: h3cs::protocol::CalResultCode::Ok,
         step: 3,
         n_end_count: n_end,
@@ -984,13 +985,15 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     // Axis 1 OK (sign +1), axis 3 OK (sign −1), axis 2 FAILED (left alone).
     let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
     snap.axes[0].calibration = Some(cal_ok(6000));
-    snap.axes[0].device_id = h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58);
+    // The result carries the unit that measured it; the snapshot's own
+    // device_id (here sim.toml's) is not what gets written.
+    assert_ne!(snap.axes[0].device_id, h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58));
     snap.axes[1].calibration = Some(h3cs::supervisor::CalibrationResult {
         result: h3cs::protocol::CalResultCode::Failed,
         reason: "stall".into(),
         ..cal_ok(0)
     });
-    snap.axes[2].calibration = Some(cal_ok(-6138));
+    snap.axes[2].calibration = Some(h3cs::supervisor::CalibrationResult { device_id: h3cs::types::DeviceId(0x5131_30ed_a00b_2040), ..cal_ok(-6138) });
     status_tx.send_replace(Arc::new(snap));
 
     // Overwrite refusal: the names of this second and the next already exist.
@@ -1028,6 +1031,7 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
         (Some(300), Some(3000), Some(5700))
     );
     assert_eq!(axes[1]["axis_id"], 3);
+    assert_eq!(axes[1]["device_id"], "513130eda00b2040");
     assert_eq!((axes[1]["mechanical_min_count"].as_i64(), axes[1]["mechanical_max_count"].as_i64()), (Some(-6138), Some(0)));
     assert_eq!(
         (axes[1]["count_at_virtual_0"].as_i64(), axes[1]["count_at_virtual_512"].as_i64(), axes[1]["count_at_virtual_1023"].as_i64()),

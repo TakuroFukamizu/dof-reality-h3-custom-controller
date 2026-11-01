@@ -536,7 +536,7 @@ async fn calibration_export(State(st): State<AppState>) -> Response {
     for a in &snap.axes {
         let Some(r) = a.calibration.as_ref().filter(|r| r.result == CalResultCode::Ok) else { continue };
         let Some(ac) = cfg.axis(a.axis_id) else { continue };
-        match calibration_export::derive(a.axis_id, a.device_id, ac.decel_zone_count, r) {
+        match calibration_export::derive(a.axis_id, r.device_id, ac.decel_zone_count, r) {
             Ok(e) => axes.push(e),
             Err(e) => return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e),
         }

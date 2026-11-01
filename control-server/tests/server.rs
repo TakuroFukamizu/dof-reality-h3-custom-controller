@@ -788,6 +788,7 @@ async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calib
     for a in &snap.axes {
         let c = a.calibration.as_ref().unwrap();
         assert_eq!((c.n_end_count, c.neutral_count, c.sign, c.reason.as_str(), c.step), (1000, 500, 1, "ok", 3));
+        assert_eq!(c.device_id, a.device_id, "the result names the connected unit");
         assert_eq!(a.actual_count, Some(500));
     }
     for (_, sim) in &srv.sims {

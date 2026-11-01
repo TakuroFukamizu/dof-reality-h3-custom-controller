@@ -1096,7 +1096,14 @@ impl SimMcu {
                 let max_step = self.params.plant_max_vel_count_s.max(0.0) * dt;
                 let before = self.actual;
                 let delta = (run.target - before).clamp(-max_step, max_step);
-                let after = (before + delta).clamp(self.end_min, self.end_max);
+                // Land exactly on a reachable target (no float residue that
+                // would keep the neutral move going forever).
+                let after = if (run.target - before).abs() <= max_step {
+                    run.target
+                } else {
+                    before + delta
+                }
+                .clamp(self.end_min, self.end_max);
                 self.actual = after;
                 self.actual_vel = (after - before) / dt;
                 self.setpoint = after;

@@ -2631,3 +2631,47 @@ fn successful_calibration_clears_reference_stale() {
     assert!(snap.axes.iter().all(|a| !a.reference_stale && a.referenced));
     assert_eq!(r.count(0, msg_type::SET_REFERENCE), [0; 3]);
 }
+
+#[test]
+fn unanswered_calibrate_is_forgotten_after_ack_timeout_and_the_power_axis_cancels_the_others() {
+    // Axes 2 / 3 calibrate slowly (10 s) so they are still at it when the ACK
+    // of axis 1 times out.
+    let mut r = Rig::with(sim_cfg(), |i, p| {
+        p.start_referenced = false;
+        p.end_min_count = -500;
+        p.end_max_count = 500;
+        if i != 0 {
+            p.plant_max_vel_count_s = 200.0;
+        }
+    });
+    r.connect_all();
+    r.run_ms(100);
+    // Sim 0 (axis 1, the power axis) never answers (frame lost on the wire).
+    r.mcus[0].set_drop_rx(true);
+    let sent = r.sent.len();
+    r.admin(AdminCmd::Calibrate { axes: vec![] }).unwrap();
+    r.run_ms(1100); // > ACK_TIMEOUT
+    let cancelled: Vec<usize> = r
+        .sent_since(sent)
+        .iter()
+        .filter(|(_, _, m)| matches!(m, HostMsg::Calibrate { mode: 0, .. }))
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert_eq!(cancelled, vec![1, 2], "{:?}", r.sent_since(sent));
+    assert!(r.sup.fault().is_none());
+    assert!(!has(&r.blockers(), "calibrate_rejected"), "{:?}", r.blockers());
+    r.mcus[0].set_drop_rx(false);
+    assert!(r.run_until(2000, all_disarmed), "{:?}", r.mcu_states());
+    r.run_ms(50);
+    // Nothing is left pending on axis 1: Stop is a plain no-op and a new
+    // calibration of axis 1 alone is accepted.
+    let ok = r.sup.admin(AdminCmd::Stop, r.now).unwrap();
+    assert_eq!(ok.note.as_deref(), Some("not driving"));
+    assert_eq!(r.count(sent, msg_type::CALIBRATE), [1, 2, 2], "no extra CALIBRATE(0) to axis 1");
+    r.admin(AdminCmd::Calibrate { axes: vec![ax(1)] }).unwrap();
+    assert!(r.run_until(3000, |r| r.sup.snapshot(r.now).axes[0].calibration.is_some()));
+    assert_eq!(r.sup.snapshot(r.now).axes[0].calibration.as_ref().unwrap().result, h3cs::protocol::CalResultCode::Ok);
+    let (events, _) = r.sup.drain_events();
+    assert!(events.iter().any(|e| e.kind == "ack_timeout"));
+    assert!(events.iter().any(|e| e.kind == "calibrate_cancelled"));
+}
