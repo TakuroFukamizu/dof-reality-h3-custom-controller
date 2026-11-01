@@ -2134,6 +2134,56 @@ inline void test_duty_command_feed_forward() {
   CHECK(v1_duty_command(500, 600.0, b2, p) == 10);
 }
 
+// Issue #25 手順 8 (a): 位置ループの各項の計器。v1_duty_command の結果は変えず、FF / P / 軌道速度 / 下限の適用 / 不感帯を書く。
+inline void test_duty_terms_report_ff_p_floor_and_band() {
+  V1Tuning t;  // kp 2、ff 100、下限 7、上限 20
+  bool band = false;
+  V1DutyTerms o;
+  // FF 6 % + P 6 % = 12 %。下限は掛からない
+  CHECK(v1_duty_command(300, 600.0, band, t, &o) == 12);
+  CHECK(o.ff_permille == 60 && o.p_permille == 60 && o.vel_count_s == 600 && !o.floor_on && !o.in_band &&
+        o.cmd_permille == 120);
+  // FF 2 % だけ → 下限 7 %（floor_on）
+  CHECK(v1_duty_command(0, 200.0, band, t, &o) == 7);
+  CHECK(o.ff_permille == 20 && o.p_permille == 0 && o.floor_on && o.cmd_permille == 70);
+  // 負の向き: P −1.2 %・FF −2 % → 合成 −3.2 % → 下限 −7 %
+  CHECK(v1_duty_command(-60, -200.0, band, t, &o) == -7);
+  CHECK(o.ff_permille == -20 && o.p_permille == -12 && o.floor_on && o.cmd_permille == -70 && o.vel_count_s == -200);
+  // M1: 誤差と逆向きの合成が下限未満 → 0。floor_on は立たない（下限を掛けていない）
+  CHECK(v1_duty_command(50, -600.0, band, t, &o) == 0);
+  CHECK(o.ff_permille == -60 && o.p_permille == 10 && !o.floor_on && o.cmd_permille == 0);
+  // 上限で飽和: FF 25 % → 20 %
+  CHECK(v1_duty_command(0, 2500.0, band, t, &o) == 20);
+  CHECK(o.ff_permille == 250 && o.cmd_permille == 200 && !o.floor_on);
+  // 静止の不感帯の中: in_band が立ち、各項は 0
+  CHECK(v1_duty_command(5, 0.0, band, t, &o) == 0 && band);
+  CHECK(o.in_band && o.ff_permille == 0 && o.p_permille == 0 && o.cmd_permille == 0 && !o.floor_on);
+  // 軌道速度は int16 に飽和
+  CHECK(v1_duty_command(0, 40000.0, band, t, &o) == 20);
+  CHECK(o.vel_count_s == 32767);
+  // 軸経由: 位置制御が止まっていれば全部 0、HOLDING で誤差 25（静止）なら P 0.5 % → 下限 7 %、floor_on
+  Harness h;
+  CHECK(h.ax.duty_terms().cmd_permille == 0 && !h.ax.duty_terms().floor_on);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  const V1DutyTerms& a = h.ax.duty_terms();
+  CHECK(a.p_permille == 5 && a.ff_permille == 0 && a.vel_count_s == 0 && a.floor_on && !a.in_band &&
+        a.cmd_permille == 70 && a.boost_permille == 0);
+  CHECK(h.ax.pwm_permille() == 70);  // sign +1: duty −7 % → カウント増の向きに +70
+  // 停止ブーストが 1 % 乗れば boost_permille 10、cmd 80
+  h.drive(200, h.ax.actual_count() + 25);
+  h.step();
+  CHECK(h.ax.duty_terms().boost_permille == 10 && h.ax.duty_terms().cmd_permille == 80 && h.ax.duty_terms().floor_on);
+  // 位置制御が切れれば 0 に戻る
+  Harness::accepted(h.host_fault());
+  CHECK(h.ax.duty_terms().cmd_permille == 0 && h.ax.duty_terms().boost_permille == 0 && !h.ax.duty_terms().floor_on);
+}
+
 inline void test_duty_deadband_and_clamp() {
   Harness h;
   v1::Config c = base_config();
@@ -2915,6 +2965,7 @@ inline void run_all() {
   test_duty_sign_follows_profile_sign();
   test_duty_deadband_and_clamp();
   test_duty_command_feed_forward();
+  test_duty_terms_report_ff_p_floor_and_band();
   test_local_estop_latches_and_blocks_reset_until_released();
   test_local_estop_in_disarmed_and_during_other_fault();
   test_bad_frames_counted_and_unanswered();

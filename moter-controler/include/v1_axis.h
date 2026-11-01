@@ -48,6 +48,24 @@ struct V1Tuning {
   uint32_t velocity_window_ms = 100;
 };
 
+// 位置ループの各項の計器（Issue #25 手順 8。画面に出す。STATUS には載せない）。符号はカウントが増える向きが正。
+// 単位は permille（0.1 %）: ff_permille = 軌道速度 / ff × 10、p_permille = 誤差 × kp / 100 × 10（どちらも四捨五入）。
+struct V1DutyTerms {
+  int16_t ff_permille = 0;     // フィードフォワード項
+  int16_t p_permille = 0;      // 比例項
+  int16_t vel_count_s = 0;     // 軌道の目標速度 [count/s]（int16 に飽和）
+  bool floor_on = false;       // この tick に Duty 下限（duty_min ＋ 停止ブースト）を掛けた
+  bool in_band = false;        // 静止の不感帯の中（Duty 0）
+  int16_t boost_permille = 0;  // 停止ブースト（Issue #15 H4）の上乗せ。V1Axis が埋める
+  int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
+};
+
+inline int16_t v1_clamp_i16(double v) {
+  if (v > 32767.0) return 32767;
+  if (v < -32768.0) return -32768;
+  return static_cast<int16_t>(lround(v));
+}
+
 // 位置制御の指令値（カウントが増える向きを正とした %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
 // フィードフォワード（vel / ff）＋比例（err × kp / 100）。目標が止まっている（vel = 0）ときだけ不感帯を使い、
 // 入る側 deadband / 出る側 deadband_out のヒステリシスで到達帯の縁での往復を防ぐ。
@@ -55,30 +73,42 @@ struct V1Tuning {
 // 下限の掛け方（Issue #15 M1、t.floor_sign_gate）: 合成値が下限未満のとき、合成値の向きが誤差の向きと逆（cmd × err < 0）なら
 // 下限まで持ち上げずに 0（惰行）。誤差 0 は「向きが一致」として扱う（旧テストの err 0・vel 600 → 下限 と同じ）。
 // gate が偽なら旧動作（合成値に下限を掛ける。目標から離れる向きの下限バーストが出る）。
-inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t) {
+// terms を渡せば各項を書く（計器用。振る舞いは変えない）。
+inline int v1_duty_command(int64_t err, double vel, bool& in_band, const V1Tuning& t, V1DutyTerms* terms = nullptr) {
+  V1DutyTerms scratch;
+  V1DutyTerms& o = terms ? *terms : scratch;
+  o = V1DutyTerms{};
+  o.vel_count_s = v1_clamp_i16(vel);
   const int64_t err_abs = err < 0 ? -err : err;
   if (vel == 0.0) {
     if (in_band) {
-      if (err_abs <= t.deadband_out) return 0;
+      if (err_abs <= t.deadband_out) { o.in_band = true; return 0; }
       in_band = false;
     } else if (err_abs <= t.deadband) {
       in_band = true;
+      o.in_band = true;
       return 0;
     }
   } else {
     in_band = false;
   }
-  double cmd = static_cast<double>(err) * t.kp_percent_per_100 / 100.0;
-  if (t.ff_count_s_per_percent > 0) cmd += vel / t.ff_count_s_per_percent;
+  const double p = static_cast<double>(err) * t.kp_percent_per_100 / 100.0;
+  const double ff = t.ff_count_s_per_percent > 0 ? vel / t.ff_count_s_per_percent : 0.0;
+  o.p_permille = v1_clamp_i16(p * 10.0);
+  o.ff_permille = v1_clamp_i16(ff * 10.0);
+  const double cmd = p + ff;
   if (cmd == 0.0) return 0;
   double mag = cmd < 0 ? -cmd : cmd;
   if (mag < t.duty_min) {
     if (t.floor_sign_gate && cmd * static_cast<double>(err) < 0.0) return 0;  // 目標から離れる向きには下限を掛けない
     mag = t.duty_min;
+    o.floor_on = true;
   }
   if (mag > t.duty_max) mag = t.duty_max;
   const int m = static_cast<int>(mag);
-  return cmd < 0 ? -m : m;
+  const int out = cmd < 0 ? -m : m;
+  o.cmd_permille = static_cast<int16_t>(out * 10);
+  return out;
 }
 
 // v1 の校正に使う AutoConfig。端当て Duty だけ従来 env より高い（V1_CAL_HOME_DUTY）。
@@ -308,6 +338,8 @@ class V1Axis {
   uint64_t mcu_time_us(uint64_t now_us) const { return now_us > boot_origin_us_ ? now_us - boot_origin_us_ : 0; }
   // 停止ブースト（Issue #15 H4）: いま Duty 下限に上乗せしている %（0 = なし）。STATUS には載せない（空きフィールドが無い）。画面用
   int stall_boost() const { return stall_boost_; }
+  // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
+  const V1DutyTerms& duty_terms() const { return terms_; }
   // ENCODER_FAULT を判定し始める |Duty|（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100)
   int encoder_fault_duty_threshold() const {
     int th = tuning.duty_max * tuning.stall_duty_ratio_percent / 100;
@@ -413,6 +445,7 @@ class V1Axis {
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
   int duty_ = 0;
+  V1DutyTerms terms_{};  // 直近の位置ループの各項（計器）
 
   // 速度（100 ms 窓）
   int64_t vel_anchor_raw_ = 0;
@@ -897,6 +930,7 @@ class V1Axis {
     stop_kind_ = StopKind::Hold;
     brake_release_cmd_ = false;
     duty_ = 0;  // 次の tick を待たず PWM 0
+    terms_ = V1DutyTerms{};
     stall_running_ = false;
     hold_here();
     v1::McuMsg m;
@@ -1220,6 +1254,7 @@ class V1Axis {
       stall_running_ = false;
       in_band_ = false;
       reset_stall_boost();
+      terms_ = V1DutyTerms{};
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
@@ -1231,7 +1266,8 @@ class V1Axis {
       t.duty_min = tuning.duty_min + stall_boost_;
       if (t.duty_min > tuning.duty_max) t.duty_min = tuning.duty_max;
     }
-    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, t);  // カウント増の向きが正
+    const int cmd = v1_duty_command(err, setpoint_vel_, in_band_, t, &terms_);  // カウント増の向きが正
+    terms_.boost_permille = static_cast<int16_t>(stall_boost_ * 10);
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_ = -static_cast<int>(sign_) * cmd;
