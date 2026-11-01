@@ -387,6 +387,22 @@ impl PoseIntake {
         Ok(accepted)
     }
 
+    /// A new gain ceiling (runtime `limits` change): re-check the latest pose
+    /// against it so a lowered ceiling takes effect at once, not at the next
+    /// pose. Freshness, seq and frame_seq are untouched. `None` when there is
+    /// no pose or nothing changed.
+    pub fn reapply_gain_ceiling(&mut self, cfg: &GameConfig, max_gain: f64) -> Option<AcceptedPose> {
+        let prev = self.latest.as_ref()?;
+        let checked =
+            compat::check_pose(prev.pose, prev.requested_gain, max_gain, cfg.clamp_out_of_range).ok()?;
+        if checked == prev.checked {
+            return None;
+        }
+        let p = AcceptedPose { checked, ..prev.clone() };
+        self.latest = Some(p.clone());
+        Some(p)
+    }
+
     /// Gain-only update: re-checks the latest pose with the new gain and
     /// never touches its freshness.
     pub fn accept_gain(&mut self, msg: &GainMsg, cfg: &GameConfig, max_gain: f64) -> Result<GainUpdate, RejectReason> {

@@ -189,7 +189,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 ```
 
 - ack は受理・拒否どちらも返す。拒否理由: `stale_session` / `old_seq` / `old_frame` / `non_finite` / `out_of_range` / `invalid_age` / `missing_frame_seq` / `bad_protocol` / `bad_message` / `axis_conflict`（§10。pose・gain とも拒否し、鮮度も更新しない）。
-- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
+- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目）が付き、`effective_gain` は新しい gain の上限、上限で切られたら `limits` に `ceiling_clamped`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
 - status は `status_period_ms` ごと。WS 自体は駆動権限を与えない。
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 

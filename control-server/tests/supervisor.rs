@@ -14,7 +14,7 @@ use h3cs::limits::MotionLimits;
 use h3cs::protocol::{capabilities, msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
 use h3cs::session::{AcceptedPose, PoseIntake, PoseMsg};
 use h3cs::sim_axis::{SimMcu, SimParams};
-use h3cs::supervisor::{admin_error, ActiveSource, AdminCmd, LinkEvent, Supervisor};
+use h3cs::supervisor::{admin_error, ActiveSource, AdminCmd, LinkEvent, Supervisor, ACK_TIMEOUT, LIMITS_RETRY};
 use h3cs::types::{status_flags, AxisId, DeviceId, FaultCode, LimitReason, McuState, Pose, RigFault, RigState};
 use tokio::time::Instant;
 
@@ -2886,4 +2886,86 @@ fn limits_are_resent_after_an_mcu_reboot() {
     let snap = r.sup.snapshot(r.now);
     assert_eq!(snap.axes[1].fw_limits.map(|l| l.boot_id), Some(0xbeef_0002));
     assert!(!has(&r.blockers(), "limits_rejected"), "{:?}", r.blockers());
+}
+
+#[test]
+fn arm_is_blocked_until_set_limits_is_acked() {
+    let cfg = sim_cfg();
+    let mut sup = Supervisor::new(&cfg);
+    let mut mcu = SimMcu::new(SimParams { device_id: cfg.axes[0].device_id, ..SimParams::default() });
+    let now = Instant::now();
+    let Some(McuMsg::Hello(hello)) = mcu.handle(&HostMsg::HelloReq { request_id: 1 }, 1).into_iter().next() else {
+        panic!("no hello")
+    };
+    sup.on_link_event(LinkEvent::Identified { axis: ax(1), hello, port: "sim:1".into() }, now);
+    sup.on_link_event(LinkEvent::Status { axis: ax(1), status: mcu.status(), received_at: now }, now);
+    let out = sup.tick(now, 0.01, None);
+    let [HostMsg::Config(c), HostMsg::SetLimits(l)] = out.admin_msgs[0].as_slice() else { panic!("{:?}", out.admin_msgs) };
+    // CONFIG ACKed, SET_LIMITS unanswered (lost on the wire): the axis stays blocked.
+    let ack = Ack { request_id: c.request_id, acked_type: msg_type::CONFIG, result: AckResult::Accepted, reason: AckReason::None };
+    sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now);
+    let configured = mcu.handle(&HostMsg::Config(*c), 2);
+    let status = configured.iter().find_map(|m| match m { McuMsg::Status(s) => Some(*s), _ => None }).unwrap_or(mcu.status());
+    sup.on_link_event(LinkEvent::Status { axis: ax(1), status, received_at: now }, now);
+    assert!(has(&sup.blockers(now), "limits_unconfirmed: axis1"), "{:?}", sup.blockers(now));
+    // The MCU answers (ACK then LIMITS): blocker gone.
+    let replies = mcu.handle(&HostMsg::SetLimits(*l), 3);
+    for m in replies {
+        match m {
+            McuMsg::Ack(ack) => sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now),
+            McuMsg::Limits(limits) => sup.on_link_event(LinkEvent::Limits { axis: ax(1), limits }, now),
+            _ => {}
+        }
+    }
+    assert!(!has(&sup.blockers(now), "limits_unconfirmed"), "{:?}", sup.blockers(now));
+    // An unanswered SET_LIMITS is re-sent after the ACK timeout; the blocker stays meanwhile.
+    let later = now + ACK_TIMEOUT + LIMITS_RETRY + Duration::from_millis(50);
+    sup.set_requested_limits(MotionLimits { duty_max_percent: 30, ..sup.effective_limits() });
+    let out = sup.tick(now + Duration::from_millis(20), 0.01, None);
+    assert!(out.admin_msgs[0].iter().any(|m| matches!(m, HostMsg::SetLimits(_))));
+    assert!(has(&sup.blockers(now + Duration::from_millis(20)), "limits_unconfirmed: axis1"));
+    // The ACK timeout forgets the request and schedules a retry one LIMITS_RETRY later.
+    let out = sup.tick(later, 0.01, None);
+    assert!(out.admin_msgs[0].is_empty(), "{:?}", out.admin_msgs);
+    let out = sup.tick(later + LIMITS_RETRY + Duration::from_millis(10), 0.01, None);
+    assert!(out.admin_msgs[0].iter().any(|m| matches!(m, HostMsg::SetLimits(_))), "re-sent after timeout: {:?}", out.admin_msgs);
+}
+
+#[test]
+fn set_limits_acked_but_limits_report_lost_is_resent_with_a_new_request_id() {
+    let cfg = sim_cfg();
+    let mut sup = Supervisor::new(&cfg);
+    let mut mcu = SimMcu::new(SimParams { device_id: cfg.axes[0].device_id, ..SimParams::default() });
+    let now = Instant::now();
+    let Some(McuMsg::Hello(hello)) = mcu.handle(&HostMsg::HelloReq { request_id: 1 }, 1).into_iter().next() else {
+        panic!("no hello")
+    };
+    sup.on_link_event(LinkEvent::Identified { axis: ax(1), hello, port: "sim:1".into() }, now);
+    sup.on_link_event(LinkEvent::Status { axis: ax(1), status: mcu.status(), received_at: now }, now);
+    let out = sup.tick(now, 0.01, None);
+    let [HostMsg::Config(_), HostMsg::SetLimits(l)] = out.admin_msgs[0].as_slice() else { panic!("{:?}", out.admin_msgs) };
+    // The MCU ACKs, but its LIMITS frame is lost on the wire.
+    let replies = mcu.handle(&HostMsg::SetLimits(*l), 2);
+    let ack = replies.iter().find_map(|m| match m { McuMsg::Ack(a) => Some(*a), _ => None }).unwrap();
+    sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now);
+    let t1 = now + Duration::from_millis(20);
+    assert!(has(&sup.blockers(t1), "limits_unconfirmed: axis1"), "{:?}", sup.blockers(t1));
+    assert!(sup.tick(t1, 0.01, None).admin_msgs[0].is_empty(), "no resend before LIMITS_RETRY");
+    // After LIMITS_RETRY: a new SET_LIMITS with a fresh request_id (a resend
+    // of the old one would be DUPLICATE without LIMITS).
+    let t2 = now + LIMITS_RETRY + Duration::from_millis(10);
+    let out = sup.tick(t2, 0.01, None);
+    let Some(HostMsg::SetLimits(l2)) = out.admin_msgs[0].iter().find(|m| matches!(m, HostMsg::SetLimits(_))) else {
+        panic!("{:?}", out.admin_msgs)
+    };
+    assert_ne!(l2.request_id, l.request_id);
+    for m in mcu.handle(&HostMsg::SetLimits(*l2), 3) {
+        match m {
+            McuMsg::Ack(ack) => sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, t2),
+            McuMsg::Limits(limits) => sup.on_link_event(LinkEvent::Limits { axis: ax(1), limits }, t2),
+            _ => {}
+        }
+    }
+    assert!(!has(&sup.blockers(t2), "limits_unconfirmed"), "{:?}", sup.blockers(t2));
+    assert!(sup.snapshot(t2).axes[0].fw_limits.is_some());
 }

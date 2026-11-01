@@ -1144,15 +1144,32 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(ack["effective_gain"], 0.7);
     assert_eq!(ack["limits"], serde_json::json!([]));
     assert_eq!(ack["fresh"], true);
+    // Lowering the ceiling re-clamps the pose being tracked (no new pose needed).
+    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_gain": 0.3}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_gain"], 0.3);
+    let mut st = next_status(&mut ws).await;
+    for _ in 0..30 {
+        if st["effective_gain"] == 0.3 {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    assert_eq!(st["requested_gain"], 0.7);
+    assert_eq!(st["effective_gain"], 0.3, "{st}");
+    assert_eq!(st["limits"], serde_json::json!(["gain_limited"]));
+    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_gain": 0.8}))).await;
+    assert_eq!(next_ack(&mut ws).await["accepted"], true);
     // Invalid value: rejected, seq not consumed.
-    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"duty_max_percent": 0}))).await;
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 0}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("out_of_range")));
-    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"duty_max_percent": 50}))).await;
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 50}))).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["duty_max_percent"], 50);
-    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({}))).await;
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({}))).await;
     assert_eq!(next_ack(&mut ws).await["reason"], "old_seq");
     // Status (WS push and GET) shows the change once the control loop took it.
     let mut st = next_status(&mut ws).await;

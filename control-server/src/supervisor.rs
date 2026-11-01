@@ -562,6 +562,11 @@ impl AxisTrack {
     fn supports_limits(&self) -> bool {
         self.hello.is_some_and(|h| h.capabilities & capabilities::LIMITS != 0)
     }
+    /// `want` is in force on the MCU: SET_LIMITS ACKed *and* its LIMITS
+    /// report received (an ACK whose LIMITS was lost is not confirmation).
+    fn limits_confirmed(&self, want: FwTuning) -> bool {
+        self.limits_acked == Some(want) && self.fw_limits.is_some()
+    }
     fn clear_limits(&mut self) {
         self.fw_limits = None;
         self.limits_acked = None;
@@ -954,6 +959,11 @@ impl Supervisor {
             }
             if let Some(r) = t.limits_rejected {
                 b.push(format!("limits_rejected: axis{n} SET_LIMITS rejected ({r:?})"));
+            } else if t.supports_limits() && !t.limits_confirmed(self.desired_tuning()) {
+                // Never arm on the firmware's default tuning (or a previous
+                // connection's): the duty cap must be the configured one,
+                // ACKed and reported back (LIMITS).
+                b.push(format!("limits_unconfirmed: axis{n} SET_LIMITS not ACKed / LIMITS not received yet"));
             }
             let Some(s) = t.status else {
                 b.push(format!("no_status: axis{n}"));
@@ -1333,10 +1343,12 @@ impl Supervisor {
         FwTuning::new(&self.limits_cfg, &self.effective_limits)
     }
 
-    /// Send SET_LIMITS to every connected axis whose ACKed tuning differs from
-    /// the desired one: once per change, one outstanding per axis, not to a
-    /// faulted MCU (it would answer FAULT_ACTIVE), not while the rig is
-    /// latched (HOST_FAULT first).
+    /// Send SET_LIMITS to every connected axis on which the desired tuning is
+    /// not confirmed (ACK + LIMITS): once per change, one outstanding per
+    /// axis, not to a faulted MCU (it would answer FAULT_ACTIVE), not while
+    /// the rig is latched (HOST_FAULT first). An ACK whose LIMITS never
+    /// arrives is re-sent after `LIMITS_RETRY` with a new request_id (a
+    /// resend of the same request would only be DUPLICATE, without LIMITS).
     fn reconcile_limits(&mut self, now: Instant) {
         if matches!(self.phase, Phase::Fault { .. }) {
             return;
@@ -1350,7 +1362,7 @@ impl Supervisor {
                 && t.status_fault().is_none()
                 && t.host_fault_confirmed()
                 && t.limits_inflight.is_none()
-                && t.limits_acked != Some(want)
+                && !t.limits_confirmed(want)
                 && t.limits_retry_at.is_none_or(|at| now >= at);
             if due {
                 let id = self.take_request_id();
@@ -1368,7 +1380,10 @@ impl Supervisor {
         if !self.axes[i].connected {
             return;
         }
-        self.axes[i].fw_limits = Some(limits);
+        let t = &mut self.axes[i];
+        t.fw_limits = Some(limits);
+        // The exchange completed: no resend pending for a lost report.
+        t.limits_retry_at = None;
         self.event(now, "limits", serde_json::json!({"axis": axis, "limits": limits}));
         self.recompute_limits();
     }
@@ -1822,6 +1837,8 @@ impl Supervisor {
                         let t = &mut self.axes[i];
                         t.limits_acked = t.limits_inflight.take();
                         t.limits_rejected = None;
+                        // LIMITS should follow at once; if it is lost, resend after this.
+                        t.limits_retry_at = Some(now + LIMITS_RETRY);
                     }
                     _ => {}
                 }

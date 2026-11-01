@@ -459,6 +459,30 @@ fn limits_message_consumes_seq_only_on_success_and_never_touches_freshness() {
 }
 
 #[test]
+fn reapply_gain_ceiling_reclamps_the_latest_pose_without_touching_freshness() {
+    let (mut s, id) = intake();
+    let t0 = Instant::now();
+    assert!(s.reapply_gain_ceiling(&cfg(), 0.1).is_none(), "no pose yet");
+    let mut m = pose_msg(&id, 1, Some(1));
+    m.gain = 0.3;
+    let before = s.accept_pose(&m, t0, &cfg(), MAX_GAIN, FRESH_MS).unwrap();
+    assert_eq!(before.checked.effective_gain, 0.3);
+    // Same ceiling: nothing changes.
+    assert!(s.reapply_gain_ceiling(&cfg(), MAX_GAIN).is_none());
+    // Lower ceiling: effective gain drops, limits report it, freshness and seq are kept.
+    let p = s.reapply_gain_ceiling(&cfg(), 0.2).unwrap();
+    assert_eq!(p.checked.effective_gain, 0.2);
+    assert_eq!(p.checked.limits, vec![LimitReason::GainLimited]);
+    assert_eq!(p.requested_gain, 0.3);
+    assert_eq!(p.fresh_until, before.fresh_until);
+    assert_eq!(s.latest().unwrap(), &p);
+    assert_eq!(s.snapshot(t0).last_seq, 1);
+    // Raised again: back to the requested gain.
+    let p = s.reapply_gain_ceiling(&cfg(), 0.5).unwrap();
+    assert_eq!((p.checked.effective_gain, p.checked.limits.len()), (0.3, 0));
+}
+
+#[test]
 fn limits_message_parses_present_fields_only() {
     let m = ClientMsg::parse(r#"{"type":"limits","protocol":1,"source_session":"abc","seq":5,"max_vel_count_s":1200,"duty_max_percent":35}"#)
         .unwrap();

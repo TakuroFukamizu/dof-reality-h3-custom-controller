@@ -694,7 +694,16 @@ async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
     match apply_limits_patch(&st, &patch) {
-        Ok(()) => Json(st.limits_view()).into_response(),
+        Ok(()) => {
+            // Same as the WS path: a lowered gain ceiling reaches the tracked pose now.
+            let max_gain = st.current_max_gain();
+            let mut s = st.session();
+            if let Some(p) = s.reapply_gain_ceiling(&st.inner.cfg.game, max_gain) {
+                st.inner.pose_tx.send_replace(Some(p));
+            }
+            drop(s);
+            Json(st.limits_view()).into_response()
+        }
         Err(PatchError::NonFinite) => error(StatusCode::BAD_REQUEST, "non_finite"),
         Err(PatchError::OutOfRange) => error(StatusCode::BAD_REQUEST, "out_of_range"),
     }
@@ -855,6 +864,11 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
         });
         return match r {
             Ok((effective, limited)) => {
+                // The new gain ceiling applies to the pose being tracked now
+                // (freshness unchanged), not only to the next one.
+                if let Some(p) = s.reapply_gain_ceiling(&cfg.game, effective.max_gain) {
+                    st.inner.pose_tx.send_replace(Some(p));
+                }
                 let reasons = if limited.is_empty() { Vec::new() } else { vec![LimitReason::CeilingClamped] };
                 AckMsg::accepted_limits(seq, effective, reasons, s.is_fresh(recv_at))
             }

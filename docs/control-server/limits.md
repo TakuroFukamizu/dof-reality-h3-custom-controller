@@ -77,7 +77,7 @@ PC は LIMITS を受けるまで同じ値（`protocol::fw_absolute`）を仮の�
 - 4 項目はどれも省略可。書いた項目だけ変わる。`seq` と `source_session` の規則は pose と同じ（`seq` は受理したときだけ消費する）。**鮮度は延長しない**。
 - ack: `{"type":"ack","seq":1252,"accepted":true,"effective_gain":0.5,"effective_limits":{...4 項目...},"limits":["ceiling_clamped"],"fresh":false}`。`effective_gain` は新しい gain の上限。`ceiling_clamped` はどれかが上限で切られたとき。
 - 拒否: 非有限は `non_finite`、`max_gain < 0`・速度と加速度の 0 以下・`duty_max_percent` の 1〜100 の外は `out_of_range`。競合中（`axis_conflict`）は pose と同じく拒否。
-- 新しい gain の上限は次の pose / gain メッセージから効く。Python クライアントは `submit_limits(...)` を pose より先に送る。
+- 新しい gain の上限は、いま追従中の姿勢にもその場で効く（`effective_gain` が下がり `gain_limited` が付く。鮮度は変えない）。Python クライアントは `submit_limits(...)` を pose より先に送る。
 - bridge（`H3_BACKEND=server`）はゲームの POST に `"limits": {...}` があればそのまま渡す（`clients/h3game/README.md`）。
 
 ### 3.2 管理者から（REST）
@@ -93,7 +93,7 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 - `motion_limits`: 上の GET と同じ 5 つ。
 - `axes[].fw_limits`: その個体が LIMITS で返した有効値（`duty_max_percent` …）と絶対上限（`abs_duty_max_percent`、`abs_max_vel_count_s`、`abs_max_acc_count_s2`）。SET_LIMITS を受ける前は `null`。
-- blockers: `firmware_limits_unsupported: axisN`（SET_LIMITS を知らない旧ファーム。焼き直すまで ARM しない）、`limits_rejected: axisN`（SET_LIMITS が拒否された。1 秒後に再送）。
+- blockers: `firmware_limits_unsupported: axisN`（SET_LIMITS を知らない旧ファーム。焼き直すまで ARM しない）、`limits_rejected: axisN`（SET_LIMITS が拒否された。1 秒後に再送）、`limits_unconfirmed: axisN`（いまの調整値の SET_LIMITS が ACK され、かつ LIMITS が届くまで。ファーム既定の 7〜20 % や前の接続の値で ARM しないための阻害。ACK が来なければ 1 秒の期限切れの後に、ACK は来たが LIMITS が落ちたなら 1 秒後に、新しい request_id で送り直す）。
 - events: `limits`（LIMITS の受信）、`ack_rejected`（SET_LIMITS の拒否）。
 
 ### 3.4 試験ページ（`GET /`）
