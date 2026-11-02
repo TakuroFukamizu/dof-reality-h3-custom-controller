@@ -175,7 +175,8 @@ constexpr uint8_t POWER_HOLD = 3;  // 主電源だけ入れておく（電源担
 namespace diag_result {
 constexpr uint8_t OK = 0;
 constexpr uint8_t FAULT = 1;       // 異常（非常停止・無パルスなど）で打ち切った。fault_code に理由
-constexpr uint8_t CANCELLED = 2;   // DIAG_START(CANCEL) / DISARM / POWER_HOLD の受信途絶
+constexpr uint8_t CANCELLED = 2;   // DIAG_START(CANCEL) / DISARM / 受信途絶（主電源待ち・待機中）
+constexpr uint8_t ABORTED = 3;     // 安全側の打ち切り（異常はラッチしない）: 解除直前の余裕不足・記録の満杯・作動後に端の余裕を越えた
 }  // namespace diag_result
 // DIAG_RESULT の stop_reason（ブレーキ作動を指令した理由）
 namespace diag_stop {
@@ -192,13 +193,23 @@ constexpr uint8_t CANCEL = 9;
 constexpr uint8_t FAULT = 10;       // 異常のラッチ（非常停止など）
 constexpr uint8_t SAG_GUARD = 11;   // ENGAGE: 走らせる前の待ちの間に沈みすぎた
 constexpr uint8_t OVERSPEED = 12;   // ENGAGE: CONFIG の overspeed を超えた
+constexpr uint8_t ROOM_LOST = 13;   // ブレーキ解除の直前に位置を見直したら余裕が足りない（解除しない。記録なし）
+constexpr uint8_t BUFFER_FULL = 14; // 記録が満杯（その周期にブレーキ作動・PWM 0、作動後の記録なしで終わる）
 }  // namespace diag_stop
 namespace diag_flags {  // DIAG_RESULT の flags / 記録 1 点の flags
 constexpr uint8_t TRUNCATED = 1u << 0;      // 記録が満杯になり後半を捨てた（DIAG_RESULT）
 constexpr uint8_t NOT_SETTLED = 1u << 1;    // 記録の終わりまでに静止しなかった（DIAG_RESULT）
+constexpr uint8_t POST_MARGIN = 1u << 2;    // ブレーキ作動の後に端の余裕（ソフトリミットの 100 count 内側）を越えた（DIAG_RESULT。待機せず終わる）
+constexpr uint8_t SESSION_KEPT = 1u << 3;   // この結果の後も DIAG の待機（主電源 ON・ブレーキ作動・PWM 0）に残っている（DIAG_RESULT）
 constexpr uint8_t BRAKE_RELEASE = 1u << 0;  // 記録 1 点: ブレーキ解除指令中
 constexpr uint8_t POWER_ON = 1u << 1;       // 記録 1 点: 主電源 ON 指令中
 }  // namespace diag_flags
+namespace diag_session {  // DIAG_DATA の session_flags（DIAG_READ はいつでも答えるので、PC はこれで電源の落ち着きを待つ）
+constexpr uint8_t ACTIVE = 1u << 0;         // DIAG の区間（主電源 ON 指令の区間）が開いている
+constexpr uint8_t POWER_CMD = 1u << 1;      // この軸が主電源 ON を指令している（電源担当軸）
+constexpr uint8_t SETTLED = 1u << 2;        // 区間の始まり（主電源 ON 指令）から電源待ち（≥ 5 s）が過ぎた
+constexpr uint8_t TEST_BUSY = 1u << 3;      // SAG / ENGAGE が電源待ち・記録中
+}  // namespace diag_session
 constexpr size_t DIAG_SAMPLES_PER_CHUNK = 16;
 constexpr size_t DIAG_SAMPLE_BYTES = 13;
 constexpr uint32_t DIAG_TIME_NONE = 0xFFFFFFFFu;
@@ -556,6 +567,8 @@ struct DiagData {
   uint16_t offset;
   uint16_t total;         // 記録の点数（いまの値）
   uint8_t n;              // この応答の点数（0〜16）
+  uint8_t session_flags;  // diag_session::*（いまの値）
+  uint16_t session_ms;    // 区間の始まり（主電源 ON 指令）からの経過 [ms]（65535 で頭打ち。区間外は 0）
   DiagSample samples[DIAG_SAMPLES_PER_CHUNK];
 };
 struct DiagResult {
@@ -582,6 +595,7 @@ struct DiagResult {
   uint8_t flags;               // diag_flags::TRUNCATED / NOT_SETTLED
   uint16_t adc_first;          // t = 0 の VIOUT 生値
   int16_t drive_pwm_permille;  // ENGAGE の走行 Duty（カウント増が正）
+  uint16_t session_ms_at_release;  // ブレーキ解除指令（t = 0）の時点の区間の経過 [ms]（電源待ちの実績。65535 で頭打ち、解除なしは 0）
 };
 #endif
 
@@ -861,6 +875,7 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       put_u8(out + 57, r.flags);
       put_u16(out + 58, r.adc_first);
       put_i16(out + 60, r.drive_pwm_permille);
+      put_u16(out + 62, r.session_ms_at_release);
       break;
     }
     case msg::DIAG_DATA: {
@@ -870,6 +885,8 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       put_u16(out + 8, d.offset);
       put_u16(out + 10, d.total);
       put_u8(out + 12, d.n);
+      put_u8(out + 13, d.session_flags);
+      put_u16(out + 14, d.session_ms);
       for (size_t i = 0; i < d.n && i < DIAG_SAMPLES_PER_CHUNK; ++i) {
         uint8_t* q = out + 16 + i * DIAG_SAMPLE_BYTES;
         const DiagSample& s = d.samples[i];
@@ -1120,6 +1137,7 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       r.flags = get_u8(p + 57);
       r.adc_first = get_u16(p + 58);
       r.drive_pwm_permille = get_i16(p + 60);
+      r.session_ms_at_release = get_u16(p + 62);
       break;
     }
     case msg::DIAG_DATA: {
@@ -1129,6 +1147,8 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       d.offset = get_u16(p + 8);
       d.total = get_u16(p + 10);
       d.n = get_u8(p + 12);
+      d.session_flags = get_u8(p + 13);
+      d.session_ms = get_u16(p + 14);
       if (d.n > DIAG_SAMPLES_PER_CHUNK) return false;
       for (size_t i = 0; i < d.n; ++i) {
         const uint8_t* q = p + 16 + i * DIAG_SAMPLE_BYTES;

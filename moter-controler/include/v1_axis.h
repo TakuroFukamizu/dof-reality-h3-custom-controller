@@ -569,14 +569,18 @@ class V1Axis {
     }
     now_us_ = now_us;
     const int32_t a = clamp_count(raw - reference_offset_);
-    // POWER_HOLD は PC からの受信が途絶えたら主電源を切る（道具が落ちたときに 24 V を入れたままにしない）
-    if (state_ == v1::state::DIAG && diag_.phase() == V1DiagBrake::Phase::PowerHold &&
-        now_us - last_rx_us_ > ms_to_us(V1_DIAG_POWER_HOLD_RX_TIMEOUT_MS)) {
+    // 待機・電源待ちの間に PC からの受信が途絶えたら区間を閉じる（道具が落ちたときに 24 V を入れたままにしない）。
+    // 記録中は自分の時計で終わる（最長約 1 s）ので見ない。終わって待機に入った後の途絶で閉じる
+    if (state_ == v1::state::DIAG && (diag_.phase() == V1DiagBrake::Phase::Hold || diag_.phase() == V1DiagBrake::Phase::Settle) &&
+        now_us - last_rx_us_ > ms_to_us(V1_DIAG_RX_TIMEOUT_MS)) {
       diag_.cancel(now_us);
     }
     diag_.step(now_us, a, adc, power_on_cmd());
     uint16_t code = v1::fault::NONE;
-    if (diag_.take_fault_request(&code)) latch_fault(code, now_us);  // 走行中の無パルス（ブレーキ作動・PWM 0 はこの周期に出る）
+    if (diag_.take_fault_request(&code)) {  // 走行中の無パルス（ブレーキ作動・PWM 0 はこの周期に出る）
+      latch_fault(code, now_us);
+      if (code == v1::fault::ENCODER_FAULT) referenced_ = false;  // エンコーダを信じられない: 基準はその場で消す（FAULT_RESET を待たない）
+    }
     if (state_ == v1::state::DIAG) {
       brake_release_cmd_ = diag_.brake_release();
       duty_permille_ = -static_cast<int>(sign_) * diag_.pwm_permille();  // カウントを増やしたいなら −sign × duty（update_duty と同じ）
@@ -584,7 +588,7 @@ class V1Axis {
     diag_finish_if_done();
     emit_status_if_changed();
   }
-  bool diag_busy() const { return diag_.busy(); }
+  bool diag_busy() const { return diag_.busy(); }   // 区間が開いている（待機を含む）: 制御タスクは毎周期 diag_step を呼ぶ
   bool diag_fast() const { return diag_.fast(); }
   const V1DiagBrake& diag() const { return diag_; }
 #endif
@@ -886,7 +890,7 @@ class V1Axis {
     return state_ == v1::state::ARMING || state_ == v1::state::HOLDING || state_ == v1::state::ACTIVE ||
            state_ == v1::state::STOPPING || state_ == v1::state::DISARMING || state_ == v1::state::CALIBRATING
 #if V1_DIAG_BRAKE_TEST
-           || state_ == v1::state::DIAG  // ARMING と同じく主電源 ON 指令（電源担当軸のみ）。待ちは tuning.power_settle_ms
+           || state_ == v1::state::DIAG  // 区間（待機を含む）の間は主電源 ON 指令（電源担当軸のみ）。最初の解除までの待ちは ≥ 5 s（v1_diag_brake.h）
 #endif
         ;
   }
@@ -1271,9 +1275,10 @@ class V1Axis {
   }
 
 #if V1_DIAG_BRAKE_TEST
-  // DIAG_START（計測専用）。CANCEL は DIAG 中なら中止、それ以外は何もせず受理。
-  // 開始の条件: DISARMED（ブレーキ作動・PWM 0）・記録の後始末が済んでいる・ローカル非常停止なし・CONFIG 済み（端の余裕は
-  // ソフトリミットから取る）。SAG / ENGAGE はさらに POSITION_REFERENCED・ソフトリミット内・開始位置に余裕。POWER_HOLD は電源担当軸だけ。
+  // DIAG_START（計測専用）。CANCEL は DIAG 中なら区間を閉じる（記録中なら作動後の記録の後）、それ以外は何もせず受理。
+  // 開始の条件: DISARMED（新しい区間）か DIAG の待機中（同じ区間の次の計測。電源待ちなし）・ローカル非常停止なし・CONFIG 済み
+  //（端の余裕はソフトリミットから取る）。SAG / ENGAGE はさらに POSITION_REFERENCED・ソフトリミット内・開始位置に余裕
+  //（ブレーキ解除の直前にもう一度見る）。POWER_HOLD は電源担当軸だけ（待機中なら期限を延ばす）。
   // 中止（DIAG_START(CANCEL) / DISARM）。ブレーキ作動・PWM 0 は次の diag_step を待たずにこの場で出力に反映する
   void diag_cancel(uint64_t now) {
     diag_.cancel(now);
@@ -1288,7 +1293,10 @@ class V1Axis {
     }
     const uint16_t pr = v1_diag_check_params(d);
     if (pr != v1::ack_reason::NONE) return pr;
-    if (state_ != v1::state::DISARMED || diag_.busy()) return v1::ack_reason::BAD_STATE;
+    // 新しい区間は DISARMED から、同じ区間の次の計測は待機中（DIAG・ブレーキ作動・PWM 0）から
+    const bool fresh = state_ == v1::state::DISARMED && !diag_.busy();
+    const bool in_session = state_ == v1::state::DIAG && diag_.idle();
+    if (!fresh && !in_session) return v1::ack_reason::BAD_STATE;
     if (estop_latched_) return v1::ack_reason::BAD_STATE;
     if (!has_config_) return v1::ack_reason::NOT_CONFIGURED;
     int32_t lo = 0;
@@ -1302,11 +1310,14 @@ class V1Axis {
       hi = config_.soft_max_count - V1_DIAG_END_MARGIN_COUNT;
       if (!v1_diag_room_ok(d, actual_count(), lo, hi)) return v1::ack_reason::INVALID_PARAM;
     }
-    state_ = v1::state::DIAG;
-    brake_release_cmd_ = false;
-    duty_permille_ = 0;
-    hold_here();
-    diag_.start(d, now, lo, hi, tuning.power_settle_ms, config_.overspeed_count_s);
+    if (fresh) {
+      state_ = v1::state::DIAG;  // 主電源 ON 指令（電源担当軸）。最初の解除は区間の始まりから ≥ 5 s（校正と同じ）
+      brake_release_cmd_ = false;
+      duty_permille_ = 0;
+      hold_here();
+      diag_.open_session(now, tuning.cal_power_settle_ms);
+    }
+    diag_.start(d, now, lo, hi, config_.overspeed_count_s);
     return v1::ack_reason::NONE;
   }
 
@@ -1320,6 +1331,16 @@ class V1Axis {
     m.diag_data.offset = r.offset;
     const size_t total = diag_.sample_count();
     m.diag_data.total = static_cast<uint16_t>(total);
+    // 区間の状態（PC は電源担当軸の SETTLED を見てから他の軸の計測を始める）
+    if (state_ == v1::state::DIAG && diag_.busy()) {
+      uint8_t f = v1::diag_session::ACTIVE;
+      if (power_on_cmd()) f |= v1::diag_session::POWER_CMD;
+      if (diag_.power_settled(now_us_)) f |= v1::diag_session::SETTLED;
+      if (diag_.test_busy()) f |= v1::diag_session::TEST_BUSY;
+      m.diag_data.session_flags = f;
+      const uint32_t ms = diag_.session_ms(now_us_);
+      m.diag_data.session_ms = static_cast<uint16_t>(ms > 0xFFFF ? 0xFFFF : ms);
+    }
     size_t n = 0;
     while (n < v1::DIAG_SAMPLES_PER_CHUNK && static_cast<size_t>(r.offset) + n < total) {
       m.diag_data.samples[n] = diag_.sample(r.offset + n);
@@ -1329,18 +1350,18 @@ class V1Axis {
     push(m);
   }
 
-  // 終わった計測: DIAG なら DISARMED（主電源 OFF 指令。ブレーキは作動済み・PWM 0）に戻し、DIAG_RESULT を 1 回。
+  // 区間が閉じた: DIAG なら DISARMED（主電源 OFF 指令。ブレーキは作動済み・PWM 0）に戻す。終わった計測があれば DIAG_RESULT を 1 回。
   // 基準: エンコーダは計測の間も数え続けるので、計測そのものでは基準を消さない（DISARMED の受動的な動きと同じ扱い）。
-  // 走行中の無パルスは ENCODER_FAULT をラッチ済みで、既存の意味どおり FAULT_RESET で消える（referenced_after = 0 で知らせる）。
+  // 走行中の無パルスは ENCODER_FAULT をラッチした周期に基準を消す（referenced_after = 0 で知らせる）。
   void diag_finish_if_done() {
-    v1::DiagResult r;
-    if (!diag_.take_result(&r)) return;
-    if (state_ == v1::state::DIAG) {
+    if (state_ == v1::state::DIAG && !diag_.busy()) {
       state_ = v1::state::DISARMED;
       brake_release_cmd_ = false;
       duty_permille_ = 0;
       hold_here();
     }
+    v1::DiagResult r;
+    if (!diag_.take_result(&r)) return;
     r.boot_id = id_.boot_id;
     r.referenced_after =
         (referenced_ && !(state_ == v1::state::FAULT && fault_code_ == v1::fault::ENCODER_FAULT)) ? 1 : 0;
