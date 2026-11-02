@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use h3cs::protocol::cobs::FrameAccumulator;
 use h3cs::protocol::{
-    decode_mcu_frame, msg_type, role_flags, Ack, AckReason, AckResult, CalResult, CalResultCode,
-    Config, HostMsg, McuMsg, SetPosition, Status, MAX_ENCODED_LEN,
+    capabilities, decode_mcu_frame, msg_type, role_flags, Ack, AckReason, AckResult, CalResult,
+    CalResultCode, Config, HostMsg, Limits, McuMsg, SetLimits, SetPosition, Status, MAX_ENCODED_LEN,
 };
 use h3cs::sim_axis::{sim_pair, SimMcu, SimParams, DEDUPE_DEPTH};
 use h3cs::types::{status_flags, FaultCode, McuState};
@@ -2190,4 +2190,169 @@ fn plant_never_passes_the_end_stops_and_the_stops_follow_every_reference() {
     assert_eq!(h.start().result, AckResult::Accepted);
     h.drive(100, 2000);
     assert!(h.sim.actual_count() <= 100, "{}", h.sim.actual_count());
+}
+
+// ---------------------------------------------------------------------------
+// SET_LIMITS / LIMITS (design 2026-11-01 §4)
+// ---------------------------------------------------------------------------
+
+fn set_limits(request_id: u32, duty_max: u8, duty_min: u8) -> HostMsg {
+    HostMsg::SetLimits(SetLimits {
+        request_id,
+        duty_max_percent: duty_max,
+        duty_min_percent: duty_min,
+        kp_percent_per_100: 2,
+        ff_count_s_per_percent: 100,
+        deadband_count: 10,
+        deadband_out_count: 20,
+    })
+}
+
+fn limits_of(out: &[McuMsg]) -> Vec<Limits> {
+    out.iter()
+        .filter_map(|m| match m {
+            McuMsg::Limits(l) => Some(*l),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn hello_advertises_limits_capability() {
+    let mut h = Harness::default();
+    let out = h.send(HostMsg::HelloReq { request_id: 5 });
+    let hello = out
+        .iter()
+        .find_map(|m| match m {
+            McuMsg::Hello(x) => Some(*x),
+            _ => None,
+        })
+        .expect("hello");
+    assert_eq!(hello.capabilities, capabilities::POSITION_MODE | capabilities::LIMITS);
+}
+
+#[test]
+fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
+    let mut h = Harness::default();
+    let d = h.sim.tuning();
+    assert_eq!((d.duty_max_percent, d.duty_min_percent), (20, 7), "firmware defaults before SET_LIMITS");
+    // DISARMED: ACK first, then exactly one LIMITS; values above the ceiling are clamped.
+    let out = h.send(set_limits(11, 90, 70));
+    assert_eq!(out[0].msg_type(), msg_type::ACK);
+    accepted(acks(&out)[0]);
+    let l = limits_of(&out);
+    assert_eq!(l.len(), 1);
+    assert_eq!((l[0].duty_max_percent, l[0].duty_min_percent, l[0].kp_percent_per_100), (60, 60, 2));
+    assert_eq!((l[0].ff_count_s_per_percent, l[0].deadband_count, l[0].deadband_out_count), (100, 10, 20));
+    assert_eq!((l[0].abs_duty_max_percent, l[0].abs_max_vel_count_s, l[0].abs_max_acc_count_s2), (60, 6000, 40000));
+    assert_eq!(l[0].boot_id, h.sim.status().boot_id);
+    assert_eq!(h.sim.tuning().duty_max_percent, 60);
+    // ACTIVE: still accepted.
+    h.reach_active();
+    let out = h.send(set_limits(12, 40, 3));
+    accepted(acks(&out)[0]);
+    assert_eq!(limits_of(&out)[0].duty_max_percent, 40);
+    assert_eq!((h.sim.tuning().duty_max_percent, h.sim.tuning().duty_min_percent), (40, 3));
+    assert_eq!(h.state(), McuState::Active);
+    // Resend of the same message: DUPLICATE, no LIMITS.
+    let out = h.send(set_limits(12, 40, 3));
+    assert_eq!(acks(&out)[0].result, AckResult::Duplicate);
+    assert!(limits_of(&out).is_empty());
+}
+
+#[test]
+fn set_limits_invalid_params_and_fault_gate() {
+    let mut h = Harness::default();
+    accepted(acks(&h.send(set_limits(1, 40, 3)))[0]);
+    let before = h.sim.tuning();
+    let cases = [
+        set_limits(2, 0, 0),   // duty_max 0
+        set_limits(3, 20, 30), // duty_min > duty_max
+        HostMsg::SetLimits(SetLimits {
+            request_id: 4,
+            duty_max_percent: 40,
+            duty_min_percent: 3,
+            kp_percent_per_100: 2,
+            ff_count_s_per_percent: 0, // ff 0
+            deadband_count: 10,
+            deadband_out_count: 20,
+        }),
+        HostMsg::SetLimits(SetLimits {
+            request_id: 5,
+            duty_max_percent: 40,
+            duty_min_percent: 3,
+            kp_percent_per_100: 2,
+            ff_count_s_per_percent: 100,
+            deadband_count: 30, // out < in
+            deadband_out_count: 20,
+        }),
+    ];
+    for m in cases {
+        let out = h.send(m);
+        rejected(acks(&out)[0], AckReason::InvalidParam);
+        assert!(limits_of(&out).is_empty());
+        assert_eq!(h.sim.tuning(), before);
+    }
+    rejected(acks(&h.send(set_limits(0, 40, 3)))[0], AckReason::InvalidParam);
+    // Faulted: FAULT_ACTIVE like every other command.
+    accepted(h.host_fault());
+    assert_eq!(h.state(), McuState::Fault);
+    let out = h.send(set_limits(6, 30, 3));
+    rejected(acks(&out)[0], AckReason::FaultActive);
+    assert!(limits_of(&out).is_empty());
+    assert_eq!(h.sim.tuning(), before);
+}
+
+#[test]
+fn config_velocity_and_acceleration_are_clamped_to_the_absolute_ceilings() {
+    let mut h = Harness::default();
+    let mut c = config(EPOCH);
+    c.max_vel_count_s = 99_999;
+    c.max_acc_count_s2 = 9_999_999;
+    accepted(h.config_with(c));
+    let stored = h.sim.config().unwrap();
+    assert_eq!((stored.max_vel_count_s, stored.max_acc_count_s2), (6000, 40000));
+    // Below the ceilings: kept as sent.
+    let mut c = config(EPOCH);
+    c.max_vel_count_s = 1234;
+    accepted(h.config_with(c));
+    assert_eq!(h.sim.config().unwrap().max_vel_count_s, 1234);
+}
+
+#[test]
+fn stopping_decelerates_with_the_last_frames_acceleration() {
+    // The same stop from the same speed: a frame max_acc of 2000 takes far
+    // longer to settle than the CONFIG ceiling would (design §4.4).
+    fn stop_time_ms(frame_acc: u32) -> u64 {
+        let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
+        h.reach_active();
+        // Accelerate toward a far target with the frame's limits (1.2 s: the
+        // slow case reaches its 2000 count/s plateau, 600 counts of travel).
+        for _ in 0..120 {
+            let mut m = h.set_position_msg(2600);
+            m.max_vel_count_s = 2000;
+            m.max_acc_count_s2 = frame_acc;
+            h.send(HostMsg::SetPosition(m));
+            h.idle(10);
+        }
+        assert_eq!(h.state(), McuState::Active);
+        accepted(h.stop());
+        // SET_POSITION keeps flowing during the stop (lease), as the PC does.
+        let mut ms = 0;
+        while h.state() == McuState::Stopping && ms < 3000 {
+            let mut m = h.set_position_msg(2600);
+            m.max_vel_count_s = 2000;
+            m.max_acc_count_s2 = frame_acc;
+            h.send(HostMsg::SetPosition(m));
+            h.idle(10);
+            ms += 10;
+        }
+        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc}");
+        ms
+    }
+    let slow = stop_time_ms(2000);
+    let fast = stop_time_ms(40000);
+    // 2000 count/s at 2000 count/s² ≈ 1 s; at 40000 count/s² = 50 ms (one 10 ms poll ≥ 10 ms).
+    assert!((800..=1300).contains(&slow), "slow {slow} ms");
+    assert!(fast <= 200, "fast {fast} ms");
 }

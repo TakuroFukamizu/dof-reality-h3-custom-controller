@@ -37,7 +37,7 @@ fn sim(srv: &h3cs::server::RunningServer, axis: u8) -> &SimHandle {
 
 /// Where each axis must end up for `POSE` (same path as the supervisor).
 fn expected_counts(cfg: &Config) -> [Counts; 3] {
-    let checked = compat::check_pose(POSE, GAIN, cfg.game.max_gain, cfg.game.clamp_out_of_range).unwrap();
+    let checked = compat::check_pose(POSE, GAIN, cfg.limits.max_gain, cfg.game.clamp_out_of_range).unwrap();
     let (virt, _) = compat::saturate(
         compat::mix(checked.pose, checked.effective_gain),
         cfg.game.virtual_min,
@@ -165,6 +165,39 @@ async fn happy_path_follows_game_then_stops_and_brakes_without_centering() {
     let s1 = sim(&srv, 1).snapshot();
     assert!((s1.actual_count - expected[0]).abs() <= TOL && s1.state == McuState::Disarmed);
     assert_eq!(srv.status().rig_state, RigState::BrakedDisarmed);
+    srv.shutdown().await;
+}
+
+/// Issue #15: a simulated axis whose link closed with `status_timeout` (the
+/// 2026-11-02 00:58 host sleep: the real ports were reopened, `sim:3` stayed
+/// OFFLINE) is reopened like a serial port, on the same simulated unit.
+#[tokio::test]
+async fn sim_axis_link_is_reopened_after_a_status_timeout() {
+    let srv = start_sim(sim_cfg()).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:3"));
+    sim(&srv, 2).nudge_actual(123);
+    let before = sim(&srv, 2).snapshot();
+    // STATUS stops (as if the host slept past the watchdog): the link closes.
+    sim(&srv, 2).set_freeze_status(true);
+    let st = wait_status(&srv, 2 * S, "axis 2 disconnected", |s| !s.axes[1].connected).await;
+    assert_eq!(st.rig_state, RigState::Offline, "{:?}", st.blockers);
+    assert!(st.fault.is_none(), "not armed: a disconnect is no fault");
+    sim(&srv, 2).set_freeze_status(false);
+    // Reopened after SERIAL_RETRY on the same unit (boot_id, position kept),
+    // re-identified and usable again.
+    let st = wait_status(&srv, server::SERIAL_RETRY + 3 * S, "axis 2 reconnected", |s| {
+        s.axes[1].connected && s.axes[1].mcu_state == Some(McuState::Disarmed)
+    })
+    .await;
+    assert_eq!(st.axes[1].port.as_deref(), Some("sim:3"));
+    assert_eq!(st.axes[1].boot_id, Some(before.boot_id), "same unit, not a reboot");
+    let after = sim(&srv, 2).snapshot();
+    assert_eq!((after.boot_id, after.actual_count, after.referenced), (before.boot_id, before.actual_count, before.referenced));
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    // The model ticks on the new link: STATUS keeps arriving and reflects a move.
+    sim(&srv, 2).nudge_actual(50);
+    wait_status(&srv, S, "moved position reported", |s| s.axes[1].actual_count == Some(before.actual_count + 50)).await;
     srv.shutdown().await;
 }
 
@@ -796,13 +829,19 @@ async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calib
         assert!(s.referenced);
         assert_eq!((s.end_min_count, s.end_max_count), (0, 1000), "P end = 0");
     }
-    // ARM is now blocked only by the operator's calibration_valid = false.
-    let snap = wait_status(&srv, S, "blockers settle", |s| blocker_codes(s) == ["calibration_invalid"]).await;
-    assert_eq!(snap.blockers.len(), 3, "{:?}", snap.blockers);
+    // ARM is now blocked only by the operator's calibration_valid = false and
+    // by the recalibration itself (Issue #15 H3: the geometry this server
+    // started with is no longer approved; a restart with the export clears it).
+    let snap = wait_status(&srv, S, "blockers settle", |s| blocker_codes(s) == ["calibration_invalid", "calibration_stale"]).await;
+    assert_eq!(snap.blockers.len(), 6, "{:?}", snap.blockers);
+    assert!(snap.axes.iter().all(|a| a.calibration_stale));
     let r = admin(srv.local_addr, "/v1/arm").await;
     assert_eq!(r.status, 409);
     assert_eq!(r.json()["error"], "not_ready");
-    assert!(r.json()["blockers"].as_array().unwrap().iter().all(|b| b.as_str().unwrap().starts_with("calibration_invalid")));
+    assert!(r.json()["blockers"].as_array().unwrap().iter().all(|b| {
+        let b = b.as_str().unwrap();
+        b.starts_with("calibration_invalid") || b.starts_with("calibration_stale")
+    }));
 
     // Export: a config next to sim.toml with the measured numbers.
     let r = http(srv.local_addr, "POST", "/v1/calibration/export", &[("Authorization", &format!("Bearer {TOKEN}"))], None).await;
@@ -820,14 +859,19 @@ async fn calibrate_all_from_the_api_then_export_a_config_that_arms_but_for_calib
     }
     srv.shutdown().await;
 
-    // A server started from the exported file: unreferenced sims at 0, one
-    // calibration later only calibration_valid stands between it and ARM.
+    // A server started from the exported file: the restart cleared the
+    // calibration_stale mark; the unreferenced sims at 0 need a reference,
+    // and a calibration later only calibration_valid plus the fresh
+    // calibration_stale stand between it and ARM.
     let srv = start_sim_with_path(out, Some(path.clone())).await;
-    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    let snap = wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    assert!(snap.axes.iter().all(|a| !a.calibration_stale), "{:?}", snap.blockers);
+    assert!(!blocker_codes(&snap).iter().any(|c| c == "calibration_stale"), "{:?}", snap.blockers);
     let r = http(srv.local_addr, "POST", "/v1/calibrate", &[("Authorization", &format!("Bearer {TOKEN}"))], Some(r#"{"axes":[1,2,3]}"#)).await;
     assert_eq!(r.status, 200, "{r:?}");
     let snap = wait_status(&srv, 8 * S, "calibrated again", |s| {
-        s.axes.iter().all(|a| a.calibration.is_some() && a.referenced && a.mcu_state == Some(McuState::Disarmed)) && blocker_codes(s) == ["calibration_invalid"]
+        s.axes.iter().all(|a| a.calibration.is_some() && a.referenced && a.mcu_state == Some(McuState::Disarmed))
+            && blocker_codes(s) == ["calibration_invalid", "calibration_stale"]
     })
     .await;
     assert_eq!(snap.rig_state, RigState::CalibrationRequired);

@@ -112,7 +112,14 @@ void task_main(void*) {
     machine.tick(ai);
 
     // 手動速度は、自動移動中でなくても無パルス／遅すぎで 0 にラッチする（センサー断線のまま動かさない）。
+#if MC_NO_MANUAL_GUARD
+    // 試験専用（env:m5stack-cores3-noguard）: フィードバックセンサーを無視して手動速度をそのまま出す。
+    // センサー断線でも止まらないので、機構の切り分け以外では使わない。
+    const int manual_out = machine.active() ? 0 : in.manual_speed;
+    (void)manual_guard;
+#else
     const int manual_out = manual_guard.tick(now, raw, machine.active() ? 0 : in.manual_speed, in.relay_live);
+#endif
     const int out = machine.active() ? machine.duty_signed : manual_out;
     motor_output_write(out);
 
@@ -253,16 +260,17 @@ V1Axis g_axis;  // 大きいのでタスクのスタックではなく静的領�
 V1Inputs g_v1_in;
 V1Snapshot g_v1_snap;
 int8_t g_signs[4] = {1, 1, 1, 1};
+MotorProfile g_profiles[4];  // NVS の各系統のプロファイル（校正の端当てで行程の見積もりに使う。校正成功で更新）
 uint8_t g_selected = 1;
 
 int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
 int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 // 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
-void write_outputs(bool power_on, bool brake_release, int duty) {
+void write_outputs(bool power_on, bool brake_release, int duty_permille) {
   digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
   digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
-  motor_output_write(duty);
+  motor_output_write_permille(duty_permille);
 }
 
 void v1_task_main(void*) {
@@ -270,6 +278,7 @@ void v1_task_main(void*) {
   id.device_id = v1_link_device_id();
   id.boot_id = v1_link_boot_id();
   g_axis.begin(id, g_selected, g_signs[g_selected], static_cast<uint64_t>(esp_timer_get_time()), encoder_count());
+  g_axis.set_profile_hint(g_profiles[g_selected]);
 
   TickType_t last_wake = xTaskGetTickCount();
   uint32_t ticks = 0;
@@ -309,17 +318,22 @@ void v1_task_main(void*) {
     if (in.select_pulse) {
       if (g_axis.select_axis(in.select_axis, now)) {
         g_axis.set_sign(g_signs[in.select_axis]);
+        g_axis.set_profile_hint(g_profiles[in.select_axis]);
       }
     }
 
     g_axis.tick(now, encoder_count());
-    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_percent());
+    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille());
 
     // 校正に成功した系統の符号を、次の系統切り替え（set_sign）に反映する。NVS への保存は loop() が行う
     //（Preferences の書き込みは数十 ms 止まることがあり、5 ms の制御タスクでは CONTROL_OVERRUN になる）。
     if (g_axis.profile_dirty()) {
       const MotorProfile& p = g_axis.dirty_profile();
-      if (profile_motor_ok(p.motor)) g_signs[p.motor] = p.sign < 0 ? -1 : 1;
+      if (profile_motor_ok(p.motor)) {
+        g_signs[p.motor] = p.sign < 0 ? -1 : 1;
+        g_profiles[p.motor] = p;
+        if (p.motor == g_axis.selected_axis()) g_axis.set_profile_hint(p);
+      }
     }
 
     // outbox → 送信キュー。順序を保つ: 満杯なら STATUS は捨て（次の周期で送る）、それ以外は保留して次の周期に再試行。
@@ -340,7 +354,11 @@ void v1_task_main(void*) {
     snap.selected_axis = g_axis.selected_axis();
     snap.power_on_cmd = g_axis.power_on_cmd();
     snap.brake_release_cmd = g_axis.brake_release_cmd();
-    snap.duty = g_axis.duty_percent();
+    snap.duty_permille = g_axis.duty_permille();
+    snap.stall_boost_permille = g_axis.stall_boost_permille();
+    snap.terms = g_axis.duty_terms();
+    snap.pwm_permille = g_axis.pwm_permille();
+    snap.encoder_fault_check_disabled = g_axis.encoder_fault_check_disabled();
     snap.actual = g_axis.actual_count();
     snap.target = g_axis.target_count();
     snap.velocity = g_axis.velocity_count_s();
@@ -353,6 +371,8 @@ void v1_task_main(void*) {
     snap.rx_error_count = g_axis.rx_error_count();
     snap.stale_drop_count = g_axis.stale_drop_count();
     snap.tx_dropped = v1_link_tx_dropped();
+    snap.tx_deferred = v1_link_tx_deferred();
+    snap.tx_stale_dropped = v1_link_tx_stale_dropped();
     ticks += 1;
     snap.tick_count = ticks;
     snap.max_tick_gap_us = max_gap_us;
@@ -384,8 +404,11 @@ void v1_task_main(void*) {
 
 }  // namespace
 
-void control_v1_begin(const int8_t signs[4], uint8_t selected_axis) {
-  for (int i = 0; i < 4; ++i) g_signs[i] = signs[i] < 0 ? -1 : 1;
+void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis) {
+  for (int i = 0; i < 4; ++i) {
+    g_profiles[i] = profiles[i];
+    g_signs[i] = profiles[i].sign < 0 ? -1 : 1;
+  }
   g_selected = (selected_axis >= 1 && selected_axis <= 3) ? selected_axis : 1;
   g_v1_snap.selected_axis = g_selected;
   g_v1_snap.state = 0;  // BOOT（タスクが begin するまで）

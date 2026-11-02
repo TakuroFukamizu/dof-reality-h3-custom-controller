@@ -17,10 +17,18 @@ Contract (what this client does and never does):
   Nothing is resent to keep the server alive: if the game stops submitting,
   the server's freshness runs out and it stops the rig.
 - ``source_age_ms`` sent = submitted age + time spent waiting in the slot.
-- On any transport error it reconnects with backoff and a NEW session.
+- On any transport error it reconnects with backoff, REUSING the current
+  session id (the server keeps the session across WS connections). A new
+  session (POST /v1/session) is requested only when there is none yet, when
+  the server answered ``stale_session`` for ours, or when ``reconnect()`` is
+  called. Issuing a session evicts whoever holds the current one (last
+  session wins, DESIGN.md §3), so a flapping WS must not do it on every retry.
   Connecting never arms, starts or centers the rig (admin API, operator only).
   A new session while the rig is ACTIVE makes the server stop the rig
   (drive is bound to the session current at START); ARM + START again.
+  Consequence: after a server restart the reused id is unknown to the new
+  process; the first pose is acked ``stale_session`` and the client parks in
+  ``session_lost`` until ``reconnect()`` (or the next WS drop) mints a new id.
 - ``frame_seq`` is passed through as given. The server's default config
   requires it (``require_frame_seq``); it is never invented here.
 - No admin token handling: arm / start / disarm belong to the operator CLI.
@@ -71,7 +79,7 @@ _DEFAULT_FRESHNESS_MS = 250.0
 _BACKOFF_MIN_S = 0.2
 _BACKOFF_MAX_S = 2.0
 # A connection must stay up this long before the backoff resets, so a server
-# that accepts and drops at once does not get a new session every 0.2 s.
+# that accepts and drops at once is not hammered with a reconnect every 0.2 s.
 _BACKOFF_RESET_AFTER_S = 1.0
 
 # Bypass *_proxy env vars: the server is local.
@@ -210,6 +218,9 @@ class MotionClient:
         # Everything below is guarded by self._cond. Never do I/O while holding it.
         self._pose: Optional[_Pending] = None
         self._gain: Optional[float] = None  # pending gain-only update
+        self._limits: Optional[Dict[str, float]] = None  # pending limits patch (merged until sent)
+        self._limits_seqs: set = set()  # seqs of limits messages awaiting their ack
+        self._last_limits_ack: Optional[dict] = None
         self._closing = False
         self._reconnect_req = False
         self._conn_failed = False  # set by the reader when its connection ends
@@ -219,6 +230,8 @@ class MotionClient:
         self._session: Optional[str] = None
         self._session_info: Optional[dict] = None
         self._session_lost = False
+        # Next connection must POST /v1/session (none yet / stale_session / reconnect()).
+        self._session_renew = True
         self._seq = 0
         self._last_ack: Optional[dict] = None
         self._last_reject: Optional[dict] = None  # last ack with accepted=False
@@ -298,6 +311,54 @@ class MotionClient:
             self._cond.notify_all()
         return True
 
+    def submit_limits(
+        self,
+        *,
+        max_gain: Optional[float] = None,
+        max_vel_count_s: Optional[float] = None,
+        max_acc_count_s2: Optional[float] = None,
+        duty_max_percent: Optional[float] = None,
+    ) -> bool:
+        """Change the server's shared motion limits (``{"type":"limits"}``).
+
+        Only the given fields change. The game channel may only *lower* the
+        operator's ``[limits]`` values: a field above them is held to them
+        by the server and reported in the ack (``effective_limits``,
+        ``limits`` has ``operator_limited``); the firmware ceilings
+        (``ceiling_clamped``) and the stop-time rule (``stop_time_limited``)
+        apply too. Raising above the operator's values is the admin's
+        ``POST /v1/limits``. Never extends freshness. Several calls before
+        the next send are merged (last value per field wins). Returns False
+        (and stores nothing) for a non-finite value or when no field is given.
+        The server resets the limits to its config on every new session, so
+        a client that wants its values must resend them after ``reconnect()``
+        (watch ``session_id``). A WS retry that reuses the session keeps them.
+        """
+        fields = {
+            "max_gain": max_gain,
+            "max_vel_count_s": max_vel_count_s,
+            "max_acc_count_s2": max_acc_count_s2,
+            "duty_max_percent": duty_max_percent,
+        }
+        patch = {k: v for k, v in fields.items() if v is not None}
+        if not patch:
+            return False
+        if not all(_finite(v) for v in patch.values()):
+            self.log.warning("submit_limits: invalid value dropped %r", patch)
+            return False
+        with self._cond:
+            merged = dict(self._limits or {})
+            merged.update({k: float(v) for k, v in patch.items()})
+            self._limits = merged
+            self._cond.notify_all()
+        return True
+
+    @property
+    def last_limits_ack(self) -> Optional[dict]:
+        """Last ack of a ``limits`` message (accepted or rejected); None before any."""
+        with self._cond:
+            return self._last_limits_ack
+
     def submit_gain(self, gain: float) -> bool:
         """Gain-only update (never extends pose freshness on the server)."""
         if not _finite(gain):
@@ -327,8 +388,10 @@ class MotionClient:
 
     @property
     def session_lost(self) -> bool:
-        """True after a ``stale_session`` ack: another client took the session.
-        Poses are not sent any more; call reconnect() to take it back."""
+        """True after a ``stale_session`` ack: another client took the session
+        (or the server restarted and forgot it). Poses are not sent any more;
+        call reconnect() to take it back. The next connection attempt (explicit
+        or after a WS drop) requests a new session instead of reusing this one."""
         with self._cond:
             return self._session_lost
 
@@ -367,11 +430,13 @@ class MotionClient:
             return self._axis_conflict
 
     def reconnect(self) -> None:
-        """Drop the connection and reconnect now with a new session.
+        """Drop the connection and reconnect now with a NEW session (the only
+        way, besides a ``stale_session`` ack, to leave the current one).
         Transport only: never arms or starts. If the rig is ACTIVE, the new
         session makes the server stop it (operator must ARM + START again)."""
         with self._cond:
             self._reconnect_req = True
+            self._session_renew = True
             self._cond.notify_all()
 
     def stop(self, timeout: float = 1.5) -> bool:
@@ -409,17 +474,33 @@ class MotionClient:
         """One connection. Returns the time it came up, or None if it never did."""
         up_since: Optional[float] = None
         try:
-            status, info = _http_json("POST", _url(self.base_url, "/v1/session"), self.connect_timeout)
-            if status != 200 or not isinstance(info, dict) or not isinstance(info.get("source_session"), str):
-                raise RuntimeError("POST /v1/session: HTTP %s %r" % (status, info))
-            if info.get("protocol", PROTOCOL_VERSION) != PROTOCOL_VERSION:
-                raise RuntimeError("server protocol %r != %d" % (info.get("protocol"), PROTOCOL_VERSION))
-            session = info["source_session"]
+            with self._cond:
+                renew = self._session_renew or self._session is None or self._session_info is None
+                session, info = self._session, self._session_info
+            if renew:
+                # Only here is a session issued: this evicts the current holder
+                # (DESIGN.md §3), so a plain WS retry must not come through here.
+                status, info = _http_json("POST", _url(self.base_url, "/v1/session"), self.connect_timeout)
+                if status != 200 or not isinstance(info, dict) or not isinstance(info.get("source_session"), str):
+                    raise RuntimeError("POST /v1/session: HTTP %s %r" % (status, info))
+                if info.get("protocol", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+                    raise RuntimeError("server protocol %r != %d" % (info.get("protocol"), PROTOCOL_VERSION))
+                session = info["source_session"]
+                with self._cond:
+                    # Installed as soon as the server answered: the old holder is
+                    # already evicted, so even if the WS connect below fails the
+                    # next attempt must come back with THIS id, not the old one.
+                    # A POST that failed leaves the flag set so it is retried.
+                    self._session = session
+                    self._session_info = info
+                    self._session_lost = False
+                    self._session_renew = False
+            assert session is not None and info is not None
             # Context-manager form works on websockets 13..17+ (17.1 warns otherwise).
             with _ws_connect(self._motion_url(session), **_connect_kwargs(self.connect_timeout)) as ws:
                 up_since = time.monotonic()
                 self._fail_logged = False
-                self._serve(ws, session, info)
+                self._serve(ws, session, info, new_session=renew)
         except Exception as e:  # noqa: BLE001
             if up_since is None:
                 # Warn once per outage, then stay quiet while retrying.
@@ -429,7 +510,7 @@ class MotionClient:
                 self.log.warning("connection error: %s", e)
         return up_since
 
-    def _serve(self, ws, session: str, info: dict) -> None:
+    def _serve(self, ws, session: str, info: dict, new_session: bool = True) -> None:
         freshness_ms = info.get("source_freshness_ms")
         if not _is_num(freshness_ms):
             freshness_ms = _DEFAULT_FRESHNESS_MS
@@ -440,7 +521,6 @@ class MotionClient:
             self._ws = ws
             self._session = session
             self._session_info = info
-            self._session_lost = False
             self._conn_failed = False
             self._connected = True
             self._axis_conflict = False  # a still-present conflict is logged again on this connection
@@ -452,7 +532,7 @@ class MotionClient:
                     self._pose = None
                     dropped_age = age
             closing = self._closing
-        self.log.info("connected, session %s...", session[:8])
+        self.log.info("connected, session %s... (%s)", session[:8], "new" if new_session else "reused")
         if dropped_age is not None:
             self.log.info("dropped pose stale at reconnect (%.0f ms old)", dropped_age)
 
@@ -480,19 +560,32 @@ class MotionClient:
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: (self._closing or self._reconnect_req or self._conn_failed
-                                             or self._pose is not None or self._gain is not None))
+                                             or self._pose is not None or self._gain is not None
+                                             or self._limits is not None))
                 if self._closing or self._reconnect_req or self._conn_failed:
                     return
                 if self._session_lost:
                     # Not our session any more: drop instead of sending into rejection.
                     self._pose = None
                     self._gain = None
+                    self._limits = None
                     continue
-                pose, gain = self._pose, self._gain
+                pose, gain, limits = self._pose, self._gain, self._limits
                 self._pose = None
                 self._gain = None
+                self._limits = None
                 msgs: List[str] = []
                 now = time.monotonic()
+                if limits is not None:
+                    # Before the pose: the new gain ceiling applies to it.
+                    self._seq += 1
+                    m_l: Dict[str, Any] = {"type": "limits", "protocol": PROTOCOL_VERSION,
+                                           "source_session": session, "seq": self._seq}
+                    m_l.update(limits)
+                    self._limits_seqs.add(self._seq)
+                    if len(self._limits_seqs) > 64:
+                        self._limits_seqs = set(sorted(self._limits_seqs)[-64:])
+                    msgs.append(json.dumps(m_l, allow_nan=False))
                 if pose is not None:
                     if pose.frame_seq is None and require_frame_seq and not self._warned_no_frame_seq:
                         self._warned_no_frame_seq = True
@@ -533,6 +626,14 @@ class MotionClient:
                     self._conn_failed = True
                     self._cond.notify_all()
 
+    def _limits_seq_pending(self, ack: dict) -> bool:
+        """True if this (rejected) ack answers a limits message we sent (guarded by _cond)."""
+        seq = ack.get("seq")
+        if seq in self._limits_seqs:
+            self._limits_seqs.discard(seq)
+            return True
+        return False
+
     def _handle_message(self, raw: Any) -> None:
         try:
             msg = json.loads(raw)
@@ -547,11 +648,17 @@ class MotionClient:
             rejected = msg.get("accepted") is False
             with self._cond:
                 self._last_ack = msg
+                if "effective_limits" in msg:
+                    self._limits_seqs.discard(msg.get("seq"))
+                    self._last_limits_ack = msg
+                elif rejected and self._limits_seq_pending(msg):
+                    self._last_limits_ack = msg
                 if rejected:
                     self._last_reject = msg
                 lost = rejected and reason == "stale_session" and not self._session_lost
                 if lost:
                     self._session_lost = True
+                    self._session_renew = True  # next connection attempt mints a new id
                 # Edge-triggered: one warning per conflict episode, not per rejected pose.
                 conflict = rejected and reason == "axis_conflict"
                 conflict_began = conflict and not self._axis_conflict
@@ -629,6 +736,8 @@ def _summary(st: dict) -> str:
             " CONFLICT" if a.get("axis_id") in conflict else "", _claimants(a)))
         if a.get("reference_stale"):
             lines.append("        reference_stale: re-reference required (axis changed on the same boot)")
+        if a.get("calibration_stale"):
+            lines.append("        calibration_stale: recalibrated; export the result and restart the server with it before ARM")
     return "\n".join(lines)
 
 

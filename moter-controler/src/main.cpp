@@ -155,6 +155,7 @@ bool ui_dirty = true;
 ControlSnapshot snap;
 uint32_t next_snap_ms = 0;
 uint32_t next_enc_ms = 0;
+uint32_t next_profile_save_ms = 0;  // NVS 保存に失敗したら 2 s 後に再試行（Issue #15 M6）
 uint32_t last_request_seq = 0;
 uint32_t last_manual_fault_seq = 0;
 AutoPhase last_phase = AutoPhase::Idle;
@@ -232,7 +233,9 @@ bool selectMotor(uint8_t motor) {
     return false;
   }
   profile_store_select_motor(motor);
-  const MotorProfile p = profile_store_load(motor);
+  bool invalid = false;
+  const MotorProfile p = profile_store_load(motor, &invalid);
+  if (invalid) Serial.printf("WARN profile_invalid motor=%u（NVS の保存が壊れている。既定値。CAL で上書き）\n", static_cast<unsigned>(motor));
   control_set_profile(p);
   Serial.printf("OK motor=%u cal=%d stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(motor),
                 p.calibrated ? 1 : 0, static_cast<long>(p.stroke), static_cast<long>(p.neutral),
@@ -908,15 +911,18 @@ void reportAuto(const ControlSnapshot& now) {
     publishEnc(now);
     Serial.flush();
   }
-  if (now.profile_dirty) {
+  // 校正結果の保存。失敗したら dirty を残して 2 s 後に再試行する（Issue #15 M6。以前は成否に関わらず下ろしていた）
+  if (now.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
     if (profile_store_save(now.profile)) {
       Serial.printf("AUTO saved motor=%u stroke=%ld neutral=%ld sign=%d\n", static_cast<unsigned>(now.profile.motor),
                     static_cast<long>(now.profile.stroke), static_cast<long>(now.profile.neutral),
                     static_cast<int>(now.profile.sign));
+      control_clear_profile_dirty();
+      next_profile_save_ms = millis() + 200;
     } else {
-      Serial.println("ERR nvs_save");
+      Serial.println("ERR nvs_save retry_in=2000ms");
+      next_profile_save_ms = millis() + 2000;
     }
-    control_clear_profile_dirty();
   }
 }
 
@@ -931,7 +937,13 @@ void setup() {
   if (!profile_store_begin()) {
     Serial.println("ERR nvs");
   }
-  control_begin(profile_store_load(profile_store_selected_motor()));
+  {
+    bool invalid = false;
+    const uint8_t motor = profile_store_selected_motor();
+    const MotorProfile initial = profile_store_load(motor, &invalid);
+    if (invalid) Serial.printf("WARN profile_invalid motor=%u（NVS の保存が壊れている。既定値で起動。CAL で上書き）\n", static_cast<unsigned>(motor));
+    control_begin(initial);
+  }
 
   if (!spriteBegin()) {
     Serial.println("ERR sprite");
@@ -1023,6 +1035,9 @@ bool ui_dirty = true;
 uint32_t next_snap_ms = 0;
 uint32_t next_render_ms = 0;
 uint32_t last_press_ms = 0;
+uint32_t next_profile_save_ms = 0;  // NVS 保存に失敗したら 2 s 後に再試行（Issue #15 M6）
+uint32_t nvs_save_failures = 0;     // 連続して失敗した回数（画面の「保存待ち」に添える。成功で 0）
+uint8_t profile_invalid_mask = 0;   // bit n = 系統 n の NVS プロファイルが壊れていて既定値で起動した（保存し直すまで表示）
 char notice[32];
 uint32_t notice_until_ms = 0;
 char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
@@ -1048,7 +1063,7 @@ void showNotice(const char* text) {
 
 void layoutV1(int width, int height) {
   v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
-  v1_buttons[1] = {kMargin, height - 50, width - kMargin * 2, 44, V1Action::Estop};  // 上に USB 診断行を置く
+  v1_buttons[1] = {kMargin, height - 42, width - kMargin * 2, 36, V1Action::Estop};  // 上に USB 診断行と制御項の行を置く
 }
 
 const V1Button* hitV1(int x, int y) {
@@ -1204,9 +1219,16 @@ void renderV1() {
 
   // 指令行
   canvas.setFont(&fonts::lgfxJapanGothic_16);
-  char cmd_text[64];
-  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %+d%%", vsnap.power_on_cmd ? "入" : "切",
-           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty);
+  char cmd_text[72];
+  char boost_text[12] = "";
+  if (vsnap.stall_boost_permille > 0) {  // 停止ブースト（Issue #15 H4）: 下限への上乗せ [%]。STATUS には出ないので画面だけ
+    snprintf(boost_text, sizeof(boost_text), "(+%d.%d)", vsnap.stall_boost_permille / 10, vsnap.stall_boost_permille % 10);
+  }
+  // Duty は permille を % で小数 1 桁（Issue #25 手順 8 b）。MD13S の向きの符号
+  const int duty_abs = vsnap.duty_permille < 0 ? -vsnap.duty_permille : vsnap.duty_permille;
+  snprintf(cmd_text, sizeof(cmd_text), "電源 %s  ブレーキ %s  Duty %s%d.%d%%%s", vsnap.power_on_cmd ? "入" : "切",
+           vsnap.brake_release_cmd ? "解除" : "作動", vsnap.duty_permille < 0 ? "-" : "+", duty_abs / 10, duty_abs % 10,
+           boost_text);
   canvas.setTextColor(vsnap.power_on_cmd || vsnap.brake_release_cmd ? kGreen : kOrange, TFT_BLACK);
   canvas.drawString(cmd_text, 8, 70);
 
@@ -1229,19 +1251,23 @@ void renderV1() {
   // フラグ行
   canvas.setTextDatum(middle_left);
   canvas.setFont(&fonts::lgfxJapanGothic_12);
-  char flag_text[64];
-  snprintf(flag_text, sizeof(flag_text), "%s  %s  %s", vsnap.configured ? "CONFIG 済" : "CONFIG 未",
+  char flag_text[96];
+  snprintf(flag_text, sizeof(flag_text), "%s  %s  %s%s", vsnap.configured ? "CONFIG 済" : "CONFIG 未",
            vsnap.referenced ? "基準 済" : "基準 未",
-           (vsnap.flags & v1::flags::POWER_CONTROLLER) ? "電源担当" : "電源担当なし");
-  canvas.setTextColor(vsnap.configured && vsnap.referenced ? kGreen : kAmber, TFT_BLACK);
+           (vsnap.flags & v1::flags::POWER_CONTROLLER) ? "電源担当" : "電源担当なし",
+           vsnap.encoder_fault_check_disabled ? "  無パルス検出なし" : "");  // duty_max < 10 %（Issue #15 M2）
+  canvas.setTextColor(vsnap.configured && vsnap.referenced && !vsnap.encoder_fault_check_disabled ? kGreen : kAmber,
+                      TFT_BLACK);
   canvas.drawString(flag_text, 8, 124);
 
   // リンク行
   char link_text[80];
   if (vsnap.has_rx) {
-    snprintf(link_text, sizeof(link_text), "PC %lu ms前  rx_err %u  stale %u  tx_drop %lu",
+    // df = TX リングに空きが無く次の poll に回した回数、old = 古い STATUS／期限切れの保留を捨てた数（Issue #15 M7）
+    snprintf(link_text, sizeof(link_text), "PC %lums前 rx_err %u stale %u tx_drop %lu df %lu old %lu",
              static_cast<unsigned long>(vsnap.last_rx_age_ms), vsnap.rx_error_count, vsnap.stale_drop_count,
-             static_cast<unsigned long>(vsnap.tx_dropped));
+             static_cast<unsigned long>(vsnap.tx_dropped), static_cast<unsigned long>(vsnap.tx_deferred),
+             static_cast<unsigned long>(vsnap.tx_stale_dropped));
     canvas.setTextColor(vsnap.last_rx_age_ms < 500 ? kGreen : kAmber, TFT_BLACK);
   } else {
     snprintf(link_text, sizeof(link_text), "PC 未受信  rx_err %u", vsnap.rx_error_count);
@@ -1255,10 +1281,23 @@ void renderV1() {
     snprintf(cal_text, sizeof(cal_text), "校正中 %s %s", calStepName(vsnap.cal_live_step), vsnap.cal_live_reason);
     canvas.setTextColor(kAmber, TFT_BLACK);
   } else if (vsnap.cal_result_valid) {
+    char pending[24] = "";
+    if (vsnap.profile_dirty) {  // 保存待ち。失敗が続いていれば回数（Issue #15 M6）
+      if (nvs_save_failures > 0) {
+        snprintf(pending, sizeof(pending), "  保存失敗 %lu", static_cast<unsigned long>(nvs_save_failures));
+      } else {
+        snprintf(pending, sizeof(pending), "  保存待ち");
+      }
+    }
     snprintf(cal_text, sizeof(cal_text), "校正 %s %s  N端 %ld  中立 %ld  sign %+d%s", calResultName(vsnap.cal_result),
              vsnap.cal_reason, static_cast<long>(vsnap.cal_n_end), static_cast<long>(vsnap.cal_neutral),
-             static_cast<int>(vsnap.cal_sign), vsnap.profile_dirty ? "  保存待ち" : "");
-    canvas.setTextColor(vsnap.cal_result == v1::cal_result::OK ? kGreen : kAmber, TFT_BLACK);
+             static_cast<int>(vsnap.cal_sign), pending);
+    canvas.setTextColor(vsnap.cal_result == v1::cal_result::OK && nvs_save_failures == 0 ? kGreen : kAmber, TFT_BLACK);
+  } else if (profile_invalid_mask) {
+    // NVS のプロファイルが壊れていた系統（既定値 = 未校正・sign +1 で起動している。校正して保存し直すまで出す）
+    snprintf(cal_text, sizeof(cal_text), "校正 未実施  NVS 破損→既定値:%s%s%s", (profile_invalid_mask & 0x02) ? " #1" : "",
+             (profile_invalid_mask & 0x04) ? " #2" : "", (profile_invalid_mask & 0x08) ? " #3" : "");
+    canvas.setTextColor(kRed, TFT_BLACK);
   } else {
     snprintf(cal_text, sizeof(cal_text), "校正 この起動では未実施");
     canvas.setTextColor(kGray, TFT_BLACK);
@@ -1276,6 +1315,32 @@ void renderV1() {
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(usbDiagColor(usb_diag), TFT_BLACK);
   canvas.drawString(usb_diag_text, 8, 182);
+
+  // 制御項の行（Issue #25 手順 8）。単位は permille（0.1 %）、符号はカウントが増える向きが正（STATUS の pwm_permille と同じ）。
+  // FF = 軌道速度 / ff、P = 誤差 × kp / 100、I = 積分（保持バイアス。Issue #25 手順 9「F」）、V = 軌道の目標速度 [count/s]、
+  // F = 床の適用状態（1 = ON。Issue #25 手順 8 c）、A = 追従中の動き出し補助（1 = 床を掛けている。Issue #25 手順 9「T」）、
+  // B = 停止ブーストの上乗せ、
+  // O = 実際に出している値（pwm_permille）。通常 ≤ 50 文字（6 px × 53 = 318 < 320。超えれば切れる）
+  // Issue #25 r6（V1_FF_DIRECTIONAL）: `FF +76 P +12 I +8 V +300 MOVE O +96`。F / A / B の代わりに状態 MOVE / HOLD / BRK。FF は方向別
+  {
+    const V1DutyTerms& tm = vsnap.terms;
+    char terms_text[64];
+    // Issue #25 r6（V1_FF_DIRECTIONAL）: 床・補助・ブーストが無いので代わりに状態 M（MOVE / HOLD / BRK = 動き出しパルス）を出す
+    const char* mode = tm.mode == V1DutyMode::HOLD ? "HOLD" : (tm.mode == V1DutyMode::BRK ? "BRK" : "MOVE");
+    if (V1_FF_DIRECTIONAL) {
+      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d %s O %+d", static_cast<int>(tm.ff_permille),
+               static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s), mode,
+               static_cast<int>(vsnap.pwm_permille));
+    } else {
+      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d F%d A%d B %d O %+d", static_cast<int>(tm.ff_permille),
+               static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s),
+               tm.floor_on ? 1 : 0, tm.assist_on ? 1 : 0, static_cast<int>(tm.boost_permille),
+               static_cast<int>(vsnap.pwm_permille));
+    }
+    canvas.setTextColor(tm.in_band ? kGray : ((tm.floor_on || tm.assist_on || tm.mode == V1DutyMode::BRK) ? kAmber : kGreen),
+                        TFT_BLACK);
+    canvas.drawString(terms_text, 8, 192);
+  }
 
   // 非常停止ボタン（ラッチ中は「解除」）
   {
@@ -1295,11 +1360,22 @@ void renderV1() {
 bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
   return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
          a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
-         a.brake_release_cmd != b.brake_release_cmd || a.duty != b.duty || a.actual != b.actual ||
+         a.brake_release_cmd != b.brake_release_cmd || (a.duty_permille / 10) != (b.duty_permille / 10) ||
+         a.stall_boost_permille != b.stall_boost_permille ||
+         // 制御項は 5 ms ごとに変わり得る。1 %（10 permille）刻みで見る（描き直しが受信を止めるのは df / old と同じ）
+         (a.terms.ff_permille / 10) != (b.terms.ff_permille / 10) || (a.terms.p_permille / 10) != (b.terms.p_permille / 10) ||
+         (a.terms.i_permille / 10) != (b.terms.i_permille / 10) || a.terms.assist_on != b.terms.assist_on ||
+         (a.terms.vel_count_s / 50) != (b.terms.vel_count_s / 50) || a.terms.floor_on != b.terms.floor_on ||
+         a.terms.in_band != b.terms.in_band || a.terms.boost_permille != b.terms.boost_permille || a.terms.mode != b.terms.mode ||
+         (a.pwm_permille / 10) != (b.pwm_permille / 10) ||
+         a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
-         a.tx_dropped != b.tx_dropped || (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
+         a.tx_dropped != b.tx_dropped ||
+         // df / old は背圧の間 poll ごとに増える（約 1 kHz）。毎回描き直すと描画自体が受信を止めるので 50 刻みで
+         (a.tx_deferred / 50) != (b.tx_deferred / 50) || (a.tx_stale_dropped / 50) != (b.tx_stale_dropped / 50) ||
+         (a.last_rx_age_ms / 100) != (b.last_rx_age_ms / 100) ||
          (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
          strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||
          a.cal_result != b.cal_result || a.cal_n_end != b.cal_n_end || a.cal_neutral != b.cal_neutral ||
@@ -1322,10 +1398,16 @@ void setup() {
   // SET_POSITION は 100 Hz × 44 byte。画面の pushSprite（数十 ms）の間に HWCDC の既定 256 byte が溢れないよう広げる。
   // begin() より前でないと効かない。
   Serial.setRxBufferSize(1024);
+  // TX リングも広げる（既定 256 byte ≈ STATUS 5 本）。書く前に空きを見て入らなければ次の poll に回す（Issue #15 M7、v1_tx_pump.h）
+  // ので、広いほど PC が一瞬読まないときの保留・STATUS 捨てが減る。
+  Serial.setTxBufferSize(V1_TX_RING_BYTES);
   // USB CDC は v1 のバイナリ専用。IDF / M5Unified のログも出さない（COBS の区切り 0x00 と混ざる）。
   // M5.begin() より前に止める。Arduino core の log_e() は CORE_DEBUG_LEVEL=0（platformio.ini）でコンパイル時に消す。
   esp_log_level_set("*", ESP_LOG_NONE);
   boardBegin();
+  // v1 は書く前に TX リングの空きを見る（v1_tx_pump.h）ので通常 write は待たない。保留が続いて空きを見ずに書く（WriteThrough）
+  // ときだけ HWCDC が tx timeout × 最大 20 回待つ。boardBegin の 20 ms（従来 env 向け）だと 400 ms になるので 1 ms（最大 20 ms）にする。
+  Serial.setTxTimeoutMs(V1_TX_TIMEOUT_MS);
   motor_output_begin();
   if (!encoder_begin()) {
     noteBootError("pcnt");
@@ -1337,11 +1419,14 @@ void setup() {
     noteBootError("link");
   }
   saved_motor = profile_store_selected_motor();
-  int8_t signs[4] = {1, 1, 1, 1};
+  MotorProfile profiles[4];
   for (uint8_t m = 1; m <= 3; ++m) {
-    signs[m] = profile_store_load(m).sign;
+    bool invalid = false;
+    profiles[m] = profile_store_load(m, &invalid);
+    if (invalid) profile_invalid_mask |= static_cast<uint8_t>(1u << m);
   }
-  control_v1_begin(signs, saved_motor);
+  if (profile_invalid_mask) noteBootError("prof");  // 壊れた系統は校正行に出す。校正して保存し直せば消える
+  control_v1_begin(profiles, saved_motor);
   vsnap.selected_axis = saved_motor;
 
   if (!spriteBegin()) {
@@ -1371,14 +1456,21 @@ void loop() {
       saved_motor = vsnap.selected_axis;
     }
     // 校正に成功した系統プロファイル（行程・中立・符号）を NVS に保存する。従来 env と同じく loop() 側で書く
-    //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。保存の成否に関わらず flag は下ろす（同じ結果で再試行しない）。
-    if (vsnap.profile_dirty) {
-      if (!profile_store_save(vsnap.profile)) {
-        showNotice("NVS 保存失敗");
-      } else {
+    //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。失敗したら flag を残し 2 s 後に再試行する
+    //（Issue #15 M6。以前は成否に関わらず下ろしていた）。保存は 1 キーの blob なので途中で切れても混ざらない（profile_blob.h）。
+    if (vsnap.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
+      if (profile_store_save(vsnap.profile)) {
         showNotice("校正を保存");
+        control_v1_clear_profile_dirty();
+        nvs_save_failures = 0;
+        if (profile_motor_ok(vsnap.profile.motor)) profile_invalid_mask &= static_cast<uint8_t>(~(1u << vsnap.profile.motor));
+        next_profile_save_ms = millis() + 200;
+      } else {
+        nvs_save_failures += 1;
+        showNotice("NVS 保存失敗 再試行");
+        next_profile_save_ms = millis() + 2000;
+        ui_dirty = true;
       }
-      control_v1_clear_profile_dirty();
     }
     if (snapChanged(previous, vsnap)) {
       ui_dirty = true;

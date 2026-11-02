@@ -33,6 +33,8 @@ pub mod msg_type {
     pub const HOST_FAULT: u8 = 0x0A;
     pub const SET_REFERENCE: u8 = 0x0B;
     pub const CALIBRATE: u8 = 0x0C;
+    /// Duty / loop tuning for the position loop (design 2026-11-01 §4.2).
+    pub const SET_LIMITS: u8 = 0x0D;
 
     pub const HELLO: u8 = 0x81;
     pub const ACK: u8 = 0x82;
@@ -41,6 +43,8 @@ pub mod msg_type {
     pub const CLOCK_SYNC_REPLY: u8 = 0x85;
     pub const AXIS_SELECT: u8 = 0x86;
     pub const CAL_RESULT: u8 = 0x87;
+    /// Effective tuning and the firmware's absolute ceilings (§4.3).
+    pub const LIMITS: u8 = 0x88;
 }
 
 /// ACK result (protocol §3.3).
@@ -115,6 +119,50 @@ pub mod capabilities {
     pub const POSITION_MODE: u32 = 1 << 0;
     pub const APPLY_AT: u32 = 1 << 1;
     pub const CURRENT_SENSE: u32 = 1 << 2;
+    /// SET_LIMITS / LIMITS supported (design 2026-11-01 §4.1).
+    pub const LIMITS: u32 = 1 << 3;
+}
+
+/// The firmware's compile-time absolute ceilings (`moter-controler`
+/// `config.h`: `V1_ABS_DUTY_MAX`, `V1_ABS_MAX_VEL_COUNT_S`,
+/// `V1_ABS_MAX_ACC_COUNT_S2`). The real values arrive in LIMITS; these are
+/// the PC's fallback before the first LIMITS and what the simulated axis
+/// reports. Keep them equal to the firmware.
+pub mod fw_absolute {
+    pub const DUTY_MAX_PERCENT: u8 = 60;
+    pub const MAX_VEL_COUNT_S: u32 = 6000;
+    pub const MAX_ACC_COUNT_S2: u32 = 40000;
+}
+
+/// SET_LIMITS payload (`0x0D`, 16 bytes): position-loop tuning the PC
+/// distributes from its `[limits]`. Values above the firmware's absolute
+/// ceilings are clamped there (never rejected); the MCU answers with ACK and
+/// then one LIMITS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SetLimits {
+    pub request_id: u32,
+    pub duty_max_percent: u8,
+    pub duty_min_percent: u8,
+    pub kp_percent_per_100: u8,
+    pub ff_count_s_per_percent: u16,
+    pub deadband_count: u16,
+    pub deadband_out_count: u16,
+}
+
+/// LIMITS payload (`0x88`, 24 bytes): the tuning in effect after a
+/// SET_LIMITS plus the firmware's absolute ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Limits {
+    pub boot_id: u32,
+    pub duty_max_percent: u8,
+    pub duty_min_percent: u8,
+    pub kp_percent_per_100: u8,
+    pub abs_duty_max_percent: u8,
+    pub ff_count_s_per_percent: u16,
+    pub deadband_count: u16,
+    pub deadband_out_count: u16,
+    pub abs_max_vel_count_s: u32,
+    pub abs_max_acc_count_s2: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -329,6 +377,7 @@ pub enum HostMsg {
         /// bit0 = `calibrate_flags::KEEP_POWER` (power-controller axis only).
         flags: u8,
     },
+    SetLimits(SetLimits),
 }
 
 /// Messages an axis MCU sends to the PC.
@@ -342,6 +391,7 @@ pub enum McuMsg {
     ClockSyncReply(ClockSyncReply),
     AxisSelect(AxisSelect),
     CalResult(CalResult),
+    Limits(Limits),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -420,6 +470,7 @@ pub const fn host_payload_len(msg_type: u8) -> Option<usize> {
         HOST_FAULT => 8,
         SET_REFERENCE => 8,
         CALIBRATE => 8,
+        SET_LIMITS => 16,
         _ => return None,
     })
 }
@@ -435,6 +486,7 @@ pub const fn mcu_payload_len(msg_type: u8) -> Option<usize> {
         CLOCK_SYNC_REPLY => 28,
         AXIS_SELECT => 8,
         CAL_RESULT => 28,
+        LIMITS => 24,
         _ => return None,
     })
 }
@@ -560,6 +612,7 @@ impl HostMsg {
             HostMsg::HostFault { .. } => t::HOST_FAULT,
             HostMsg::SetReference { .. } => t::SET_REFERENCE,
             HostMsg::Calibrate { .. } => t::CALIBRATE,
+            HostMsg::SetLimits(_) => t::SET_LIMITS,
         }
     }
 
@@ -622,6 +675,16 @@ impl HostMsg {
                 reference_count,
             } => w.u32(request_id).i32(reference_count),
             HostMsg::Calibrate { request_id, mode, flags } => w.u32(request_id).u8(mode).u8(flags).u16(0),
+            HostMsg::SetLimits(l) => w
+                .u32(l.request_id)
+                .u8(l.duty_max_percent)
+                .u8(l.duty_min_percent)
+                .u8(l.kp_percent_per_100)
+                .u8(0)
+                .u16(l.ff_count_s_per_percent)
+                .u16(l.deadband_count)
+                .u16(l.deadband_out_count)
+                .u16(0),
         };
         w.finish()
     }
@@ -723,6 +786,26 @@ impl HostMsg {
                 r.skip(2)?;
                 m
             }
+            t::SET_LIMITS => {
+                let request_id = r.u32()?;
+                let duty_max_percent = r.u8()?;
+                let duty_min_percent = r.u8()?;
+                let kp_percent_per_100 = r.u8()?;
+                r.skip(1)?;
+                let ff_count_s_per_percent = r.u16()?;
+                let deadband_count = r.u16()?;
+                let deadband_out_count = r.u16()?;
+                r.skip(2)?;
+                HostMsg::SetLimits(SetLimits {
+                    request_id,
+                    duty_max_percent,
+                    duty_min_percent,
+                    kp_percent_per_100,
+                    ff_count_s_per_percent,
+                    deadband_count,
+                    deadband_out_count,
+                })
+            }
             other => return Err(DecodeError::UnknownType(other)),
         })
     }
@@ -744,6 +827,7 @@ impl McuMsg {
             McuMsg::ClockSyncReply(_) => t::CLOCK_SYNC_REPLY,
             McuMsg::AxisSelect(_) => t::AXIS_SELECT,
             McuMsg::CalResult(_) => t::CAL_RESULT,
+            McuMsg::Limits(_) => t::LIMITS,
         }
     }
 
@@ -817,6 +901,18 @@ impl McuMsg {
                 .u8(0)
                 .u16(0)
                 .bytes(&c.reason),
+            McuMsg::Limits(l) => w
+                .u32(l.boot_id)
+                .u8(l.duty_max_percent)
+                .u8(l.duty_min_percent)
+                .u8(l.kp_percent_per_100)
+                .u8(l.abs_duty_max_percent)
+                .u16(l.ff_count_s_per_percent)
+                .u16(l.deadband_count)
+                .u16(l.deadband_out_count)
+                .u16(0)
+                .u32(l.abs_max_vel_count_s)
+                .u32(l.abs_max_acc_count_s2),
         };
         w.finish()
     }
@@ -931,6 +1027,29 @@ impl McuMsg {
                     neutral_count,
                     sign,
                     reason,
+                })
+            }
+            t::LIMITS => {
+                let boot_id = r.u32()?;
+                let duty_max_percent = r.u8()?;
+                let duty_min_percent = r.u8()?;
+                let kp_percent_per_100 = r.u8()?;
+                let abs_duty_max_percent = r.u8()?;
+                let ff_count_s_per_percent = r.u16()?;
+                let deadband_count = r.u16()?;
+                let deadband_out_count = r.u16()?;
+                r.skip(2)?;
+                McuMsg::Limits(Limits {
+                    boot_id,
+                    duty_max_percent,
+                    duty_min_percent,
+                    kp_percent_per_100,
+                    abs_duty_max_percent,
+                    ff_count_s_per_percent,
+                    deadband_count,
+                    deadband_out_count,
+                    abs_max_vel_count_s: r.u32()?,
+                    abs_max_acc_count_s2: r.u32()?,
                 })
             }
             other => return Err(DecodeError::UnknownType(other)),

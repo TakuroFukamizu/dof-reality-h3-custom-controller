@@ -150,7 +150,7 @@ class AgainstServerTests(unittest.TestCase):
         c = self.client()
         info = c.session_info
         self.assertEqual(info["protocol"], 1)
-        self.assertEqual(info["max_gain"], 0.35)
+        self.assertEqual(info["max_gain"], 0.5)
         self.assertEqual(info["source_freshness_ms"], 250)
         self.assertTrue(info["require_frame_seq"])
         self.assertTrue(c.submit_pose(0.2, -0.1, 0.0, 0.3, frame_seq=1, source_age_ms=2.0))
@@ -175,15 +175,56 @@ class AgainstServerTests(unittest.TestCase):
         c.submit_pose(0.0, 0.0, 0.0, 0.9, frame_seq=1)
         ack = self.ack_after(c, 0)
         self.assertTrue(ack["accepted"], ack)
-        self.assertAlmostEqual(ack["effective_gain"], 0.35)
+        self.assertAlmostEqual(ack["effective_gain"], 0.5)
         self.assertIn("gain_limited", ack["limits"])
         # Gain-only message: same cap, freshness not extended.
         s = self.seq(c)
-        c.submit_gain(0.5)
+        c.submit_gain(0.7)
         ack = self.ack_after(c, s)
         self.assertTrue(ack["accepted"], ack)
-        self.assertAlmostEqual(ack["effective_gain"], 0.35)
+        self.assertAlmostEqual(ack["effective_gain"], 0.5)
         self.assertIn("gain_limited", ack["limits"])
+
+    def test_limits_change_the_gain_ceiling_and_are_held_to_the_operator_values(self):
+        # Issue #15: the game channel may only lower the operator's [limits]
+        # (sim.toml: max_gain 0.5, max_vel 3000); raising is the admin's POST.
+        c = self.client()
+        self.assertTrue(c.submit_limits(max_gain=0.8, max_vel_count_s=7000))
+        ack = wait_until(lambda: c.last_limits_ack, msg="limits ack")
+        self.assertTrue(ack["accepted"], ack)
+        self.assertEqual(ack["effective_limits"]["max_gain"], 0.5, "operator's value, not the firmware ceiling")
+        self.assertEqual(ack["effective_limits"]["max_vel_count_s"], 3000)
+        self.assertEqual(ack["limits"], ["operator_limited"])
+        self.assertFalse(ack["fresh"], "a limits message never extends freshness")
+        # Lowering the gain ceiling applies to the next pose.
+        self.assertTrue(c.submit_limits(max_gain=0.3))
+        ack = wait_until(lambda: c.last_limits_ack if c.last_limits_ack["effective_gain"] == 0.3 else None,
+                         msg="limits ack 0.3")
+        s = self.seq(c)
+        c.submit_pose(0.0, 0.0, 0.0, 0.7, frame_seq=1)
+        ack = self.ack_after(c, s)
+        self.assertAlmostEqual(ack["effective_gain"], 0.3)
+        self.assertEqual(ack["limits"], ["gain_limited"])
+        # Visible in status and GET /v1/limits; a new session resets to the config.
+        st = wait_until(lambda: (lambda v: v if v and v["motion_limits"]["effective"]["max_gain"] == 0.3 else None)(c.status()),
+                        msg="status with the new limits")
+        ml = st["motion_limits"]
+        self.assertEqual(ml["requested"]["max_vel_count_s"], 7000)
+        self.assertEqual(ml["effective"]["max_vel_count_s"], 3000)
+        self.assertEqual(ml["operator_max"], ml["defaults"])
+        self.assertEqual(ml["game_fields"], ["max_gain", "max_vel_count_s"])
+        self.assertEqual(ml["limited"], ["max_vel_count_s"])
+        self.assertEqual(ml["reasons"], ["operator_limited"])
+        with hmc._HTTP.open(self.url + "/v1/limits", timeout=2) as r:
+            v = json.loads(r.read())
+        self.assertEqual(v["effective"]["max_gain"], 0.3)
+        self.assertEqual(v["reasons"], ["operator_limited"])
+        c2 = self.client()
+        self.assertEqual(c2.session_info["max_gain"], 0.5)
+        with hmc._HTTP.open(self.url + "/v1/limits", timeout=2) as r:
+            v = json.loads(r.read())
+        self.assertEqual(v["effective"], v["defaults"])
+        self.assertEqual(v["game_fields"], [])
 
     def test_largest_frame_seq_the_client_allows_is_accepted(self):
         # MotionClient's upper bound must match the server's u64 parse.

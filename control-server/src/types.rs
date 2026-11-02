@@ -145,6 +145,18 @@ pub enum LimitReason {
     AccelerationLimited,
     /// Target count was clamped to the axis operational soft limits.
     SoftLimited,
+    /// A requested motion limit (WS `limits` / `POST /v1/limits`) exceeded a
+    /// ceiling and was reduced (design 2026-11-01 §5.3).
+    CeilingClamped,
+    /// The requested `max_vel` / `max_acc` could not stop within the stop
+    /// deadline: `max_acc` was raised (or `max_vel` lowered) to the bound
+    /// (Issue #15 H2, `limits::clamp`).
+    StopTimeLimited,
+    /// A motion limit requested over the game channel (WS `limits`) exceeded
+    /// the operator's `[limits]` value and was reduced to it: the game may
+    /// only lower the operator's limits; `POST /v1/limits` (admin) raises
+    /// them (Issue #15, `limits::OperatorCap`).
+    OperatorLimited,
 }
 
 /// Whole-rig state (server side), architecture §10.
@@ -291,6 +303,11 @@ pub enum RigFault {
     AxisStateMismatch { axis: AxisId, expected: McuState, actual: McuState },
     /// ARMING did not reach HOLDING on all axes in time.
     ArmTimeout,
+    /// START was not confirmed on this axis: its ACK did not arrive within
+    /// `ACK_TIMEOUT` (the detail says `ack_timeout: …` and what the MCU
+    /// reports, which may well be ACTIVE), or the axis had not reached
+    /// ACTIVE within `arm_timeout_ms` (then the detail names its state).
+    StartTimeout { axis: AxisId },
     /// STOPPING did not settle in time.
     StopTimeout,
     /// The three axes' last applied group_frame_id diverged beyond the limit.

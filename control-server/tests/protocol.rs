@@ -732,8 +732,8 @@ fn unknown_type_rejected_including_cross_direction() {
         Err(DecodeError::UnknownType(0x00))
     );
     assert_eq!(
-        McuMsg::decode_payload(0x88, &[]),
-        Err(DecodeError::UnknownType(0x88))
+        McuMsg::decode_payload(0x89, &[]),
+        Err(DecodeError::UnknownType(0x89))
     );
 }
 
@@ -753,6 +753,7 @@ fn payload_length_tables_match_spec() {
         (HOST_FAULT, 8),
         (SET_REFERENCE, 8),
         (CALIBRATE, 8),
+        (SET_LIMITS, 16),
     ];
     let mcu = [
         (HELLO, 32),
@@ -762,6 +763,7 @@ fn payload_length_tables_match_spec() {
         (CLOCK_SYNC_REPLY, 28),
         (AXIS_SELECT, 8),
         (CAL_RESULT, 28),
+        (LIMITS, 24),
     ];
     let mut n_host = 0;
     let mut n_mcu = 0;
@@ -1093,6 +1095,15 @@ fn round_trip_every_host_message_edge_values() {
                 mode: h as u8,
                 flags: 0,
             },
+            HostMsg::SetLimits(SetLimits {
+                request_id: u,
+                duty_max_percent: h as u8,
+                duty_min_percent: h as u8,
+                kp_percent_per_100: h as u8,
+                ff_count_s_per_percent: h,
+                deadband_count: h,
+                deadband_out_count: h,
+            }),
         ];
         for m in msgs {
             host_rt(m);
@@ -1189,6 +1200,18 @@ fn round_trip_every_mcu_message_edge_values() {
                 reason: [b; CAL_REASON_LEN],
             }));
         }
+        mcu_rt(McuMsg::Limits(Limits {
+            boot_id: u,
+            duty_max_percent: b,
+            duty_min_percent: b,
+            kp_percent_per_100: b,
+            abs_duty_max_percent: b,
+            ff_count_s_per_percent: h,
+            deadband_count: h,
+            deadband_out_count: h,
+            abs_max_vel_count_s: u,
+            abs_max_acc_count_s2: u,
+        }));
     }
 }
 

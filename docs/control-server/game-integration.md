@@ -5,6 +5,7 @@
 | 知りたいこと | 読む場所 |
 | --- | --- |
 | サーバーの起動・設定・管理操作（curl） | [README.md](README.md) |
+| 思いどおりに動かす Tips（gain で全域、速さ・加速度の決まり方、揺れの周波数の上限、START は中立から、鮮度、症状 → 原因） | [game-tips.md](game-tips.md) |
 | Game API の契約（WS `/v1/motion` の JSON、ack の拒否理由、`GET /v1/status` の形） | [../../control-server/DESIGN.md](../../control-server/DESIGN.md) §7 |
 | h3game に当てるパッチと bridge の動かし方 | [../../clients/h3game/README.md](../../clients/h3game/README.md) |
 | Python クライアント（bridge が使う。他のゲームからも使える） | [../../clients/python/README.md](../../clients/python/README.md) |
@@ -17,6 +18,8 @@
 cd control-server && cargo build && ./target/debug/h3-control-server --config config/sim.toml
 # 2) 運転用テストページ（状態・ARM/START/STOP・姿勢スライダー）
 open http://127.0.0.1:8892/
+#    ジョイスティックで roll / pitch を動かして確かめるページ（h3game と同じ符号。DESIGN.md §7.5）
+open http://127.0.0.1:8892/joystick
 # 3) h3game（パッチ適用後）を server モードで
 H3_BACKEND=server python3 bridge.py        # Chrome で http://localhost:8891
 ```
@@ -29,7 +32,8 @@ H3_BACKEND=server python3 bridge.py        # Chrome で http://localhost:8891
 
 - **やること**: `POST /v1/session` で session を取り、`WS /v1/motion?session=...` に **`frame_seq` が進む姿勢**を送り続ける（DESIGN.md §7.1）。各フィールド:
   - `pitch` / `roll` / `yaw`: −1..1（範囲外は互換モードでクリップされ `limits` に出る）
-  - `gain`: 0..1 の要求値。サーバーの `max_gain`（既定 0.35、bring-up は 0.15）で頭打ちになり、ack の `effective_gain` で分かる
+  - `gain`: 0..1 の要求値。サーバーの `max_gain`（`[limits]`。example / sim は 0.5、bringup.toml は 0.15）で頭打ちになり、ack の `effective_gain` で分かる
+- **動きの制限を変えたいとき**（[limits.md](limits.md) §3.1）: 同じ WS に `{"type":"limits","protocol":1,"source_session":"...","seq":N,"max_gain":0.8,"max_vel_count_s":3000,"max_acc_count_s2":15000,"duty_max_percent":40}`（どの項目も省略可）。**ゲームからは操作者の `[limits]` の値を下げることしかできない**: それより上の要求は操作者の値で頭打ちにし、ack の `effective_limits` と `limits`（`operator_limited`。ファームの絶対上限なら `ceiling_clamped`）で返す。上げるのは操作者の `POST /v1/limits`（トークン付き）だけ。鮮度は延びない。`POST /v1/session` のたびに設定ファイルの初期値に戻るので、接続のたびに送り直す。bridge は POST の `"limits": {...}` をそのまま渡す
   - `seq`: 単調増加（接続ごと）。`frame_seq`: **ゲームのフレームが進んだときだけ増やす**。同じ値の再送では鮮度が延びない
   - `source_age_ms`: 入力の古さ（0 でよい）
 - **やらないこと**: ARM / START / STOP / 校正は**操作者**（テストページまたは curl）。ゲームは駆動権限を持たない。ゲームがつながっただけでは座席は動かない。
@@ -42,7 +46,7 @@ H3_BACKEND=server python3 bridge.py        # Chrome で http://localhost:8891
 
 - `rig_state`: `OFFLINE` / `CALIBRATION_REQUIRED` / `READY_TO_ARM` / `ARMING` / `HOLDING` / `ACTIVE` / `STOPPING` / `BRAKED_DISARMED` / `FAULT_LATCHED`
 - `blockers`（`"<code>: <detail>"`。`:` より前の code で判定）、`fault`、`axis_conflict`
-- `session.fresh`（ゲーム入力が新鮮か）、`effective_gain`、`limits`
+- `session.fresh`（ゲーム入力が新鮮か）、`effective_gain`、`limits`、`motion_limits`（いまの制限値と上限）
 - 軸ごと: `mcu_state` / `fault_code` / `actual_count` / `following_error_count` など
 
 bridge のパッチは HUD に `rig_state`・`blockers`・`hud_note`（系統の競合 / 個体の不一致 / 再基準化が必要）を出す（clients/h3game/README.md）。

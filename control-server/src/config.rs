@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Upper bound for every `*_ms` setting (1 h). Larger values are typos and
 /// would overflow `Instant + Duration`.
@@ -40,6 +40,10 @@ pub struct Config {
     pub timing: TimingConfig,
     #[serde(default)]
     pub game: GameConfig,
+    /// Motion limits: the PC-side current set's initial values plus the
+    /// values distributed to the MCUs (design 2026-11-01 §2).
+    #[serde(default)]
+    pub limits: LimitsConfig,
     pub backend: BackendConfig,
     /// The only axis whose MCU drives the shared main-power relay (G2).
     pub power_controller_axis: AxisId,
@@ -106,6 +110,21 @@ pub struct TimingConfig {
     pub stop_hold_ms: u64,
     /// Max allowed spread of last_applied_frame across axes while ACTIVE.
     pub max_frame_skew: u32,
+    /// Center: once the planner is at neutral, every axis's MEASURED position must
+    /// be within `game.center_tolerance_count` of neutral within this, or the rig
+    /// faults (StopTimeout) instead of reporting `center_reached` on a lagging axis.
+    pub center_reach_timeout_ms: u64,
+    /// Measured rest (Issue #15 H1): an axis is "at rest" when STATUS reports
+    /// |velocity_count_s| <= `rest_velocity_count_s` AND
+    /// |following_error_count| <= `rest_error_count`, continuously for
+    /// `rest_dwell_ms`. STOPPING (Decel -> Hold, Hold -> DISARM) and the
+    /// post-center settle require every axis at rest, not just a trajectory
+    /// at velocity 0: the MCU declares HOLDING when its SETPOINT stops, while a
+    /// gravity-loaded axis can still be moving / hundreds of counts off.
+    pub rest_velocity_count_s: u32,
+    /// Must cover the firmware deadband (`limits.deadband_out_count`).
+    pub rest_error_count: u32,
+    pub rest_dwell_ms: u64,
     /// Handshake: HELLO_REQ retry period and overall timeout per port.
     pub hello_retry_ms: u64,
     pub hello_timeout_ms: u64,
@@ -124,6 +143,10 @@ impl Default for TimingConfig {
             stop_settle_timeout_ms: 3000,
             stop_hold_ms: 1000,
             max_frame_skew: 5,
+            center_reach_timeout_ms: 5000,
+            rest_velocity_count_s: 50,
+            rest_error_count: 50,
+            rest_dwell_ms: 200,
             hello_retry_ms: 200,
             hello_timeout_ms: 2000,
         }
@@ -133,9 +156,6 @@ impl Default for TimingConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GameConfig {
-    /// Max effective gain allowed by this machine profile. The old UI max 0.6 is
-    /// NOT a validated limit for the new rig.
-    pub max_gain: f64,
     /// When false, a pose without `frame_seq` is rejected. When true it is accepted
     /// and freshness is "timer only" (cannot detect a frozen game loop).
     pub allow_missing_frame_seq: bool,
@@ -146,17 +166,102 @@ pub struct GameConfig {
     pub virtual_max: f64,
     /// Planner scale for the admin `center` move (fraction of axis max velocity).
     pub center_speed_fraction: f64,
+    /// Center is complete only when every axis's MEASURED count (STATUS.actual_count)
+    /// is within this many counts of neutral. Must cover the firmware deadband
+    /// (`limits.deadband_out_count`) with margin; 2026-11-01 a lagging axis was
+    /// declared centered 280 counts short because only the setpoint was checked.
+    pub center_tolerance_count: u32,
+    /// Rig orientation (compat::Orientation): the game sends pitch / roll / yaw
+    /// in its own sense; these map them onto this rig's mixer inputs. The
+    /// operator sets them after the orientation check (hardware-bringup.md §7);
+    /// the game never needs to know. Rebuilt H3 2026-11-02: swap_pitch_roll = true.
+    pub swap_pitch_roll: bool,
+    pub invert_pitch: bool,
+    pub invert_roll: bool,
+    pub invert_yaw: bool,
+    /// START (game) is refused (`pose_not_near_hold`) when the fresh pose
+    /// would command any axis farther than this from where it is held: a
+    /// forgotten tab streaming an extreme pose must not launch the seat at
+    /// START (Issue #15 M4). The game should be at neutral when START is
+    /// pressed. Measured in counts along the same path as tracking
+    /// (mix → saturate → calibration → soft limits).
+    pub start_max_offset_count: u32,
+}
+
+impl GameConfig {
+    pub fn orientation(&self) -> crate::compat::Orientation {
+        crate::compat::Orientation {
+            swap_pitch_roll: self.swap_pitch_roll,
+            invert_pitch: self.invert_pitch,
+            invert_roll: self.invert_roll,
+            invert_yaw: self.invert_yaw,
+        }
+    }
 }
 
 impl Default for GameConfig {
     fn default() -> Self {
         Self {
-            max_gain: 0.35,
             allow_missing_frame_seq: false,
             clamp_out_of_range: true,
             virtual_min: 0.0,
             virtual_max: 1023.0,
             center_speed_fraction: 0.25,
+            center_tolerance_count: 50,
+            swap_pitch_roll: false,
+            invert_pitch: false,
+            invert_roll: false,
+            invert_yaw: false,
+            start_max_offset_count: 300,
+        }
+    }
+}
+
+/// `[limits]`: one set for all three axes. The first four are the runtime
+/// set's initial values (changed by WS `limits` / `POST /v1/limits`, reset
+/// on `POST /v1/session`); the rest are distributed to the MCUs (SET_LIMITS,
+/// CONFIG) and not changeable at runtime. Every value is an estimate not yet
+/// verified on the rig (`docs/control-server/limits.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsConfig {
+    /// Gain ceiling for the game (≤ 1.0; 0.5 keeps a full pitch+roll inside
+    /// virtual 0..=1023).
+    pub max_gain: f64,
+    pub max_vel_count_s: u32,
+    pub max_acc_count_s2: u32,
+    /// Position-loop duty cap sent to the MCUs (clamped there to the
+    /// firmware's absolute ceiling).
+    pub duty_max_percent: u8,
+    /// Smallest non-zero duty the loop commands (the firmware default 7 %
+    /// made slow motion step).
+    pub duty_min_percent: u8,
+    pub kp_percent_per_100: u8,
+    /// Feed-forward: trajectory speed [count/s] ÷ this = duty [%].
+    pub ff_count_s_per_percent: u16,
+    pub deadband_count: u16,
+    pub deadband_out_count: u16,
+    /// Protection thresholds (CONFIG).
+    pub following_error_limit_count: u32,
+    /// Must be ≥ 1.5 × `max_vel_count_s`; also caps runtime velocity
+    /// requests at `overspeed / 1.5`.
+    pub overspeed_count_s: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_gain: 0.5,
+            max_vel_count_s: 3000,
+            max_acc_count_s2: 15000,
+            duty_max_percent: 40,
+            duty_min_percent: 3,
+            kp_percent_per_100: 2,
+            ff_count_s_per_percent: 100,
+            deadband_count: 10,
+            deadband_out_count: 20,
+            following_error_limit_count: 800,
+            overspeed_count_s: 9000,
         }
     }
 }
@@ -261,10 +366,6 @@ pub struct AxisConfig {
     pub soft_min_count: i32,
     pub soft_max_count: i32,
     pub decel_zone_count: i32,
-    pub max_vel_count_s: u32,
-    pub max_acc_count_s2: u32,
-    pub following_error_limit_count: u32,
-    pub overspeed_count_s: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -292,8 +393,8 @@ impl Config {
 
     /// Structural validation. Must reject: wrong schema_version; not exactly one
     /// axis per AxisId 1..=3; duplicate device_id; non-loopback bind without
-    /// allow_non_loopback; max_gain outside 0..=1; virtual_min/max outside
-    /// 0..=1023 or min >= max; timing values of 0; per-axis calibration
+    /// allow_non_loopback; virtual_min/max outside 0..=1023 or min >= max;
+    /// timing values of 0; `[limits]` rules (below); per-axis calibration
     /// invariants (see `crate::calibration::AxisCalibration::validate`).
     ///
     /// All-zero device_ids (`DeviceId::is_unassigned`) mean "no cross-check"
@@ -378,6 +479,10 @@ impl Config {
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.max_frame_skew", u64::from(t.max_frame_skew)),
+            ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_velocity_count_s", u64::from(t.rest_velocity_count_s)),
+            ("timing.rest_error_count", u64::from(t.rest_error_count)),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
         ] {
@@ -395,6 +500,8 @@ impl Config {
             ("timing.arm_timeout_ms", t.arm_timeout_ms),
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
+            ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
             ("server.status_period_ms", s.status_period_ms),
@@ -417,12 +524,25 @@ impl Config {
                 t.mcu_command_timeout_ms, t.planner_period_ms
             ));
         }
+        // The rest dwell is part of every stop: it must fit in the settle window.
+        if t.stop_settle_timeout_ms > 0 && t.rest_dwell_ms >= t.stop_settle_timeout_ms {
+            errs.push(format!(
+                "timing.rest_dwell_ms ({}) must be < timing.stop_settle_timeout_ms ({})",
+                t.rest_dwell_ms, t.stop_settle_timeout_ms
+            ));
+        }
+        if t.rest_error_count > 0 && u32::from(self.limits.deadband_out_count) > t.rest_error_count {
+            // The firmware stops correcting inside deadband_out, so a rest
+            // tolerance tighter than that could never be met: every STOP would
+            // time out.
+            errs.push(format!(
+                "timing.rest_error_count ({}) must be >= limits.deadband_out_count ({})",
+                t.rest_error_count, self.limits.deadband_out_count
+            ));
+        }
 
         // Game.
         let g = &self.game;
-        if !(g.max_gain.is_finite() && (0.0..=1.0).contains(&g.max_gain)) {
-            errs.push(format!("game.max_gain must be within 0..=1, got {}", g.max_gain));
-        }
         let vrange = VIRTUAL_MIN..=VIRTUAL_MAX;
         if !vrange.contains(&g.virtual_min) {
             errs.push(format!("game.virtual_min must be within 0..=1023, got {}", g.virtual_min));
@@ -436,8 +556,122 @@ impl Config {
                 g.virtual_min, g.virtual_max
             ));
         }
+        if g.center_tolerance_count == 0 {
+            errs.push("game.center_tolerance_count must be > 0".into());
+        } else if u32::from(self.limits.deadband_out_count) > g.center_tolerance_count {
+            // The firmware stops correcting inside deadband_out, so a tolerance
+            // tighter than that could never be met: CENTER would always time out.
+            errs.push(format!(
+                "game.center_tolerance_count ({}) must be >= limits.deadband_out_count ({})",
+                g.center_tolerance_count, self.limits.deadband_out_count
+            ));
+        }
         if !(g.center_speed_fraction > 0.0 && g.center_speed_fraction <= 1.0) {
             errs.push(format!("game.center_speed_fraction must be within (0, 1], got {}", g.center_speed_fraction));
+        }
+        if g.start_max_offset_count == 0 {
+            errs.push("game.start_max_offset_count must be > 0".into());
+        }
+
+        // Limits (design 2026-11-01 §2).
+        let l = &self.limits;
+        if !(l.max_gain.is_finite() && l.max_gain > 0.0 && l.max_gain <= 1.0) {
+            errs.push(format!("limits.max_gain must be within (0, 1], got {}", l.max_gain));
+        }
+        for (name, v) in [
+            ("limits.max_vel_count_s", l.max_vel_count_s),
+            ("limits.max_acc_count_s2", l.max_acc_count_s2),
+            ("limits.following_error_limit_count", l.following_error_limit_count),
+            ("limits.overspeed_count_s", l.overspeed_count_s),
+        ] {
+            if v == 0 {
+                errs.push(format!("{name} must be > 0"));
+            }
+        }
+        if !(1..=100).contains(&l.duty_max_percent) {
+            errs.push(format!("limits.duty_max_percent must be within 1..=100, got {}", l.duty_max_percent));
+        }
+        if l.duty_min_percent > l.duty_max_percent {
+            errs.push(format!(
+                "limits.duty_min_percent ({}) must be <= limits.duty_max_percent ({})",
+                l.duty_min_percent, l.duty_max_percent
+            ));
+        }
+        if l.ff_count_s_per_percent == 0 {
+            errs.push("limits.ff_count_s_per_percent must be > 0".into());
+        }
+        if l.deadband_out_count < l.deadband_count {
+            errs.push(format!(
+                "limits.deadband_out_count ({}) must be >= limits.deadband_count ({})",
+                l.deadband_out_count, l.deadband_count
+            ));
+        }
+        if l.kp_percent_per_100 == 0 {
+            // With kp = 0 the loop outputs nothing at rest (FF is zero when the
+            // trajectory stands still), so the axis cannot hold position at all.
+            errs.push("limits.kp_percent_per_100 must be > 0".into());
+        }
+        // Cross-check (2026-11-01 on hardware): the position loop's output before
+        // FOLLOWING_ERROR trips is at most kp x following_error_limit / 100 (+ FF,
+        // which is 0 against a static load). If that is below duty_min, the loop
+        // can never command more than the floor before the fault: a load that the
+        // floor cannot move is either stuck (static) or faults (moving target),
+        // with no third outcome. kp 2 x 400 / 100 = 8 % vs a measured 9 % breakaway
+        // did exactly that. duty_min_percent should be the measured breakaway duty.
+        let authority = f64::from(l.kp_percent_per_100) * f64::from(l.following_error_limit_count) / 100.0;
+        if authority < f64::from(l.duty_min_percent) {
+            errs.push(format!(
+                "limits.kp_percent_per_100 ({}) x limits.following_error_limit_count ({}) / 100 = {authority:.1} % \
+                 must be >= limits.duty_min_percent ({} %): the position loop would never exceed the duty floor \
+                 before FOLLOWING_ERROR (raise kp or following_error_limit_count, or lower duty_min)",
+                l.kp_percent_per_100, l.following_error_limit_count, l.duty_min_percent
+            ));
+        }
+        if f64::from(l.overspeed_count_s) < crate::limits::OVERSPEED_MARGIN * f64::from(l.max_vel_count_s) {
+            errs.push(format!(
+                "limits.overspeed_count_s ({}) must be >= {} x limits.max_vel_count_s ({})",
+                l.overspeed_count_s,
+                crate::limits::OVERSPEED_MARGIN,
+                l.max_vel_count_s
+            ));
+        }
+        // Stop-time rule (Issue #15 H2): a STOP decelerates at max_acc; if that
+        // takes longer than the stop timeouts the rig faults and brakes at speed.
+        // Checked on the initial set and on the firmware ceilings (a runtime
+        // request may raise max_vel to the ceiling; the clamp then needs an
+        // acceleration bound it can actually reach).
+        {
+            use crate::limits::{min_acc_for_stop, stop_deadline, stop_time_s, Ceilings, STOP_TIME_FRACTION};
+            let deadline = stop_deadline(t);
+            let deadline_s = deadline.as_secs_f64();
+            let budget = format!(
+                "{deadline_s:.3} s ({STOP_TIME_FRACTION} x min(timing.mcu_stop_timeout_ms {}, timing.stop_settle_timeout_ms {}))",
+                t.mcu_stop_timeout_ms, t.stop_settle_timeout_ms
+            );
+            if l.max_acc_count_s2 > 0 {
+                let stop_s = stop_time_s(l.max_vel_count_s, l.max_acc_count_s2);
+                if stop_s > deadline_s {
+                    errs.push(format!(
+                        "limits.max_vel_count_s ({}) / limits.max_acc_count_s2 ({}) = {stop_s:.3} s worst-case stop time \
+                         must be <= {budget}: a STOP would run into the timeout and brake at speed \
+                         (max_acc_count_s2 must be >= {})",
+                        l.max_vel_count_s,
+                        l.max_acc_count_s2,
+                        min_acc_for_stop(l.max_vel_count_s, deadline)
+                    ));
+                }
+            }
+            let c = Ceilings::fallback(l.overspeed_count_s);
+            let stop_s = stop_time_s(c.max_vel_count_s, c.max_acc_count_s2);
+            if stop_s > deadline_s {
+                errs.push(format!(
+                    "firmware ceilings: max_vel {} / max_acc {} = {stop_s:.3} s worst-case stop time must be <= {budget} \
+                     (protocol::fw_absolute and limits.overspeed_count_s / {})",
+                    c.max_vel_count_s,
+                    c.max_acc_count_s2,
+                    crate::limits::OVERSPEED_MARGIN
+                ));
+            }
         }
 
         // Backend.

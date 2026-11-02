@@ -16,10 +16,6 @@ pub struct AxisCalibration {
     pub soft_min_count: Counts,
     pub soft_max_count: Counts,
     pub decel_zone_count: i32,
-    pub max_vel_count_s: u32,
-    pub max_acc_count_s2: u32,
-    pub following_error_limit_count: u32,
-    pub overspeed_count_s: u32,
     pub operator_marked_valid: bool,
 }
 
@@ -39,18 +35,14 @@ impl AxisCalibration {
             soft_min_count: a.soft_min_count,
             soft_max_count: a.soft_max_count,
             decel_zone_count: a.decel_zone_count,
-            max_vel_count_s: a.max_vel_count_s,
-            max_acc_count_s2: a.max_acc_count_s2,
-            following_error_limit_count: a.following_error_limit_count,
-            overspeed_count_s: a.overspeed_count_s,
             operator_marked_valid: a.calibration_valid,
         }
     }
     /// Invariants: mechanical_min < soft_min, soft_max < mechanical_max, with at
     /// least decel_zone_count margin on each side; decel_zone_count >= 0;
-    /// count_at strictly monotonic; all three points inside [soft_min, soft_max];
-    /// velocity/accel/following-error/overspeed limits > 0 and
-    /// max_vel_count_s < overspeed_count_s.
+    /// count_at strictly monotonic; all three points inside [soft_min, soft_max].
+    /// Velocity / acceleration / protection thresholds live in `[limits]`
+    /// (design 2026-11-01), not here.
     ///
     /// Reports the first violated invariant, naming the field.
     pub fn validate(&self) -> Result<(), CalibrationError> {
@@ -93,22 +85,6 @@ impl AxisCalibration {
             if c < soft_min || c > soft_max {
                 return err(format!("{name} ({c}) must lie inside soft limits [{soft_min}, {soft_max}]"));
             }
-        }
-        for (name, v) in [
-            ("max_vel_count_s", self.max_vel_count_s),
-            ("max_acc_count_s2", self.max_acc_count_s2),
-            ("following_error_limit_count", self.following_error_limit_count),
-            ("overspeed_count_s", self.overspeed_count_s),
-        ] {
-            if v == 0 {
-                return err(format!("{name} must be > 0"));
-            }
-        }
-        if self.max_vel_count_s >= self.overspeed_count_s {
-            return err(format!(
-                "max_vel_count_s ({}) must be < overspeed_count_s ({})",
-                self.max_vel_count_s, self.overspeed_count_s
-            ));
         }
         Ok(())
     }
@@ -161,13 +137,14 @@ impl AxisCalibration {
 }
 
 /// CRC-32/ISO-HDLC over a canonical little-endian serialization of
-/// (rig_id bytes, axis_id, count_at[3], mechanical/soft limits, decel zone,
-/// velocity/accel/following/overspeed limits). Sent in CONFIG; echoed in HELLO.
+/// (rig_id bytes, axis_id, count_at[3], mechanical/soft limits, decel zone).
+/// Sent in CONFIG; echoed in HELLO. Geometry only: the motion limits moved
+/// to `[limits]` (design 2026-11-01) and are not part of the hash.
 ///
 /// Layout: u32 len(rig_id) | rig_id UTF-8 | u8 axis_id | i32 count_at[0..3] |
-/// i32 mechanical_min, mechanical_max, soft_min, soft_max, decel_zone |
-/// u32 max_vel, max_acc, following_error_limit, overspeed. `operator_marked_valid`
-/// is deliberately excluded: it is server-side policy, not an MCU parameter.
+/// i32 mechanical_min, mechanical_max, soft_min, soft_max, decel_zone.
+/// `operator_marked_valid` is deliberately excluded: it is server-side
+/// policy, not an MCU parameter.
 pub fn calibration_hash(rig_id: &str, cal: &AxisCalibration) -> u32 {
     let mut buf = Vec::with_capacity(64 + rig_id.len());
     let id = rig_id.as_bytes();
@@ -186,9 +163,6 @@ pub fn calibration_hash(rig_id: &str, cal: &AxisCalibration) -> u32 {
     ] {
         buf.extend_from_slice(&c.to_le_bytes());
     }
-    for u in [cal.max_vel_count_s, cal.max_acc_count_s2, cal.following_error_limit_count, cal.overspeed_count_s] {
-        buf.extend_from_slice(&u.to_le_bytes());
-    }
     Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&buf)
 }
 
@@ -206,10 +180,6 @@ pub fn from_config(cfg: &Config) -> [AxisCalibration; 3] {
             soft_min_count: 0,
             soft_max_count: 0,
             decel_zone_count: 0,
-            max_vel_count_s: 0,
-            max_acc_count_s2: 0,
-            following_error_limit_count: 0,
-            overspeed_count_s: 0,
             operator_marked_valid: false,
         },
     })

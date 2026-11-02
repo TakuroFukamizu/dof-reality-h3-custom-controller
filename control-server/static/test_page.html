@@ -9,10 +9,13 @@
   サーバーが GET / で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
   - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。
   - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
-  - タブが隠れても姿勢送信は止めない（運用上は別のウィンドウを前に出すことが普通）。隠れたタブでは
-    ブラウザがタイマーを 1 Hz 程度に間引くので frame_seq の進みが遅くなり、サーバー側の鮮度切れ
-    （source_freshness_ms）で減速停止する。安全はサーバーの鮮度判定に任せる。
-    隠れても 0（中央）を送らない: サーバーの source_freshness_ms が止める。
+  - タブが隠れても姿勢送信は止めない（運用上は別のウィンドウを前に出すことが普通）。送信の 50 Hz タイマーは
+    Web Worker で回す: 主スレッドの setInterval は、タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に
+    間引かれ、frame_seq が進まずサーバーの鮮度切れ（source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。
+    Worker のタイマーは間引かれないので、ウィンドウが裏に回っても送り続ける。
+    隠れても 0（中央）を送らない: 止めたいときは STOP か「送信停止」。
+  - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。「session 発行」は送信中なら先に送信を止める
+    （WS は ?session= の旧 id に固定されるので、新 id の pose はすべて拒否されるため）。再開は「送信開始」（Issue #15 L2）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
   - 校正（POST /v1/calibrate、DESIGN.md §11）は機構を両端まで動かす。確認ダイアログの後にだけ送る。
 -->
@@ -60,9 +63,9 @@
     <span class="dim small">sessionStorage に保存（このタブだけ）</span>
   </div>
   <div class="row" style="margin-top:8px">
-    <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する">session 発行</button>
-    <button id="bArm">ARM</button>
-    <button id="bStart">START</button>
+    <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する。送信中なら先に送信を止める（新 session で「送信開始」を押し直す）">session 発行</button>
+    <button id="bArm" title="POST /v1/arm。全軸 HOLDING まで">ARM</button>
+    <button id="bStart" title="POST /v1/start。HOLDING → ACTIVE（新鮮な姿勢が要る）">START</button>
     <button id="bDisarm">DISARM</button>
     <button id="bCenter">CENTER</button>
     <button id="bFault" class="warn">FAULT</button>
@@ -117,15 +120,30 @@
   <label class="sl">pitch <input type="range" id="pitch" min="-1" max="1" step="0.01" value="0"><span id="pitchV">0.00</span></label>
   <label class="sl">roll <input type="range" id="roll" min="-1" max="1" step="0.01" value="0"><span id="rollV">0.00</span></label>
   <label class="sl">yaw <input type="range" id="yaw" min="-1" max="1" step="0.01" value="0"><span id="yawV">0.00</span></label>
-  <label class="sl">gain <input type="range" id="gain" min="0" max="0.35" step="0.01" value="0.2"><span id="gainV">0.20</span></label>
+  <label class="sl">gain <input type="range" id="gain" min="0" max="0.5" step="0.01" value="0.2"><span id="gainV">0.20</span></label>
   <div class="row">
     <button id="bStream">送信開始</button>
     <button id="bZero">スライダーを 0 に</button>
     <span>WS: <b id="wsState">closed</b></span>
     <span>seq: <b id="seq">0</b></span>
-    <span>max_gain: <b id="maxGain">0.35</b></span>
+    <span>max_gain: <b id="maxGain">0.5</b> <span class="dim small">（gain スライダーの上限。下の「動きの制限」の max_gain で変える。送信中につまみを離すと送られる）</span></span>
   </div>
   <div style="margin-top:4px">最後の ack: <span id="ack" class="dim">—</span></div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">動きの制限 <span class="dim small">WS の limits メッセージ（送信中だけ送れる）。ゲーム経路は操作者の [limits] の値（status の motion_limits.operator_max）より上げられない（operator_limited）。それ以上はファームの上限（motion_limits.ceiling）まで POST /v1/limits で。POST /v1/session で設定ファイルの初期値に戻る</span></h2>
+  <label class="sl">max_gain <input type="range" id="limGain" min="0.05" max="1" step="0.05" value="0.5"><span id="limGainV">0.50</span></label>
+  <label class="sl">max_vel <input type="range" id="limVel" min="100" max="6000" step="100" value="3000"><span id="limVelV">3000</span></label>
+  <label class="sl">max_acc <input type="range" id="limAcc" min="500" max="40000" step="500" value="15000"><span id="limAccV">15000</span></label>
+  <label class="sl">duty_max <input type="range" id="limDuty" min="1" max="60" step="1" value="40"><span id="limDutyV">40</span></label>
+  <div class="row">
+    <button id="bLimits">制限を送る</button>
+    <button id="bLimitsReset">設定の初期値に戻す</button>
+    <span>有効値: <b id="limEff">—</b></span>
+    <span>上限: <b id="limCeil">—</b></span>
+  </div>
+  <div style="margin-top:4px">limits の ack: <span id="limAck" class="dim">—</span></div>
 </section>
 
 <section>
@@ -143,7 +161,7 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const TOKEN_KEY = 'h3cs_admin_token';
-  const state = { session: null, maxGain: 0.35, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0, pollBusy: false, eventsBusy: false };
+  const state = { session: null, maxGain: 0.5, lastStatus: null, ws: null, timer: null, seq: 0, frameSeq: 0, pollBusy: false, eventsBusy: false, limitsCeiling: null };
 
   $('hostLabel').textContent = location.host;
 
@@ -238,6 +256,9 @@
   });
 
   $('bSession').addEventListener('click', async () => {
+    // 送信中に新しい session を発行すると、WS は旧 id に固定されたまま（?session=）で pose だけ新 id になり
+    // すべて stale_session で拒否される。先に送信を止め、新 session で「送信開始」を押し直す（Issue #15 L2）。
+    if (state.timer || state.ws) { stopStream('session 発行'); log('姿勢送信: 新しい session を発行するので送信を止めた。「送信開始」で新 session の WS を開く'); }
     try {
       const r = await call('POST', '/v1/session');
       if (r.ok && r.json) {
@@ -267,7 +288,70 @@
     return c;
   }
 
+  const LIMIT_FIELDS = ['max_gain', 'max_vel_count_s', 'max_acc_count_s2', 'duty_max_percent'];
+  function limitsText(o) {
+    return o ? LIMIT_FIELDS.map((k) => fmt(o[k])).join(' / ') : '—';
+  }
+  function renderLimits(ml) {
+    if (!ml) return;
+    // `limited` = fields the clamp changed, `reasons` = why (ceiling_clamped / operator_limited /
+    // stop_time_limited), `pending` = waiting for every axis to ACK the new duty cap before the
+    // planner uses it.
+    const why = (ml.limited && ml.limited.length)
+      ? ' (clamped: ' + ml.limited.join(',') + ((ml.reasons && ml.reasons.length) ? ' — ' + ml.reasons.join(',') : '') + ')'
+      : '';
+    $('limEff').textContent = limitsText(ml.effective) + why + (ml.pending ? ' [pending: SET_LIMITS 未 ACK]' : '');
+    $('limCeil').textContent = limitsText(ml.ceiling)
+      + (ml.operator_max ? ' / ゲーム経路の上限 ' + limitsText(ml.operator_max) : '');
+    // This page sends over the WS game channel, which is held to the operator's
+    // [limits] (operator_max); the sliders' maxima follow that (and the firmware
+    // ceilings where a unit reports lower ones).
+    const cap = ml.operator_max && ml.ceiling
+      ? Object.fromEntries(LIMIT_FIELDS.map((k) => [k, Math.min(ml.operator_max[k], ml.ceiling[k])]))
+      : (ml.operator_max || ml.ceiling);
+    if (cap) {
+      state.limitsCeiling = cap;
+      $('limGain').max = String(cap.max_gain);
+      $('limVel').max = String(cap.max_vel_count_s);
+      $('limAcc').max = String(cap.max_acc_count_s2);
+      $('limDuty').max = String(cap.duty_max_percent);
+    }
+    if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) {
+      setMaxGain(ml.effective.max_gain);
+    }
+  }
+
+  // 操作ボタンの押せる／押せない（STOP 以外）。リグ状態から決め、押せない理由を title に出す。
+  // サーバー側の判定が正。ここは「いま意味のある操作」を見せるためのもの。
+  function updateButtons(s) {
+    const st = s.rig_state || '';
+    const armedStates = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
+    const calibrating = (s.axes || []).some((a) => a.mcu_state === 'CALIBRATING');
+    const hasCal = (s.axes || []).some((a) => a.calibration && a.calibration.result === 'OK');
+    const fresh = !!(s.session && s.session.fresh);
+    const rules = {
+      bArm: [st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED', '前提: READY_TO_ARM か BRAKED_DISARMED（いま ' + st + '）'],
+      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
+      bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
+      bCenter: [st === 'HOLDING', '前提: HOLDING（いま ' + st + '）'],
+      bFault: [armedStates.indexOf(st) >= 0 || calibrating, '前提: 駆動中か校正中（いま ' + st + '）'],
+      bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
+      bCalibrate: [!calibrating && armedStates.indexOf(st) < 0 && st !== 'FAULT_LATCHED' && st !== 'OFFLINE', calibrating ? '校正中' : '前提: 全軸接続・DISARMED・FAULT なし（いま ' + st + '）'],
+      bCalibrateCancel: [calibrating, '校正中だけ'],
+      bCalExport: [hasCal, 'OK の校正結果がまだ無い'],
+    };
+    for (const id in rules) {
+      const el = $(id);
+      if (!el) continue;
+      const [ok, why] = rules[id];
+      el.disabled = !ok;
+      el.title = ok ? (el.dataset.titleOk || el.dataset.title0 || '') : why;
+      if (el.dataset.title0 === undefined) el.dataset.title0 = el.getAttribute('title') || '';
+    }
+  }
+
   function renderStatus(s) {
+    renderLimits(s.motion_limits);
     if (s.admin_token_required === false) {
       tokenInput.placeholder = '不要（require_admin_token = false）';
       tokenInput.disabled = true;
@@ -276,6 +360,7 @@
       tokenInput.disabled = false;
     }
     state.lastStatus = s;
+    updateButtons(s);
     const rig = $('rigState');
     rig.textContent = s.rig_state;
     rig.className = 'state ' + s.rig_state;
@@ -350,7 +435,8 @@
     set(c[14], fmt(a.following_error_count), 'num');
     set(c[15], fmt(a.pwm_permille), 'num');
     set(c[16], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : a.status_age_ms.toFixed(0) + ' ms', 'num');
-    set(c[17], a.reference_stale ? '要再基準化' : '—', a.reference_stale ? 'bad' : '');
+    const stale = [a.reference_stale ? '要再基準化' : '', a.calibration_stale ? '再校正済み（export→再起動）' : ''].filter(Boolean);
+    set(c[17], stale.join(' / ') || '—', stale.length ? 'bad' : '');
     set(c[18], calText(a), calClass(a));
   }
   function calText(a) {
@@ -419,16 +505,70 @@
     ['pitch', 'roll', 'yaw'].forEach((id) => { $(id).value = '0'; $(id + 'V').textContent = '0.00'; });
   });
 
+  // ---------------------------------------------------------------- motion limits
+  [['limGain', 2], ['limVel', 0], ['limAcc', 0], ['limDuty', 0]].forEach(([id, d]) => {
+    $(id).addEventListener('input', () => { $(id + 'V').textContent = parseFloat($(id).value).toFixed(d); });
+    // 送信中は、つまみを離した時点で制限を送る（「制限を送る」を押さなくてよい）
+    $(id).addEventListener('change', () => { if (state.ws && state.ws.readyState === WebSocket.OPEN) $('bLimits').click(); });
+  });
+  function sendLimits(fields) {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { log('制限: 姿勢送信（WS）を開始してから送ってください', true); return; }
+    state.seq += 1;
+    const msg = Object.assign({ type: 'limits', protocol: 1, source_session: state.session, seq: state.seq }, fields);
+    state.lastLimitsSeq = state.seq;
+    ws.send(JSON.stringify(msg));
+    $('seq').textContent = String(state.seq);
+    log('limits → ' + JSON.stringify(fields));
+  }
+  $('bLimits').addEventListener('click', () => {
+    sendLimits({
+      max_gain: parseFloat($('limGain').value),
+      max_vel_count_s: parseInt($('limVel').value, 10),
+      max_acc_count_s2: parseInt($('limAcc').value, 10),
+      duty_max_percent: parseInt($('limDuty').value, 10),
+    });
+  });
+  $('bLimitsReset').addEventListener('click', () => {
+    const d = state.lastStatus && state.lastStatus.motion_limits && state.lastStatus.motion_limits.defaults;
+    if (!d) { log('制限: status の motion_limits.defaults がまだ無い', true); return; }
+    $('limGain').value = String(d.max_gain); $('limGainV').textContent = Number(d.max_gain).toFixed(2);
+    $('limVel').value = String(d.max_vel_count_s); $('limVelV').textContent = String(d.max_vel_count_s);
+    $('limAcc').value = String(d.max_acc_count_s2); $('limAccV').textContent = String(d.max_acc_count_s2);
+    $('limDuty').value = String(d.duty_max_percent); $('limDutyV').textContent = String(d.duty_max_percent);
+    sendLimits({ max_gain: d.max_gain, max_vel_count_s: d.max_vel_count_s, max_acc_count_s2: d.max_acc_count_s2, duty_max_percent: d.duty_max_percent });
+  });
+
   function setWsState(text, bad) {
     $('wsState').textContent = text;
     $('wsState').className = bad ? 'bad' : '';
   }
 
-  function stopStream(reason) {
+  // 50 Hz のタイマーは Worker で回す（主スレッドの setInterval は裏に回ると 1 Hz 程度に間引かれる）
+  let tickWorker = null;
+  function startTicker(ms) {
+    stopTicker();
+    try {
+      const src = 'let t=null;onmessage=e=>{if(e.data&&e.data.start){clearInterval(t);t=setInterval(()=>postMessage(1),e.data.start)}else{clearInterval(t);t=null}}';
+      tickWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      tickWorker.onmessage = () => sendPose();
+      tickWorker.postMessage({ start: ms });
+    } catch (e) {
+      log('Worker が使えないので setInterval で送る（裏に回ると間引かれる）: ' + e, true);
+      state.timer = setInterval(sendPose, ms);
+    }
+  }
+  function stopTicker() {
+    if (tickWorker) { try { tickWorker.terminate(); } catch (e) { /* 無視 */ } tickWorker = null; }
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  }
+
+  // bad = 操作者の意図しない停止（stale_session など）。理由を赤で残し、再開は「送信開始」を押す。
+  function stopStream(reason, bad) {
+    stopTicker();
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
-    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), !!bad);
   }
 
   function sendPose() {
@@ -454,13 +594,29 @@
     setWsState('connecting', false);
     ws.onopen = () => {
       setWsState('open', false);
-      if (state.timer) clearInterval(state.timer);
-      state.timer = setInterval(sendPose, 20);
+      startTicker(20);
+      state.timer = state.timer || true;  // 「送信中」の印（stopStream が片付ける）
       $('bStream').textContent = '送信停止';
     };
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      // stale_session（pose でも limits でも）: この session はもう自分のものではない（別のクライアントが発行した／
+      // サーバー再起動）。50 Hz で拒否され続けても意味が無いので止める（Python クライアントと同じ）。再開は「送信開始」。
+      if (m.type === 'ack' && m.accepted === false && m.reason === 'stale_session' && state.ws === ws) {
+        $('ack').textContent = 'seq ' + fmt(m.seq) + ' REJECTED stale_session';
+        $('ack').className = 'bad';
+        stopStream('stale_session', true);
+        log('WS: ack stale_session — session が無効になった（別のクライアントが session を発行したか、サーバーが再起動した）。送信を止めた。「session 発行」→「送信開始」で再開', true);
+        return;
+      }
+      if (m.type === 'ack' && (m.effective_limits || (m.accepted === false && m.seq === state.lastLimitsSeq))) {
+        const a = $('limAck');
+        a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted ' + limitsText(m.effective_limits) : 'REJECTED ' + fmt(m.reason)) +
+          ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし');
+        a.className = m.accepted ? 'ok' : 'bad';
+        return;
+      }
       if (m.type === 'ack') {
         const a = $('ack');
         a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +

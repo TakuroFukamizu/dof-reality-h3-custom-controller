@@ -114,6 +114,12 @@ async fn foreign_origin_is_forbidden() {
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+    // The embedded pages too (a foreign page must not read them).
+    for p in ["/", "/joystick"] {
+        let (st, body) = call(&s.app, req("GET", p, &[("origin", "http://evil.example")], "")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
+        assert_eq!(body["error"], "forbidden_origin", "{p}");
+    }
     assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
 
     let (st, _) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://localhost:8891")], "")).await;
@@ -143,6 +149,40 @@ async fn test_page_is_served_at_root_and_index_html() {
     }
     // POST / is a known path with the wrong method.
     let (st, body) = call(&s.app, req("POST", "/", &[], "")).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["error"], "method_not_allowed");
+    assert!(s.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn joystick_page_is_served_and_self_contained() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/joystick", "/joystick.html"] {
+        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert_eq!(html, api::JOYSTICK_PAGE);
+        assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
+        assert!(html.contains("ジョイスティック") && html.contains("/v1/motion") && html.contains("/v1/session"), "{path}");
+    }
+    assert_ne!(api::JOYSTICK_PAGE, api::TEST_PAGE);
+    // The pure stick mapping lives in a `H3Joy` module (exercised from the browser check) and
+    // follows h3game: roll from the X axis, pitch from the Y axis, `getGamepads` for the pads.
+    // The 50 Hz tick runs in a Web Worker (main-thread timers and rAF are throttled when the
+    // window is hidden or covered); rAF is kept for rendering only.
+    for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
+        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    }
+    // No external resources: the page must work offline.
+    for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
+        assert!(!api::JOYSTICK_PAGE.contains(needle), "external resource in the page: {needle}");
+    }
+    // POST /joystick is a known path with the wrong method.
+    let (st, body) = call(&s.app, req("POST", "/joystick", &[], "")).await;
     assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"], "method_not_allowed");
     assert!(s.seen.lock().unwrap().is_empty());
@@ -391,7 +431,7 @@ async fn session_response_and_pose_watch_cleared() {
     assert_eq!(id.len(), 32);
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(body["protocol"], 1);
-    assert_eq!(body["max_gain"], 0.35);
+    assert_eq!(body["max_gain"], 0.5);
     assert_eq!(body["source_freshness_ms"], 250);
     assert_eq!(body["require_frame_seq"], true);
     let (_, body2) = call(&s.app, req("POST", "/v1/session", &[], "")).await;
@@ -431,10 +471,10 @@ async fn new_session_makes_the_old_websocket_stale() {
     let mut ws_b = ws_connect(srv.local_addr, &b).await;
     ws_send(&mut ws_b, pose_json(&a, 3, 3, 0.1, 0.0, 0.0, 0.35)).await;
     assert_eq!(next_ack(&mut ws_b).await["reason"], "stale_session");
-    ws_send(&mut ws_b, pose_json(&b, 1, 1, 0.1, 0.0, 0.0, 0.5)).await;
+    ws_send(&mut ws_b, pose_json(&b, 1, 1, 0.1, 0.0, 0.0, 0.6)).await;
     let ack = next_ack(&mut ws_b).await;
     assert_eq!(ack["accepted"], true);
-    assert_eq!(ack["effective_gain"], 0.35);
+    assert_eq!(ack["effective_gain"], 0.5); // limits.max_gain
     assert_eq!(ack["limits"][0], "gain_limited");
     srv.shutdown().await;
 }
@@ -489,14 +529,14 @@ const STATUS_KEYS: &[&str] = &[
     "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
     "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
     "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "axis_conflict", "measured_angles",
-    "physical_estop", "telemetry",
+    "physical_estop", "telemetry", "motion_limits",
 ];
 const AXIS_KEYS: &[&str] = &[
     "axis_id", "name", "connected", "port", "device_id", "expected_device_id", "assignment", "claimants",
     "reference_stale", "boot_id", "mcu_state", "fault_code", "configured",
     "referenced", "calibration_valid", "actual_count", "target_count", "velocity_count_s",
     "following_error_count", "pwm_permille", "power_on_cmd", "brake_release_cmd", "power_controller", "current_a",
-    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count", "decode_errors",
+    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count", "decode_errors", "fw_limits",
 ];
 const SESSION_KEYS: &[&str] = &["source_session_prefix", "fresh", "freshness_mode", "source_age_ms", "last_seq", "last_frame_seq"];
 const TELEMETRY_KEYS: &[&str] =
@@ -514,6 +554,20 @@ fn check_status_shape(v: &Value) {
     }
     assert_keys(&v["session"], SESSION_KEYS, "session");
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
+    assert_keys(
+        &v["motion_limits"],
+        &["effective", "requested", "ceiling", "defaults", "operator_max", "game_fields", "limited", "reasons", "pending"],
+        "motion_limits",
+    );
+    assert!(v["motion_limits"]["pending"].is_boolean());
+    assert!(v["motion_limits"]["game_fields"].is_array());
+    for k in ["effective", "requested", "ceiling", "defaults", "operator_max"] {
+        assert_keys(
+            &v["motion_limits"][k],
+            &["max_gain", "max_vel_count_s", "max_acc_count_s2", "duty_max_percent"],
+            k,
+        );
+    }
     for k in ["tick_dt_ms", "pose_rx_to_tick_ms", "status_age_ms", "frame_skew"] {
         assert_keys(&v["telemetry"][k], &["p50", "p95", "p99", "max"], k);
     }
@@ -691,8 +745,17 @@ async fn non_loopback_peers_get_only_status_and_stop() {
     let s = stub(cfg.clone(), Some(ok_reply));
     let app = s.app.clone().layer(MockConnectInfo(lan));
     let auth = bearer();
-    // The test page (it holds the admin token) is closed to the LAN too.
-    for (m, p) in [("POST", "/v1/session"), ("GET", "/v1/motion"), ("POST", "/v1/arm"), ("POST", "/v1/fault"), ("GET", "/"), ("GET", "/index.html")] {
+    // The test pages (they hold the admin token) are closed to the LAN too.
+    for (m, p) in [
+        ("POST", "/v1/session"),
+        ("GET", "/v1/motion"),
+        ("POST", "/v1/arm"),
+        ("POST", "/v1/fault"),
+        ("GET", "/"),
+        ("GET", "/index.html"),
+        ("GET", "/joystick"),
+        ("GET", "/joystick.html"),
+    ] {
         let (st, body) = call(&app, req(m, p, &[("authorization", &auth)], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{m} {p}");
         assert_eq!(body["error"], "loopback_only");
@@ -1087,4 +1150,255 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["error"], "no_config_path");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ motion limits (design 2026-11-01 §5.3)
+
+fn limits_json(session: &str, seq: u64, fields: Value) -> String {
+    let mut m = serde_json::json!({"type": "limits", "protocol": 1, "source_session": session, "seq": seq});
+    for (k, v) in fields.as_object().unwrap() {
+        m[k] = v.clone();
+    }
+    m.to_string()
+}
+
+#[tokio::test]
+async fn limits_over_ws_and_rest() {
+    let srv = start_sim(sim_cfg()).await;
+    let addr = srv.local_addr;
+    wait_state(&srv, RigState::ReadyToArm, Duration::from_secs(3)).await;
+
+    // GET: defaults in effect, ceilings from the (simulated) firmware.
+    let r = http(addr, "GET", "/v1/limits", &[], None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["effective"]["max_gain"], 0.5);
+    assert_eq!(v["effective"]["max_vel_count_s"], 3000);
+    assert_eq!(v["ceiling"]["duty_max_percent"], 60);
+    assert_eq!(v["ceiling"]["max_vel_count_s"], 6000);
+    assert_eq!(v["defaults"]["max_acc_count_s2"], 15000);
+    assert_eq!(v["operator_max"], v["defaults"], "the game channel's cap is the operator's [limits]");
+    assert_eq!(v["game_fields"], serde_json::json!([]));
+    assert_eq!(v["limited"], serde_json::json!([]));
+
+    // WS (the game): asks for more gain and velocity than the operator's
+    // [limits] allow → held to them, not to the firmware ceilings (Issue #15).
+    let id = new_session(addr).await;
+    let mut ws = ws_connect(addr, &id).await;
+    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_gain": 0.8, "max_vel_count_s": 7000}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["seq"], 1);
+    assert_eq!(ack["effective_gain"], 0.5);
+    assert_eq!(ack["effective_limits"]["max_gain"], 0.5);
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 15000);
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited"]));
+    assert_eq!(ack["fresh"], false, "a limits message never extends freshness");
+    // The pose is still held to the operator's 0.5.
+    ws_send(&mut ws, pose_json(&id, 2, 1, 0.1, 0.0, 0.0, 0.7)).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_gain"], 0.5);
+    assert_eq!(ack["limits"], serde_json::json!(["gain_limited"]));
+    assert_eq!(ack["fresh"], true);
+    // Lowering is the game's to do, and re-clamps the pose being tracked
+    // (no new pose needed).
+    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_gain": 0.3}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_gain"], 0.3);
+    // The ack reports the whole request: the 7000 is still held.
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited"]));
+    let mut st = next_status(&mut ws).await;
+    for _ in 0..30 {
+        if st["effective_gain"] == 0.3 {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    assert_eq!(st["requested_gain"], 0.7);
+    assert_eq!(st["effective_gain"], 0.3, "{st}");
+    assert_eq!(st["limits"], serde_json::json!(["gain_limited"]));
+    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_gain": 0.8}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["effective_gain"].as_f64()), (Some(true), Some(0.5)));
+    // Invalid value: rejected, seq not consumed.
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 0}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("out_of_range")));
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 30}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["duty_max_percent"], 30);
+    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({}))).await;
+    assert_eq!(next_ack(&mut ws).await["reason"], "old_seq");
+    // Status (WS push and GET) shows the change once the control loop took it.
+    let mut st = next_status(&mut ws).await;
+    for _ in 0..20 {
+        if st["motion_limits"]["effective"]["duty_max_percent"] == 30 {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    let ml = &st["motion_limits"];
+    assert_eq!(ml["effective"]["max_gain"], 0.5);
+    assert_eq!(ml["effective"]["max_vel_count_s"], 3000);
+    assert_eq!(ml["requested"]["max_vel_count_s"], 7000);
+    assert_eq!(ml["requested"]["max_gain"], 0.8);
+    assert_eq!(ml["operator_max"]["max_vel_count_s"], 3000);
+    assert_eq!(ml["game_fields"], serde_json::json!(["max_gain", "max_vel_count_s", "duty_max_percent"]));
+    assert_eq!(ml["limited"], serde_json::json!(["max_gain", "max_vel_count_s"]));
+    assert_eq!(ml["reasons"], serde_json::json!(["operator_limited"]), "{ml}");
+    // The simulated axes received the new duty cap.
+    let mut ok = false;
+    for _ in 0..30 {
+        let r = http(addr, "GET", "/v1/status", &[], None).await;
+        let v = r.json();
+        if v["axes"].as_array().unwrap().iter().all(|a| a["fw_limits"]["duty_max_percent"] == 30) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "fw_limits did not follow SET_LIMITS");
+
+    // REST (the admin): token required; applies the same patch rules.
+    let bearer = format!("Bearer {TOKEN}");
+    let r = http(addr, "POST", "/v1/limits", &[], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
+    assert_eq!(r.status, 401);
+    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some("not json")).await;
+    assert_eq!(r.status, 400);
+    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_vel_count_s": -1}"#)).await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "out_of_range");
+    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    // The game's 7000 is still held to 3000; 3000 count/s at 1000 count/s²
+    // would take 3 s to stop (deadline 0.8 x 1500 ms): raised to 2500 and
+    // reported (Issue #15 H2).
+    assert_eq!(v["requested"]["max_acc_count_s2"], 1000);
+    assert_eq!(v["effective"]["max_acc_count_s2"], 2500);
+    assert_eq!(v["limited"], serde_json::json!(["max_gain", "max_vel_count_s", "max_acc_count_s2"]));
+    assert_eq!(v["reasons"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    assert_eq!(v["effective"]["duty_max_percent"], 30, "other fields kept");
+    // The admin may raise above the operator's values, up to the firmware
+    // ceilings; the fields it writes leave the game's cap.
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[("Authorization", &bearer)],
+        Some(r#"{"max_gain": 0.8, "max_vel_count_s": 7000}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["effective"]["max_gain"], 0.8);
+    assert_eq!(v["effective"]["max_vel_count_s"], 6000, "firmware ceiling");
+    assert_eq!(v["effective"]["max_acc_count_s2"], 5000, "6000 count/s needs 5000 count/s² to stop in time");
+    assert_eq!(v["game_fields"], serde_json::json!(["duty_max_percent"]));
+    assert_eq!(v["limited"], serde_json::json!(["max_vel_count_s", "max_acc_count_s2"]));
+    assert_eq!(v["reasons"], serde_json::json!(["ceiling_clamped", "stop_time_limited"]));
+    // The game writing the field again puts it back under the cap.
+    ws_send(&mut ws, limits_json(&id, 6, serde_json::json!({"max_vel_count_s": 6500}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
+    assert_eq!(ack["effective_gain"], 0.8, "the admin's gain stays");
+    // (the admin's max_acc 1000 is again raised for the capped 3000 count/s)
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 2500);
+    assert_eq!(ack["limits"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["game_fields"], serde_json::json!(["max_vel_count_s", "duty_max_percent"]));
+
+    // A new session resets everything to the configured defaults (and
+    // releases every field).
+    let _id2 = new_session(addr).await;
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["effective"], v["defaults"]);
+    assert_eq!(v["requested"]["max_vel_count_s"], 3000);
+    assert_eq!(v["game_fields"], serde_json::json!([]));
+    assert_eq!(v["reasons"], serde_json::json!([]));
+    let _ = ws.close(None).await;
+    srv.shutdown().await;
+}
+
+/// Issue #15 H2: a game cannot lower `max_acc` below what stops `max_vel`
+/// inside the stop deadline (0.8 x min(mcu_stop_timeout 1500, stop_settle 3000)
+/// = 1.2 s); velocity and acceleration in one message are judged jointly.
+#[tokio::test]
+async fn limits_stop_time_rule_over_ws() {
+    let srv = start_sim(sim_cfg()).await;
+    let addr = srv.local_addr;
+    wait_state(&srv, RigState::ReadyToArm, Duration::from_secs(3)).await;
+    let id = new_session(addr).await;
+    let mut ws = ws_connect(addr, &id).await;
+
+    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_vel_count_s": 600}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["limits"], serde_json::json!([]));
+    // acc 1 at 600 count/s: 600 s to stop. Raised to ceil(600 / 1.2) = 500.
+    ws_send(&mut ws, limits_json(&id, 2, serde_json::json!({"max_acc_count_s2": 1}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 600);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 500);
+    assert_eq!(ack["limits"], serde_json::json!(["stop_time_limited"]));
+    // A consistent pair in one message is taken as is …
+    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_vel_count_s": 300, "max_acc_count_s2": 250}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 300);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 250);
+    assert_eq!(ack["limits"], serde_json::json!([]));
+    // … and an inconsistent one is judged on the NEW velocity (1200 needs 1000).
+    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_vel_count_s": 1200, "max_acc_count_s2": 900}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!(ack["accepted"], true, "{ack}");
+    assert_eq!(ack["effective_limits"]["max_vel_count_s"], 1200);
+    assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 1000);
+    assert_eq!(ack["limits"], serde_json::json!(["stop_time_limited"]));
+    // Status shows the clamp and its reason; nothing is pending (duty unchanged).
+    let mut st = next_status(&mut ws).await;
+    for _ in 0..30 {
+        if st["motion_limits"]["effective"]["max_acc_count_s2"] == 1000 {
+            break;
+        }
+        st = next_status(&mut ws).await;
+    }
+    assert_eq!(st["motion_limits"]["effective"]["max_vel_count_s"], 1200, "{st}");
+    assert_eq!(st["motion_limits"]["requested"]["max_acc_count_s2"], 900);
+    assert_eq!(st["motion_limits"]["limited"], serde_json::json!(["max_acc_count_s2"]));
+    assert_eq!(st["motion_limits"]["reasons"], serde_json::json!(["stop_time_limited"]));
+    assert_eq!(st["motion_limits"]["pending"], false);
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["effective"]["max_acc_count_s2"], 1000);
+    assert_eq!(v["reasons"], serde_json::json!(["stop_time_limited"]));
+    let _ = ws.close(None).await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn limits_message_is_rejected_during_an_axis_conflict() {
+    let cfg = Arc::new(sim_cfg());
+    let (admin_tx, _admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
+    let (pose_tx, _pose_rx) = watch::channel(None);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
+    snap.axis_conflict = vec![h3cs::types::AxisId::new(2).unwrap()];
+    let (_status_tx, status_rx) = watch::channel(Arc::new(snap));
+    let session = Arc::new(Mutex::new(PoseIntake::new()));
+    let state = AppState::new(cfg, session, Arc::new(pose_tx), admin_tx, status_rx, TOKEN.into(), shutdown_rx);
+    let addr = serve(api::router(state)).await;
+    let id = new_session(addr).await;
+    let mut ws = ws_connect(addr, &id).await;
+    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_gain": 0.9}))).await;
+    let ack = next_ack(&mut ws).await;
+    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
+    let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
+    assert_eq!(v["requested"]["max_gain"], 0.5, "not applied");
 }

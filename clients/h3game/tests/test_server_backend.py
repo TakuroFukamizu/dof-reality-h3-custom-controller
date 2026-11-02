@@ -46,6 +46,10 @@ class FakeClient:
         self.calls.append(("gain", gain))
         return True
 
+    def submit_limits(self, **patch):
+        self.calls.append(("limits", dict(sorted(patch.items()))))
+        return True
+
     def status(self):
         return self._status
 
@@ -90,6 +94,28 @@ class SubmitTests(unittest.TestCase):
     def test_pose_with_frame_seq_is_forwarded_with_age(self):
         self.assertEqual(self.b.submit(1, body(1, age=7.5), STATE), hsb.SENT)
         self.assertEqual(self.c.poses(), [("pose", 0.1, 0.2, 0.3, 0.3, 1, 7.5)])
+
+    def test_limits_object_is_forwarded_independently_of_the_pose(self):
+        # Alongside a pose: both go out, the pose result is unchanged.
+        r = self.b.submit(1, body(1, limits={"max_vel_count_s": 2500, "duty_max_percent": 45}), STATE)
+        self.assertEqual(r, hsb.SENT)
+        self.assertIn(("limits", {"duty_max_percent": 45.0, "max_vel_count_s": 2500.0}), self.c.calls)
+        self.assertEqual(self.b.stats[hsb.LIMITS], 1)
+        # Alone (no pose keys): still forwarded, submit reports `nothing` for the pose.
+        r = self.b.submit(1, {"owner": 1, "limits": {"max_gain": 0.8}}, STATE)
+        self.assertEqual(r, hsb.NOTHING)
+        self.assertEqual(self.c.calls[-1], ("limits", {"max_gain": 0.8}))
+        self.assertEqual(self.b.stats[hsb.LIMITS], 2)
+        # Unknown keys are ignored, a non-numeric value drops the whole object as invalid.
+        self.b.submit(1, {"owner": 1, "limits": {"max_gain": 0.9, "bogus": 1}}, STATE)
+        self.assertEqual(self.c.calls[-1], ("limits", {"max_gain": 0.9}))
+        n = len(self.c.calls)
+        self.b.submit(1, {"owner": 1, "limits": {"max_gain": "fast"}}, STATE)
+        self.assertEqual(len(self.c.calls), n)
+        self.assertEqual(self.b.stats[hsb.INVALID], 1)
+        # Not an object: ignored.
+        self.b.submit(1, {"owner": 1, "limits": 3}, STATE)
+        self.assertEqual(len(self.c.calls), n)
 
     def test_missing_age_means_zero(self):
         self.b.submit(1, body(1, age=None), STATE)

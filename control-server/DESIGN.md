@@ -26,7 +26,8 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `protocol` (`cobs`, `frame`, `mod`) | 純粋 | USB v1 のエンコード・デコード、ストリーム再同期 |
 | `config` | 純粋 | TOML スキーマ（済）と `validate()` |
 | `compat` | 純粋 | h3game-v1 の Pose 検査・gain 制限・混合式・飽和、旧 `H3` の送信値モデル（参照用） |
-| `calibration` | 純粋 | 3 点区分線形の virtual→count、ソフトリミット、検証、ハッシュ |
+| `calibration` | 純粋 | 3 点区分線形の virtual→count、ソフトリミット、検証、ハッシュ（幾何だけ） |
+| `limits` | 純粋 | 動きの制限値の 2 段（docs/control-server/limits.md）: 実行時に変わる 4 つ（gain・速度・加速度・Duty 上限）、ファーム申告の絶対上限と `overspeed / 1.5` から作る上限、`clamp`（WS の ack と supervisor が同じ関数を使う）、SET_LIMITS の中身、API と制御ループが共有する要求値 |
 | `sim_axis` | 純粋＋非同期 | **MCU 側の参照モデル**。protocol §5 の状態機械・期限・epoch/seq 検査・ACK・STATUS を実装し、簡単な位置追従プラントを持つ。異常注入可。CoreS3 ファームはこの挙動に合わせる |
 | `planner` | 純粋 | 100Hz の 3 軸目標生成。速度制限は 3 軸一様スケール、加速度制限、停止（減速）モード |
 | `session` | 純粋 | 駆動クライアントのセッション（単一所有）、Pose 受理判定と鮮度 |
@@ -95,13 +96,13 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | 状態 | 条件・動作 |
 | --- | --- |
 | `OFFLINE` | 3 軸のどれかに primary が無い（未接続、または系統の競合 `axis_conflict`、§10） |
-| `CALIBRATION_REQUIRED` | 3 軸接続済みだが、どれかが: 設定の `calibration_valid = false` / `POSITION_REFERENCED` なし / 設定の `device_id` との不一致（`axis_device_mismatch`）/ 系統を変えた個体の再基準化待ち（`reference_stale`）/ 未知の装置のポートあり（`unknown_device`）/ CONFIG 未受理 / MCU が DISARMED 以外（FAULT 等）/ 実位置（STATUS.actual_count）がソフトリミット外（MCU も ARM_PREPARE を BAD_STATE で拒否する）/ CONFIG 受理後の STATUS `POWER_CONTROLLER` が設定（`power_controller_axis` の軸だけ 1）と違う（`power_role_mismatch`。主電源リレーを 2 軸が操作しないように。計画 §10）。`blockers` に理由を列挙 |
+| `CALIBRATION_REQUIRED` | 3 軸接続済みだが、どれかが: 設定の `calibration_valid = false` / `POSITION_REFERENCED` なし / 設定の `device_id` との不一致（`axis_device_mismatch`）/ 系統を変えた個体の再基準化待ち（`reference_stale`）/ この起動中に再校正された（`calibration_stale`、§11。export → 設定反映 → 再起動まで）/ 未知の装置のポートあり（`unknown_device`）/ CONFIG 未受理 / MCU が DISARMED 以外（FAULT 等）/ 実位置（STATUS.actual_count）がソフトリミット外（MCU も ARM_PREPARE を BAD_STATE で拒否する）/ CONFIG 受理後の STATUS `POWER_CONTROLLER` が設定（`power_controller_axis` の軸だけ 1）と違う（`power_role_mismatch`。主電源リレーを 2 軸が操作しないように。計画 §10）。`blockers` に理由を列挙 |
 | `READY_TO_ARM` | 上記がすべて解消。接続時は各軸へ CONFIG を送る（epoch は現行値）。CONFIG ACK を待って `configured` |
 | `ARMING` | `Arm` で epoch += 1 → 全軸へ CONFIG（新 epoch）→ 全 ACK ACCEPTED → 全軸へ ARM_PREPARE → 全軸が STATUS で HOLDING → planner を実測位置で初期化して `HOLDING`。`arm_timeout_ms` 超過 → FAULT_LATCHED(ArmTimeout)。ARMING 中から SET_POSITION（現在位置＝保持目標）を毎 tick 送る（lease） |
-| `HOLDING` | 毎 tick SET_POSITION（保持目標）。`Start`: 新鮮な Pose が無ければ拒否。あれば全軸へ START → 全軸 ACTIVE を確認して `ACTIVE(game)`。`Center`: 全軸へ START → `ACTIVE(center)`。MCU は期限内の SET_POSITION が無い START を BAD_STATE で拒否するので、START は SET_POSITION を送り続けている HOLDING からだけ出す |
+| `HOLDING` | 毎 tick SET_POSITION（保持目標）。`Start`: 新鮮な Pose が無ければ拒否（`no_fresh_pose`）。あっても、その Pose が追従と同じ経路（mix → saturate → 校正 → ソフトリミット）で作る目標が、どれかの軸で保持位置（planner の位置。未初期化なら実位置）から `game.start_max_offset_count`（既定 300 count）を超えて離れていれば拒否（`pose_not_near_hold`、blockers に軸ごとの距離 `pose_not_near_hold: axis1 target 2000 is +2000 counts from hold 0 (max 300)`。忘れたタブの極端な姿勢で START 直後に飛ばないため。Issue #15 M4）。通れば全軸へ START → 全軸の ACK と STATUS の ACTIVE を確認して `ACTIVE(game)`。確認できなければ FAULT（`StartTimeout { axis }`。ACK が `ACK_TIMEOUT`（1 s）内に来なければその時点で detail `ack_timeout: START on axisN not ACKed … (MCU reports ACTIVE)`、ACK は来たが `arm_timeout_ms` 内に ACTIVE にならなければ detail にその軸の状態。MCU が ACTIVE なのに `axis_state_mismatch` の expected = actual = ACTIVE と出ていた 2026-11-02 03:48 の形はもう出ない）。`Center`: 全軸へ START → `ACTIVE(center)`。MCU は期限内の SET_POSITION が無い START を BAD_STATE で拒否するので、START は SET_POSITION を送り続けている HOLDING からだけ出す |
 | `ACTIVE(game)` | 新鮮な Pose → compat → calibration（ソフトリミットでクリップ）→ planner.step_track。Pose が古い/無い → `STOPPING(source_stale)`。center 目標へは動かない |
-| `ACTIVE(center)` | 目標 = 各軸 neutral count、速度上限 × `center_speed_fraction`。到達（全軸 |pos − neutral| ≤ 1 かつ vel = 0）→ 全軸 CONTROLLED_STOP → `HOLDING`。Pose は使わない |
-| `STOPPING` | `Stop` / 鮮度切れ: 全軸へ CONTROLLED_STOP、planner.step_stop。settled かつ全軸 HOLDING → `stop_hold_ms` 保持 → 全軸 DISARM → 全軸 DISARMED で `BRAKED_DISARMED`。`stop_settle_timeout_ms` 超過 → FAULT_LATCHED(StopTimeout) |
+| `ACTIVE(center)` | 目標 = 各軸 neutral count、速度上限 × `center_speed_fraction`。到達 = planner と各 MCU の `target_count` が中立（|pos − neutral| ≤ 1 かつ vel = 0）**かつ全軸の実位置 `actual_count` が neutral ± `game.center_tolerance_count`** → `center_reached` → 全軸 CONTROLLED_STOP → `HOLDING`。目標が中立に着いてから `timing.center_reach_timeout_ms` 以内に実位置が入らない軸があれば FAULT（`StopTimeout`、detail `center: axisN …`）。Pose は使わない。CONTROLLED_STOP 後の `HOLDING(settling)` は全軸 HOLDING **かつ全軸が実測で静止**（STOPPING の行の定義）で終わり、それまで `Start` / `Center` は `busy`。`stop_settle_timeout_ms` 以内に静止しなければ FAULT（`center stop did not settle: axisN vel … fe …`） |
+| `STOPPING` | `Stop` / 鮮度切れ: 全軸へ CONTROLLED_STOP、planner.step_stop。**Decel → Hold**: planner が settled かつ全軸 HOLDING **かつ全軸が実測で静止**（下記）→ **Hold → Disarming**: `stop_hold_ms` 以上保持し、その時点でも全軸が静止していれば全軸 DISARM（保持中に動いた軸があれば静止に戻るまで待つ。`stop_hold_ms + stop_settle_timeout_ms` を超えたら FAULT）→ 全軸 DISARMED で `BRAKED_DISARMED`。Decel が `stop_settle_timeout_ms` 以内に静止しなければ FAULT_LATCHED(StopTimeout)。detail には静止していない軸の実測 `vel` / `fe` と閾値を入れる（`deceleration did not settle: axis2 vel +0 count/s fe +200 (rest: …)`）。**実測の静止**（Issue #15 H1）= その軸の STATUS が `|velocity_count_s| ≤ timing.rest_velocity_count_s` かつ `|following_error_count| ≤ timing.rest_error_count` を `timing.rest_dwell_ms` 連続で満たしている（`AxisTrack.rest_since`。STATUS ごとに判定し、外れたら振り出し。切断・再接続・再起動でも振り出し）。MCU の HOLDING は「軌道の速度が 0」でしかなく（protocol.md §5）、自重のかかった軸は HOLDING のまま数百 count 手前で動いていることがある（2026-11-01） |
 | `BRAKED_DISARMED` | 停止後。`Arm` は READY_TO_ARM と同じ前提で受ける（自動再 ARM しない）。前提が崩れたら CALIBRATION_REQUIRED / OFFLINE へ |
 | `FAULT_LATCHED` | 原因: 軸の STATUS.fault_code ≠ NONE / FAULT_EVENT / 駆動中（ARMING〜STOPPING）の軸断・boot_id 変化・状態不一致（例: ACTIVE 中に軸が DISARMED）/ ARMING・STOPPING のタイムアウト / ACTIVE 中の frame skew（下記）> `max_frame_skew`（猶予: ACTIVE 到達から 200ms）/ 管理 `Fault`。ラッチ時に接続中の全軸へ HOST_FAULT（各軸は PWM 0・ブレーキ作動）。ラッチ中に再接続・再起動した軸にも HOST_FAULT を送る（CONFIG は送らない。CONFIG は解除後に `reconcile_config` が送る）。HOST_FAULT の ACK が `ACK_TIMEOUT` 内に来なければ再送（MCU 側で冪等）。`FaultReset`: 全軸接続、かつ各軸で **HOST_FAULT の ACK より後に受けた STATUS** がある（古い STATUS は「DISARMED・NONE」のままのことがあり、それで判断すると FAULT_RESET を送らずにラッチを外してしまう）、かつ管理以外の原因が解消していれば、FAULT の軸へ FAULT_RESET → 全 ACK かつ全軸がリセット受理後の STATUS で DISARMED・NONE を確認して再分類（自動再 ARM しない）。原因が残れば拒否 |
 
@@ -115,6 +116,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 「後に受けた」は時刻ではなくイベント順（supervisor 内の受信通番）で判定する。同一ポートの受信は順序が保たれるので、ACK の後に来た STATUS は HOST_FAULT 処理後の状態を表す。
 - frame skew: 各軸の STATUS を取り込んだ時点の `group_frame_id` と、その STATUS の `last_applied_frame` の差（遅れ量 lag）を軸ごとに記録し、3 軸の lag の最大−最小を skew とする。STATUS が遅れた・途絶えた軸は lag が古いままで skew にはならない（途絶は `axis_status_timeout_ms` で `AxisDisconnected`）。同時に適用されていないフレーム（SET_POSITION を取りこぼす軸）は lag が増えて検出される。
 - 管理命令の拒否理由 `blockers` は `"<code>: <detail>"` 形式（例 `not_connected: axis2`、`rig_state: HOLDING`、`no_fresh_pose: …`）。状態名は JSON と同じ表記（`HOLDING` など）。クライアントは `:` より前の code だけで判定する。
+- 動きの制限値（limits.md）は 3 段で持つ: `requested`（API が書いた値。項目ごとに「ゲームが書いた」印つき: その項目は操作者の `[limits]` の値を超えない、Issue #15）→ `target`（上限と停止時間の規則で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と SET_POSITION が使う値）。target の SET_LIMITS 内容（Duty 上限）が effective のものと同じなら target を即 effective にする（速度・加速度・gain だけの変更は待たない）。違えば、接続中で SET_LIMITS を知る全軸がその内容を ACK するまで effective は確定済みの組を保ち、target のうち**下がった**成分だけを先に取り込む（status `motion_limits.pending = true`）。速度と Duty を同時に上げても、旧 Duty 上限のままの軸に速い目標を送らない（Issue #15 M3）。成分ごとの最小は停止時間の規則を保つ（両組が `acc ≥ vel / 期限` を満たせば最小同士も満たす）。
 - 状態のスナップショット（`StatusSnapshot`、§7）を毎 tick 作る。
 
 ## 6. sim_axis（MCU 参照モデル）
@@ -135,7 +137,10 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | API | 認証 | 内容 |
 | --- | --- | --- |
 | `GET /`, `GET /index.html` | なし（loopback だけ） | オペレーター用の試験ページ（§7.4）。`text/html`、`Cache-Control: no-store` |
-| `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.35, "source_freshness_ms": 250, "require_frame_seq": true}` |
+| `GET /joystick`, `GET /joystick.html` | なし（loopback だけ） | ジョイスティック試験ページ（§7.5）。ヘッダーは `GET /` と同じ |
+| `POST /v1/session` | なし | `{"source_session": "...", "protocol": 1, "max_gain": 0.5, "source_freshness_ms": 250, "require_frame_seq": true}`。動きの制限値を `[limits]` の初期値に戻す（`max_gain` はその値） |
+| `GET /v1/limits` | なし（loopback だけ） | `{"ok":true,"effective":{...},"requested":{...},"ceiling":{...},"defaults":{...},"operator_max":{...},"game_fields":[...],"limited":[...],"reasons":[...]}`（4 項目: `max_gain`, `max_vel_count_s`, `max_acc_count_s2`, `duty_max_percent`。`effective` は clamp した要求値で、制御ループが適用済みかは status の `motion_limits.pending`。`operator_max` はゲーム経路の上限（`[limits]` の値）、`game_fields` はいまゲームが書いた項目。limits.md §3.2） |
+| `POST /v1/limits` `{"max_vel_count_s":1500,...}`（省略可） | Bearer | 書いた項目だけ変える（ゲームと違い、操作者の `[limits]` の値を超えてファームの上限まで上げられる。書いた項目は `game_fields` から外れる）。応答は GET と同じ形。不正な値は 400 `non_finite` / `out_of_range` |
 | `GET /v1/motion[?session=<id>]`（WS） | なし | §7.1。`session` は省略可（各メッセージの `source_session` で判定）。指定した場合は別セッション名のメッセージも `stale_session` |
 | `GET /v1/status` | なし | StatusSnapshot（§7.2） |
 | `GET /v1/events[?n=&after=]` | なし（loopback だけ） | 制御ループのイベントリング（障害前後の経過）。§7.3 |
@@ -162,7 +167,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | 500 | `no_config_path` / `config_read_failed` / `rewrite_failed` / `invalid_result` / `write_failed` | `/v1/calibration/export` だけ。`detail` 付き。設定ファイルから起動していない / 読めない / `[[axis]]` ブロックの書き換えに失敗 / 書き換えた結果が `Config::from_toml_str` を通らない（何も書かない）/ 書けない |
 | 503 | `control_loop_unavailable` | 制御ループが `ADMIN_TIMEOUT`（1 秒）内に答えない、または止まっている（`GET /v1/status` も 503） |
 
-- 409 の code: `not_ready` / `already_armed` / `not_holding` / `busy` / `no_fresh_pose` / `fault_latched` / `not_faulted` / `reset_in_progress` / `axis_disconnected` / `axis_not_settled` / `not_disarmed` / `axis_conflict`（§10、arm / start / center）/ `calibrating` / `mcu_not_disarmed` / `power_axis_required`（§11）/ `no_calibration_result` / `exists`（export）/ `shutting_down`。
+- 409 の code: `not_ready` / `already_armed` / `not_holding` / `busy` / `no_fresh_pose` / `pose_not_near_hold`（start。§5 HOLDING）/ `fault_latched` / `not_faulted` / `reset_in_progress` / `axis_disconnected` / `axis_not_settled` / `not_disarmed` / `axis_conflict`（§10、arm / start / center）/ `calibrating` / `mcu_not_disarmed` / `power_axis_required`（§11）/ `no_calibration_result` / `exists`（export）/ `shutting_down`。
 - 503 の意味: 制御ループがまだ取り出していなかった命令は**実行されない**（遅れて実行しない。ループは実行前に要求を claim し、API の打ち切りとどちらか一方だけが成立する）。ただし `Stop` / `Disarm` / `Fault` は安全側なので、ループが追いつけば実行する（呼び出し側から結果は分からない）。ループが claim 済みなら API は応答を待って 200/409 を返す。
 
 ### 7.1 WS /v1/motion
@@ -173,16 +178,20 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 {"type":"pose","protocol":1,"source_session":"...","seq":1250,"frame_seq":2408,"source_age_ms":3.0,
  "pitch":0.3,"roll":-0.2,"yaw":0.0,"gain":0.35}
 {"type":"gain","protocol":1,"source_session":"...","seq":1251,"gain":0.3}
+{"type":"limits","protocol":1,"source_session":"...","seq":1252,"max_gain":0.8,"max_vel_count_s":7000}
 ```
 
 サーバー → クライアント:
 
 ```json
 {"type":"ack","seq":1250,"accepted":true,"reason":null,"effective_gain":0.35,"limits":["pose_clamped"],"fresh":true}
+{"type":"ack","seq":1252,"accepted":true,"reason":null,"effective_gain":0.5,"limits":["operator_limited"],"fresh":false,
+ "effective_limits":{"max_gain":0.5,"max_vel_count_s":3000,"max_acc_count_s2":15000,"duty_max_percent":40}}
 {"type":"status", ...StatusSnapshot}
 ```
 
 - ack は受理・拒否どちらも返す。拒否理由: `stale_session` / `old_seq` / `old_frame` / `non_finite` / `out_of_range` / `invalid_age` / `missing_frame_seq` / `bad_protocol` / `bad_message` / `axis_conflict`（§10。pose・gain とも拒否し、鮮度も更新しない）。
+- `limits`（limits.md §3.1）: 4 項目はどれも省略可。header の規則は pose と同じで、`seq` は受理したときだけ消費する。鮮度は延長しない。ack に `effective_limits`（クランプ後の 4 項目。制御ループが適用済みかは status の `motion_limits.pending`）が付き、`effective_gain` は新しい gain の上限。**ゲーム経路は操作者の `[limits]` の値を下げるだけ**（Issue #15）: 書いた項目がそれを超えたら操作者の値で切って `limits` に `operator_limited`（項目ごとに「最後に書いたのがゲームか」を覚える。`POST /v1/limits` が書いた項目はファームの上限まで上がる）、ファームの上限で切られたら `ceiling_clamped`、停止時間の規則（limits.md §1.1: `max_acc ≥ max_vel / 停止期限`）で `max_acc` を上げた（または `max_vel` を下げた）ら `stop_time_limited`。新しい gain の上限は受理済みの最新 Pose にもその場で再適用する（`PoseIntake::reapply_gain_ceiling`。鮮度は変えない）。ARM の阻害要因に `limits_unconfirmed`（SET_LIMITS 未 ACK）。拒否理由は `non_finite` / `out_of_range`（`max_gain < 0`、速度・加速度 ≤ 0、`duty_max_percent` が 1〜100 の外）と pose 共通のもの。
 - status は `status_period_ms` ごと。WS 自体は駆動権限を与えない。
 - 1 メッセージの最大長は `max_body_bytes`。不正 JSON は `bad_message` の ack（seq は null）で、接続は維持。
 
@@ -202,13 +211,16 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
   "blockers": [],
   "session": {"source_session_prefix": "8b69173f", "fresh": false, "freshness_mode": "frame_seq", "source_age_ms": null, "last_seq": 0, "last_frame_seq": null},
   "requested_pose": null, "requested_gain": null, "effective_gain": null, "limits": [],
+  "motion_limits": {"effective": {"max_gain": 0.5, "max_vel_count_s": 3000, "max_acc_count_s2": 15000, "duty_max_percent": 40},
+                    "requested": {...}, "ceiling": {"max_gain": 1.0, "max_vel_count_s": 6000, "max_acc_count_s2": 40000, "duty_max_percent": 60},
+                    "defaults": {...}, "operator_max": {...}, "game_fields": [], "limited": [], "reasons": [], "pending": false},
   "virtual_targets": [512.0, 512.0, 512.0],
   "target_counts": [0, 0, 0],
   "session_epoch": 3,
   "group_frame_id": 1234,
   "axes": [{"axis_id": 1, "name": "…", "connected": true, "port": "sim:2", "device_id": "5131000000000001",
             "expected_device_id": "5131000000000001", "assignment": "selected",
-            "claimants": [{"port": "sim:2", "device_id": "5131000000000001"}], "reference_stale": false,
+            "claimants": [{"port": "sim:2", "device_id": "5131000000000001"}], "reference_stale": false, "calibration_stale": false,
             "boot_id": 1, "mcu_state": "HOLDING", "fault_code": "NONE", "configured": true, "referenced": true,
             "calibration_valid": true, "actual_count": 0, "target_count": 0, "velocity_count_s": 0,
             "following_error_count": 0, "pwm_permille": 0, "power_on_cmd": true, "brake_release_cmd": true,
@@ -229,12 +241,12 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 実測角度は未校正なので `measured_angles: null`。`requested_pose` は指令値であって実測ではない。
 - `session.source_session_prefix`: 現行セッション id の先頭 8 桁（なければ null）。完全な id は `POST /v1/session` の応答でだけ返す（id が Pose 入力の唯一の鍵なので、認証なしの status に載せない）。自分のセッションか確かめるときは先頭 8 桁を比べる。
 - `active_source`: `"game"` / `"center"` / null（ACTIVE 以外）。
-- `fault`: null または `kind` で分かれるオブジェクト: `{"kind":"axis_fault","axis":1,"code":"FOLLOWING_ERROR"}` / `{"kind":"axis_disconnected","axis":2}` / `{"kind":"axis_rebooted","axis":3}` / `{"kind":"axis_changed","axis":1}`（駆動中に担当個体の系統が変わった、§10）/ `{"kind":"axis_state_mismatch","axis":1,"expected":"ACTIVE","actual":"DISARMED"}` / `{"kind":"arm_timeout"}` / `{"kind":"stop_timeout"}` / `{"kind":"frame_skew","max_skew_frames":6}` / `{"kind":"operator","note":"..."}`。リンク送信失敗は `operator` で note が `link_send_failed: …`。
+- `fault`: null または `kind` で分かれるオブジェクト: `{"kind":"axis_fault","axis":1,"code":"FOLLOWING_ERROR"}` / `{"kind":"axis_disconnected","axis":2}` / `{"kind":"axis_rebooted","axis":3}` / `{"kind":"axis_changed","axis":1}`（駆動中に担当個体の系統が変わった、§10）/ `{"kind":"axis_state_mismatch","axis":1,"expected":"ACTIVE","actual":"DISARMED"}` / `{"kind":"arm_timeout"}` / `{"kind":"start_timeout","axis":2}`（START が確認できない。detail が `ack_timeout: …` なら ACK が来なかった、そうでなければ ACTIVE にならなかった軸の状態）/ `{"kind":"stop_timeout"}` / `{"kind":"frame_skew","max_skew_frames":6}` / `{"kind":"operator","note":"..."}`。リンク送信失敗は `operator` で note が `link_send_failed: …`。
 - `fault_history[]`: `{"at_ms": 14510.7, "fault": {…上と同じ形…}, "detail": null|"..."}`。`at_ms` は supervisor 起動からの ms（壁時計ではない）。最大 32 件、古いものから捨てる。ラッチ中に重なった原因も入る。
 - `blockers`: ARM の前提条件だけ（`"<code>: <detail>"`）。armed 中は []。FAULT_LATCHED でも [] のことがある（ARM 拒否の理由は `fault`）ので、クライアントは `fault` も見る。
 - `axes[].device_id` は接続中の個体（無ければ設定値）、`expected_device_id` は設定の照合値（0 = 照合なし）、`assignment` は `"selected"`（MCU の `selected_axis`）/ `"config"`（`device_id` の後方互換経路）/ null（未接続）、`claimants` はこの軸を名乗るポート（通常は primary 1 つ、競合中は 2 つ以上）、`reference_stale` は同じ boot のまま系統を変えた個体で SET_REFERENCE のやり直し待ち。最上位の `axis_conflict` は競合中の軸番号（空なら無し）。§10。
 - `axes[].power_controller`: STATUS の `POWER_CONTROLLER` フラグ（MCU が自分を主電源担当と思っているか）。STATUS が無ければ null。
-- `axes[].calibration`: この boot の最新の CAL_RESULT（§11）: `{"result":"OK"|"FAILED"|"CANCELLED","step":3,"n_end_count":5551,"neutral_count":2775,"sign":1,"reason":"ok","boot_id":…,"at_ms":…}`。無ければ null（再起動・別の個体への交代で消える）。校正中は `mcu_state` が `CALIBRATING`、`blockers` に `calibrating: axisN`。
+- `axes[].calibration`: この boot の最新の CAL_RESULT（§11）: `{"result":"OK"|"FAILED"|"CANCELLED","step":3,"n_end_count":5551,"neutral_count":2775,"sign":1,"reason":"ok","boot_id":…,"at_ms":…}`。無ければ null（再起動・別の個体への交代で消える）。校正中は `mcu_state` が `CALIBRATING`、`blockers` に `calibrating: axisN`。`axes[].calibration_stale`: この起動中にその軸が CAL_RESULT OK を返した（§11、Issue #15 H3）。`calibration_valid` は false になり、blockers に `calibration_stale: axisN recalibrated (stroke S, neutral N); export and reload config before ARM`。個体の再接続・再起動では消えず、サーバーの再起動でだけ消える。
 - telemetry の各統計は `{count, p50, p95, p99, max, max_all}`。`count` は起動以来の件数、p* と `max` は直近の窓、`max_all` は起動以来。サンプルがなければ p* / max / max_all は **null**（0 ではない）。`frame_skew` の単位はフレーム（上記の lag 差）。`recorder_dropped` は JSONL 記録で落とした件数（記録器は未配線なので常に 0）。`log_dropped` はイベントリング（§7.3）から失われた件数（上書き＋supervisor のキューで落ちた分）。
 - telemetry に無いもの（計画 §8・§11 との差。未実装）: ゲーム側の source age の分布、SET_POSITION の送信→MCU 適用の遅延、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。サーバー受信→MCU 適用 p99 などの §8 の目標は、この telemetry では評価できない。
 
@@ -258,13 +270,23 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 
 - 表示: `GET /v1/status` を 200 ms ごとに読み、`rig_state`・`blockers`・`fault`・`axis_conflict`・3 系統の表（接続 / port / device_id / expected / assignment / claimants / mcu_state / fault_code / flags（P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller）/ actual / target / velocity / following_error / pwm / status_age / reference_stale）。`GET /v1/events?n=50` を 1 秒ごとに読んで末尾を出す。HTTP の応答本文（エラーを含む）はすべてログ欄に出す。
 - 操作: 管理トークン欄（`sessionStorage` にだけ置く。タブを閉じると消える）、session 発行、ARM、START、**STOP（大きい赤、トークン不要）**、DISARM、CENTER、FAULT、FAULT RESET、軸ごとの REFERENCE（count 入力、既定 0、確認ダイアログ）、校正（3 軸）（確認ダイアログ: **機構が両端まで動く**）、校正を中止、校正結果を設定に書き出す（応答の path と各軸の値を表示）。3 系統の表に校正列（CALIBRATING か最後の CAL_RESULT）。読み込んだだけでは何もしない（自動で session を発行・ARM・送信しない）。
-- 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
+- 動きの制限（limits.md §3.4）: `max_gain` / `max_vel` / `max_acc` / `duty_max` のスライダー（上限は status の `motion_limits.ceiling`）と「制限を送る」「設定の初期値に戻す」。WS の `limits` で送る（姿勢送信中だけ）。limits の ack は姿勢の ack と別に表示。
+- 姿勢送信: pitch / roll / yaw（−1..1）と gain（0..`max_gain`。`max_gain` は `POST /v1/session` の応答と status の `motion_limits.effective.max_gain` から）のスライダー、開始 / 停止のトグル。開始で `WS /v1/motion?session=<id>` を開き、50 Hz で `pose`（`seq`・`frame_seq` は単調増加、`source_age_ms: 0`）を送り、最後の ack（accepted / reason / effective_gain / limits / fresh）を表示する。**`document.hidden` になったら送信を止めて WS を閉じる**（隠れたタブから送り続けない。隠れたときに 0 ＝中央を送ることもしない: サーバーの `source_freshness_ms` で減速停止させる。testing.md の h3game の index.html と同じ規則）。再開は操作者のボタンでだけ。
 - Origin: ブラウザーは同一 origin でも POST と WS に `Origin` を付けるので、`check_origin` は `allowed_origins` に加えて「**自分自身の origin**」を通す: `Origin` が `http://<Host ヘッダー>` と一致（大文字小文字を無視、末尾のスラッシュなし）し、かつ Host のホスト名が `localhost` または loopback の IP リテラル（`127.0.0.1`、`[::1]`、`127.x.y.z`）であること（`api::same_origin_loopback`）。loopback の条件が DNS リバインディングを塞ぐ（`Host: evil.example:8892` に `Origin: http://evil.example:8892` を付けても 403。攻撃者のページは Host をサーバーの名前にしながら Origin を自分の origin にせざるを得ないので一致しない）。他の origin の扱い、`Origin` 無し（curl・Python クライアント）の扱い、`max_body_bytes`・rate limit は変わらない。
 - LAN: `GET /` は `lan_allowed` に入れない（ページは管理トークンを扱う。トークンは LAN を通らない）。`allow_non_loopback` のときも loopback 以外からは 403 `loopback_only`。
 
+### 7.5 ジョイスティック試験ページ `GET /joystick`
+
+`control-server/static/joystick_page.html` を `include_str!` で埋め込み、`GET /joystick` と `GET /joystick.html` で返す（ヘッダー・Origin・LAN の扱いは §7.4 と同じ。外部資源なし、日本語 UI）。ゲームの代わりに手元のスティック（Gamepad API）で roll / pitch を動かし、新しい設定（limits など）を確かめるためのもの。
+
+- スティックの扱いは h3game（`web/input.js`・`index.html`）に合わせる: 機器の判定 `isStick`（T.16000M / Thrustmaster / joystick / stick / HOTAS、または軸 3 以上＋ボタン 4 以上）、center / min / max による正規化（`norm`）、不感帯の再スケール、「動かして割り当て」（いちばん大きく動いた軸）。**roll ← 左右（`axes[0]`）、pitch ← 前後（`axes[1]`）、符号は変えない**（h3game の `target.pitch = inp.y; target.roll = inp.x`。前後は「奥へ倒す = マイナス」）。反転は軸ごとのチェックボックス。不感帯の既定は 0.05（h3game は 0.12）、ならしはしない。選んだ機器と割当は `localStorage`。純粋な写像は `window.H3Joy` にまとめ、ブラウザーの試験から呼べる。
+- 表示: §7.4 と同じ status のポーリング（200 ms）で `rig_state`・blockers・fault・`session.fresh`・`effective_gain`・`motion_limits`（有効値と上限）・`requested_pose`・`target_counts`、3 系統の表（接続 / mcu_state / fault_code / flags / actual（エンコーダー）/ target / velocity / f.err / pwm‰ / status_age / decode_errors / 校正）。機器の一覧（id / index / axes / buttons / 判定）、生の値と正規化後の値、棒グラフ。
+- 送信: 「送信開始」で `POST /v1/session`（新 session。走行中なら止まり、制限値は初期値に戻る）→ `WS /v1/motion?session=`、50 Hz で `pose`（yaw 0、gain はスライダー、`source_age_ms` 0）。`seq` は送信ごと、**`frame_seq` は描画フレーム（`requestAnimationFrame`）でスティックを読めたときだけ**進む。タブが隠れても送信を止めず 0 も送らない: rAF が止まれば `frame_seq` が進まず、サーバーの鮮度切れで減速停止する。選んだ機器が見えなくなったときも同じ（最後の姿勢のまま `frame_seq` を止める。中央へ戻さない）。「姿勢を 0 に固定」はスティックの代わりに 0 を送る（`frame_seq` が進むのはスティックが見えているときだけ、という規則は変わらない）。
+- 操作: ARM / START / STOP（トークン不要）/ DISARM / FAULT RESET（トークンの扱いは §7.4 と同じ）。`/` へのリンク。読み込んだだけでは何もしない。
+
 ## 8. Python クライアントと h3game アダプター
 
-- `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。
+- `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `submit_limits(max_gain=, max_vel_count_s=, max_acc_count_s2=, duty_max_percent=)`（省略可、pose より先に送る、`last_limits_ack`）, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。
 - `clients/h3game/`: h3game リポジトリ（`TakuroFukamizu/20261004_shi3z_hackathon`）への小さいパッチと、bridge 用のバックエンド層 `h3_server_backend.py`。`H3_BACKEND=legacy|server|dry`（既定 legacy＝現状どおり）。server では旧 USB を開かず、60Hz 再送・1 秒で中央へ戻す処理・auto_sway を無効にし、POST の Pose をクライアントへ渡すだけ。`/state` の既存キーを残し、`backend`, `rig_state`, `armed`, `calibration_valid`, `fault` を追加。`index.html` は frame_seq と frame 経過時間を POST に追加する数行の変更。シーン（scene*.js）は変更しない。
 - パッチは h3game リポジトリへは push しない。`clients/h3game/patches/` に置き、適用手順を README に書く。
 
@@ -314,6 +336,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `SimParams.selected_axis`。`SimMcu::select_axis(new, now_us) -> Vec<McuMsg>`: DISARMED 以外では何もしない（`select_axis_unchecked` はテスト用に規則違反を起こす）。切り替えで CONFIGURED / POSITION_REFERENCED / calibration_hash を消し、AXIS_SELECT を返し、以後の STATUS / HELLO に新しい値を載せる。`SimHandle::select_axis` / `select_axis_unchecked`。規則違反（DISARMED 以外）の切り替えでは制限値と lease を保つ（POSITION_REFERENCED だけ消す）ので、PC が書かなくなった個体は COMMAND_TIMEOUT で FAULT になる（protocol.md §1.1 の要求。`tests/server.rs` で確認）。
 - `[backend] kind = "sim"` に `report_selected_axis = true`（既定 true）。true なら各模擬軸の `selected_axis` = その軸番号（割当は選択で決まり、`device_id` は照合に使われる）。false なら 0（設定の `device_id` だけで決まる旧経路の試験用）。模擬軸の device_id は設定値、設定が 0（照合なし）なら `5131000000000000 + 軸番号`（個体は必ず device_id を持つ）。
 - serial backend の `[backend] sim_axes`: 列挙した軸は実機の代わりに模擬軸（`sim:<軸>`）で埋める（実機が足りない bring-up 用。模擬軸を先に識別するので、同じ系統を名乗る実機は競合になる）。
+- 模擬軸のポートも実ポートと同じく「閉じたら開け直す」（Issue #15。2026-11-02 00:58 の Mac のスリープ復帰で 3 軸が `status_timeout` になり、実機 2 台は 3 s 後に再識別されたのに `sim:3` だけ OFFLINE のままだった）。server.rs の `sim_port_task` がリンクの終了を見て `SERIAL_RETRY` 後に `SimHandle::attach` で同じ `SimMcu` に新しいストリームを付け直す（boot_id・基準・位置・時計はそのまま。`sim_detached` で作った模型に、ランナーだけ付け替える）。`RunningServer.sims` は模型の `view()`（検査・異常注入用。落としてもランナーは止まらない）。`UnknownDevice` になった模擬軸は開け直さない（個体の識別は変わらないので）。
 - server.rs の「primary でないポートの Status / Ack / FaultEvent を捨てる」判定は `Supervisor::axis_port` のままでよい（競合中は `None` なので全部落ちる）。`Disconnected` が primary 以外から来たら `PortClosed` に変換する既存処理で claimants から外す。
 
 ## 11. 校正（protocol.md §1.2）
@@ -323,7 +346,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `AdminCmd::Calibrate{axes}`（`POST /v1/calibrate {"axes":[1,2,3]}`、省略 = 全軸）: 受理の条件はこの順に、競合なし（`axis_conflict`）、駆動していない（ARMING〜STOPPING は `not_disarmed`。FAULT_LATCHED は `fault_latched`: ラッチ中に機構を動かさない。§11 の当初案の「Idle / Fault 以外」より安全側に倒した）、どの軸も校正中でない（`calibrating`）、対象に **電源担当軸（`power_controller_axis`）を含む**（含まなければ `power_axis_required`。電源担当軸なしでは他の軸に 24V が無く `stall` で失敗する）、対象がすべて接続（`axis_disconnected`）・DISARMED（`mcu_not_disarmed`。FAULT の軸・STATUS 未受信も含む）。各軸へ CALIBRATE(mode 1) を送り ACK を追跡する。**REJECTED は FAULT にしない**: イベント `ack_rejected` と blocker `calibrate_rejected: axisN CALIBRATE rejected (…)`（次の Calibrate / CalibrateCancel、CAL_RESULT、再接続で消える）。電源担当軸の CALIBRATE が拒否されたときは、他の対象へ即 CALIBRATE(0) を送る（イベント `calibrate_cancelled`）。ACK が `ACK_TIMEOUT` 内に来ない CALIBRATE(1) も同じ扱い（blocker は付けない。軸を「ACK 待ち」のまま残さない）。`AdminCmd::CalibrateCancel`（`POST /v1/calibrate/cancel`）: CALIBRATING の軸と CALIBRATE(1) の ACK 待ちの軸へ CALIBRATE(mode 0)（何も無ければ note `no axis calibrating`）。`Stop` は校正中も受理し、同じく CALIBRATE(0) を送る（note `calibration cancelled: axisN, …`）。
 - 校正中（どれかの軸が `CALIBRATING`）: RigState は `CALIBRATION_REQUIRED` のまま、blockers に `calibrating: axisN`（`mcu_not_disarmed` の代わり）。`Arm` / `Start` / `Center` / `Reference` / `Calibrate` は `calibrating`。
 - `McuState::Calibrating = 8`。CALIBRATING の軸へは SET_POSITION を送らない（SET_POSITION は ARM 中にしか作らず、ARM は校正中に受けない。万一 ARM 中に軸が CALIBRATING を報告すれば `axis_state_mismatch` で FAULT）。CALIBRATE(1) の ACK 待ち〜校正中は CONFIG の再送（`reconcile_config`）もしない（MCU が BAD_STATE で拒否して `not_configured` が立つのを避ける）。STATUS 途絶・切断の扱いは DISARMED と同じ（FAULT にしない。`status_stale` / `not_connected` の blocker になるだけ）。
-- CAL_RESULT: `AxisSnapshot.calibration = {device_id, result, step, n_end_count, neutral_count, sign, reason, boot_id, at_ms}`（`device_id` は報告した個体。export はこれを書く）（この boot の最新。同じ boot の再接続では残り、boot_id の変化・別の個体への交代で消える）。イベント `cal_result`。成功した軸は MCU が自分で基準を確立するので STATUS の `POSITION_REFERENCED` から `referenced = true` になる（PC は SET_REFERENCE を送らない）。OK の結果はその個体の `reference_stale` も消す（系統を変えた後でも新しい基準を MCU が作ったため）。FAILED / CANCELLED では MCU が `POSITION_REFERENCED` を消すので `not_referenced` に戻る。CAL_RESULT はどの RigState でも受け取る。
+- CAL_RESULT: `AxisSnapshot.calibration = {device_id, result, step, n_end_count, neutral_count, sign, reason, boot_id, at_ms}`（`device_id` は報告した個体。export はこれを書く）（この boot の最新。同じ boot の再接続では残り、boot_id の変化・別の個体への交代で消える）。イベント `cal_result`。成功した軸は MCU が自分で基準を確立するので STATUS の `POSITION_REFERENCED` から `referenced = true` になる（PC は SET_REFERENCE を送らない）。OK の結果はその個体の `reference_stale` も消す（系統を変えた後でも新しい基準を MCU が作ったため）。**OK の結果は同時にその軸を `calibration_stale` にする**（Issue #15 H3）: MCU は P 端 = 0 に原点を取り直すので `soft_*` / 中立 / `sign` が設定と違い得るのに、`operator_valid` / `cal` / `hashes` は起動時の設定から一度だけ計算している。そこで ARM の承認を落とし、blocker `calibration_stale: axisN recalibrated (stroke S, neutral N); export and reload config before ARM`、status の `axes[].calibration_stale = true`、`calibration_valid = false`、イベント `calibration_stale {axis, stroke, neutral}` を出す。この印は supervisor のメモリにだけあり、**個体の再接続・再起動（CAL_RESULT の記録は消える）でも残る**（電源を入れ直して旧設定の値で `/v1/reference` しても旧幾何で ARM できないように）。消えるのは **サーバーの再起動** だけ: export したファイルで起動し直せば、設定と MCU の幾何が揃った状態で始まる（旧設定のまま再起動しても印は消える。設定を反映したかの確認は操作者の手順、hardware-bringup.md §5.0）。`/v1/calibration/export` は印が立っていても使える（export のための印なので）。FAILED / CANCELLED では MCU が `POSITION_REFERENCED` を消すので `not_referenced` に戻る。CAL_RESULT はどの RigState でも受け取る。
 - `POST /v1/calibration/export`（token）: snapshot の OK の結果がある軸の値から設定を作り、サーバーの設定ファイル（`--config`）と同じディレクトリに `<rig_id>.calibration-<YYYYmmdd-HHMMSS>.toml` を書く（`calibration_export.rs`。現在の設定ファイルの **テキスト** の `[[axis]]` ブロック内の `mechanical_* / soft_* / count_at_virtual_* / device_id / calibration_valid` の行だけを値で置き換え、コメントは残す。`device_id` は接続中の個体、`calibration_valid` は **false**（元が true でも）、先頭に書き出し時刻（UTC。サーバーはタイムゾーンを持たない）・各軸の生の結果・置き換え前の値をコメントで残す）。値の作り方は protocol.md §1.2（`mechanical = [min(0, n_end), max(0, n_end)]`、`soft = mechanical ∓ decel_zone_count`（現在の設定の値）、`count_at_virtual_0 / 512 / 1023 = soft の P 端側 / neutral_count / soft の N 端側`。sign −1 なら単調減少になる）。書く前に `Config::from_toml_str` で検証し、通らなければ 500 `invalid_result` で何も書かない。応答に path と各軸の値。結果が無い軸はそのまま。同名があれば 409 `exists`（上書きしない）。OK の結果が 1 軸も無ければ 409 `no_calibration_result`。設定ファイルから起動していなければ 500 `no_config_path`。
 - sim: `SimParams.end_min_count / end_max_count`（模擬機構の端、既定 −3000 / 3000。`[backend] end_min_count / end_max_count`）。プラントは端を越えない。CALIBRATE(1) は DISARMED だけ: 電源 ON（role bit）→ `arming_delay_ms / 2` → ブレーキ解除 → `arming_delay_ms / 2` → **P 端 = `end_min_count`（count が最小の端。模擬軸は sign +1）** → N 端 → 中立（中点）→ 終了手順（`disarming_delay_ms`）→ CAL_RESULT(OK, step 3, `n_end_count = max − min`, `neutral = n_end / 2`, sign 1, `ok`）→ P 端 = 0 に基準を取り直して REFERENCED → STATUS(DISARMED)。CALIBRATE(0) / DISARM は CANCELLED（reason `stop`）、`set_calibration_failure` / `set_stall` は FAILED（注入した reason / `stall`）で、どちらも REFERENCED を消す。HOST_FAULT / `force_fault` は CAL_RESULT(FAILED, `fault`) を送ってから FAULT_EVENT・FAULT（実機ファームも同じにする。PC 側はどちらでも壊れない）。校正中は動作異常の判定をしない（端まで行くのが目的）。
 - テストページ: 「校正（3 軸）」（確認ダイアログ。**機構が端まで動く**）、軸ごとの進行（CALIBRATING / 結果）、「校正を中止」、「校正結果を設定に書き出す」（path と値を表示）。
