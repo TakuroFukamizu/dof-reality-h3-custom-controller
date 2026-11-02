@@ -296,6 +296,12 @@ constexpr int32_t V1_SUP_MIN_BUDGET_COUNT = V1_SUP_MIN_BUDGET ? V1_SUP_MIN_BUDGE
 // 「エンコーダが確かに動いた」（予算を戻す唯一の根拠）: 出している Duty の向きへ、窓の中の最も戻った所から V1_SUP_RENEW_MOVE_COUNT 以上の
 // 正味の移動。±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならないので戻さない。窓は半分（100 ms）ずつ 2 つを持つ滑り窓の近似
 // （実効 100〜200 ms）。Duty 0・向きの反転で窓を取り直す。既知の穴: ±2 以上の雑音の往復は戻してしまう（PCNT のフィルタが無効）
+// r10（実測 2）: 既定ではどちら向きの正味の移動でも数える（-DV1_SUP_RENEW_DIRECTIONAL=1 で「出している向きだけ」）。乗員の荷重で
+// 沈む（出力と逆向きに動く）軸を「エンコーダ断」と同じに扱うと、保持出力を学ぶ間に予算が尽きる。逆向きでも 2 count の正味の移動は
+// エンコーダが生きている証拠（±1 のちらつき・片相のトグルは 1 にしかならないのは同じ）
+#ifndef V1_SUP_RENEW_DIRECTIONAL
+#define V1_SUP_RENEW_DIRECTIONAL 0
+#endif
 constexpr int32_t V1_SUP_RENEW_MOVE_COUNT = 2;
 constexpr uint32_t V1_SUP_RENEW_WINDOW_MS = 200;
 // 過負荷（LOAD_LIMITED）: |出力| ≥ duty_max × 99 % で誤差の向きに出している（飽和）のに、100 ms の窓ごとに向きへ 5 count 進む・
@@ -392,6 +398,33 @@ constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっ�
 //    2 count までの包絡線を積む）と最悪の tick（15 ms = 37.5 count）の先読みを、その予算で賄う
 constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = static_cast<double>(V1_BRAKE_GUARD_ACC_COUNT_S2);
 constexpr int32_t V1_SOFT_RESERVE_COUNT = V1_SUP_END_RESERVE_COUNT - V1_MECH_DECEL_ZONE_COUNT + V1_SUP_END_MARGIN_COUNT;
+// r10（Issue #44 の実測 2、14:43: 乗員が座った状態の HOLDING で、9 % の動き出しパルスで 2〜4 count 持ち上げては、出力が 1〜4 % に
+// 落ちて重さで沈む往復を 0.2〜0.3 s ごとに繰り返し、#2 は静止の監視で ENCODER_FAULT）: 保持出力の学習。方向別の経路だけ。-DV1_HOLD_LEARN=0 で r9 と同じ。
+// r6〜r9 は「荷重が無ければ自分で止まっている」前提で、保持（HOLD）に入ると出力 0・I を捨て、|I| ≤ 3 % だった。乗員の荷重で逆に回る
+//（back-drive する）軸は、それでは保てない。
+//  - I の上限を duty_max × V1_HOLD_I_MAX_RATIO_PERCENT（90 %）に上げる（走行中も同じ I。保持出力は向きによらない荷重の補償）
+//  - 軌道が止まっているときの積分は Ki = V1_HOLD_KI（15 permille/(count·s)）、変化率 ≤ V1_HOLD_I_RATE（60 permille/s）。走行中は従来の
+//    Ki 0.2・10 permille/s のまま（反転時に I が暴れないよう遅く）。60 permille/s の理由: 乗員の保持 Duty（6〜10 %）を 1〜2 s で
+//    覚える（従来の 10 permille/s では 9 s 掛かり、その間沈み続ける）。速くすると静止摩擦が切れるまでの遅れ（約 100 ms）の間に
+//    I が行き過ぎる量が増える（60 permille/s で約 6 permille。静止摩擦と動摩擦の差 3〜4 % より十分小さい）
+//  - 保持（HOLD）に入っても I を捨てず、出力 = I（保持出力。P は保持の帯の外だけ）。HOLD の中でも |誤差| ≥ hold_enter（2）なら
+//    同じ Ki で I を詰める（±1 のちらつきでは積まない: 無負荷の軸が静止摩擦の中で I を育てて往復しないように）
+//  - I を捨てるのは DISARM / FAULT / 系統切替 / 基準の取り直し / ブレーキの停止（位置制御が止まるとき）だけ
+//  - 保持の帯の近くの動き出しパルスは、I がまだ動き出しの Duty に育っていない間だけ（荷重で目標から離れている＝沈んでいる間は打たない。
+//    進まないパルス 3 回でやめ、あとは I が詰める）。B の「出力 0 で残差を受け入れる」は使わない（乗員がいると沈み続ける）
+#ifndef V1_HOLD_LEARN
+#define V1_HOLD_LEARN 1
+#endif
+constexpr int V1_HOLD_I_MAX_RATIO_PERCENT = 90;
+constexpr double V1_HOLD_KI_PERMILLE_PER_COUNT_S = 15.0;
+constexpr int V1_HOLD_I_RATE_PERMILLE_PER_S = 60;
+// 見えない走行の予算との関係: 軌道が止まっていて |誤差| ≤ V1_RESIDUAL_BAND_COUNT のとき、最後に確かな動きを見た時点の I（保持出力。
+// エンコーダが生きていた間に学んだ値）＋ V1_HOLD_ALLOW_TRIM_PERMILLE までの出力は包絡線に積まない（それを超えた分は従来どおり積む）。
+// 荷重に釣り合う保持出力は動かすための出力ではない、という扱い。余裕 4 % は静止摩擦と動摩擦の差（3〜4 %）: 静止摩擦で止まった軸の I が
+// 動き出しまで育つ間は積まない。それを超えた分は、超過に比例した包絡線（20 % の超過で 2500 count/s）で積む（一律にしない。上乗せが
+// 小さければ動ける速さも小さい。仕様の一律の包絡線からの逸脱で、目標の近くで静止中だけ）。残る穴: 保持中にエンコーダが死に、荷重が変わる（乗員が降りる）と、保持出力（I の上限 = duty_max の 90 %
+// まで）で見えないまま動きうる（電流検出が無いと区別できない。PR #50 のリスクに記載）
+constexpr int V1_HOLD_ALLOW_TRIM_PERMILLE = 40;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

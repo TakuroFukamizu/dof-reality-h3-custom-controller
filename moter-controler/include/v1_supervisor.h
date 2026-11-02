@@ -54,6 +54,8 @@ struct V1SupTuning {
   int32_t mech_decel_zone_count = V1_MECH_DECEL_ZONE_COUNT;
   int32_t end_hard_margin_count = V1_END_HARD_MARGIN_COUNT;
   int32_t renew_move_count = V1_SUP_RENEW_MOVE_COUNT;
+  bool renew_directional = V1_SUP_RENEW_DIRECTIONAL != 0;  // false（既定）: どちら向きの正味の移動でも数える
+  int hold_allow_trim_permille = V1_HOLD_ALLOW_TRIM_PERMILLE;
   uint32_t renew_window_ms = V1_SUP_RENEW_WINDOW_MS;
   uint32_t projection_ms = V1_OVERRUN_MS;  // 先読みの刻み: 次の tick までの最悪の間隔（これを超えれば CONTROL_OVERRUN）
   int load_sat_ratio_permille = V1_LOAD_SAT_RATIO_PERMILLE;
@@ -106,6 +108,8 @@ class V1Supervisor {
     double vel = 0.0;            // 実測速度 [count/s]
     long duty_max_pm = 0;
     int32_t hold_exit = 0;
+    double i_pm = 0.0;            // 位置ループの積分（保持出力）[permille]。確かな動きを見た時点の値を「学んだ保持出力」として持つ
+    bool stationary_near = false; // 軌道が止まっていて目標の近く（保持出力の分を包絡線に積まない）
   };
 
   V1SupTuning t;
@@ -128,6 +132,9 @@ class V1Supervisor {
   // 位置制御が止まった（DISARMED / FAULT / 校正 / ARMING のブレーキ解除前）: その回だけの状態を捨てる
   void end_session(int64_t raw, uint64_t now_us) {
     last_out_ = 0;
+    last_charge_ = 0;
+    i_verified_ = 0.0;
+    any_win_ = false;
     have_last_us_ = false;
     ren_dir_ = 0;
     sat_running_ = false;  // LOAD_LIMITED は持続する停止なのでここでは消さない（clear_episode まで）
@@ -153,16 +160,40 @@ class V1Supervisor {
       last_change_us_ = c.now_us;
       last_raw_ = c.raw;
     }
-    // 包絡線（出したものはすべて積む。端の手前の制動も含む）
+    // 包絡線（出したものはすべて積む。端の手前の制動も含む。ただし目標の近くで静止中は、学んだ保持出力 + 余裕の分を引いた超過だけ）
     const int d = last_out_ > 0 ? 1 : (last_out_ < 0 ? -1 : 0);
-    if (d != 0 && dt_us > 0) {
-      const double add = env_speed(last_out_) * static_cast<double>(dt_us) / 1e6;
+    if (d != 0 && dt_us > 0 && last_charge_ != 0) {
+      const double add = charge_speed(last_charge_, last_charge_near_) * static_cast<double>(dt_us) / 1e6;
       env_ep_[idx(d)] += add;
       env_cum_[idx(d)] += add;
     }
-    // 確かな動き: 出している向きへ、窓の中で最も戻った所から renew_move 以上。窓は半分ずつ 2 つ（いまの半分と 1 つ前の半分）を
-    // 持つ滑り窓の近似（実効 renew_window / 2 〜 renew_window）。区切りをまたいだ 2 count も拾う
-    if (d == 0) {
+    if (!t.renew_directional) {
+      // どちら向きでも: 半分の窓 2 つの中の最小・最大から renew_move 以上離れた
+      const uint64_t half = ms(t.renew_window_ms) / 2;
+      if (!any_win_) {
+        any_win_ = true;
+        any_start_us_ = c.now_us;
+        any_min_ = any_max_ = any_min_prev_ = any_max_prev_ = raw_before;
+      } else if (c.now_us - any_start_us_ >= half) {
+        any_min_prev_ = any_min_;
+        any_max_prev_ = any_max_;
+        any_min_ = any_max_ = raw_before;
+        any_start_us_ = c.now_us;
+      }
+      const int64_t lo = any_min_ < any_min_prev_ ? any_min_ : any_min_prev_;
+      const int64_t hi = any_max_ > any_max_prev_ ? any_max_ : any_max_prev_;
+      if (c.raw - lo >= t.renew_move_count || hi - c.raw >= t.renew_move_count) {
+        renew(c);
+      } else {
+        if (c.raw < any_min_) any_min_ = c.raw;
+        if (c.raw > any_max_) any_max_ = c.raw;
+      }
+    }
+    // 確かな動き（renew_directional のとき）: 出している向きへ、窓の中で最も戻った所から renew_move 以上。窓は半分ずつ 2 つ（いまの半分と
+    // 1 つ前の半分）を持つ滑り窓の近似（実効 renew_window / 2 〜 renew_window）。区切りをまたいだ 2 count も拾う
+    if (!t.renew_directional) {
+      // 上で見た
+    } else if (d == 0) {
       ren_dir_ = 0;
     } else {
       const uint64_t half = ms(t.renew_window_ms) / 2;
@@ -179,13 +210,7 @@ class V1Supervisor {
       if ((d > 0 && c.raw < ren_ext_) || (d < 0 && c.raw > ren_ext_)) ren_ext_ = c.raw;  // 最も戻った所
       const int64_t lowest = d > 0 ? (ren_ext_ < ren_ext_prev_ ? ren_ext_ : ren_ext_prev_)
                                    : (ren_ext_ > ren_ext_prev_ ? ren_ext_ : ren_ext_prev_);
-      if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) {
-        trusted_raw_ = c.raw;
-        for (int i = 0; i < 2; ++i) { env_ep_[i] = 0.0; env_cum_[i] = 0.0; }
-        ren_start_us_ = c.now_us;
-        ren_ext_ = c.raw;
-        ren_ext_prev_ = c.raw;
-      }
+      if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) renew(c);
     }
     // FOLLOWING_ERROR の猶予に使う |誤差| の傾向（fe_window ごとに比べる）
     const int64_t fe_abs = c.err < 0 ? -c.err : c.err;
@@ -283,11 +308,11 @@ class V1Supervisor {
         out = update_load(c, out);
       }
       // 見えない走行の予算（先読み）。制動の出力も含めて、出す出力はすべてここを通す（P1a）
-      if (out != 0) {
+      if (out != 0 && charge_of(out, c) != 0) {
         const int d = out > 0 ? 1 : -1;
         uint64_t step_us = last_dt_us_;
         if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
-        const double proj = env_speed(out) * static_cast<double>(step_us) / 1e6;
+        const double proj = charge_speed(charge_of(out, c), c.stationary_near) * static_cast<double>(step_us) / 1e6;
         const double eps = 1e-9;
         if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
             env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
@@ -299,6 +324,8 @@ class V1Supervisor {
       }
     }
     last_out_ = out;
+    last_charge_ = charge_of(out, c);
+    last_charge_near_ = c.stationary_near;
     last_ctx_ = c;
     has_ctx_ = true;
     return out;
@@ -359,6 +386,12 @@ class V1Supervisor {
   uint64_t last_change_us_ = 0;
   // --- その回だけ ---
   int last_out_ = 0;
+  int last_charge_ = 0;          // last_out_ のうち包絡線に積む分（目標の近くで静止中は保持出力の分を引いた超過）
+  bool last_charge_near_ = false;
+  double i_verified_ = 0.0;      // 最後に確かな動きを見た時点の I（学んだ保持出力）
+  bool any_win_ = false;         // どちら向きでも数える確かな動きの窓
+  uint64_t any_start_us_ = 0;
+  int64_t any_min_ = 0, any_max_ = 0, any_min_prev_ = 0, any_max_prev_ = 0;
   bool have_last_us_ = false;
   uint64_t last_us_ = 0;
   uint64_t last_dt_us_ = 0;
@@ -395,6 +428,39 @@ class V1Supervisor {
     if (v > INT32_MAX) return INT32_MAX;
     if (v < INT32_MIN) return INT32_MIN;
     return static_cast<int32_t>(v);
+  }
+
+  // 確かな動き: 信用できる位置をいまにし、包絡線を 0 に。そのときの I を学んだ保持出力として持つ
+  void renew(const Ctx& c) {
+    trusted_raw_ = c.raw;
+    for (int i = 0; i < 2; ++i) { env_ep_[i] = 0.0; env_cum_[i] = 0.0; }
+    ren_start_us_ = c.now_us;
+    ren_ext_ = c.raw;
+    ren_ext_prev_ = c.raw;
+    any_start_us_ = c.now_us;
+    any_min_ = any_max_ = any_min_prev_ = any_max_prev_ = c.raw;
+    i_verified_ = c.i_pm;
+  }
+  // 出力 out のうち包絡線に積む分（符号は out と同じ）。目標の近くで静止中は、学んだ保持出力の向きに |i_verified| + trim、
+  // 逆向きに trim までを引く
+  int charge_of(int out, const Ctx& c) const {
+    if (out == 0 || !c.stationary_near) return out;
+    const int od = out > 0 ? 1 : -1;
+    const int vd = i_verified_ > 0.0 ? 1 : (i_verified_ < 0.0 ? -1 : 0);
+    double allow = static_cast<double>(t.hold_allow_trim_permille);
+    if (vd == 0 || vd == od) allow += (i_verified_ < 0.0 ? -i_verified_ : i_verified_);
+    const double excess = static_cast<double>(out < 0 ? -out : out) - allow;
+    if (excess <= 0.0) return 0;
+    return od * static_cast<int>(ceil(excess));
+  }
+
+  // 積む速さ: 目標の近くで静止中の「学んだ保持出力 + 余裕」を超えた分は、超過に比例（V1_SUP_ENV_PROP_REF_PERMILLE = 20 % で 2500 count/s）。
+  // 荷重と釣り合っている出力への上乗せが小さければ、見えないまま動ける速さも小さい（一律にすると、静止摩擦で止まった軸の I が
+  // 動き出しまで育つ間に予算が尽きる。実測 2）。それ以外は env_speed（既定は一律 2500）
+  double charge_speed(int charge, bool near) const {
+    if (!near) return env_speed(charge);
+    const double mag = charge < 0 ? -static_cast<double>(charge) : static_cast<double>(charge);
+    return static_cast<double>(t.env_count_s) * mag / static_cast<double>(V1_SUP_ENV_PROP_REF_PERMILLE);
   }
 
   double env_speed(int out) const {

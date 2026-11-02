@@ -73,6 +73,9 @@ struct Harness {
   double pwm_count_s_per_permille = 12.0;  // 20 % で 2400 count/s（比例の包絡線 12.5 の下）
   double plant_max_vel = 1e9;
   int pwm_deadband_permille = 0;
+  // r10（実測 2）: 荷重で逆に回る（back-drive する）軸。プラントが見る Duty = pwm − load_permille（ブレーキ解除中）。load 60 なら
+  // 6 % 未満では不足分に比例した速さで沈む（deadband があればその分は静止摩擦）
+  int load_permille = 0;
   bool pwm_deadband_subtract = false;  // true なら速度 = (|pwm| − deadband) × 係数（静止摩擦を越えた分だけで動く。荷重で 15 % 要る軸など）
   double ext_vel = 0.0;
   uint32_t brake_delay_ms = 0;
@@ -226,9 +229,10 @@ struct Harness {
         brake_cmd_off_at = now - dt_ms * MS;  // この区間の始まりに指令が落ちた
       }
       const bool engaged = !released && !brake_fails && now - brake_cmd_off_at >= brake_delay_ms * MS;
-      if (released && !held && (u > pwm_deadband_permille || u < -pwm_deadband_permille)) {
-        v = static_cast<double>(u) * pwm_count_s_per_permille;
-        if (pwm_deadband_subtract) v = static_cast<double>(u > 0 ? u - pwm_deadband_permille : u + pwm_deadband_permille) * pwm_count_s_per_permille;
+      const int un = u - load_permille;
+      if (released && !held && (un > pwm_deadband_permille || un < -pwm_deadband_permille)) {
+        v = static_cast<double>(un) * pwm_count_s_per_permille;
+        if (pwm_deadband_subtract) v = static_cast<double>(un > 0 ? un - pwm_deadband_permille : un + pwm_deadband_permille) * pwm_count_s_per_permille;
         if (v > plant_max_vel) v = plant_max_vel;
         if (v < -plant_max_vel) v = -plant_max_vel;
       }
@@ -3533,6 +3537,7 @@ inline void test_integral_does_not_flip_floor_direction_when_stationary() {
 
 inline V1Tuning r6_tuning(int kp = 6, int duty_max = 20) {
   V1Tuning t(true);
+  t.hold_learn = false;  // r10（実測 2）の保持出力の学習は test_r10_* で見る。r6〜r9 の試験はその版の振る舞い（HOLD で出力 0・I を捨てる）
   t.kp_percent_per_100 = kp;
   t.duty_min = 9;
   t.duty_max = duty_max;
@@ -4372,9 +4377,10 @@ struct R9PlantResult {
   int reversals = 0;          // 真の速度の符号反転（上り一定の軌道なので 0 のはず）
   bool active = false;
 };
-inline R9PlantResult r9_plant_run(double kd, double cog, double period, double tau_s) {
+inline R9PlantResult r9_plant_run(double kd, double cog, double period, double tau_s, bool hold_learn = false) {
   Harness h;
   h.ax.tuning = r6_tuning(30);
+  h.ax.tuning.hold_learn = hold_learn;  // r10（実測 2）の保持出力の学習の有無で比べる（test_r10_hold_learn_tracking_fe_before_after）
   h.ax.tuning.vel_kd_permille_per_count_s = kd;
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;

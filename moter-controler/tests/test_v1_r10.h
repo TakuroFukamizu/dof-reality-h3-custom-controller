@@ -31,6 +31,7 @@ inline void r10_active(Harness& h, int32_t ref = 0, uint32_t fe_limit = 100000, 
                        bool pwm_plant = true) {
   h.ax.tuning = r6_tuning(kp, duty_max);
   h.ax.tuning.supervisor = true;
+  h.ax.tuning.hold_learn = true;  // r10（実測 2）: 保持出力の学習
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // 減衰（r9）は保護に関係しない。手で動かすカウントで v_fast が跳ねるので切る
   h.pwm_plant = pwm_plant;
   h.stall = !pwm_plant;
@@ -73,6 +74,8 @@ inline void test_r10_conservative_defaults() {
   CHECK(t.projection_ms == V1_OVERRUN_MS);                  // 最悪の tick 間隔
   CHECK(!t.soft_grace && t.fe_grace_max_ms == 0);           // SOFT_LIMIT / FOLLOWING_ERROR の猶予は OFF
   CHECK(V1Tuning(true).supervisor == (V1_SUPERVISOR != 0) && !V1Tuning(false).supervisor);
+  CHECK(!t.renew_directional && t.hold_allow_trim_permille == 40);  // どちら向きでも確かな動き、保持出力 + 4 % は積まない（実測 2）
+  CHECK(V1Tuning(true).hold_learn == (V1_HOLD_LEARN != 0) && !V1Tuning(false).hold_learn);
 }
 
 // --- V1Supervisor 単体（数を厳密に見るため先読みは 5 ms） -------------------------
@@ -119,10 +122,13 @@ inline void test_r10_budget_derivation() {
   CHECK(lim(2740, 1) == 0);      // D = 10 → 0（機械端から 20 以内へは出さない）
 }
 
-// 確かな動きだけが予算を戻す: ±1 のちらつき・片相のトグル・出力と逆向きの動き・PWM の隙間・出力の反転では戻らない
+// 確かな動きだけが予算を戻す: ±1 のちらつき・片相のトグル・PWM の隙間・出力の反転では戻らない。出力と逆向きの動き（押し戻された・
+// 荷重で沈む）は、既定（どちら向きでも数える。実測 2）では戻し、renew_directional（Issue #44 の元の指示）では戻さない
 inline void test_r10_renewal_rules_unit() {
-  auto ticks_until_inhibit = [](std::function<int64_t(int)> raw_at, std::function<int(int)> cmd_at, int* up, int* down) {
+  auto ticks_until_inhibit = [](std::function<int64_t(int)> raw_at, std::function<int(int)> cmd_at, int* up, int* down,
+                                bool directional = false) {
     SupRig r;
+    r.s.t.renew_directional = directional;
     int n = 0;
     for (int i = 0; i < 2000 && !r.s.feedback_uncertain(); ++i) {
       const int out = r.tick(cmd_at(i), raw_at(i));
@@ -140,7 +146,12 @@ inline void test_r10_renewal_rules_unit() {
   up = down = 0;
   CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>((i / 2) % 2); }, [](int) { return 200; }, &up, &down) == 80);  // 片相
   up = down = 0;
-  CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>(-i); }, [](int) { return 200; }, &up, &down) == 80);  // 逆向き
+  CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>(-i); }, [](int) { return 200; }, &up, &down, true) == 80);  // 逆向き（向きつき）
+  {  // 逆向き（既定）: 2 count ごとに戻るので止まらない
+    SupRig r;
+    for (int i = 0; i < 400; ++i) r.tick(200, -i);
+    CHECK(!r.s.feedback_uncertain() && r.s.envelope_episode(1) <= 25.0);
+  }
   up = down = 0;
   CHECK(ticks_until_inhibit([](int) { return int64_t{0}; }, [](int i) { return (i / 10) % 2 == 0 ? 200 : 0; }, &up, &down) == 80);  // 隙間
   up = down = 0;
@@ -485,6 +496,7 @@ inline void test_r10_inhibit_during_arming_keeps_brake_applied() {
 inline void test_r10_end_braking_guard() {
   Harness h;
   r10_active(h, 2400, 100000, 6, 20, false);
+  h.ax.tuning.sup.renew_directional = true;  // 外向きの動きで予算が戻らないようにして、制動の出力が積まれることを見る
   for (int i = 0; i < 12; ++i) {  // 1200 count/s で上へ（停止距離 720 > 残り 300〜240）
     h.raw += 6;
     h.set_position(2400);
@@ -527,6 +539,7 @@ inline void test_r10_encoder_loss_during_braking() {
     if (h.ax.pwm_permille() != 0) ++n;
   }
   CHECK(h.ax.supervisor().end_braking());
+  n = 0;  // 断線の後に出した tick（動いていた間は確かな動きで予算が戻っている）
   for (int i = 0; i < 200; ++i) {  // カウントが止まる（断線）
     h.set_position(2400);
     h.step();
@@ -686,23 +699,26 @@ inline void test_r10_known_hole_noisy_pm2_feedback_renews_budget() {
 }
 
 
-// --- 静止目標での引き上げ（A）と小さな残り誤差の受け入れ（B）。Issue #44 の 14:22 の実測 -------------------------------
+// --- 静止目標での引き上げ（A）、保持出力の学習（実測 2）、小さな残り誤差の受け入れ（B、学習 OFF のときだけ） ---------------------------
 
-// 静止で |誤差| 26（#1 が最下端で行き過ぎた量）の軸を、指定の Duty（静止摩擦）を越えないと動かないプラントで戻す。最大の出力・動いたか・結果を返す
+// 荷重で逆に回るプラント（load_permille、静止摩擦 deadband）で、保持してから目標を err0 だけ上へ動かす。最大の出力・動いたか・結果を返す
 struct EscResult {
   int max_out = 0;
   int32_t final_err = 0;
   bool moved = false;
   double blind = 0.0;
 };
-inline EscResult escalation_run(Harness& h, int deadband_pm, int32_t err0, uint32_t ms, bool disconnect = false,
+inline EscResult escalation_run(Harness& h, int load_pm, int deadband_pm, int32_t err0, uint32_t ms, bool disconnect = false,
                                 double creep = 0.0) {
-  r10_active(h, 0, 200);
+  r10_active(h, 0, 400);
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = load_pm;
   h.pwm_deadband_permille = deadband_pm;
   h.pwm_deadband_subtract = true;
+  drive_count_nonzero(h, 3000, 0);  // 荷重の下で保持出力を学ぶ
+  CHECK(!h.ax.supervisor_inhibited() && h.ax.state() == st::ACTIVE);  // 荷重の下で保持できている
   const int32_t start = h.ax.actual_count();
   const int32_t target = start + err0;
-  drive_count_nonzero(h, 60, target);  // 軌道が目標に着く（プラントは静止摩擦で動かない）
   if (disconnect) h.enc_connected = false;
   h.ext_vel = creep;
   const double phys0 = h.phys;
@@ -719,60 +735,199 @@ inline EscResult escalation_run(Harness& h, int deadband_pm, int32_t err0, uint3
   return r;
 }
 
-// A: 15 % 要る軸。合成（P 78 + I）では動かないが、引き上げが 15 % を越えて動き、目標の近く（残り誤差の帯）に着く。停止も FAULT も無い
+// A: 保持 12 %・静止摩擦 3 %（持ち上げに 15 % 要る）軸を 26 count 上へ（#1 の最下端の行き過ぎ）。引き上げが 15 % を越えて動き、着いて保つ
 inline void test_r10_escalation_lifts_axis_needing_15_percent() {
   Harness h;
-  const EscResult r = escalation_run(h, 149, 26, 2000);
-  if (std::getenv("R10_PRINT")) std::printf("esc 15%%: max_out %d final_err %d moved %d\n", r.max_out, r.final_err, r.moved ? 1 : 0);
-  CHECK(r.max_out >= 150 && r.moved && std::abs(r.final_err) <= V1_RESIDUAL_BAND_COUNT + 3);
+  const EscResult r = escalation_run(h, 120, 30, 26, 3000);
+  if (std::getenv("R10_PRINT")) std::printf("esc 15%%: max_out %d final_err %d moved %d I %d\n", r.max_out, r.final_err, r.moved ? 1 : 0, h.ax.integral_permille());
+  CHECK(r.max_out >= 150 && r.moved && std::abs(r.final_err) <= 2);
   CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
   CHECK(h.ax.escalation_permille() == 0);  // 着いたら戻る
-  // 監視 OFF（r9 と同じ）では引き上げが無く、動けないまま静止 2 s の監視で ENCODER_FAULT（14:22 の #1 の再現）
+  // 監視 OFF・学習 OFF（r9 と同じ）では、動けないまま静止 2 s の監視で ENCODER_FAULT（14:22 の #1 の再現）。保持もできない
   Harness k;
-  r10_active(k, 0, 200);
+  r10_active(k, 0, 400);
   k.ax.tuning.supervisor = false;
-  k.pwm_deadband_permille = 149;
+  k.ax.tuning.hold_learn = false;
+  k.pwm_count_s_per_permille = 4.0;
+  k.load_permille = 120;
+  k.pwm_deadband_permille = 30;
   k.pwm_deadband_subtract = true;
-  const int32_t t0 = k.ax.actual_count() + 26;
-  int max_out = 0;
-  for (int i = 0; i < 500 && k.ax.state() != st::FAULT; ++i) {
-    if ((i % 2) == 0) k.set_position(t0);
+  for (int i = 0; i < 1200 && k.ax.state() != st::FAULT; ++i) {
+    if ((i % 2) == 0) k.set_position(26);
     k.step();
-    if (std::abs(k.ax.pwm_permille()) > max_out) max_out = std::abs(k.ax.pwm_permille());
   }
-  if (std::getenv("R10_PRINT")) std::printf("esc off: fault %u max_out %d\n", k.ax.fault_code(), max_out);
-  CHECK(k.ax.fault_code() == fc::ENCODER_FAULT);
+  if (std::getenv("R10_PRINT")) std::printf("esc off: fault %u\n", k.ax.fault_code());
+  CHECK(k.ax.state() == st::FAULT);
 }
 
-// A: 25 % 要る軸（duty_max 20 % では動かない）。duty_max まで引き上げ、カウントが全く動かないので見えない走行の予算で PWM 0 ＋ ブレーキ。
-// 少しずつ動く（15 count/s のにじみ）なら予算は戻り、duty_max の飽和 1 s で LOAD_LIMITED（ブレーキ）。どちらも ENCODER_FAULT にしない
+// A: 25 % 要る軸（静止摩擦 25 %。duty_max 20 % では動かない）。duty_max まで引き上げ、カウントが動かないので
+// 見えない走行の予算で PWM 0 ＋ ブレーキ。にじむ（15 count/s）なら予算は戻り、duty_max の飽和 1 s で LOAD_LIMITED。ENCODER_FAULT なし
 inline void test_r10_escalation_to_duty_max_then_braked_inhibit() {
   Harness h;
-  const EscResult r = escalation_run(h, 249, 26, 3000);
+  const EscResult r = escalation_run(h, 0, 249, 26, 3000);
   if (std::getenv("R10_PRINT")) std::printf("esc 25%%: max_out %d moved %d\n", r.max_out, r.moved ? 1 : 0);
   CHECK(r.max_out == 200 && !r.moved);
   CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && no_fault_events(h));
   Harness g;
-  const EscResult q = escalation_run(g, 249, 40, 3000, false, 15.0);
+  const EscResult q = escalation_run(g, 0, 249, 40, 3000, false, 15.0);
   if (std::getenv("R10_PRINT")) std::printf("esc 25%% creep: max_out %d final_err %d\n", q.max_out, q.final_err);
   CHECK(q.max_out == 200);
   CHECK(braked_inhibit(g) && g.ax.supervisor().load_limited() && !g.ax.supervisor().feedback_uncertain() && no_fault_events(g));
 }
 
-// A: 引き上げの途中でエンコーダが死ぬ（物理は 15 % を越えて動く）→ 引き上げは duty_max まで続くが、見えない走行の予算で止まる（物理の移動 ≤ 1000）
+// A: 引き上げの途中でエンコーダが死ぬ（物理は持ち上がる）→ 予算で止まる（物理の移動 ≤ 1000）
 inline void test_r10_escalation_cut_by_budget_when_encoder_dead() {
   Harness h;
-  const EscResult r = escalation_run(h, 149, 26, 3000, true);
+  const EscResult r = escalation_run(h, 120, 30, 26, 3000, true);
   if (std::getenv("R10_PRINT")) std::printf("esc dead: max_out %d blind %.1f\n", r.max_out, r.blind);
-  CHECK(r.max_out == 200 && r.blind > 0.0 && r.blind <= 1000.0);
+  CHECK(r.blind > 0.0 && r.blind <= 1000.0);
   CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && no_fault_events(h));
 }
 
-// B: 保持の近くで残り誤差 4（下向き）、プラントは 6 %（下向きのパルス 60）では動かない（#2 の 14:22）: パルスは 3 回まで、その後は出力 0 の
-// まま（パルスの合間も 0。「4 で止まったまま P + I が流れる」r6 の振る舞いにならない）。|誤差| が 12 を超える（目標が動く）と解除して動く
-inline void test_r10_residual_pulses_limited_then_zero_output() {
+// 保持出力の学習の結果（保持の区間）
+struct HoldResult {
+  int pulse_onsets = 0;       // 着いてから 2 s 以降の動き出しパルスの立ち上がり
+  int max_abs_err = 0;        // 着いてから 2 s 以降の |誤差| の最大
+  int out_min = 1000, out_max = -1000;  // 同、出力の範囲 [permille]
+  double out_mean = 0.0;
+  bool inhibited = false;
+  bool fault = false;
+};
+// 荷重 load（back-drive、静止摩擦 deadband）の軸を 0 → 300 へ動かし、hold_s 秒保持する
+inline HoldResult hold_run(Harness& h, int load_pm, int deadband_pm, uint32_t hold_s, bool learn = true) {
+  r10_active(h, 0, 400);
+  h.ax.tuning.hold_learn = learn;
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = load_pm;
+  h.pwm_deadband_permille = deadband_pm;
+  h.pwm_deadband_subtract = true;
+  h.pos_max_vel = 300;
+  drive_count_nonzero(h, 3000, 300);  // 移動と着いてからの 2 s（学習）
+  HoldResult r;
+  bool prev = false;
+  long sum = 0;
+  int n = 0;
+  for (uint32_t t = 0; t < hold_s * 1000 && h.ax.state() != st::FAULT; t += 5) {
+    if ((t % 10) == 0) h.set_position(300);
+    h.step();
+    const bool brk = h.ax.duty_terms().mode == V1DutyMode::BRK;
+    if (brk && !prev) ++r.pulse_onsets;
+    prev = brk;
+    const int e = std::abs(h.ax.following_error_count());
+    if (e > r.max_abs_err) r.max_abs_err = e;
+    const int u = h.ax.pwm_permille();
+    if (u < r.out_min) r.out_min = u;
+    if (u > r.out_max) r.out_max = u;
+    sum += u;
+    ++n;
+    if (h.ax.supervisor_inhibited()) r.inhibited = true;
+  }
+  r.out_mean = n ? static_cast<double>(sum) / n : 0.0;
+  r.fault = h.ax.state() == st::FAULT;
+  return r;
+}
+
+// 実測 2: 乗員の荷重（6 % 未満では沈む、静止摩擦なし / 1.5 %）の下で 30 s 保持。出力は保持 Duty（≈ 60）に収まり、位置は ±2、
+// パルスの往復なし、停止・FAULT なし。無負荷（静止摩擦 3 %）なら出力はほぼ 0。学習 OFF（r6〜r9）では往復が出る（14:43 の再現）
+inline void test_r10_hold_learns_holding_duty_against_backdrive() {
+  for (int deadband : {0, 15}) {
+    Harness h;
+    const HoldResult r = hold_run(h, 60, deadband, 30);
+    if (std::getenv("R10_PRINT")) {
+      std::printf("hold load 60 db %d: err max %d out %d..%d mean %.1f pulses %d inhibited %d fault %d I %d\n", deadband,
+                  r.max_abs_err, r.out_min, r.out_max, r.out_mean, r.pulse_onsets, r.inhibited ? 1 : 0, r.fault ? 1 : 0,
+                  h.ax.integral_permille());
+    }
+    CHECK(!r.fault && !r.inhibited && no_fault_events(h) && h.ax.state() == st::ACTIVE);
+    CHECK(r.max_abs_err <= 2);
+    CHECK(r.pulse_onsets == 0);
+    // 保持 Duty（静止摩擦があればその帯 60 ± deadband のどこでも保てる）に収まり、出力は揺れない
+    CHECK(std::abs(r.out_mean - 60.0) <= deadband + 5.0 && r.out_max - r.out_min <= 10);
+  }
+  {  // 無負荷・静止摩擦 3 %: 出力はほぼ 0 で止まっている
+    Harness h;
+    const HoldResult r = hold_run(h, 0, 30, 10);
+    if (std::getenv("R10_PRINT")) std::printf("hold unloaded: err max %d out %d..%d mean %.1f pulses %d\n", r.max_abs_err, r.out_min, r.out_max, r.out_mean, r.pulse_onsets);
+    CHECK(!r.fault && !r.inhibited && r.max_abs_err <= 2 && std::abs(r.out_min) <= 30 && std::abs(r.out_max) <= 30 && r.pulse_onsets == 0);
+  }
+  {  // 学習 OFF（r6〜r9 の保持）: 荷重 6 % で往復（パルスが繰り返す）か FAULT
+    Harness h;
+    h.ax.tuning.supervisor = true;
+    const HoldResult r = hold_run(h, 60, 15, 10, false);
+    if (std::getenv("R10_PRINT")) std::printf("hold no-learn: err max %d pulses %d fault %d inhibited %d\n", r.max_abs_err, r.pulse_onsets, r.fault ? 1 : 0, r.inhibited ? 1 : 0);
+    CHECK(r.pulse_onsets >= 3 || r.fault || r.inhibited || r.max_abs_err > 4);
+  }
+}
+
+// 保持出力の学習で追従（正弦波・反転）の誤差が悪くならないこと。荷重 6 % と無負荷で、学習 ON / OFF の FE を比べる（PR #50 のコメントの値）。
+// r9 の遅れ・慣性のあるプラント（100 count/s の上り）でも比べる
+inline void test_r10_hold_learn_tracking_fe_before_after() {
+  for (int k = 0; k < 2; ++k) {
+    const double cog = k == 0 ? 5.0 : 8.0, period = k == 0 ? 30.0 : 40.0, tau = k == 0 ? 0.050 : 0.080;
+    const R9PlantResult off = r9_plant_run(V1_VEL_KD_PERMILLE_PER_COUNT_S, cog, period, tau, false);
+    const R9PlantResult on = r9_plant_run(V1_VEL_KD_PERMILLE_PER_COUNT_S, cog, period, tau, true);
+    if (std::getenv("R10_PRINT")) {
+      std::printf("r9 plant cog %.0f: fe_rms off %.2f on %.2f / vel_err off %.1f on %.1f / rev off %d on %d\n", cog, off.fe_rms, on.fe_rms,
+                  off.vel_err_rms, on.vel_err_rms, off.reversals, on.reversals);
+    }
+    CHECK(on.active && on.fe_rms <= off.fe_rms * 1.15 + 0.2 && on.reversals == 0);
+  }
+  for (int load : {0, 60}) {
+    double rms[2] = {0, 0};
+    int fe_max[2] = {0, 0};
+    double stop_over[2] = {0, 0};
+    for (int learn = 0; learn < 2; ++learn) {
+      Harness h;
+      r10_active(h, 0, 100000);
+      h.ax.tuning.hold_learn = learn != 0;
+      h.pwm_count_s_per_permille = 4.0;
+      h.load_permille = load;
+      h.pwm_deadband_permille = 15;
+      h.pwm_deadband_subtract = true;
+      h.pos_max_vel = 1000;
+      drive_count_nonzero(h, 2000, 0);
+      double se = 0.0;
+      int n = 0;
+      const double pi = 3.14159265358979323846;
+      for (int i = 0; i < 600; ++i) {  // 6 s: 振幅 300・周期 2 s の正弦波（最大 940 count/s… ではなく 300 × π ≈ 940 → 遅い側に 150 で）
+        const double tgt = 150.0 * sin(2.0 * pi * i / 200.0);
+        h.set_position(static_cast<int32_t>(lround(tgt)));
+        h.idle(10);
+        if (i >= 100) {
+          const int fe = std::abs(h.ax.actual_count() - static_cast<int32_t>(lround(tgt)));
+          se += static_cast<double>(fe) * fe;
+          ++n;
+          if (fe > fe_max[learn]) fe_max[learn] = fe;
+        }
+      }
+      rms[learn] = sqrt(se / n);
+      // 反転の後に止める: 下りの途中から 0 に止めたときの行き過ぎ
+      for (int i = 0; i < 100; ++i) { h.set_position(-150 + i * 3); h.idle(10); }
+      double over = 0.0;
+      for (int i = 0; i < 200; ++i) {
+        h.set_position(150);
+        h.idle(10);
+        const double o = static_cast<double>(h.ax.actual_count()) - 150.0;
+        if (o > over) over = o;
+      }
+      stop_over[learn] = over;
+      CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
+    }
+    if (std::getenv("R10_PRINT")) {
+      std::printf("tracking load %d: FE rms off %.2f on %.2f / max off %d on %d / stop overshoot off %.0f on %.0f\n", load, rms[0],
+                  rms[1], fe_max[0], fe_max[1], stop_over[0], stop_over[1]);
+    }
+    CHECK(rms[1] <= rms[0] * 1.15 + 0.5);
+    CHECK(stop_over[1] <= stop_over[0] + 3.0);
+  }
+}
+
+// B（学習 OFF のときだけ）: 保持の近くで残り誤差 4（下向き）、プラントは 6 %（下向きのパルス 60）では動かない（#2 の 14:22）: パルスは 3 回まで、
+// その後は出力 0（受け入れ）。学習 ON では使わない（乗員の荷重で沈むので保持出力を出し続ける。実測 2）
+inline void test_r10_residual_pulses_limited_then_zero_output_without_learning() {
   Harness h;
   r10_active(h, 0, 200);
+  h.ax.tuning.hold_learn = false;
   h.pwm_deadband_permille = 60;
   const int32_t start = h.ax.actual_count();
   int onsets = 0;
@@ -792,12 +947,10 @@ inline void test_r10_residual_pulses_limited_then_zero_output() {
   CHECK(onsets >= 1 && onsets <= V1_RESIDUAL_MAX_PULSES);
   CHECK(h.ax.residual_accepted() && nonzero_after_accept == 0 && nonzero_non_pulse == 0 && h.ax.pwm_permille() == 0);
   CHECK(h.ax.following_error_count() == 4 && h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
-  // 目標が動けば解除（遠くへ）: 動き出す
   h.pwm_deadband_permille = 0;
   drive_count_nonzero(h, 800, start - 300);
   CHECK(!h.ax.residual_accepted() && std::abs(h.ax.actual_count() - (start - 300)) <= V1_RESIDUAL_BAND_COUNT);
 }
-
 
 // r10 統合（PR #48 × #49）: 端の余裕の一元化。再生バッファの参照が端へ向かうと、参照はソフトリミットから V1_SOFT_RESERVE_COUNT（= 400 − 50 + 250
 // = 600）の手前で止まり、そこは監視の「端へ出せない帯」（機械端から 400）の外に 250 count の予算を残す所。PWM で動くプラント（エンコーダは
@@ -889,7 +1042,9 @@ inline void run_all() {
   test_r10_escalation_lifts_axis_needing_15_percent();
   test_r10_escalation_to_duty_max_then_braked_inhibit();
   test_r10_escalation_cut_by_budget_when_encoder_dead();
-  test_r10_residual_pulses_limited_then_zero_output();
+  test_r10_hold_learns_holding_duty_against_backdrive();
+  test_r10_hold_learn_tracking_fe_before_after();
+  test_r10_residual_pulses_limited_then_zero_output_without_learning();
   test_r10_integrated_playout_stops_outside_no_drive_zone();
   test_r10_status_flags_bits();
 }

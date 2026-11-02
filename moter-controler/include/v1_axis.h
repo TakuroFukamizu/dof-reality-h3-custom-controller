@@ -104,6 +104,11 @@ struct V1Tuning {
   //（FEEDBACK_UNCERTAIN）・過負荷（LOAD_LIMITED）・端の手前の制動・SOFT_LIMIT / FOLLOWING_ERROR の猶予に置き換わる
   bool supervisor = false;  // コンストラクタで既定を入れる
   V1SupTuning sup;
+  // r10（実測 2）: 保持出力の学習（config.h V1_HOLD_LEARN）。方向別の経路だけ。false なら r6〜r9 と同じ（HOLD で出力 0・I を捨てる）
+  bool hold_learn = false;  // コンストラクタで既定を入れる
+  int hold_i_max_ratio_percent = V1_HOLD_I_MAX_RATIO_PERCENT;
+  double hold_ki_permille_per_count_s = V1_HOLD_KI_PERMILLE_PER_COUNT_S;
+  int hold_i_rate_permille_per_s = V1_HOLD_I_RATE_PERMILLE_PER_S;
   // r10（supervisor のときだけ）: 静止目標での力の段階的な引き上げ（step 0 で無効）と小さな残り誤差の受け入れ（band 0 で無効）。config.h
   int escalate_step_permille = V1_ESCALATE_STEP_PERMILLE;
   uint32_t escalate_window_ms = V1_ESCALATE_WINDOW_MS;
@@ -117,6 +122,7 @@ struct V1Tuning {
       ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
       vel_kd_permille_per_count_s = V1_VEL_DAMPING ? V1_VEL_KD_PERMILLE_PER_COUNT_S : 0.0;
       supervisor = V1_SUPERVISOR != 0;
+      hold_learn = V1_HOLD_LEARN != 0;
     }
   }
   // 静止の帯の入口／出口（r6 は hold_enter / hold_exit、従来は deadband / deadband_out）。v1_duty_command・整定判定・静止監視で共用
@@ -159,6 +165,7 @@ struct V1DutyState {
   bool in_band = false;   // 静止の不感帯の中（入る側 deadband / 出る側 deadband_out）
   bool floor_on = false;  // 床（Duty 下限）の適用状態（ON: |誤差| > deadband_out かつ向き一致 / OFF: |誤差| ≤ floor_off か向き不一致）
   double i_pm = 0.0;      // 積分項 [permille]（Issue #25 手順 9「F」。|i_pm| ≤ i_max_permille。位置制御が止まれば 0）
+  int64_t hold_best_abs = 0;  // r10（hold_learn）: この保持の間に一番目標に近かった |誤差|（そこから 1 count 離れたら I を詰める）
 };
 
 // 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
@@ -209,6 +216,8 @@ inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
 // 5. r9（Issue #35）の減衰項: has_v_fast（V1Axis の 40 ms 窓の速度推定が使える）かつ kd > 0 なら
 //    u_d = clamp(kd × (vel − v_fast), ±vel_d_max) を合成に足す（u = FF + P + I + u_d）。保持の中では足さない（出力 0 のまま）。
 //    飽和・アンチワインドアップ・動き出しパルスの「合成」は u_d 込みの u で見る（四捨五入は合成で 1 回）。
+// 6. r10（Issue #44 の実測 2、t.hold_learn）: 保持出力の学習。保持に入っても I を捨てず、出力 = I（P なし）。保持の中でも |誤差| ≥ hold_enter
+//    なら Ki_hold で I を詰める。|I| ≤ duty_max × hold_i_max_ratio。軌道が止まっている間は Ki_hold / hold_i_rate、走行中は従来の Ki / rate。
 inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
                                        double dt_s, bool settle_ok, bool breakaway, bool has_v_fast, double v_fast) {
   const int64_t err_abs = err < 0 ? -err : err;
@@ -221,16 +230,43 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
       if (err_abs > t.hold_exit) st.in_band = false;
     } else if (err_abs <= t.hold_enter && settle_ok) {
       st.in_band = true;
-      st.i_pm = 0.0;  // 保持に入ったら I を捨てる（#1 は中立付近で自己保持する。出力 0）
+      st.hold_best_abs = err_abs;
+      if (!t.hold_learn) st.i_pm = 0.0;  // r6〜r9: 保持に入ったら I を捨てる（#1 は無負荷なら中立付近で自己保持する。出力 0）
     }
   } else {
     st.in_band = false;
   }
+  const double i_cap = t.hold_learn ? static_cast<double>(duty_max_pm) * t.hold_i_max_ratio_percent / 100.0
+                                    : static_cast<double>(t.i_max_permille);
+  const bool still = t.hold_learn && vel == 0.0;  // 軌道が止まっている: 保持出力を速く学ぶ
+  const double ki = still ? t.hold_ki_permille_per_count_s : t.ki_permille_per_count_s;
+  const double i_rate = still ? static_cast<double>(t.hold_i_rate_permille_per_s) : static_cast<double>(t.i_rate_permille_per_s);
   if (st.in_band) {
     o.in_band = true;
     o.mode = V1DutyMode::HOLD;
-    o.cmd_permille = 0;
-    return 0;
+    if (!t.hold_learn) {
+      o.cmd_permille = 0;
+      return 0;
+    }
+    // r10: 保持の出力 = I（保持出力）。この保持の間に一番近かった所から 1 count 以上離れた（荷重で沈んだ）ときだけ I を詰める。
+    // 静止摩擦で目標の 1〜2 count 手前に止まっている無負荷の軸では I を育てない（育てると静止摩擦が切れた所で I が余って向こう側まで
+    // 動き続ける往復になる）。沈む軸は離れた分だけ詰めて、戻り始めて一番近い所まで来れば止まる
+    if (err_abs < st.hold_best_abs) st.hold_best_abs = err_abs;
+    if (dt_s > 0.0 && ki > 0.0 && err_abs >= 1 && err_abs >= st.hold_best_abs + 1) {
+      double di = ki * static_cast<double>(err) * dt_s;
+      const double di_max = i_rate * dt_s;
+      if (di > di_max) di = di_max;
+      if (di < -di_max) di = -di_max;
+      st.i_pm += di;
+      if (st.i_pm > i_cap) st.i_pm = i_cap;
+      if (st.i_pm < -i_cap) st.i_pm = -i_cap;
+    }
+    long h = lround(st.i_pm);
+    if (h > duty_max_pm) h = duty_max_pm;
+    if (h < -duty_max_pm) h = -duty_max_pm;
+    o.i_permille = static_cast<int16_t>(h);
+    o.cmd_permille = static_cast<int16_t>(h);
+    return static_cast<int>(h);
   }
   const double p_pm = static_cast<double>(err * t.kp_percent_per_100) * V1_PERMILLE_PER_PERCENT / 100.0;
   const double ff_pm = v1_ff_directional_pm(vel, t);
@@ -270,18 +306,17 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   const int out = static_cast<int>(dir * mag);
   o.cmd_permille = static_cast<int16_t>(out);
   // 積分の更新（次の tick のため）。パルス中は凍結
-  if (dt_s > 0.0 && t.ki_permille_per_count_s > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
-    double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
-    const double di_max = static_cast<double>(t.i_rate_permille_per_s) * dt_s;
+  if (dt_s > 0.0 && ki > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
+    double di = ki * static_cast<double>(err) * dt_s;
+    const double di_max = i_rate * dt_s;
     if (di > di_max) di = di_max;
     if (di < -di_max) di = -di_max;
     const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
     const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
     if (!deeper || unwinding) {
       st.i_pm += di;
-      const double i_max = static_cast<double>(t.i_max_permille);
-      if (st.i_pm > i_max) st.i_pm = i_max;
-      if (st.i_pm < -i_max) st.i_pm = -i_max;
+      if (st.i_pm > i_cap) st.i_pm = i_cap;
+      if (st.i_pm < -i_cap) st.i_pm = -i_cap;
     }
   }
   return out;
@@ -800,6 +835,7 @@ class V1Axis {
   int64_t esc_anchor_raw_ = 0;
   int last_combined_pm_ = 0;  // 直近の v1_duty_command の結果（引き上げの起点）
   bool residual_accepted_ = false;
+  bool hold_pulses_spent_ = false;  // r10（hold_learn）: 保持の帯の近くで進まないパルスを打ち切った（以後は I が詰める）
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
@@ -1610,6 +1646,10 @@ class V1Axis {
     c.vel = v_fast_valid_ ? v_fast_ : static_cast<double>(velocity_);
     c.duty_max_pm = v1_permille(tuning.duty_max);
     c.hold_exit = tuning.hold_exit;
+    // r10（実測 2）: 保持出力の扱い。軌道が止まっていて目標の近くなら、学んだ保持出力（I）の分は包絡線に積まない（V1Supervisor）
+    c.i_pm = duty_state_.i_pm;
+    const int64_t ea = c.err < 0 ? -c.err : c.err;
+    c.stationary_near = tuning.hold_learn && setpoint_vel_ == 0.0 && ea <= escalation_floor();
     return c;
   }
 
@@ -1841,6 +1881,7 @@ class V1Axis {
       reset_stall_boost();
       reset_escalation();
       residual_accepted_ = false;
+      hold_pulses_spent_ = false;
       terms_ = V1DutyTerms{};
       return;
     }
@@ -1849,6 +1890,9 @@ class V1Axis {
     // r10: 小さな残り誤差の受け入れの解除（|誤差| が出口を超えた・軌道が動いた・ブレーキ作動・監視 OFF）
     if (residual_accepted_ && (!supervisor_on() || err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || !brake_release_cmd_)) {
       residual_accepted_ = false;
+    }
+    if (hold_pulses_spent_ && (err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || duty_state_.in_band || !brake_release_cmd_)) {
+      hold_pulses_spent_ = false;
     }
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
@@ -1864,8 +1908,10 @@ class V1Axis {
     // r10（supervisor_on）: 静止目標（軌道速度 0・保持でない）での出力の形
     //  - |誤差| ≤ residual_band か残り誤差の受け入れ中: 動き出しパルスの間だけ出す。それ以外は 0（I も 0）。受け入れ中はパルスも無い
     //  - |誤差| > residual_band で進まない: 誤差の向きに max(合成, 引き上げ) を出す（duty_max まで）
+    // （保持出力の学習 hold_learn が ON なら、小さな誤差での出力 0 は使わない: 乗員の荷重で沈むので保持出力 I を出し続ける）
     if (supervisor_on() && setpoint_vel_ == 0.0 && !duty_state_.in_band) {
-      if (residual_accepted_ || (tuning.residual_band > 0 && err_abs <= tuning.residual_band && !brk_active_)) {
+      if (!tuning.hold_learn &&
+          (residual_accepted_ || (tuning.residual_band > 0 && err_abs <= tuning.residual_band && !brk_active_))) {
         cmd = 0;
         duty_state_.i_pm = 0.0;
         terms_.cmd_permille = 0;
@@ -2022,6 +2068,19 @@ class V1Axis {
       reset_breakaway();
       return false;
     }
+    // r10（hold_learn）: 保持の帯の近くのパルスは、I がまだ動き出しの Duty に育っていない間だけ。荷重で目標から離れている（沈んでいる）
+    // 間は打たない（パルスで持ち上げても出力が落ちればまた沈む往復になる。I が詰める）。進まないパルス 3 回で打ち切る
+    if (tuning.hold_learn && setpoint_vel_ == 0.0 && err != 0) {
+      const int edir = err > 0 ? 1 : -1;
+      long need = edir > 0 ? tuning.breakaway_up_permille : tuning.breakaway_down_permille;
+      if (need < 0) need = -need;
+      const double v = v_fast_valid_ ? v_fast_ : static_cast<double>(velocity_);
+      const bool sagging = static_cast<double>(edir) * v < -static_cast<double>(tuning.breakaway_moving_max_vel_count_s);
+      if (hold_pulses_spent_ || static_cast<double>(edir) * duty_state_.i_pm >= static_cast<double>(need) || sagging) {
+        reset_breakaway();
+        return false;
+      }
+    }
     int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
     const bool traj_moving = setpoint_vel_ != 0.0;
     const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
@@ -2085,12 +2144,19 @@ class V1Axis {
         brk_active_ = false;  // 進まずに終わった
         ++brk_pulses_;
         if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
-        // r10: 静止目標の小さな残り誤差で進まないパルスが residual_max_pulses 回 → 受け入れて出力 0（パルスを打ち続けない）
-        if (supervisor_on() && mode == 0 && tuning.residual_band > 0 && tuning.residual_max_pulses > 0 &&
-            err_abs <= tuning.residual_band && brk_pulses_ >= tuning.residual_max_pulses) {
-          residual_accepted_ = true;
-          reset_breakaway();
-          return false;
+        // r10: 静止目標の小さな残り誤差で進まないパルスが residual_max_pulses 回 → 打ち切る。hold_learn なら以後は I が詰める
+        //（出力 0 で受け入れない）。hold_learn が OFF なら従来の B（受け入れて出力 0）
+        if (mode == 0 && tuning.residual_max_pulses > 0 && brk_pulses_ >= tuning.residual_max_pulses) {
+          if (tuning.hold_learn) {
+            hold_pulses_spent_ = true;
+            reset_breakaway();
+            return false;
+          }
+          if (supervisor_on() && tuning.residual_band > 0 && err_abs <= tuning.residual_band) {
+            residual_accepted_ = true;
+            reset_breakaway();
+            return false;
+          }
         }
         if (band) brk_cooldown_until_us_ = now + ms_to_us(tuning.breakaway_band_cooldown_ms);
         brk_phase_start_us_ = now;
