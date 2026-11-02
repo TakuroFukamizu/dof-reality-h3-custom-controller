@@ -325,4 +325,18 @@ pub mod status_flags {
     pub const POWER_CONTROLLER: u16 = 1 << 4;
     pub const CURRENT_VALID: u16 = 1 << 5;
     pub const CLOCK_SYNCED: u16 = 1 << 6;
+    /// r10 (Issues #44 / #46): protection-supervisor states. None of them is a
+    /// fault/latch; the MCU stays in its state (e.g. ACTIVE).
+    /// Overload: saturated for 1 s without progress, output 0 (clears when the
+    /// error goes away, reverses, or after a 2 s rest).
+    pub const LOAD_LIMITED: u16 = 1 << 7;
+    /// Blind-drive budget exhausted (no credible encoder motion): output 0 until
+    /// the axis is DISARMED again (explicit re-ARM). Replaces the old
+    /// "no progress -> ENCODER_FAULT" latches.
+    pub const FEEDBACK_UNCERTAIN: u16 = 1 << 8;
+    /// Measured velocity cannot stop before the soft limit: full opposite duty.
+    pub const END_BRAKING: u16 = 1 << 9;
+    /// Recovering inward from slightly outside the soft window, or a following
+    /// error over the limit that is shrinking (grace instead of a latch).
+    pub const LIMIT_RECOVERY: u16 = 1 << 10;
 }

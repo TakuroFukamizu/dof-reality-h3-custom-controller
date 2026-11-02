@@ -438,6 +438,20 @@ inline void test_vectors_mcu() {
     CHECK(!v1::decode_host_payload(v1::msg::CALIBRATE, p, 7, &h));
     CHECK(v1::decode_host_payload(v1::msg::CALIBRATE, p, 8, &h) && h.calibrate.mode == 0);
   }
+  {  // 7.23 STATUS（r10 の保護フラグ。Issue #44・#46）: 配置は 7.15 と同じ。flags = 0x079F = 0x001F | LOAD_LIMITED | FEEDBACK_UNCERTAIN |
+     // END_BRAKING | LIMIT_RECOVERY（bit 7〜10）。PC 側 control-server/tests/protocol_vectors.rs と同じバイト列
+    v1::McuMsg m{};
+    m.type = v1::msg::STATUS;
+    m.status = {2309737967u, 1234567890ull, 4, 1, v1::fault::NONE, 0x079F, 0, -1230, -1080, 0, -150, 1234, 1000, 1000,
+                0, 1, 2};
+    CHECK((v1::flags::LOAD_LIMITED | v1::flags::FEEDBACK_UNCERTAIN | v1::flags::END_BRAKING | v1::flags::LIMIT_RECOVERY) == 0x0780);
+    check_mcu_vector(
+        "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 9F 07 00 00 32 FB FF FF C8 FB FF FF 00 00 00 00 6A FF FF "
+        "FF D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 8F 3A",
+        "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 03 9F 07 01 09 32 FB FF FF C8 FB FF FF 01 01 01 07 6A FF "
+        "FF FF D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 8F 3A 00",
+        m, eq_status);
+  }
   {  // 7.22 LIMITS（boot_id 0x89ABCDEF、duty_max 40、duty_min 3、kp 2、abs_duty_max 60、ff 100、deadband 10、
      // deadband_out 20、abs_max_vel 6000、abs_max_acc 40000。motion-limits 設計 §4.5）。CRC は Python でも確認した値
     v1::McuMsg m{};

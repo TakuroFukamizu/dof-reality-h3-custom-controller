@@ -359,6 +359,7 @@ void v1_task_main(void*) {
     snap.terms = g_axis.duty_terms();
     snap.pwm_permille = g_axis.pwm_permille();
     snap.encoder_fault_check_disabled = g_axis.encoder_fault_check_disabled();
+    snap.sup = g_axis.supervisor_info();
     snap.actual = g_axis.actual_count();
     snap.target = g_axis.target_count();
     snap.velocity = g_axis.velocity_count_s();

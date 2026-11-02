@@ -1259,6 +1259,25 @@ void renderV1() {
   canvas.setTextColor(vsnap.configured && vsnap.referenced && !vsnap.encoder_fault_check_disabled ? kGreen : kAmber,
                       TFT_BLACK);
   canvas.drawString(flag_text, 8, 124);
+  // r10（Issue #44・#46）: 保護の監視。フラグ行の右側に、立っている状態と見えない走行の残り予算（上/下 count）・活動の経過
+  if (vsnap.sup.enabled) {
+    const V1SupInfo& sp = vsnap.sup;
+    char sup_text[64];
+    // 不確か = FEEDBACK_UNCERTAIN（再 ARM まで出力 0）、過負荷 = LOAD_LIMITED、端制動 = END_BRAKING、戻し = LIMIT_RECOVERY、予 = 平常。
+    // 続く数は上/下の残り予算 [count] と、カウントが最後に変わってからの秒（左の CONFIG/基準/電源担当と重ならない幅に収める）
+    const char* what = sp.feedback_uncertain ? "不確か"
+                       : sp.load_limited     ? "過負荷"
+                       : sp.end_braking      ? "端制動"
+                       : (sp.soft_recovery || sp.fe_recovery) ? "戻し"
+                                                               : "予";
+    snprintf(sup_text, sizeof(sup_text), "%s %ld/%ld %lus", what, static_cast<long>(sp.budget_up),
+             static_cast<long>(sp.budget_down), static_cast<unsigned long>(sp.activity_age_ms / 1000));
+    canvas.setTextDatum(middle_right);
+    const bool any = sp.feedback_uncertain || sp.load_limited || sp.end_braking || sp.soft_recovery || sp.fe_recovery;
+    canvas.setTextColor(sp.feedback_uncertain ? kRed : (any ? kAmber : kGray), TFT_BLACK);
+    canvas.drawString(sup_text, width - 8, 124);
+    canvas.setTextDatum(middle_left);
+  }
 
   // リンク行
   char link_text[80];
@@ -1372,6 +1391,11 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.terms.d_permille / 5) != (b.terms.d_permille / 5) ||  // r9 の減衰項（±10 permille）は 0.5 % 刻みで見る
          (a.pwm_permille / 10) != (b.pwm_permille / 10) ||
          a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
+         a.sup.feedback_uncertain != b.sup.feedback_uncertain || a.sup.load_limited != b.sup.load_limited ||
+         a.sup.end_braking != b.sup.end_braking || a.sup.soft_recovery != b.sup.soft_recovery ||
+         a.sup.fe_recovery != b.sup.fe_recovery || (a.sup.budget_up / 100) != (b.sup.budget_up / 100) ||
+         (a.sup.budget_down / 100) != (b.sup.budget_down / 100) ||
+         (a.sup.activity_age_ms / 1000) != (b.sup.activity_age_ms / 1000) ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||

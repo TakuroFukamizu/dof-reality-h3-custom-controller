@@ -57,6 +57,7 @@ struct V1Snapshot {
   V1DutyTerms terms{};           // 位置ループの各項（Issue #25 手順 8 の計器行。permille、カウント増が正）
   int16_t pwm_permille = 0;      // STATUS と同じ pwm_permille（カウント増が正）
   bool encoder_fault_check_disabled = false;  // duty_max がしきい値より低く無パルスの ENCODER_FAULT が出ない（Issue #15 M2）
+  V1SupInfo sup{};               // r10（Issue #44・#46）: 保護の監視の計器（活動の経過・飽和時間・残りの予算・フラグ）
   int32_t actual = 0;
   int32_t target = 0;
   int32_t velocity = 0;          // count/s（100 ms 窓）

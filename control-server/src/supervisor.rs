@@ -413,6 +413,12 @@ pub struct AxisSnapshot {
     pub brake_release_cmd: Option<bool>,
     /// STATUS flag POWER_CONTROLLER: the MCU's own idea of its main-power role.
     pub power_controller: Option<bool>,
+    /// STATUS flags of the r10 protection supervisor (Issues #44 / #46,
+    /// protocol §3.4 bits 7..10). Display only: none of them is a fault.
+    pub load_limited: Option<bool>,
+    pub feedback_uncertain: Option<bool>,
+    pub end_braking: Option<bool>,
+    pub limit_recovery: Option<bool>,
     /// Amperes, only when the MCU sets CURRENT_VALID.
     pub current_a: Option<f64>,
     pub last_applied_frame: Option<u32>,
@@ -1360,6 +1366,10 @@ impl Supervisor {
                     power_on_cmd: s.map(|s| s.flags & status_flags::POWER_ON_CMD != 0),
                     brake_release_cmd: s.map(|s| s.flags & status_flags::BRAKE_RELEASE_CMD != 0),
                     power_controller: s.map(|s| s.flags & status_flags::POWER_CONTROLLER != 0),
+                    load_limited: s.map(|s| s.flags & status_flags::LOAD_LIMITED != 0),
+                    feedback_uncertain: s.map(|s| s.flags & status_flags::FEEDBACK_UNCERTAIN != 0),
+                    end_braking: s.map(|s| s.flags & status_flags::END_BRAKING != 0),
+                    limit_recovery: s.map(|s| s.flags & status_flags::LIMIT_RECOVERY != 0),
                     current_a: s
                         .filter(|s| s.flags & status_flags::CURRENT_VALID != 0)
                         .map(|s| f64::from(s.current_ma) / 1000.0),
