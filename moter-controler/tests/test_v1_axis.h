@@ -3847,8 +3847,9 @@ inline void test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall() 
   CHECK(g.ax.duty_terms().mode == V1DutyMode::BRK && g.ax.breakaway_active() && g.ax.duty_permille() <= -90);
 }
 
-// PR #33 Codex P2: 静止 2 s の監視は「誤差の向きへ 3 count 進んだ」ときだけ時計を戻す。自重で目標から離れる動きでは戻さず、
-// 2 s で ENCODER_FAULT。従来経路（directional = false）は向きを問わない（既存テストのまま）。
+// つなぎ（Issue #44）: 静止 2 s の監視は、どちら向きでも 3 count 動けば時計を戻す（エンコーダが生きている証拠）。乗員に押されて
+// 目標から離れ続ける間は ENCODER_FAULT にしない（PR #33 の Codex P2 で向きを限定したら、手をかけただけで FAULT になった）。
+// 押さえ込まれて全く動かなければ従来どおり 2 s で ENCODER_FAULT（根本対策は #44 の r10）。
 inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
@@ -3865,8 +3866,10 @@ inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
     h.raw -= 3;  // 150 ms ごとに目標から 3 count 離れる（従来の向きを問わない判定なら時計が戻っていた）
   }
   CHECK(h.ax.state() == st::HOLDING);
-  h.drive(200, h.ax.target_count());
-  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT && h.now - t0 <= 2300 * MS);
+  h.drive(1000, h.ax.target_count());  // 押されて離れた後、動きが止まってから 2 s 経つまでは FAULT にしない
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(1200, h.ax.target_count());  // 押さえ込まれて動かないまま 2 s → 従来どおり ENCODER_FAULT
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   // 誤差の向きへ 3 count 進めば時計は戻る
   Harness g;
   g.ax.tuning = r6_tuning(2);
