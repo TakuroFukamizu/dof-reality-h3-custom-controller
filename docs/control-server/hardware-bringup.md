@@ -336,6 +336,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 7. 1 軸ずつ通ったら gain 0.10、0.15 で同じ Pose。`max_gain`（0.15 にしてある）を超える値は `effective_gain` が 0.15 に制限される（`limits` に `gain_limited`）。
 8. 各回、status の `following_error_count`（`following_error_limit_count` に近づくと FAULT）、`velocity_count_s`（`max_vel_count_s` 以下）、`telemetry.tick_dt_ms.p99`（10 ms 前後）を控える。
 9. 向きが 3 軸とも合ったら、limits.md §4 の手順で `duty_min` → 速度・加速度 → Duty 上限の順に上げる（試験ページの「動きの制限」か `POST /v1/limits`。サーバーを再起動せずに変えられる）。
+10. 固定の Pose の代わりに手元のスティックで roll / pitch を動かして確かめるときは **<http://127.0.0.1:8892/joystick>**（DESIGN.md §7.5。h3game と同じ符号: 左右 = roll、前後 = pitch、奥へ倒す = マイナス。yaw は 0。gain はスライダー、`max_gain` で頭打ち）。スティックを離せば 0、抜けば鮮度切れで減速停止する（中央へは戻らない）。
 
 ### 7.3 `/v1/center`
 

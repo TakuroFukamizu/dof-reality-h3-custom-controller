@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>h3-control-server ジョイスティック試験</title>
+<!--
+  h3-control-server のジョイスティック試験ページ（DESIGN.md §7.5）。
+  サーバーが GET /joystick で配信する単一ファイル。外部資源は読まない（オフラインで動く）。
+  ゲームの代わりに、手元のスティックで roll / pitch を動かして新しい設定（limits など）を確かめるためのもの。
+  - スティックの扱いは h3game の web/input.js と index.html に合わせる:
+      roll  ← スティックの左右（axes[0]）、pitch ← スティックの前後（axes[1]）。符号は変えない
+      （h3game: target.pitch = inp.y, target.roll = inp.x。前後は「奥へ倒す = マイナス」）。
+      center / min / max による正規化（norm）、不感帯の再スケール、isStick の判定も同じ式。
+    不感帯の既定だけ h3game の 0.12 ではなく 0.05（細かい動きを見るため）。ならし（smooth）はしない。
+  - 入力モード（localStorage、既定は「速度」）。サーバーとの約束（pose + gain）は変えず、ページの側で倒し量を姿勢に写す:
+      「位置」: 倒し量（不感帯の後、−1..1）をそのまま pose にする（従来どおり）。
+      「速度」: 倒し量を姿勢の変化の速さにする。刻みごとに pose += 倒し量 × rate × dt（rate = 全ストローク/秒、
+        既定 1.0、0.2〜3.0）、−1..1 で切る。倒したままなら進み続け、離せば（不感帯の内側）その姿勢で止まる。
+        大きく倒せば速く（サーバーの max_vel で頭打ち）、少し倒せばゆっくり動く。「中央へ」で指令姿勢を 0 に戻す。
+        「離すと中央へ戻る」を入れると、離したあと戻る速さ（/秒）で 0 へ戻る（既定は切）。
+        「勢い」（実験的、既定は切）: 倒し量の変化の速さ（d|倒し量|/dt を平滑）で rate を 1〜4 倍にする。
+        弾くように倒すと速く、ゆっくり押すと普通の rate。
+      dt は刻みの実測（最大 0.1 s）。スティックを読めなかった刻みは積分しない（指令姿勢はそのまま、frame_seq も止まる）。
+      「姿勢を 0 に固定」のあいだは速度モードの指令姿勢も 0 に戻す（切ったとき中央から始まる）。
+      速度モードから位置モードへ切り替えると姿勢はその場の倒し量へ跳ぶ（位置モードは倒し量 = 姿勢なので）。
+  - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当・入力モードは localStorage。
+  - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
+  - 姿勢は 50 Hz で送る。50 Hz の刻みは Web Worker で回す: 主スレッドの setInterval や requestAnimationFrame は、
+    タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に間引かれ、frame_seq が進まずサーバーの鮮度切れ
+    （source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。Worker のタイマーは間引かれないので、
+    刻みごとに主スレッドでスティックを読み（navigator.getGamepads は隠れていても読める）、姿勢を計算し、
+    スティックを読めたときだけ frame_seq を進めて送る。描画（棒・数値）だけ requestAnimationFrame で行い、
+    描画が止まっても frame_seq と送信は止まらない。隠れても 0（中央）は送らない: 止めたいときは STOP か「送信停止」。
+  - 選んだスティックが見えなくなったら、最後の姿勢のまま frame_seq を止める（0 を送って中央へ戻さない）。
+    割り当てた軸が機器に無い（poseFrom が null）ときも同じ「喪失」扱い。一度も読めていなければ何も送らない（0 を作らない）。
+  - 自動選択はスティックと判定できる機器だけ（軸 2 本以上＋id / mapping）。ペダルやハンドルは静止で ±1 を出すので、
+    間違って選ぶと START で端へ飛ぶ。該当が無ければバナーで知らせ、操作者が一覧から選ぶ（Issue #15 M4）。
+  - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。再開は「送信開始」で新しい session（Issue #15 L2）。
+  - 操作ボタン（ARM / START / DISARM / FAULT RESET）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
+    （判定はサーバーが正。STOP は常に押せる）。
+  - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
+-->
+<!--
+  見た目（2026-11）: 管制卓風の暗い画面。情報の順位は 1. rig_state と fault、2. STOP / ARM / START / DISARM / 中央へ、
+  3. 倒し量と指令姿勢（XY）、4. 3 系統の表、5. 制限と札、6. ログ。装飾はすべて CSS（外部資源・画像・フォントの読み込みは無し）。
+  JS は element の id と、#xy の子の順（u = 輪, b = 塗り）、.bar の先頭の i、#rateCtl の中身、表の列の順に依存する。
+  JS が className を書き換える要素（#rigState, バナー, #padState, #rateCtl, 札, #limEff, #sentPose, .ok / .bad の値, 表の td）は
+  id か JS が付けるクラス名だけで装飾する（markup に足したクラスは最初の更新で消える）。
+-->
+<style>
+  :root {
+    --bg: #050806; --panel: #090d0a; --panel2: #0d130f; --line: #253028; --line2: #46604f;
+    --ink: #e6e8df; --muted: #8f9a91; --dim: #61796a;
+    --orange: #ff8a00; --blue: #69c3e6; --green: #51e593; --yellow: #f6de30; --red: #ff382f; --red2: #c81e15;
+    --amber: var(--orange);
+    --cond: "DIN Condensed", "Avenir Next Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+    --mincho: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+    --sans: "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif;
+    --mono: "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body { margin: 0; padding: 0 0 40px; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+  a { color: var(--muted); }
+  a:hover { color: var(--orange); }
+  b { font-weight: 700; }
+  ::selection { background: var(--orange); color: #000; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+
+  /* ---- 最上段: 管理帯 */
+  h1 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; min-height: 40px; margin: 0; padding: 6px 20px;
+       border-bottom: 1px solid var(--line); font: 700 12px/1.4 var(--mono); letter-spacing: .1em; color: var(--orange); }
+  h1 .small { font-weight: 400; letter-spacing: .06em; }
+  h1 a { margin-left: auto !important; text-decoration: none; border: 1px solid var(--line2); padding: 2px 10px; letter-spacing: .04em; }
+
+  /* ---- バナー: 縞の縁 + 判定文 */
+  .banner { display: none; margin: 10px 20px 0; padding: 8px 12px 8px 24px; font-size: 13px; line-height: 1.5; position: relative; }
+  .banner.show { display: block; }
+  .banner::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 12px; }
+  .banner.bad { color: #ffd9d6; background: #2a0a08; border: 1px solid var(--red); }
+  .banner.bad::before { background: repeating-linear-gradient(135deg, var(--red) 0 6px, #2a0a08 6px 12px); }
+  .banner.warn { color: #fff3b0; background: #221f06; border: 1px solid var(--yellow); }
+  .banner.warn::before { background: repeating-linear-gradient(135deg, var(--yellow) 0 6px, #221f06 6px 12px); }
+
+  /* ---- 1. 指令帯: rig_state / fault / STOP / 操作 */
+  .command { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(300px, 400px); gap: 0; margin: 12px 20px 0;
+             border-top: 4px solid var(--line2); border-bottom: 1px solid var(--line2); background: var(--panel); }
+  .command > div { padding: 12px 16px; min-width: 0; }
+  .state-block { border-right: 1px solid var(--line); }
+  .eyebrow { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font: 700 12px var(--mono); letter-spacing: .14em; color: var(--orange); margin-bottom: 6px; }
+  .eyebrow .small { font-weight: 400; letter-spacing: .04em; }
+  /* rig_state: 画面の主語。コンデンスドの極太を clamp で。語の左に状態色の帯、横に CSS の和文判定語（生の記号も残す） */
+  .state { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 .3em; width: 100%; padding: 2px 12px 6px 14px;
+           border-left: 10px solid var(--muted); color: var(--muted); background: transparent;
+           font: 700 clamp(34px, 5.5vw, 72px)/1 var(--cond); letter-spacing: -.01em; overflow-wrap: anywhere; }
+  .state::after { font: 900 .5em/1 var(--mincho); letter-spacing: .05em; }
+  .state.OFFLINE::after { content: "未接続"; }
+  .state.CONNECTED_DISARMED::after { content: "接続"; }
+  .state.BRAKED_DISARMED::after { content: "制動"; }
+  .state.CALIBRATION_REQUIRED::after { content: "要校正"; }
+  .state.READY_TO_ARM::after { content: "待機"; }
+  .state.ARMING::after { content: "投入中"; }
+  .state.HOLDING::after { content: "保持"; }
+  .state.ACTIVE::after { content: "運転"; }
+  .state.STOPPING::after { content: "停止中"; }
+  .state.FAULT_LATCHED::after { content: "異常"; }
+  .state.CALIBRATION_REQUIRED, .state.ARMING, .state.HOLDING, .state.STOPPING { color: var(--yellow); border-left-color: var(--yellow); }
+  .state.READY_TO_ARM { color: var(--green); border-left-color: var(--green); }
+  .state.ACTIVE { color: #050806; background: var(--orange); border-left-color: #ffd199; }
+  .state.FAULT_LATCHED { color: #0a0202; background: var(--red); border-left-color: #ffd9d6; animation: fault-blink 1s steps(1, end) infinite; }
+  @keyframes fault-blink { 0%, 100% { background: var(--red); } 50% { background: var(--red2); } }
+  .meta { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 10px; font: 12px/1.6 var(--mono); color: var(--muted); }
+  .meta b { color: var(--ink); font-weight: 600; }
+  .meta .ok { color: var(--green); }
+  .fault-line { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font: 13px/1.6 var(--mono); color: var(--muted); }
+  .fault-line > span { overflow-wrap: anywhere; }
+  .fault-line .ok { color: var(--green); }
+  .fault-line .bad { color: var(--red); font-weight: 700; }
+  #fault.bad { display: inline-block; padding: 0 6px; background: var(--red); color: #0a0202; }
+
+  /* STOP: 最も目立つ操作。縞の枠の中の赤い矩形。常に押せる（JS は disabled にしない） */
+  .stop-block { display: flex; align-items: center; justify-content: center; border-right: 1px solid var(--line); }
+  .stop-frame { padding: 8px; background: repeating-linear-gradient(45deg, var(--red) 0 10px, var(--bg) 10px 20px); }
+  button.stop { display: block; margin: 0; min-width: 200px; min-height: 104px; padding: 16px 32px; border: 0; border-radius: 0;
+                background: var(--red); color: #0a0202; font: 900 clamp(32px, 3.2vw, 44px)/1 var(--cond); letter-spacing: .18em; text-indent: .18em;
+                cursor: pointer; box-shadow: inset 0 0 0 3px #0a0202, inset 0 0 0 5px var(--red); }
+  button.stop:hover { background: #ff5a52; }
+  button.stop:active { background: #ffffff; }
+  button.stop:disabled { opacity: 1; cursor: pointer; }
+
+  /* 操作: 直角、細い枠、コンデンスドの大文字。押せないものは薄く。START は緑で区別 */
+  .ops-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { font: 700 15px/1.2 var(--cond); letter-spacing: .08em; padding: 10px 16px; min-height: 42px; border-radius: 0;
+           border: 1px solid var(--line2); background: var(--panel2); color: var(--ink); cursor: pointer; touch-action: manipulation; }
+  button:hover { border-color: var(--orange); color: var(--orange); }
+  button:disabled { opacity: .35; cursor: default; }
+  button:disabled:hover { border-color: var(--line2); color: var(--ink); }
+  button.on { background: var(--orange); color: #050806; border-color: var(--orange); }
+  #bStart { border-color: var(--green); color: var(--green); }
+  #bStart:hover { background: var(--green); color: #050806; }
+  #bFaultReset { border-color: var(--red); color: #ffb3ad; }
+  #bFaultReset:disabled { border-color: var(--line2); color: var(--ink); }
+  #bCmdCenter { border-color: var(--blue); color: var(--blue); }
+  .token-row { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; color: var(--muted); }
+  .token-row label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink); }
+  .hint { margin-top: 8px; font-size: 11px; line-height: 1.6; color: var(--dim); }
+
+  /* ---- 入力: 直角、暗い面、橙のアクセント */
+  input[type=text], input[type=password], input[type=number], select {
+    font: 13px var(--mono); padding: 6px 8px; border: 1px solid var(--line2); border-radius: 0; background: #070b08; color: var(--ink); min-height: 34px; }
+  input[type=number] { width: 5em; }
+  input:disabled, select:disabled { opacity: .45; }
+  input[type=range] { accent-color: var(--orange); min-height: 24px; }
+  input[type=checkbox] { accent-color: var(--orange); width: 16px; height: 16px; vertical-align: -3px; }
+  ::placeholder { color: var(--dim); }
+
+  /* ---- 面: 番号付きの見出し、1px の罫 */
+  body { counter-reset: sec; }
+  section.panel { background: var(--panel); border: 1px solid var(--line); padding: 12px 14px 14px; min-width: 0; }
+  h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 0 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line);
+       font: 700 14px/1.3 var(--sans); color: var(--orange); letter-spacing: .04em; }
+  h2::before { counter-increment: sec; content: counter(sec, decimal-leading-zero); font: 700 12px var(--mono); letter-spacing: .1em;
+               padding: 1px 5px; border: 1px solid var(--orange); }
+  h2 .small { font: 400 11px/1.4 var(--mono); color: var(--dim); letter-spacing: 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 14px 20px 0; }
+  .stack { margin: 14px 20px 0; display: grid; gap: 14px; }
+  .setup { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 14px 20px 0; }
+  .setup section.panel { font-size: 13px; }
+  .setup h2 { color: var(--muted); }
+  .setup h2::before { border-color: var(--muted); }
+
+  /* ---- 3. 主図: 倒し量（橙の輪）と指令姿勢（青の塗り） */
+  .figure-body { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: flex-start; }
+  .xy { position: relative; flex: none; width: 280px; height: 280px; border: 1px solid var(--line2); background-color: #060a07;
+        background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+        background-size: 28px 28px; background-position: 50% 50%; }
+  .xy::before, .xy::after { content: ""; position: absolute; background: var(--line2); }
+  .xy::before { left: 50%; top: 0; bottom: 0; width: 1px; }
+  .xy::after { top: 50%; left: 0; right: 0; height: 1px; }
+  /* 塗り = 指令姿勢（送る値） */
+  .xy b { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; background: var(--blue); left: 50%; top: 50%;
+          box-shadow: 0 0 0 1px #050806; }
+  /* 輪 = 倒し量（スティック）。位置モードでは重なる */
+  .xy u { position: absolute; width: 20px; height: 20px; margin: -11px 0 0 -11px; border: 2px solid var(--orange); left: 50%; top: 50%;
+          text-decoration: none; box-sizing: content-box; }
+  .xy u::before, .xy u::after { content: ""; position: absolute; background: var(--orange); }
+  .xy u::before { left: 50%; top: -6px; bottom: -6px; width: 1px; margin-left: -.5px; }
+  .xy u::after { top: 50%; left: -6px; right: -6px; height: 1px; margin-top: -.5px; }
+  .readouts { display: grid; grid-template-columns: auto auto; gap: 8px 28px; flex: 1 1 260px; min-width: 0; }
+  .readouts > div > .dim { font: 11px/1.4 var(--mono); letter-spacing: .04em; margin-bottom: 4px; }
+  .readouts > div > div:not(.dim) { display: grid; grid-template-columns: 3.2em 1fr; align-items: baseline; font: 12px var(--mono); color: var(--muted); }
+  .big { font: 600 34px/1.15 var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+  #rollBig, #pitchBig { color: var(--orange); }
+  #rollCmd, #pitchCmd { color: var(--blue); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; grid-column: 1 / -1; font: 11px var(--mono); color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; vertical-align: -1px; margin-right: 6px; }
+  .legend .l-stick { border: 2px solid var(--orange); width: 8px; height: 8px; }
+  .legend .l-cmd { background: var(--blue); }
+  .echo { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 2px 18px; padding-top: 8px; border-top: 1px dashed var(--line); font: 12px/1.6 var(--mono); color: var(--muted); }
+  .echo b { color: var(--ink); font-weight: 600; }
+
+  /* ---- 送信 */
+  label.sl { display: grid; grid-template-columns: 4em 1fr 4.5em; gap: 8px; align-items: center; margin: 6px 0; font: 13px var(--mono); }
+  label.sl.w { grid-template-columns: 6em 1fr 4.5em; }
+  label.sl span { text-align: right; color: var(--orange); }
+  .off { opacity: .4; }
+  .kv { display: flex; flex-wrap: wrap; gap: 2px 18px; font: 12px/1.7 var(--mono); color: var(--muted); }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .kv .ok, .ok { color: var(--green); }
+  .bad { color: var(--red); font-weight: 700; }
+  .dim { color: var(--muted); }
+  .small { font-size: 12px; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  #sentPose, #ack { font: 12px/1.6 var(--mono); overflow-wrap: anywhere; }
+  #wsState.bad { background: var(--red); color: #0a0202; padding: 0 6px; }
+  .stream-note { font-size: 11px; line-height: 1.7; color: var(--dim); margin-top: 8px; }
+
+  /* ---- 札: 消灯は輪郭、点灯は黄の塗り */
+  .flag { display: inline-block; padding: 2px 8px; border: 1px solid var(--line2); margin-right: 6px; color: var(--dim); font: 12px var(--mono); letter-spacing: .04em; }
+  .flag.on { background: var(--yellow); color: #171400; border-color: var(--yellow); font-weight: 700; }
+  /* motion_limits の pending（JS は bad を付ける）: 保留 = 黄 */
+  #limEff.bad { color: var(--yellow); font-weight: 700; }
+  .limits-row { display: flex; flex-direction: column; gap: 4px; font: 12px/1.7 var(--mono); color: var(--muted); }
+  .limits-row > span > span { color: var(--orange); letter-spacing: .04em; }
+  .limits-row b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+
+  /* ---- 表: 罫線と桁揃え。列の順は JS が index で書く */
+  .tbl { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font: 12.5px/1.4 var(--mono); font-variant-numeric: tabular-nums; }
+  th, td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; white-space: nowrap; }
+  th { font: 700 11px var(--mono); letter-spacing: .1em; color: var(--orange); border-bottom: 1px solid var(--line2); }
+  td { color: var(--ink); }
+  td.num { text-align: right; }
+  td.ok { color: var(--green); }
+  td.bad { color: #0a0202; background: var(--red); font-weight: 700; }
+  td.num.bad { color: var(--red); background: transparent; }
+  tbody tr:nth-child(even) td { background: #0b100c; }
+  tbody tr:nth-child(even) td.bad { background: var(--red); }
+  tbody tr:nth-child(even) td.num.bad { background: #0b100c; }
+  #axes td:first-child { color: var(--orange); font-weight: 700; }
+
+  /* ---- 軸の割当: 値と棒（中央 0、右が +） */
+  .axis { display: grid; grid-template-columns: 4em 1fr; gap: 6px 10px; align-items: center; margin: 8px 0; }
+  .axis > b { font: 700 18px var(--cond); letter-spacing: .06em; color: var(--orange); }
+  .axis .ctl { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+  .axis .ctl label { display: flex; align-items: center; gap: 4px; }
+  .bar { position: relative; height: 14px; background: #070b08; border: 1px solid var(--line2); overflow: hidden; }
+  .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line2); }
+  .bar i { position: absolute; top: 0; bottom: 0; background: var(--orange); }
+  .bar.raw i { background: var(--dim); }
+  .btns span { display: inline-block; min-width: 1.6em; text-align: center; border: 1px solid var(--line); margin: 1px; font: 11px/1.6 var(--mono); color: var(--dim); }
+  .btns span.on { background: var(--orange); color: #050806; border-color: var(--orange); }
+  #padState { font-size: 12px; }
+  #padState.bad { color: var(--red); font-weight: 700; }
+  #padState.ok { color: var(--green); }
+
+  /* ---- ログ */
+  .log { font: 11.5px/1.5 var(--mono); background: #030504; border: 1px solid var(--line); padding: 8px; margin: 0; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; color: var(--muted); }
+  .log .bad { color: var(--red); font-weight: 400; }
+
+  /* ---- 狭い幅: 主状態 → 操作 → 主図 → 表 の順を保つ */
+  @media (max-width: 1100px) {
+    .command { grid-template-columns: minmax(0, 1fr) auto; }
+    .ops-block { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+  }
+  @media (max-width: 760px) {
+    h1, .banner, .command, .workspace, .stack, .setup { margin-left: 10px; margin-right: 10px; }
+    h1 { padding: 6px 10px; }
+    .command { grid-template-columns: 1fr; }
+    .command > div { padding: 10px 12px; }
+    .state-block, .stop-block { border-right: 0; }
+    .state { font-size: clamp(30px, 10vw, 44px); border-left-width: 8px; padding-left: 10px; }
+    .stop-block { padding: 10px 12px; }
+    .stop-frame { width: 100%; }
+    button.stop { width: 100%; min-height: 84px; }
+    .ops-row button { flex: 1 1 40%; min-height: 48px; }
+    .workspace, .setup { grid-template-columns: 1fr; }
+    .xy { width: 240px; height: 240px; margin: 0 auto; }
+    .figure-body { justify-content: center; }
+    .readouts { grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+    .big { font-size: 28px; }
+    .meta, .fault-line, .kv { gap: 2px 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<h1>h3-control-server ジョイスティック試験 <span class="dim small" id="hostLabel"></span> <a href="/" class="small" style="margin-left:12px">オペレーター用試験ページ（/）へ</a></h1>
+<div id="pollBanner" class="banner bad"></div>
+<div id="padBanner" class="banner warn"></div>
+
+<!-- 1. 指令帯: rig_state と fault、STOP、操作 -->
+<section class="command">
+  <div class="state-block">
+    <div class="eyebrow">リグ状態 <span class="dim small">GET /v1/status（200 ms）</span> <span id="statusAge" class="dim small"></span></div>
+    <span id="rigState" class="state">—</span>
+    <div class="meta">
+      <span>armed: <b id="armed">—</b></span>
+      <span>active_source: <b id="activeSource">—</b></span>
+      <span>session: <b id="statusSession">—</b></span>
+      <span>fresh: <b id="fresh">—</b></span>
+    </div>
+    <div class="fault-line">
+      <span>fault: <span id="fault">—</span></span>
+      <span>axis_conflict: <b id="axisConflict">—</b></span>
+      <span>blockers: <span id="blockers" class="dim">—</span></span>
+    </div>
+  </div>
+  <div class="stop-block">
+    <div class="stop-frame"><button id="bStop" class="stop" title="POST /v1/stop（トークン不要）。物理非常停止ではない">STOP</button></div>
+  </div>
+  <div class="ops-block">
+    <div class="ops-row">
+      <button id="bArm">ARM</button>
+      <button id="bStart">START</button>
+      <button id="bDisarm">DISARM</button>
+      <button id="bFaultReset">FAULT RESET</button>
+      <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
+    </div>
+    <div class="token-row">
+      <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
+      <span class="dim small">sessionStorage に保存（このタブだけ）</span>
+    </div>
+    <div class="hint">順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</div>
+  </div>
+</section>
+
+<div class="workspace">
+<!-- 3. 主図: 倒し量と指令姿勢 -->
+<section class="panel">
+  <h2>倒し量と指令姿勢 <span class="small">横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）</span></h2>
+  <div class="figure-body">
+    <div class="xy" id="xy" title="横 = roll、縦 = pitch（上 = マイナス = 前へ倒す）。輪 = 倒し量、塗り = 指令姿勢（送る値）"><u></u><b></b></div>
+    <div class="readouts">
+      <div><div class="dim small">倒し量（不感帯の後、−1..1）</div>
+        <div>roll <span id="rollBig" class="big mono">0.00</span></div>
+        <div>pitch <span id="pitchBig" class="big mono">0.00</span></div></div>
+      <div><div class="dim small">指令姿勢（pose として送る値）</div>
+        <div>roll <span id="rollCmd" class="big mono">—</span></div>
+        <div>pitch <span id="pitchCmd" class="big mono">—</span></div></div>
+      <div class="legend"><span><i class="l-stick"></i>輪 = 倒し量（スティック）</span><span><i class="l-cmd"></i>塗り = 指令姿勢（送る値）</span></div>
+      <div class="echo">
+        <span>requested_pose: <b id="reqPose" class="mono">—</b></span>
+        <span>target_counts: <b id="targets" class="mono">—</b></span>
+      </div>
+      <div class="dim small" id="cmdNote" style="grid-column:1/-1">速度モード: 倒し量 × rate × dt を積分したものが指令姿勢。位置モード: 倒し量 = 指令姿勢（yaw は 0）</div>
+    </div>
+  </div>
+</section>
+
+<!-- 2'. 送信（session / WS） -->
+<section class="panel">
+  <h2>送信 <span class="small">POST /v1/session → WS /v1/motion、50 Hz（Web Worker の刻み）、seq 単調増加、frame_seq はスティックを読めた刻みごと、source_age_ms 0、yaw 0</span></h2>
+  <!-- 入力モード（localStorage）。既定は「速度」: 倒し量 = 姿勢の変化の速さ。サーバーに送るものは pose + gain のまま -->
+  <div class="row">
+    <label>入力モード <select id="inMode">
+      <option value="rate">速度（倒し量 = 姿勢の変化の速さ）</option>
+      <option value="pos">位置（倒し量 = 姿勢）</option>
+    </select></label>
+    <span class="dim small" id="modeNote"></span>
+  </div>
+  <div id="rateCtl">
+    <label class="sl w" title="倒し切ったときの姿勢の変化の速さ。1.0 = 中央から端まで 1 秒。サーバーの max_vel がそれより遅ければサーバーの制限で頭打ちになる（velocity_limited が点く）">rate <input type="range" id="rate" min="0.2" max="3" step="0.1" value="1.0"><span id="rateV">1.0 /s</span></label>
+    <div class="row small">
+      <label title="倒し量が 0（不感帯の内側）のあいだ、指令姿勢を中央へ戻す。切なら離した姿勢で止まる"><input type="checkbox" id="rtc"> 離すと中央へ戻る</label>
+      <label class="sl w" style="display:inline-grid; margin:0" title="中央へ戻る速さ（全ストローク/秒）">戻る速さ <input type="range" id="rtcSpeed" min="0.1" max="3" step="0.1" value="0.5"><span id="rtcSpeedV">0.5 /s</span></label>
+      <label title="実験的。倒し量の変化の速さ（d|倒し量|/dt を約 0.15 s で平滑）で rate を 1〜4 倍にする。弾くように倒すと速く、ゆっくり押すと普通の rate。離す動きでは増やさない"><input type="checkbox" id="momentum"> 勢い（実験的）</label>
+      <span id="momentumV" class="mono dim">×1.00</span>
+    </div>
+  </div>
+  <!-- 既定 1.0 = スティック全開でソフトリミット内の端まで。安全側の上限はサーバーの max_gain（setMaxGain でスライダーの最大に反映） -->
+  <label class="sl w">gain <input type="range" id="gain" min="0" max="1" step="0.01" value="1.00"><span id="gainV">1.00</span></label>
+  <div class="row" style="margin-top:8px">
+    <button id="bStream">送信開始</button>
+    <button id="bZero" title="入のあいだはスティックの値の代わりに pitch = roll = 0 を送る（frame_seq はスティックが見えているときだけ進む）">姿勢を 0 に固定: 切</button>
+  </div>
+  <div class="kv" style="margin-top:8px">
+    <span>WS: <b id="wsState">closed</b></span>
+    <span>seq: <b id="seq" class="mono">0</b></span>
+    <span>frame_seq: <b id="frameSeq" class="mono">0</b></span>
+    <span>max_gain: <b id="maxGain">—</b></span>
+    <span>session: <b id="sessionLabel" class="mono">なし</b></span>
+  </div>
+  <div class="kv" style="margin-top:4px"><span>送っている pose: <span id="sentPose" class="mono dim">—</span></span></div>
+  <div class="kv" style="margin-top:4px"><span>最後の ack: <span id="ack" class="dim">—</span></span></div>
+  <div class="stream-note">
+    「送信開始」は新しい session を発行する（走行中なら新 session で止まり、動きの制限は設定の初期値に戻る）。
+    位置モード: スティックを離せば（不感帯の内側なら）0 を送る。速度モード: 離せばその姿勢で止まる（「離すと中央へ戻る」なら戻る速さで 0 へ）。「中央へ」で指令姿勢を 0 に。
+    スティックが見えなくなったり割り当てた軸が機器に無いときは最後の値のまま frame_seq を止める（速度モードの積分も止まる。サーバーが鮮度切れで減速停止する）。
+    ack が stale_session（別のクライアントが session を発行した・サーバー再起動）なら送信を止める。再開は「送信開始」。
+  </div>
+</section>
+</div>
+
+<div class="stack">
+<!-- 4. 3 系統 -->
+<section class="panel">
+  <h2>3 系統 <span class="small">actual = エンコーダーの値（count）</span></h2>
+  <div class="tbl">
+  <table>
+    <thead><tr>
+      <th>軸</th><th>名前</th><th>接続</th><th>mcu_state</th><th>fault_code</th><th>flags</th>
+      <th>actual</th><th>target</th><th>velocity</th><th>f.err</th><th>pwm‰</th><th>status_age</th><th>decode_errors</th><th>校正</th>
+    </tr></thead>
+    <tbody id="axes"></tbody>
+  </table>
+  </div>
+  <div class="dim small" style="margin-top:6px">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral / sign）。</div>
+</section>
+
+<!-- 5. 制限と札 -->
+<section class="panel">
+  <h2>制限と札 <span class="small">status の limits / motion_limits</span></h2>
+  <div class="limits-row">
+    <span><span>effective_gain:</span> <b id="effGain">—</b></span>
+    <span><span>limits:</span> <b id="limits">—</b></span>
+    <span><span>motion_limits 有効値 (max_gain / max_vel / max_acc / duty_max):</span> <b id="limEff" class="mono">—</b></span>
+    <span><span>上限:</span> <b id="limCeil" class="mono">—</b></span>
+  </div>
+  <!-- velocity_limited / acceleration_limited は planner が出す札なので WS の ack には乗らず（ack の limits は受け付け時の
+       pose_clamped / gain_limited だけ）、GET /v1/status の limits（200 ms）に出る。ここはそれを札で見せる -->
+  <div style="margin-top:10px">サーバーの制限 <span class="dim small">status の limits</span>: <span class="flag" id="flagVel">velocity_limited</span><span class="flag" id="flagAcc">acceleration_limited</span><span id="flagOther" class="dim small"></span></div>
+  <div class="stream-note">点いているあいだは、速さを決めているのはページでなくサーバー（planner の max_vel / max_acc）。速くしたいならオペレーター用試験ページの「動きの制限」（max_vel / max_acc）を上げる。このページの rate や gain を上げても速くならない。</div>
+</section>
+</div>
+
+<div class="setup">
+<!-- 機器の選択 -->
+<section class="panel">
+  <h2>ジョイスティック <span class="small">Gamepad API</span></h2>
+  <div class="dim small">ブラウザは<b>ボタンを 1 回押すか大きく倒す</b>まで機器を出さない。自動で選ぶのは「軸 2 本以上で、id（T.16000M / joystick / stick / HOTAS / pad / joy / controller。Thrustmaster だけでは同社のハンドルも通るので入れない）か mapping = standard がスティックだと言っている」機器だけ（ペダル・ハンドル等には落ちない。該当が無ければ一覧から選ぶ）。選択は localStorage に保存。</div>
+  <div class="row" style="margin-top:8px">
+    <label>使用するスティック <select id="padSelect"><option value="">（未検出）</option></select></label>
+    <button id="bPadDefault" title="スティックと判定できる機器（軸 2 本以上＋id / mapping）で最初に見つかるものを選ぶ">自動で選ぶ</button>
+    <span id="padState" class="dim small">—</span>
+  </div>
+  <div class="tbl" style="margin-top:8px">
+  <table>
+    <thead><tr><th>index</th><th>id</th><th>axes</th><th>buttons</th><th>判定</th><th>使用</th></tr></thead>
+    <tbody id="pads"></tbody>
+  </table>
+  </div>
+  <div class="row small" style="margin-top:8px">
+    <span>選択中の生の値:</span><span id="padAxes" class="mono dim">—</span>
+  </div>
+  <div class="btns" id="padButtons" style="margin-top:4px"></div>
+</section>
+
+<!-- 軸の割当 -->
+<section class="panel">
+  <h2>軸の割当 <span class="small">roll ← 左右（axes[0]）、pitch ← 前後（axes[1]）。h3game と同じ符号（前へ倒す = pitch マイナス）</span></h2>
+  <div class="axis">
+    <b>roll</b>
+    <div class="ctl">
+      <label>axis <input type="number" id="rollAxis" min="0" step="1" value="0"></label>
+      <label><input type="checkbox" id="rollInvert"> 反転</label>
+      <button id="bAssignRoll" title="4 秒のあいだにいちばん大きく動いた軸を roll に割り当てる">動かして割り当て</button>
+      <span id="assignRoll" class="dim small"></span>
+    </div>
+    <span class="dim small">raw</span><div class="bar raw" id="rollRawBar"><i></i></div>
+    <span class="dim small">norm</span><div class="bar" id="rollBar"><i></i></div>
+    <span></span><div class="row small"><span>raw <span id="rollRaw" class="mono">—</span></span><span>norm <span id="rollNorm" class="mono">—</span></span><span class="dim">(center <span id="rollCenter" class="mono">0</span>)</span></div>
+  </div>
+  <div class="axis">
+    <b>pitch</b>
+    <div class="ctl">
+      <label>axis <input type="number" id="pitchAxis" min="0" step="1" value="1"></label>
+      <label><input type="checkbox" id="pitchInvert"> 反転</label>
+      <button id="bAssignPitch" title="4 秒のあいだにいちばん大きく動いた軸を pitch に割り当てる">動かして割り当て</button>
+      <span id="assignPitch" class="dim small"></span>
+    </div>
+    <span class="dim small">raw</span><div class="bar raw" id="pitchRawBar"><i></i></div>
+    <span class="dim small">norm</span><div class="bar" id="pitchBar"><i></i></div>
+    <span></span><div class="row small"><span>raw <span id="pitchRaw" class="mono">—</span></span><span>norm <span id="pitchNorm" class="mono">—</span></span><span class="dim">(center <span id="pitchCenter" class="mono">0</span>)</span></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>不感帯 <input type="number" id="dead" min="0" max="0.9" step="0.01" value="0.05"></label>
+    <button id="bCenter" title="いまの生の値を両軸の中央（0）にする">中央を取り直す</button>
+    <button id="bResetMap" title="axes 0 / 1、反転なし、center 0、不感帯 0.05 に戻す">割当を初期化</button>
+  </div>
+</section>
+</div>
+
+<div class="stack">
+<!-- 6. ログ -->
+<section class="panel">
+  <h2>HTTP ログ <span class="small">応答本文はすべて表示</span></h2>
+  <div id="httpLog" class="log"></div>
+</section>
+</div>
+
+<script>
+// ---------------------------------------------------------------- H3Joy: 純粋な写像（試験から呼べるように window に置く）
+// h3game の web/input.js と同じ式。DOM もネットワークも触らない。
+window.H3Joy = (function () {
+  'use strict';
+  // input.js: isStick / isPedal（id の正規表現、または軸・ボタンの数）。表示用の判定で、自動選択には使わない
+  const isStick = (p) => /t\.16000|thrustmaster|joystick|stick|hotas/i.test(p.id) || (p.axes.length >= 3 && p.buttons.length >= 4);
+  const isPedal = (p) => /pedal|rudder|saitek|crosswind|logitech g/i.test(p.id) || (p.axes.length <= 3 && p.buttons.length <= 1);
+  // 自動選択してよい機器（Issue #15 M4）: 軸 2 本以上、かつ id か mapping がスティック／パッドだと言っている。
+  // 軸・ボタンの本数だけでは選ばない（ペダルやハンドルは静止で ±1 を出すので、間違って選ぶと START で端へ飛ぶ）。
+  // "thrustmaster" は入れない: 同社のハンドル（T300 / T248、ペダルの軸が静止で ±1）も通ってしまう。スティックは
+  // T.16000M / T.Flight Hotas / T.Flight Stick X のどれも t\.16000 / hotas / stick で拾える。
+  const STICK_ID = /t\.16000|joystick|stick|hotas|pad|joy|controller/i;
+  const looksLikeStick = (p) => p.axes.length >= 2 && !isPedal(p) && (p.mapping === 'standard' || STICK_ID.test(p.id));
+  // 既定のスティック: looksLikeStick の最初のもの（index 順）。無ければ null（操作者が一覧から選ぶ）。
+  function pickDefault(pads) {
+    const sorted = pads.slice().sort((a, b) => a.index - b.index);
+    return sorted.find(looksLikeStick) || null;
+  }
+  // 選んだ機器を探す: 同じ index と id → 同じ id（index が変わった）→ null
+  function findPad(pads, sel) {
+    if (!sel) return null;
+    return pads.find((q) => q.index === sel.index && q.id === sel.id) || pads.find((q) => q.id === sel.id) || null;
+  }
+  // input.js の norm(): center を 0 とし、記録した min / max（無ければ ±1）で片側ずつ伸ばす。反転、±1 で切る。
+  function norm(m, raw) {
+    if (m == null || raw == null || !Number.isFinite(raw)) return 0;
+    const c = m.center || 0;
+    const up = (m.max != null && m.max > c + 0.05) ? m.max - c : 1 - c;
+    const dn = (m.min != null && m.min < c - 0.05) ? c - m.min : 1 + c;
+    let v = raw >= c ? (raw - c) / Math.max(0.05, up) : (raw - c) / Math.max(0.05, dn);
+    if (m.invert) v = -v;
+    return Math.max(-1, Math.min(1, v));
+  }
+  // input.js の get(): 不感帯の内側は 0、外側は 0..1 に伸ばし直す
+  function deadzone(v, dead) {
+    const d = Math.max(0, Math.min(0.9, Number(dead) || 0));
+    if (Math.abs(v) < d) return 0;
+    return Math.sign(v) * (Math.abs(v) - d) / (1 - d);
+  }
+  // 姿勢: roll ← 左右の軸、pitch ← 前後の軸（index.html: target.pitch = inp.y, target.roll = inp.x。符号は変えない）
+  function poseFrom(pad, map, dead) {
+    if (!pad) return null;
+    const rawR = pad.axes[map.roll.axis];
+    const rawP = pad.axes[map.pitch.axis];
+    if (rawR == null || rawP == null) return null;
+    const roll = deadzone(norm(map.roll, rawR), dead);
+    const pitch = deadzone(norm(map.pitch, rawP), dead);
+    return { roll, pitch, rawRoll: rawR, rawPitch: rawP, normRoll: norm(map.roll, rawR), normPitch: norm(map.pitch, rawP) };
+  }
+  // 割当: seen[axis] = {min, max} のうち、いちばん大きく動いた軸（threshold より大きい動きだけ）
+  function mostMoved(seen, threshold) {
+    let best = -1, span = threshold == null ? 0.45 : threshold;
+    seen.forEach((s, a) => { const sc = s.max - s.min; if (sc > span) { span = sc; best = a; } });
+    return best < 0 ? null : { axis: best, span };
+  }
+  // 速度モードの 1 刻み（純粋関数）。cmd = 指令姿勢 {pitch, roll}、stick = 倒し量（不感帯の後、−1..1）、dt = 秒。
+  // opts: rate（全ストローク/秒）、mult（勢いの倍率、1 以上）、rtc（離すと中央へ戻る）、rtcSpeed（/秒）。
+  // 倒していれば cmd += stick × rate × mult × dt、倒していなければそのまま（rtc なら rtcSpeed で 0 へ寄せ、行き過ぎない）。
+  // dt は 0..0.1 s で切る（刻みが遅れても跳ばない）。結果は −1..1 で切る。
+  function rateStep(cmd, stick, dt, opts) {
+    const o = opts || {};
+    const r = Math.max(0, Number(o.rate) || 0) * Math.max(1, Number(o.mult) || 1);
+    const d = Math.max(0, Math.min(0.1, Number(dt) || 0));
+    const out = {};
+    for (const k of ['pitch', 'roll']) {
+      const s = stick ? (Number(stick[k]) || 0) : 0;
+      let v = cmd ? (Number(cmd[k]) || 0) : 0;
+      if (s !== 0) v += s * r * d;
+      else if (o.rtc) { const step = Math.max(0, Number(o.rtcSpeed) || 0) * d; v = Math.abs(v) <= step ? 0 : v - Math.sign(v) * step; }
+      out[k] = Math.max(-1, Math.min(1, v));
+    }
+    return out;
+  }
+  // 勢い（実験的）: 倒し量の変化の速さ |Δstick| / dt を時定数 tau で平滑し、倍率 1 + k × speed（1..max）にする。
+  // 1 を下回らない（普通に倒したときより遅くはしない）。離す動き（|stick| が減る）は数えない。
+  function momentum(prev, stick, lastStick, dt, opts) {
+    const o = opts || {};
+    const tau = o.tau == null ? 0.15 : o.tau, k = o.k == null ? 0.2 : o.k, max = o.max == null ? 4 : o.max;
+    const d = Number(dt) || 0;
+    let speed = prev ? (Number(prev.speed) || 0) : 0;
+    if (d > 0 && stick && lastStick) {
+      const mag = Math.hypot(stick.roll, stick.pitch), lastMag = Math.hypot(lastStick.roll, lastStick.pitch);
+      const inst = mag > lastMag ? Math.hypot(stick.roll - lastStick.roll, stick.pitch - lastStick.pitch) / d : 0;
+      const a = d / (tau + d);
+      speed += a * (inst - speed);
+    }
+    return { speed, mult: Math.max(1, Math.min(max, 1 + k * speed)) };
+  }
+  // ブラウザの Gamepad API を素の配列に写す（試験では navigator.getGamepads を差し替える）
+  function readPads() {
+    let gp = [];
+    try { gp = navigator.getGamepads ? Array.from(navigator.getGamepads()) : []; } catch (e) { gp = []; }
+    return gp.filter((g) => g).map((g) => ({
+      id: String(g.id), index: g.index, mapping: String(g.mapping || ''), axes: Array.from(g.axes, Number),
+      buttons: Array.from(g.buttons, (b) => !!(b && b.pressed)),
+    }));
+  }
+  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, rateStep, momentum, readPads };
+})();
+</script>
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const J = window.H3Joy;
+  const TOKEN_KEY = 'h3cs_admin_token';
+  const MAP_KEY = 'h3cs_joystick';
+  const INPUT_KEY = 'h3cs_joystick_input';
+  const DEFAULT_MAP = () => ({ roll: { axis: 0, invert: false, center: 0, min: null, max: null }, pitch: { axis: 1, invert: false, center: 0, min: null, max: null } });
+  const DEFAULT_INPUT = () => ({ mode: 'rate', rate: 1.0, rtc: false, rtcSpeed: 0.5, momentum: false });
+  const state = {
+    session: null, maxGain: null, lastStatus: null, ws: null, streaming: false, seq: 0, frameSeq: 0,
+    pollBusy: false, lastPollError: null,
+    pads: [], sel: null, pad: null, map: DEFAULT_MAP(), dead: 0.05, pose: null, zero: false, assigning: null,
+    padLost: false, lostWhy: '', noAutoPick: false,
+    // 入力モード。pose = 倒し量（不感帯の後）、cmd = 指令姿勢（pose として送る値）。位置モードでは cmd = pose、
+    // 速度モードでは cmd を倒し量で積分する。lastTick = 前回スティックを読めた刻みの時刻（dt の実測）。
+    input: DEFAULT_INPUT(), cmd: { pitch: 0, roll: 0 }, lastTick: null, mom: { speed: 0, mult: 1 },
+  };
+
+  $('hostLabel').textContent = location.host;
+
+  // ---------------------------------------------------------------- token
+  const tokenInput = $('token');
+  tokenInput.value = sessionStorage.getItem(TOKEN_KEY) || '';
+  tokenInput.addEventListener('input', () => sessionStorage.setItem(TOKEN_KEY, tokenInput.value));
+  const token = () => tokenInput.value.trim();
+
+  // ---------------------------------------------------------------- http log
+  const httpLog = $('httpLog');
+  function log(line, bad) {
+    const d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString() + ' ' + line;
+    if (bad) d.className = 'bad';
+    httpLog.prepend(d);
+    while (httpLog.childElementCount > 60) httpLog.removeChild(httpLog.lastChild);
+  }
+
+  // Every request goes through here so every error body is shown.
+  async function call(method, path, opts) {
+    opts = opts || {};
+    const headers = {};
+    if (opts.auth && token()) headers['Authorization'] = 'Bearer ' + token();
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    let resp, text;
+    try {
+      resp = await fetch(path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body), cache: 'no-store' });
+      text = await resp.text();
+    } catch (e) {
+      if (!opts.silent) log(method + ' ' + path + ' -> ネットワークエラー: ' + e, true);
+      throw e;
+    }
+    if (!opts.silent) log(method + ' ' + path + ' -> ' + resp.status + ' ' + text, !resp.ok);
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { /* 本文は JSON とは限らない */ }
+    return { ok: resp.ok, status: resp.status, text, json };
+  }
+
+  // ---------------------------------------------------------------- admin buttons
+  function adminButton(id, path, opts) {
+    $(id).addEventListener('click', async () => {
+      const b = $(id);
+      b.disabled = true;
+      try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
+      // 戻すときはリグ状態の判定に任せる（次の status を待たずに、押せない状態を押せるに戻さない）
+      if (state.lastStatus) updateButtons(state.lastStatus); else b.disabled = false;
+    });
+  }
+  $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
+  adminButton('bArm', '/v1/arm', { auth: true });
+  adminButton('bStart', '/v1/start', { auth: true });
+  adminButton('bDisarm', '/v1/disarm', { auth: true });
+  adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+
+  // ---------------------------------------------------------------- status
+  const fmt = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  const LIMIT_FIELDS = ['max_gain', 'max_vel_count_s', 'max_acc_count_s2', 'duty_max_percent'];
+  const limitsText = (o) => o ? LIMIT_FIELDS.map((k) => fmt(o[k])).join(' / ') : '—';
+
+  function setMaxGain(g) {
+    state.maxGain = g;
+    const gain = $('gain');
+    gain.max = String(g);
+    if (parseFloat(gain.value) > g) gain.value = String(g);
+    $('maxGain').textContent = String(g);
+    $('gainV').textContent = parseFloat(gain.value).toFixed(2);
+  }
+
+  // 操作ボタンの押せる／押せない（STOP 以外）。リグ状態から決め、押せない理由を title に出す。
+  // サーバー側の判定が正。ここは「いま意味のある操作」を見せるためのもの（オペレーター用試験ページと同じ規則）。
+  // bCenter はこのページではスティックの「中央を取り直す」なので対象外。
+  function updateButtons(s) {
+    const st = s.rig_state || '';
+    const armedStates = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
+    const fresh = !!(s.session && s.session.fresh);
+    const rules = {
+      bArm: [st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED', '前提: READY_TO_ARM か BRAKED_DISARMED（いま ' + st + '）'],
+      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
+      bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
+      bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
+    };
+    for (const id in rules) {
+      const el = $(id);
+      if (!el) continue;
+      const [ok, why] = rules[id];
+      if (el.dataset.title0 === undefined) el.dataset.title0 = el.getAttribute('title') || '';
+      el.disabled = !ok;
+      el.title = ok ? el.dataset.title0 : why;
+    }
+  }
+
+  function renderStatus(s) {
+    if (s.admin_token_required === false) {
+      tokenInput.placeholder = '不要（require_admin_token = false）';
+      tokenInput.disabled = true;
+    } else if (s.admin_token_required === true) {
+      tokenInput.placeholder = 'H3CS_ADMIN_TOKEN';
+      tokenInput.disabled = false;
+    }
+    state.lastStatus = s;
+    updateButtons(s);
+    const rig = $('rigState');
+    rig.textContent = s.rig_state;
+    rig.className = 'state ' + s.rig_state;
+    $('armed').textContent = fmt(s.armed);
+    $('activeSource').textContent = fmt(s.active_source);
+    $('statusSession').textContent = s.session ? (fmt(s.session.source_session_prefix) + ' last_seq=' + fmt(s.session.last_seq) + ' last_frame_seq=' + fmt(s.session.last_frame_seq)) : 'なし';
+    const fresh = $('fresh');
+    fresh.textContent = s.session ? String(s.session.fresh) : '—';
+    fresh.className = s.session && s.session.fresh ? 'ok' : '';
+    $('effGain').textContent = fmt(s.effective_gain);
+    $('limits').textContent = (s.limits && s.limits.length) ? s.limits.join(', ') : 'なし';
+    renderLimitFlags(s.limits);
+    const p = s.requested_pose;
+    $('reqPose').textContent = p ? ('pitch ' + Number(p.pitch).toFixed(2) + ' roll ' + Number(p.roll).toFixed(2) + ' yaw ' + Number(p.yaw).toFixed(2)) : '—';
+    $('targets').textContent = Array.isArray(s.target_counts) ? s.target_counts.join(', ') : '—';
+    const ml = s.motion_limits;
+    if (ml) {
+      // pending: 全軸の SET_LIMITS 確認待ち（別 PR で追加。無いサーバーでは出さない）
+      const pending = (ml.pending !== undefined && ml.pending !== null && ml.pending !== false && !(Array.isArray(ml.pending) && !ml.pending.length));
+      $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '') + (pending ? ' (pending: ' + fmt(ml.pending) + ')' : '');
+      $('limEff').className = pending ? 'mono bad' : 'mono';
+      $('limCeil').textContent = limitsText(ml.ceiling);
+      if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) setMaxGain(ml.effective.max_gain);
+    }
+    const conflict = s.axis_conflict || [];
+    $('axisConflict').textContent = conflict.length ? conflict.join(', ') + '（競合: 入力拒否）' : 'なし';
+    $('axisConflict').className = conflict.length ? 'bad' : 'ok';
+    const bl = $('blockers');
+    bl.textContent = (s.blockers && s.blockers.length) ? s.blockers.join(' / ') : 'なし';
+    bl.className = (s.blockers && s.blockers.length) ? 'bad' : 'ok';
+    const f = $('fault');
+    f.textContent = s.fault ? JSON.stringify(s.fault) : 'なし';
+    f.className = s.fault ? 'bad' : 'ok';
+    (s.axes || []).forEach((a, i) => updateAxisRow(axisRow(i), a));
+  }
+
+  // 軸の行は 1 回だけ作り、以後は td の中身だけ更新する。
+  const axisRows = [];
+  const COLS = 14;
+  function axisRow(i) {
+    if (axisRows[i]) return axisRows[i];
+    const tr = document.createElement('tr');
+    const cells = [];
+    for (let c = 0; c < COLS; c++) { const td = document.createElement('td'); tr.appendChild(td); cells.push(td); }
+    $('axes').appendChild(tr);
+    axisRows[i] = { tr, cells };
+    return axisRows[i];
+  }
+  function set(cell, text, cls) {
+    if (cell.textContent !== text) cell.textContent = text;
+    const c = cls || '';
+    if (cell.className !== c) cell.className = c;
+  }
+  function updateAxisRow(row, a) {
+    const c = row.cells;
+    set(c[0], String(a.axis_id));
+    set(c[1], a.name || '');
+    set(c[2], a.connected ? '接続' : '未接続', a.connected ? 'ok' : 'bad');
+    set(c[3], fmt(a.mcu_state), a.mcu_state === 'FAULT' ? 'bad' : '');
+    set(c[4], fmt(a.fault_code), (a.fault_code && a.fault_code !== 'NONE') ? 'bad' : '');
+    set(c[5], [a.power_on_cmd ? 'P' : '-', a.brake_release_cmd ? 'B' : '-', a.configured ? 'C' : '-', a.referenced ? 'R' : '-', a.power_controller ? 'PC' : '--'].join(' '));
+    set(c[6], fmt(a.actual_count), 'num');
+    set(c[7], fmt(a.target_count), 'num');
+    set(c[8], fmt(a.velocity_count_s), 'num');
+    set(c[9], fmt(a.following_error_count), 'num');
+    set(c[10], fmt(a.pwm_permille), 'num');
+    set(c[11], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : Number(a.status_age_ms).toFixed(0) + ' ms', 'num');
+    set(c[12], fmt(a.decode_errors), (a.decode_errors ? 'num bad' : 'num'));
+    set(c[13], calText(a), calClass(a));
+  }
+  function calText(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'CALIBRATING';
+    const c = a.calibration;
+    if (!c) return '—';
+    return c.result + ' (' + c.reason + ') n_end ' + fmt(c.n_end_count) + ' neutral ' + fmt(c.neutral_count) + ' sign ' + fmt(c.sign);
+  }
+  function calClass(a) {
+    if (a.mcu_state === 'CALIBRATING') return 'bad';
+    const c = a.calibration;
+    if (!c) return '';
+    return c.result === 'OK' ? 'ok' : 'bad';
+  }
+
+  // 同じエラーが続いても HTTP ログには 1 回だけ出す（バナーには常に出す）。
+  function pollError(text) {
+    const banner = $('pollBanner');
+    banner.textContent = text;
+    banner.className = 'banner bad show';
+    if (state.lastPollError !== text) { state.lastPollError = text; log(text, true); }
+  }
+  async function pollStatus() {
+    if (state.pollBusy) return;
+    state.pollBusy = true;
+    const t0 = performance.now();
+    try {
+      const r = await call('GET', '/v1/status', { silent: true });
+      if (r.ok && r.json) {
+        renderStatus(r.json);
+        $('pollBanner').className = 'banner bad';
+        state.lastPollError = null;
+        $('statusAge').textContent = '(' + (performance.now() - t0).toFixed(0) + ' ms)';
+      } else {
+        pollError('GET /v1/status -> ' + r.status + ' ' + r.text);
+      }
+    } catch (e) {
+      pollError('GET /v1/status に届かない: ' + e);
+    }
+    state.pollBusy = false;
+  }
+  setInterval(pollStatus, 200);
+  pollStatus();
+
+  // ---------------------------------------------------------------- joystick: 選択と割当（localStorage）
+  function loadMap() {
+    try {
+      const s = JSON.parse(localStorage.getItem(MAP_KEY));
+      if (s && typeof s === 'object') {
+        if (s.sel && typeof s.sel.id === 'string' && Number.isInteger(s.sel.index)) state.sel = { id: s.sel.id, index: s.sel.index };
+        for (const k of ['roll', 'pitch']) {
+          const m = s.map && s.map[k];
+          if (m && Number.isInteger(m.axis) && m.axis >= 0) {
+            state.map[k] = { axis: m.axis, invert: !!m.invert, center: Number(m.center) || 0, min: Number.isFinite(m.min) ? m.min : null, max: Number.isFinite(m.max) ? m.max : null };
+          }
+        }
+        if (Number.isFinite(s.dead)) state.dead = Math.max(0, Math.min(0.9, s.dead));
+      }
+    } catch (e) { /* 壊れた保存値は無視 */ }
+  }
+  function saveMap() {
+    try { localStorage.setItem(MAP_KEY, JSON.stringify({ sel: state.sel, map: state.map, dead: state.dead })); } catch (e) { /* 無視 */ }
+  }
+  function renderMapControls() {
+    for (const k of ['roll', 'pitch']) {
+      $(k + 'Axis').value = String(state.map[k].axis);
+      $(k + 'Invert').checked = state.map[k].invert;
+      $(k + 'Center').textContent = Number(state.map[k].center).toFixed(3);
+    }
+    $('dead').value = String(state.dead);
+  }
+  loadMap();
+  renderMapControls();
+
+  for (const k of ['roll', 'pitch']) {
+    $(k + 'Axis').addEventListener('change', () => {
+      const v = parseInt($(k + 'Axis').value, 10);
+      if (Number.isInteger(v) && v >= 0) { state.map[k] = { axis: v, invert: state.map[k].invert, center: 0, min: null, max: null }; saveMap(); renderMapControls(); }
+    });
+    $(k + 'Invert').addEventListener('change', () => { state.map[k].invert = $(k + 'Invert').checked; saveMap(); });
+  }
+  $('dead').addEventListener('change', () => {
+    const v = parseFloat($('dead').value);
+    if (Number.isFinite(v)) { state.dead = Math.max(0, Math.min(0.9, v)); saveMap(); renderMapControls(); }
+  });
+  // 中央を取り直す: いまの生の値を両軸の center にする（input.js の centerAll と同じ。min / max は残す）
+  $('bCenter').addEventListener('click', () => {
+    const pad = J.findPad(state.pads, state.sel);
+    if (!pad) { log('中央: スティックが見えていない', true); return; }
+    for (const k of ['roll', 'pitch']) {
+      const raw = pad.axes[state.map[k].axis];
+      if (raw != null) state.map[k].center = +raw.toFixed(3);
+    }
+    saveMap(); renderMapControls();
+    log('中央を取り直した: roll ' + state.map.roll.center + ' pitch ' + state.map.pitch.center);
+  });
+  $('bResetMap').addEventListener('click', () => {
+    state.map = DEFAULT_MAP(); state.dead = 0.05; saveMap(); renderMapControls();
+    log('割当を初期化した（axes 0 / 1、反転なし、center 0、不感帯 0.05）');
+  });
+
+  // ---------------------------------------------------------------- 入力モード（localStorage）。既定は「速度」
+  const clampNum = (v, lo, hi, dflt) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt);
+  function loadInput() {
+    try {
+      const s = JSON.parse(localStorage.getItem(INPUT_KEY));
+      if (s && typeof s === 'object') {
+        const d = DEFAULT_INPUT();
+        state.input = {
+          mode: s.mode === 'pos' ? 'pos' : 'rate',
+          rate: clampNum(Number(s.rate), 0.2, 3, d.rate),
+          rtc: !!s.rtc,
+          rtcSpeed: clampNum(Number(s.rtcSpeed), 0.1, 3, d.rtcSpeed),
+          momentum: !!s.momentum,
+        };
+      }
+    } catch (e) { /* 壊れた保存値は無視 */ }
+  }
+  function saveInput() {
+    try { localStorage.setItem(INPUT_KEY, JSON.stringify(state.input)); } catch (e) { /* 無視 */ }
+  }
+  function renderInputControls() {
+    const inp = state.input;
+    const rate = inp.mode === 'rate';
+    $('inMode').value = inp.mode;
+    $('rate').value = String(inp.rate);
+    $('rateV').textContent = inp.rate.toFixed(1) + ' /s';
+    $('rtc').checked = inp.rtc;
+    $('rtcSpeed').value = String(inp.rtcSpeed);
+    $('rtcSpeedV').textContent = inp.rtcSpeed.toFixed(1) + ' /s';
+    $('momentum').checked = inp.momentum;
+    $('rateCtl').className = rate ? '' : 'off';
+    for (const id of ['rate', 'rtc', 'rtcSpeed', 'momentum', 'bCmdCenter']) $(id).disabled = !rate;
+    $('rtcSpeed').disabled = !rate || !inp.rtc;
+    $('modeNote').textContent = rate
+      ? '倒し量が姿勢の変化の速さになる。倒したままなら進み続け、離せばその姿勢で止まる（大きく倒す = 速い、少し倒す = ゆっくり）'
+      : '倒し量がそのまま姿勢になる（従来どおり）。離せば 0（中央）へ';
+  }
+  loadInput();
+  renderInputControls();
+  $('inMode').addEventListener('change', () => {
+    const m = $('inMode').value === 'pos' ? 'pos' : 'rate';
+    if (m === state.input.mode) return;
+    // 位置 → 速度: cmd は位置モードのあいだ倒し量を追っているのでそのまま続く（跳ばない）。
+    // 速度 → 位置: 次の刻みで cmd = 倒し量になる（その場の倒し量へ跳ぶ。送信中なら注意）。
+    state.input.mode = m; saveInput(); renderInputControls();
+    state.mom = { speed: 0, mult: 1 };
+    log('入力モード: ' + (m === 'rate' ? '速度（倒し量 = 姿勢の変化の速さ）' : '位置（倒し量 = 姿勢）') + (m === 'pos' && state.streaming ? ' — 姿勢はいまの倒し量へ跳ぶ' : ''), m === 'pos' && state.streaming);
+  });
+  $('rate').addEventListener('input', () => { state.input.rate = clampNum(parseFloat($('rate').value), 0.2, 3, 1.0); saveInput(); renderInputControls(); });
+  $('rtc').addEventListener('change', () => { state.input.rtc = $('rtc').checked; saveInput(); renderInputControls(); });
+  $('rtcSpeed').addEventListener('input', () => { state.input.rtcSpeed = clampNum(parseFloat($('rtcSpeed').value), 0.1, 3, 0.5); saveInput(); renderInputControls(); });
+  $('momentum').addEventListener('change', () => { state.input.momentum = $('momentum').checked; state.mom = { speed: 0, mult: 1 }; saveInput(); renderInputControls(); });
+  // 中央へ: 指令姿勢を 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす（跳ぶのは指令値だけ）。
+  $('bCmdCenter').addEventListener('click', () => {
+    state.cmd = { pitch: 0, roll: 0 };
+    log('指令姿勢を中央（pitch 0 / roll 0）にした');
+  });
+
+  // 割当: 4 秒のあいだ、選択中のスティックでいちばん大きく動いた軸を役割に結びつける（input.js の assign と同じ規則）
+  function assign(key) {
+    if (state.assigning) return;
+    const pad0 = J.findPad(state.pads, state.sel);
+    if (!pad0) { log('割当: スティックが見えていない', true); return; }
+    const SECONDS = 4;
+    const t0 = performance.now();
+    const base = pad0.axes.slice();
+    const seen = base.map((v) => ({ min: v, max: v }));
+    const out = $(key === 'roll' ? 'assignRoll' : 'assignPitch');
+    state.assigning = key;
+    $('bAssignRoll').disabled = $('bAssignPitch').disabled = true;
+    const iv = setInterval(() => {
+      const pad = J.findPad(state.pads, state.sel);
+      const el = (performance.now() - t0) / 1000;
+      if (pad) {
+        for (let a = 0; a < seen.length && a < pad.axes.length; a++) {
+          seen[a].min = Math.min(seen[a].min, pad.axes[a]);
+          seen[a].max = Math.max(seen[a].max, pad.axes[a]);
+        }
+      }
+      const best = J.mostMoved(seen);
+      out.textContent = (SECONDS - el).toFixed(1) + ' s: ' + key + ' にしたい軸を大きく倒して戻す' + (best ? '（候補 axis ' + best.axis + '）' : '');
+      // 大きく動いて戻ったら早めに確定
+      const returned = best && pad && el >= 1.5 && Math.abs(pad.axes[best.axis] - base[best.axis]) < 0.08 && best.span > 0.6;
+      if (el >= SECONDS || returned) {
+        clearInterval(iv);
+        state.assigning = null;
+        $('bAssignRoll').disabled = $('bAssignPitch').disabled = false;
+        if (best) {
+          const c = base[best.axis];
+          state.map[key] = { axis: best.axis, invert: state.map[key].invert, center: +c.toFixed(3), min: +seen[best.axis].min.toFixed(3), max: +seen[best.axis].max.toFixed(3) };
+          saveMap(); renderMapControls();
+          out.textContent = 'axis ' + best.axis + ' を割り当てた（center ' + state.map[key].center + ', min ' + state.map[key].min + ', max ' + state.map[key].max + '）';
+          log('割当: ' + key + ' ← axis ' + best.axis);
+        } else {
+          out.textContent = '動いた軸が無かった（割当は変えない）';
+        }
+      }
+    }, 50);
+  }
+  $('bAssignRoll').addEventListener('click', () => assign('roll'));
+  $('bAssignPitch').addEventListener('click', () => assign('pitch'));
+
+  // ---------------------------------------------------------------- joystick: 機器の一覧と選択
+  const padSelect = $('padSelect');
+  let padsKey = '';
+  const padKey = (p) => p.index + '|' + p.id;
+  function renderPadList() {
+    const key = state.pads.map(padKey).join('\n') + '\n' + (state.sel ? padKey(state.sel) : '');
+    if (key === padsKey) return;
+    padsKey = key;
+    const cur = J.findPad(state.pads, state.sel);
+    // select
+    while (padSelect.firstChild) padSelect.removeChild(padSelect.firstChild);
+    if (!state.pads.length) {
+      const o = document.createElement('option'); o.value = ''; o.textContent = '（未検出: ボタンを 1 回押すか大きく倒す）'; padSelect.appendChild(o);
+    }
+    for (const p of state.pads) {
+      const o = document.createElement('option');
+      o.value = padKey(p);
+      o.textContent = '#' + p.index + ' ' + p.id + ' (axes ' + p.axes.length + ', buttons ' + p.buttons.length + ')';
+      if (cur && padKey(cur) === padKey(p)) o.selected = true;
+      padSelect.appendChild(o);
+    }
+    // table
+    const tb = $('pads');
+    while (tb.firstChild) tb.removeChild(tb.firstChild);
+    for (const p of state.pads) {
+      const tr = document.createElement('tr');
+      const cells = [String(p.index), p.id, String(p.axes.length), String(p.buttons.length),
+        (J.isStick(p) ? 'stick' : '') + (J.isPedal(p) ? ' pedal' : ''), (cur && padKey(cur) === padKey(p)) ? '使用中' : ''];
+      cells.forEach((t, i) => { const td = document.createElement('td'); td.textContent = t; if (i === 5 && t) td.className = 'ok'; tr.appendChild(td); });
+      tb.appendChild(tr);
+    }
+  }
+  padSelect.addEventListener('change', () => {
+    const p = state.pads.find((q) => padKey(q) === padSelect.value);
+    if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); padsKey = ''; log('スティック: #' + p.index + ' ' + p.id); }
+  });
+  $('bPadDefault').addEventListener('click', () => {
+    const p = J.pickDefault(state.pads);
+    if (!p) {
+      log(state.pads.length ? 'スティック: スティックと判定できる機器が無い（ペダル・ハンドル等は自動で選ばない）。一覧から選ぶ' : 'スティック: 機器が見えていない（ボタンを 1 回押す）', true);
+      return;
+    }
+    state.sel = { id: p.id, index: p.index }; saveMap(); padsKey = '';
+    log('スティック（自動）: #' + p.index + ' ' + p.id);
+  });
+  window.addEventListener('gamepadconnected', (e) => log('gamepadconnected: #' + e.gamepad.index + ' ' + e.gamepad.id));
+  window.addEventListener('gamepaddisconnected', (e) => log('gamepaddisconnected: #' + e.gamepad.index + ' ' + e.gamepad.id, true));
+
+  // ---------------------------------------------------------------- joystick: 50 Hz の刻み（Worker）で読む。frame_seq はここで進む
+  // 刻みごとに: スティックを読む → 姿勢を計算 → 読めたときだけ frame_seq を進める → WS が開いていれば送る。
+  // 描画は別（rAF の frame()）。描画が止まっても（タブが隠れる・別ウィンドウに覆われる）ここは止まらない。
+  function tick() {
+    state.pads = J.readPads();
+    state.noAutoPick = false;
+    if (!state.sel && state.pads.length) {
+      const p = J.pickDefault(state.pads);
+      if (p) { state.sel = { id: p.id, index: p.index }; saveMap(); log('スティック（自動）: #' + p.index + ' ' + p.id); }
+      else state.noAutoPick = true; // スティックと判定できる機器が無い: 操作者が一覧から選ぶ（ペダル等に落ちない）
+    }
+    const pad = J.findPad(state.pads, state.sel);
+    state.pad = pad;
+    // 姿勢が計算できた刻みだけ frame_seq を進める。スティックが見えない・割り当てた軸が機器に無い（null）は
+    // どちらも「喪失」: 最後の姿勢のまま frame_seq を止める（0 を作って送らない。Issue #15 M4）。
+    const pose = pad ? J.poseFrom(pad, state.map, state.dead) : null;
+    if (pose) {
+      // 指令姿勢を進める。dt は刻みの実測（読めなかった刻みのあとは 0 から: 跳ばない。rateStep が 0.1 s で切る）。
+      const now = performance.now();
+      const dt = state.lastTick == null ? 0 : (now - state.lastTick) / 1000;
+      state.lastTick = now;
+      if (state.input.mode !== 'rate') {
+        state.cmd = { pitch: pose.pitch, roll: pose.roll };          // 位置: 倒し量 = 姿勢
+      } else if (state.zero) {
+        state.cmd = { pitch: 0, roll: 0 };                           // 0 固定のあいだは積分しない（切ると中央から）
+      } else {
+        state.mom = state.input.momentum ? J.momentum(state.mom, pose, state.pose, dt) : { speed: 0, mult: 1 };
+        state.cmd = J.rateStep(state.cmd, pose, dt, { rate: state.input.rate, mult: state.mom.mult, rtc: state.input.rtc, rtcSpeed: state.input.rtcSpeed });
+      }
+      state.pose = pose;
+      state.frameSeq += 1;
+      state.padLost = false;
+      state.lostWhy = '';
+    } else {
+      state.lastTick = null; // 喪失中は積分しない（cmd はそのまま）
+      state.padLost = !!(state.sel && state.streaming);
+      state.lostWhy = pad ? ('割り当てた軸が機器に無い（roll axis ' + state.map.roll.axis + ' / pitch axis ' + state.map.pitch.axis + '、機器の軸は ' + pad.axes.length + ' 本）') : 'スティックが見えない';
+    }
+    sendPose();
+  }
+
+  // 50 Hz のタイマーは Worker で回す（主スレッドの setInterval は裏に回ると 1 Hz 程度に間引かれる）
+  let tickWorker = null;
+  let tickTimer = null;
+  function startTicker(ms) {
+    stopTicker();
+    try {
+      const src = 'let t=null;onmessage=e=>{if(e.data&&e.data.start){clearInterval(t);t=setInterval(()=>postMessage(1),e.data.start)}else{clearInterval(t);t=null}}';
+      tickWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      tickWorker.onmessage = () => tick();
+      tickWorker.postMessage({ start: ms });
+    } catch (e) {
+      log('Worker が使えないので setInterval で刻む（裏に回ると間引かれる）: ' + e, true);
+      tickTimer = setInterval(tick, ms);
+    }
+  }
+  function stopTicker() {
+    if (tickWorker) { try { tickWorker.terminate(); } catch (e) { /* 無視 */ } tickWorker = null; }
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  }
+
+  // ---------------------------------------------------------------- joystick: 描画（rAF）。読み取りも frame_seq も触らない
+  function setBar(id, v) {
+    const i = $(id).firstElementChild;
+    const w = Math.min(1, Math.abs(v)) * 50;
+    i.style.left = (v < 0 ? 50 - w : 50) + '%';
+    i.style.width = w + '%';
+  }
+  function renderStick(pad, pose, cmd) {
+    if (pad) {
+      $('padAxes').textContent = pad.axes.map((v) => (v >= 0 ? '+' : '') + v.toFixed(3)).join('  ');
+      const bb = $('padButtons');
+      if (bb.childElementCount !== pad.buttons.length) {
+        while (bb.firstChild) bb.removeChild(bb.firstChild);
+        pad.buttons.forEach((_, i) => { const s = document.createElement('span'); s.textContent = String(i + 1); bb.appendChild(s); });
+      }
+      pad.buttons.forEach((on, i) => { const s = bb.children[i]; const c = on ? 'on' : ''; if (s.className !== c) s.className = c; });
+    } else {
+      $('padAxes').textContent = '—';
+    }
+    const vals = pose || { roll: 0, pitch: 0, rawRoll: null, rawPitch: null, normRoll: 0, normPitch: 0 };
+    for (const k of ['roll', 'pitch']) {
+      const raw = vals[k === 'roll' ? 'rawRoll' : 'rawPitch'];
+      const n = vals[k === 'roll' ? 'normRoll' : 'normPitch'];
+      $(k + 'Raw').textContent = raw == null ? '—' : raw.toFixed(3);
+      $(k + 'Norm').textContent = n.toFixed(3);
+      $(k + 'Big').textContent = vals[k].toFixed(2);
+      setBar(k + 'RawBar', raw == null ? 0 : raw);
+      setBar(k + 'Bar', vals[k]);
+    }
+    // 輪 = 倒し量、塗り = 指令姿勢（送る値）。位置モードでは重なる。指令姿勢がまだ無ければ塗りは中央に置く
+    const ring = $('xy').firstElementChild;
+    ring.style.left = (50 + vals.roll * 45) + '%';
+    ring.style.top = (50 + vals.pitch * 45) + '%';
+    const c = cmd || { pitch: 0, roll: 0 };
+    const dot = ring.nextElementSibling;
+    dot.style.left = (50 + c.roll * 45) + '%';
+    dot.style.top = (50 + c.pitch * 45) + '%';
+    $('rollCmd').textContent = cmd ? c.roll.toFixed(2) : '—';
+    $('pitchCmd').textContent = cmd ? c.pitch.toFixed(2) : '—';
+    $('momentumV').textContent = '×' + state.mom.mult.toFixed(2);
+  }
+
+  function frame() {
+    renderPadList();
+    const pad = state.pad;
+    const banner = $('padBanner');
+    const readable = pad && !state.lostWhy;
+    if (readable) {
+      $('padState').textContent = '読み取り中: #' + pad.index + ' ' + pad.id;
+      $('padState').className = 'ok small';
+    } else if (pad) {
+      $('padState').textContent = '#' + pad.index + ' ' + pad.id + ': ' + state.lostWhy;
+      $('padState').className = 'bad small';
+    } else {
+      $('padState').textContent = state.sel ? '選んだスティックが見えない: #' + state.sel.index + ' ' + state.sel.id
+        : (state.noAutoPick ? '未選択: スティックと判定できる機器が無い（一覧から選ぶ）' : '未選択（ボタンを 1 回押すと一覧に出る）');
+      $('padState').className = 'bad small';
+    }
+    // バナー: 送信中の喪失（見えない／軸が範囲外）は警告。未選択で自動選択できない機器だけのときも知らせる。
+    if (state.padLost) {
+      banner.textContent = state.lostWhy + ': 最後の姿勢のまま frame_seq を止めている（サーバーの鮮度切れで減速停止する。姿勢がまだ無ければ何も送らない）。STOP で止めてもよい';
+      banner.className = 'banner warn show';
+    } else if (!state.sel && state.noAutoPick) {
+      banner.textContent = 'スティックと判定できる機器が見つからない（ペダル・ハンドル等は自動で選ばない）。使う機器を「使用するスティック」から選んでください';
+      banner.className = 'banner warn show';
+    } else if (banner.className.indexOf('show') >= 0) {
+      banner.className = 'banner warn';
+    }
+    // 読めているあいだはいまの値、喪失中は棒を 0 に戻す（送っている最後の姿勢は sentPose に出る）
+    renderStick(pad, readable ? state.pose : null, state.pose ? state.cmd : null);
+    $('frameSeq').textContent = String(state.frameSeq);
+    requestAnimationFrame(frame);
+  }
+  startTicker(20);
+  requestAnimationFrame(frame);
+
+  // ---------------------------------------------------------------- pose streamer
+  $('gain').addEventListener('input', () => { $('gainV').textContent = parseFloat($('gain').value).toFixed(2); });
+  $('bZero').addEventListener('click', () => {
+    state.zero = !state.zero;
+    $('bZero').textContent = '姿勢を 0 に固定: ' + (state.zero ? '入' : '切');
+    $('bZero').className = state.zero ? 'on' : '';
+  });
+
+  function setWsState(text, bad) {
+    $('wsState').textContent = text;
+    $('wsState').className = bad ? 'bad' : '';
+  }
+
+  // 送信を止める。50 Hz の刻み（スティックの読み取り）は止めない: sendPose が WS の無いときは何もしない。
+  // bad = 操作者の意図しない停止（stale_session など）。理由を赤で残し、再開は「送信開始」を押す。
+  function stopStream(reason, bad) {
+    state.streaming = false;
+    state.padLost = false;
+    if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
+    $('bStream').textContent = '送信開始';
+    $('padBanner').className = 'banner warn';
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), !!bad);
+  }
+
+  // 送る姿勢: 0 固定なら 0、そうでなければ指令姿勢 cmd（位置モードでは最後に読んだ倒し量、速度モードでは積分値。yaw は常に 0）。
+  // まだ一度もスティックを読めていなければ null（0 をでっち上げて送らない。Issue #15 M4）。
+  function currentPose() {
+    if (state.zero) return { pitch: 0, roll: 0 };
+    return state.pose ? { pitch: state.cmd.pitch, roll: state.cmd.roll } : null;
+  }
+
+  // status の limits を札で出す（velocity_limited / acceleration_limited が点いているあいだは速さを決めているのはサーバー。
+  // planner の札なので WS の ack には乗らない: ack の limits は受け付け時の pose_clamped / gain_limited だけ）
+  function renderLimitFlags(limits) {
+    const l = Array.isArray(limits) ? limits : [];
+    $('flagVel').className = 'flag' + (l.indexOf('velocity_limited') >= 0 ? ' on' : '');
+    $('flagAcc').className = 'flag' + (l.indexOf('acceleration_limited') >= 0 ? ' on' : '');
+    const other = l.filter((x) => x !== 'velocity_limited' && x !== 'acceleration_limited');
+    $('flagOther').textContent = other.length ? other.join(', ') : '';
+  }
+
+  function sendPose() {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const p = currentPose();
+    if (!p) {
+      $('sentPose').textContent = '（姿勢がまだ無い: 送らない）';
+      $('sentPose').className = 'mono bad';
+      return;
+    }
+    state.seq += 1;
+    const msg = {
+      type: 'pose', protocol: 1, source_session: state.session,
+      seq: state.seq, frame_seq: state.frameSeq, source_age_ms: 0,
+      pitch: p.pitch, roll: p.roll, yaw: 0,
+      gain: parseFloat($('gain').value),
+    };
+    ws.send(JSON.stringify(msg));
+    $('seq').textContent = String(state.seq);
+    $('sentPose').textContent = 'pitch ' + p.pitch.toFixed(3) + ' roll ' + p.roll.toFixed(3) + ' yaw 0 gain ' + msg.gain.toFixed(2) + (state.zero ? '（0 固定）' : '') + (state.padLost ? '（喪失: ' + state.lostWhy + '、frame_seq 停止）' : '');
+    $('sentPose').className = 'mono' + (state.padLost ? ' bad' : '');
+  }
+
+  async function startStream() {
+    const b = $('bStream');
+    b.disabled = true;
+    try {
+      const r = await call('POST', '/v1/session');
+      if (!(r.ok && r.json && typeof r.json.source_session === 'string')) { b.disabled = false; return; }
+      state.session = r.json.source_session;
+      if (typeof r.json.max_gain === 'number') setMaxGain(r.json.max_gain);
+      $('sessionLabel').textContent = state.session.slice(0, 8) + '…';
+    } catch (e) { b.disabled = false; return; }
+    b.disabled = false;
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/v1/motion?session=' + encodeURIComponent(state.session));
+    state.ws = ws;
+    setWsState('connecting', false);
+    ws.onopen = () => {
+      setWsState('open', false);
+      state.streaming = true; // 以後は Worker の刻み（tick）が sendPose を呼ぶ
+      b.textContent = '送信停止';
+    };
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type !== 'ack') return;
+      const a = $('ack');
+      a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted' : 'REJECTED ' + fmt(m.reason)) +
+        ' effective_gain=' + fmt(m.effective_gain) + ' limits=' + ((m.limits && m.limits.length) ? m.limits.join(',') : 'なし') + ' fresh=' + fmt(m.fresh);
+      a.className = m.accepted ? 'ok' : 'bad';
+      // stale_session: この session はもう自分のものではない（別のクライアントが発行した／サーバー再起動）。
+      // 50 Hz で拒否され続けても意味が無いので送信を止める（Python クライアントと同じ）。再開は「送信開始」（新 session）。
+      if (m.accepted === false && m.reason === 'stale_session' && state.ws === ws) {
+        stopStream('stale_session', true);
+        log('WS: ack stale_session — session が無効になった（別のクライアントが session を発行したか、サーバーが再起動した）。送信を止めた。再開は「送信開始」', true);
+      }
+    };
+    ws.onerror = () => { setWsState('error', true); };
+    ws.onclose = (ev) => { if (state.ws === ws) stopStream('close ' + ev.code); };
+  }
+
+  $('bStream').addEventListener('click', () => {
+    if (state.streaming || state.ws) stopStream('operator'); else startStream();
+  });
+
+  window.addEventListener('pagehide', () => stopStream('pagehide'));
+})();
+</script>
+</body>
+</html>

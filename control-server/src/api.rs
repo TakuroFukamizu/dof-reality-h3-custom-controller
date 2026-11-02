@@ -42,7 +42,10 @@
 //! - `GET /` and `GET /index.html` serve the embedded operator test page
 //!   ([`TEST_PAGE`], `static/test_page.html`, no external resources). It is
 //!   not in [`lan_allowed`]: the page carries the admin token, which never
-//!   travels over the LAN.
+//!   travels over the LAN. `GET /joystick` and `GET /joystick.html` serve the
+//!   joystick test page ([`JOYSTICK_PAGE`], `static/joystick_page.html`:
+//!   roll / pitch from a Gamepad API stick, same rules and headers), also
+//!   closed to the LAN.
 //! - Origin check ([`check_origin`]): an `Origin` header must be in
 //!   `allowed_origins`, **or** be the page's own origin: exactly
 //!   `http://<Host header>` where the Host's hostname is `localhost` or a
@@ -101,6 +104,9 @@ pub const ADMIN_QUEUE_LEN: usize = 16;
 
 /// Operator test page (DESIGN.md §7.4), embedded so the binary works offline.
 pub const TEST_PAGE: &str = include_str!("../static/test_page.html");
+/// Joystick test page (DESIGN.md §7.5): roll / pitch from a stick, same
+/// status / admin handling as the operator page. Embedded like [`TEST_PAGE`].
+pub const JOYSTICK_PAGE: &str = include_str!("../static/joystick_page.html");
 
 pub type AdminReply = Result<AdminOk, AdminError>;
 /// One admin command and where to send its result.
@@ -302,6 +308,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(test_page))
         .route("/index.html", get(test_page))
+        .route("/joystick", get(joystick_page))
+        .route("/joystick.html", get(joystick_page))
         .route("/v1/session", post(new_session))
         .route("/v1/motion", get(motion))
         .route("/v1/status", get(status))
@@ -476,7 +484,16 @@ impl TokenBucket {
 // ------------------------------------------------------------------ test page
 
 async fn test_page() -> Response {
-    ([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], Html(TEST_PAGE)).into_response()
+    embedded_page(TEST_PAGE)
+}
+
+async fn joystick_page() -> Response {
+    embedded_page(JOYSTICK_PAGE)
+}
+
+/// `text/html`, `Cache-Control: no-store` (the pages change with the binary).
+fn embedded_page(html: &'static str) -> Response {
+    ([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], Html(html)).into_response()
 }
 
 // ------------------------------------------------------------------ admin

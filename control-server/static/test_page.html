@@ -14,6 +14,8 @@
     間引かれ、frame_seq が進まずサーバーの鮮度切れ（source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。
     Worker のタイマーは間引かれないので、ウィンドウが裏に回っても送り続ける。
     隠れても 0（中央）を送らない: 止めたいときは STOP か「送信停止」。
+  - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。「session 発行」は送信中なら先に送信を止める
+    （WS は ?session= の旧 id に固定されるので、新 id の pose はすべて拒否されるため）。再開は「送信開始」（Issue #15 L2）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
   - 校正（POST /v1/calibrate、DESIGN.md §11）は機構を両端まで動かす。確認ダイアログの後にだけ送る。
 -->
@@ -61,7 +63,7 @@
     <span class="dim small">sessionStorage に保存（このタブだけ）</span>
   </div>
   <div class="row" style="margin-top:8px">
-    <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する">session 発行</button>
+    <button id="bSession" title="POST /v1/session。走行中なら新 session で停止する。送信中なら先に送信を止める（新 session で「送信開始」を押し直す）">session 発行</button>
     <button id="bArm" title="POST /v1/arm。全軸 HOLDING まで">ARM</button>
     <button id="bStart" title="POST /v1/start。HOLDING → ACTIVE（新鮮な姿勢が要る）">START</button>
     <button id="bDisarm">DISARM</button>
@@ -254,6 +256,9 @@
   });
 
   $('bSession').addEventListener('click', async () => {
+    // 送信中に新しい session を発行すると、WS は旧 id に固定されたまま（?session=）で pose だけ新 id になり
+    // すべて stale_session で拒否される。先に送信を止め、新 session で「送信開始」を押し直す（Issue #15 L2）。
+    if (state.timer || state.ws) { stopStream('session 発行'); log('姿勢送信: 新しい session を発行するので送信を止めた。「送信開始」で新 session の WS を開く'); }
     try {
       const r = await call('POST', '/v1/session');
       if (r.ok && r.json) {
@@ -558,11 +563,12 @@
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
   }
 
-  function stopStream(reason) {
+  // bad = 操作者の意図しない停止（stale_session など）。理由を赤で残し、再開は「送信開始」を押す。
+  function stopStream(reason, bad) {
     stopTicker();
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
-    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), false);
+    setWsState('closed' + (reason ? ' (' + reason + ')' : ''), !!bad);
   }
 
   function sendPose() {
@@ -595,6 +601,15 @@
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      // stale_session（pose でも limits でも）: この session はもう自分のものではない（別のクライアントが発行した／
+      // サーバー再起動）。50 Hz で拒否され続けても意味が無いので止める（Python クライアントと同じ）。再開は「送信開始」。
+      if (m.type === 'ack' && m.accepted === false && m.reason === 'stale_session' && state.ws === ws) {
+        $('ack').textContent = 'seq ' + fmt(m.seq) + ' REJECTED stale_session';
+        $('ack').className = 'bad';
+        stopStream('stale_session', true);
+        log('WS: ack stale_session — session が無効になった（別のクライアントが session を発行したか、サーバーが再起動した）。送信を止めた。「session 発行」→「送信開始」で再開', true);
+        return;
+      }
       if (m.type === 'ack' && (m.effective_limits || (m.accepted === false && m.seq === state.lastLimitsSeq))) {
         const a = $('limAck');
         a.textContent = 'seq ' + fmt(m.seq) + ' ' + (m.accepted ? 'accepted ' + limitsText(m.effective_limits) : 'REJECTED ' + fmt(m.reason)) +
