@@ -249,6 +249,28 @@ constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
 constexpr double V1_VEL_KD_PERMILLE_PER_COUNT_S = 0.05;  // Kd: 速度誤差 1 count/s あたり 0.05 permille（200 count/s で上限 10）
 constexpr int V1_VEL_D_MAX_PERMILLE = 10;                // |u_d| の上限 1 %
 constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定の窓
+// Issue #45: 再生バッファ（playout）で SET_POSITION の列から参照（位置・速度）を作る。既定 1、-DV1_PLAYOUT=0 で従来の
+// 「目標ごとに行って止まる」軌道（profile_step）に戻る（V1Tuning::playout_delay_ms = 0 と同じ）。
+// 従来の欠陥: 100 Hz の整数の目標を毎回の移動先として扱い、追いつくと速度を加速度制限を迂回して 0 にしていた → ゆっくり
+//（≲ 70 count/s）では FF（切片 4.6 % を |v| < 30 でテーパ）と r9 の減衰が 1 tick で約 50 permille 抜ける。
+// 新しい経路: 受信時刻つきでフレームをリングに積み、playout 時刻 = いま − DELAY で、その前後 WINDOW の最小二乗直線から
+// 位置・速度を出し、速度・加速度の制限（フレームの max_vel / max_acc。CONFIG で頭打ち）の中で参照を追従させる。
+// 新しいフレームが途切れたら EXTRAP_MS までは直線で外挿、それを越えたら max_acc で減速する（期限 valid_for の扱いは従来どおり）。
+#ifndef V1_PLAYOUT
+#define V1_PLAYOUT 1
+#endif
+#ifndef V1_PLAYOUT_DELAY_MS
+#define V1_PLAYOUT_DELAY_MS 40                            // 再生の遅れ（20 / 40 / 60 を実機で比べる。Issue #45）
+#endif
+constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを推定する窓（playout 時刻を中心に ±窓/2）
+constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
+constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）
+constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
+// Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
+// ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。
+// !!! A_BRAKE・RESERVE は仮値。実機が実際に止まれる減速度と、全速（600 count/s）から止めたときの行き過ぎを計測して決めること。
+constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = 1000.0;     // 端に向かうときの想定減速度 [count/s²]（CONFIG の max_acc より小さく）
+constexpr int32_t V1_SOFT_RESERVE_COUNT = 100;            // ソフトリミットの手前に残す距離 [count]
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

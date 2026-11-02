@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -174,7 +176,8 @@ struct Harness {
     m.hello_req.request_id = request_id;
     return send(m);
   }
-  v1::HostMsg set_position_msg(int32_t target, uint16_t valid_for_ms = 50) {
+  // max_acc: フレームの max_acc_count_s2（Issue #45 の試験は運用値 2000。既定は従来どおり 20000）
+  v1::HostMsg set_position_msg(int32_t target, uint16_t valid_for_ms = 50, uint32_t max_acc = 20000) {
     v1::HostMsg m;
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::SET_POSITION;
@@ -183,7 +186,7 @@ struct Harness {
     m.set_position.group_frame_id = ++frame;
     m.set_position.target_count = target;
     m.set_position.max_vel_count_s = pos_max_vel;
-    m.set_position.max_acc_count_s2 = 20000;
+    m.set_position.max_acc_count_s2 = max_acc;
     m.set_position.valid_for_ms = valid_for_ms;
     m.set_position.apply_at_us = 0;
     return m;
@@ -4381,6 +4384,266 @@ inline void test_r9_damping_reduces_velocity_ripple_in_delayed_plant() {
   }
 }
 
+// ---- Issue #45: 再生バッファ（playout）の参照 -------------------------------------------------------------
+// 実機の受信を模擬する: サーバーの planner が frame_ms ごとに整数の目標を作り（planner.rs と同じく丸める）、USB で遅れて届く
+//（基本 5 ms ＋ 決定的な ±5 ms のぶれ。任意で 100 ms ごとに 40 ms 途切れ、途切れの間のフレームは明けにまとめて届く）。
+// 制御タスク（control_task.cpp）と同じく、5 ms の tick の直前に、その時刻までに届いたフレームを受信時刻つきで渡す
+//（handle(m, tick の時刻, 受信時刻)）。フレームは運用値 max_vel 600 / max_acc 2000、valid_for 100 ms（bringup.toml）。
+// 見るもの: 参照速度 setpoint_vel（FF・r9 の減衰・保持の判定が使う値そのもの）と FF 項。
+
+struct PlayoutScenario {
+  double vel = 50.0;            // 目標の軌道の速度 [count/s]（負なら下向き）
+  uint32_t frame_ms = 10;       // フレームの間隔
+  bool jitter = false;          // ±5 ms のぶれ
+  bool blackout = false;        // 100 ms ごとに 40 ms 途切れてまとめて届く
+  uint32_t drop_every = 0;      // N フレームごとに 1 つ落とす（seq は進む）
+  uint32_t ramp_ms = 3000;      // 軌道が動く時間（その後は止まった目標を送り続ける）
+  uint32_t hold_ms = 1000;
+  uint32_t max_acc = 2000;
+  uint32_t max_vel = 600;
+  bool reverse_half = false;    // 前半 +vel、後半 −vel（反転）
+  uint32_t delay_ms = V1_PLAYOUT_DELAY_MS;  // 0 = 従来の profile_step
+  uint32_t warm_ms = 300;       // 定常区間の始まり（立ち上がりを除く）
+};
+
+struct PlayoutResult {
+  int snaps = 0;            // 定常区間で 速度 ≠ 0 → ちょうど 0 になった回数（人工的な停止）
+  int zero_ticks = 0;       // 定常区間で速度がちょうど 0 の tick
+  double max_dv = 0.0;      // 全区間の |Δv_ref| / tick の最大 [count/s]
+  int ff_p99 = 0;           // 定常区間の |ΔFF| / tick の p99 [permille]
+  int ff_max = 0;
+  double mean_v = 0.0;      // 定常区間の平均の参照速度
+  int sign_changes = 0;     // 全区間で参照速度の向きが変わった回数（0 を挟んでも 1 回）
+  bool left_active = false; // 途中で ACTIVE を外れた（期限切れ・FAULT）
+  bool final_zero = false;  // 最後に参照速度がちょうど 0
+  int32_t final_target = 0; // 最後に送った目標
+  int32_t final_ref = 0;    // 最後の参照位置（target_count）
+  bool hold_mode = false;   // 最後に保持（HOLD）に入っている
+  double ref_min = 0.0, ref_max = 0.0;  // 参照位置の最小・最大
+  int32_t act_min = 0, act_max = 0;     // 実位置の最小・最大
+};
+
+inline double playout_traj(const PlayoutScenario& s, double t_ms) {
+  const double tr = t_ms < s.ramp_ms ? t_ms : s.ramp_ms;
+  double x;
+  if (!s.reverse_half) {
+    x = s.vel * tr / 1000.0;
+  } else {
+    const double half = s.ramp_ms / 2.0;
+    x = tr <= half ? s.vel * tr / 1000.0 : s.vel * (half - (tr - half)) / 1000.0;
+  }
+  const v1::Config c = base_config();  // サーバーと同じく目標はソフトリミットの内側に clamp して送る
+  if (x < c.soft_min_count) x = c.soft_min_count;
+  if (x > c.soft_max_count) x = c.soft_max_count;
+  return x;
+}
+
+inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
+  PlayoutResult r;
+  Harness h;
+  h.ax.tuning = V1Tuning(true);
+  h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // FF の落ちをそのまま見る（r9 の減衰も同じ参照速度を使う）
+  h.ax.tuning.playout_delay_ms = s.delay_ms;
+  h.pos_max_vel = s.max_vel;
+  h.reach_active();
+  const uint64_t t0 = h.now;
+  const uint32_t total_ms = s.ramp_ms + s.hold_ms;
+  struct F {
+    uint64_t del;
+    v1::HostMsg m;
+  };
+  std::vector<F> frames;
+  uint64_t prev_del = t0;
+  for (uint32_t k = 0; k * s.frame_ms <= total_ms; ++k) {
+    const uint32_t tg_ms = k * s.frame_ms;
+    const int32_t target = static_cast<int32_t>(llround(playout_traj(s, tg_ms)));
+    const v1::HostMsg m = h.set_position_msg(target, 100, s.max_acc);  // 落とすフレームも seq は進める
+    r.final_target = target;
+    if (s.drop_every && k % s.drop_every == s.drop_every - 1) continue;
+    int64_t lat_ms = 5;
+    if (s.jitter) lat_ms += static_cast<int64_t>((k * 37u) % 11u) - 5;  // 0〜10 ms
+    uint64_t del = t0 + (static_cast<uint64_t>(tg_ms) + static_cast<uint64_t>(lat_ms)) * MS;
+    if (s.blackout) {
+      const uint64_t ph = (del - t0) % (100 * MS);
+      if (ph >= 50 * MS && ph < 90 * MS) del += 90 * MS - ph;  // 途切れの間に届くはずだったものは明けにまとめて
+    }
+    if (del < prev_del) del = prev_del;  // USB は順序を保つ
+    prev_del = del;
+    frames.push_back(F{del, m});
+  }
+  size_t fi = 0;
+  double v_prev = h.ax.setpoint_vel();
+  int ff_prev = h.ax.duty_terms().ff_permille;
+  int last_sign = 0;
+  std::vector<int> dff;
+  double sum_v = 0.0;
+  int n_v = 0;
+  r.ref_min = r.ref_max = h.ax.setpoint_pos();
+  r.act_min = r.act_max = h.ax.actual_count();
+  const uint64_t end = t0 + static_cast<uint64_t>(total_ms) * MS;
+  while (h.now < end) {
+    const uint64_t tick = h.now + 5 * MS;
+    while (fi < frames.size() && frames[fi].del <= tick) {
+      h.ax.handle(frames[fi].m, tick, frames[fi].del);
+      h.drain();
+      ++fi;
+    }
+    h.step(5);
+    if (h.ax.state() != st::ACTIVE) r.left_active = true;
+    const double v = h.ax.setpoint_vel();
+    const int ff = h.ax.duty_terms().ff_permille;
+    const double t_ms = static_cast<double>(h.now - t0) / 1000.0;
+    const double dv = fabs(v - v_prev);
+    if (dv > r.max_dv) r.max_dv = dv;
+    const int sgn = v > 0.0 ? 1 : (v < 0.0 ? -1 : 0);
+    if (sgn != 0) {
+      if (last_sign != 0 && sgn != last_sign) ++r.sign_changes;
+      last_sign = sgn;
+    }
+    if (h.ax.setpoint_pos() < r.ref_min) r.ref_min = h.ax.setpoint_pos();
+    if (h.ax.setpoint_pos() > r.ref_max) r.ref_max = h.ax.setpoint_pos();
+    if (h.ax.actual_count() < r.act_min) r.act_min = h.ax.actual_count();
+    if (h.ax.actual_count() > r.act_max) r.act_max = h.ax.actual_count();
+    bool steady = t_ms >= s.warm_ms && t_ms <= s.ramp_ms;
+    if (s.reverse_half && fabs(t_ms - s.ramp_ms / 2.0 - s.delay_ms) < 250.0) steady = false;  // 反転の前後は除く
+    if (steady) {
+      if (v == 0.0) {
+        ++r.zero_ticks;
+        if (v_prev != 0.0) ++r.snaps;
+      }
+      const int d = ff - ff_prev;
+      dff.push_back(d < 0 ? -d : d);
+      sum_v += v;
+      ++n_v;
+    }
+    v_prev = v;
+    ff_prev = ff;
+  }
+  if (!dff.empty()) {
+    std::vector<int> sorted = dff;
+    std::sort(sorted.begin(), sorted.end());
+    r.ff_p99 = sorted[static_cast<size_t>(0.99 * static_cast<double>(sorted.size() - 1))];
+    r.ff_max = sorted.back();
+  }
+  r.mean_v = n_v ? sum_v / n_v : 0.0;
+  r.final_zero = h.ax.setpoint_vel() == 0.0;
+  r.final_ref = h.ax.target_count();
+  r.hold_mode = h.ax.duty_terms().mode == V1DutyMode::HOLD;
+  if (getenv("V1_PLAYOUT_REPORT")) {
+    std::printf("playout delay=%u vel=%+.0f frame=%u jit=%d bo=%d drop=%u rev=%d: snaps=%d zero=%d max_dv=%.2f "
+                "ff_p99=%d ff_max=%d mean_v=%.1f sign=%d left=%d final(v0=%d ref=%d tgt=%d hold=%d) ref[%.1f,%.1f]\n",
+                s.delay_ms, s.vel, s.frame_ms, s.jitter, s.blackout, s.drop_every, s.reverse_half, r.snaps,
+                r.zero_ticks, r.max_dv, r.ff_p99, r.ff_max, r.mean_v, r.sign_changes, r.left_active, r.final_zero,
+                r.final_ref, r.final_target, r.hold_mode, r.ref_min, r.ref_max);
+  }
+  return r;
+}
+
+// 従来の profile_step（playout_delay_ms = 0）が Issue #45 の欠陥を再現すること（この試験は欠陥の記録。従来の経路を残す間は通る）:
+// ゆっくりの定常ランプで参照速度が加速度制限を迂回して 0 に落ち、FF が 1 tick で数十 permille 抜ける。
+inline void test_playout_legacy_profile_reproduces_issue45_snaps() {
+  for (double vel : {25.0, 50.0, -50.0}) {
+    PlayoutScenario s;
+    s.vel = vel;
+    s.jitter = true;
+    s.blackout = true;
+    s.delay_ms = 0;
+    const PlayoutResult r = run_playout_scenario(s);
+    CHECK(!r.left_active);
+    CHECK(r.snaps >= 10);           // 2.7 s の定常区間で人工的な停止が何度も
+    CHECK(r.max_dv > 10.0 + 1e-6);  // 加速度制限（2000 × 5 ms = 10 count/s）を迂回した 0 への落ち
+    if (vel > 0) CHECK(r.ff_p99 >= 30);  // 上向きは切片 4.6 % がテーパごと抜ける
+  }
+}
+
+// 再生バッファ（既定）: ±25 / 50 / 100 count/s、10 / 20 ms のフレーム、ぶれ・途切れの有無で、定常区間に人工的な停止が無く、
+// |Δv_ref| ≤ max_acc × 5 ms（10 count/s）、平均速度は軌道どおり、最後は止まった目標にちょうど止まって保持に入る。
+inline void test_playout_ramps_have_no_artificial_stops() {
+  for (double vel : {25.0, -25.0, 50.0, -50.0, 100.0, -100.0}) {
+    for (uint32_t frame_ms : {10u, 20u}) {
+      for (int noisy = 0; noisy < 2; ++noisy) {
+        PlayoutScenario s;
+        s.vel = vel;
+        s.frame_ms = frame_ms;
+        s.jitter = noisy != 0;
+        s.blackout = noisy != 0;
+        const PlayoutResult r = run_playout_scenario(s);
+        CHECK(!r.left_active);
+        CHECK(r.snaps == 0);
+        CHECK(r.zero_ticks == 0);
+        CHECK(r.max_dv <= 10.0 + 1e-6);
+        CHECK(fabs(r.mean_v - vel) <= 0.1 * fabs(vel));
+        CHECK(r.sign_changes == 0);
+        CHECK(r.ff_p99 <= 10);
+        CHECK(r.final_zero);
+        CHECK(r.final_ref == r.final_target);
+        CHECK(r.hold_mode);
+      }
+    }
+  }
+}
+
+// 反転（+v → −v）: 向きは 1 回だけ変わり、|Δv_ref| は加速度制限の中、反転の前後以外で止まらない
+inline void test_playout_reversal_is_smooth() {
+  for (double vel : {50.0, 100.0, -50.0}) {
+    PlayoutScenario s;
+    s.vel = vel;
+    s.reverse_half = true;
+    s.jitter = true;
+    s.blackout = true;
+    const PlayoutResult r = run_playout_scenario(s);
+    CHECK(!r.left_active);
+    CHECK(r.sign_changes == 1);
+    CHECK(r.snaps == 0);
+    CHECK(r.max_dv <= 10.0 + 1e-6);
+    CHECK(r.final_zero);
+    CHECK(r.final_ref == r.final_target);
+  }
+}
+
+// フレームの欠落（3 つに 1 つ落ちる。seq は進む）でも止まらない
+inline void test_playout_dropped_frames() {
+  for (double vel : {25.0, 50.0, -100.0}) {
+    PlayoutScenario s;
+    s.vel = vel;
+    s.jitter = true;
+    s.drop_every = 3;
+    const PlayoutResult r = run_playout_scenario(s);
+    CHECK(!r.left_active);
+    CHECK(r.snaps == 0);
+    CHECK(r.max_dv <= 10.0 + 1e-6);
+    CHECK(fabs(r.mean_v - vel) <= 0.1 * fabs(vel));
+    CHECK(r.final_zero);
+    CHECK(r.final_ref == r.final_target);
+  }
+}
+
+// Issue #46: 全速（600 count/s、max_acc 2000）でソフトリミットに向かっても、参照は端の reserve（100）手前で行き過ぎずに止まり、
+// SOFT_LIMIT にならない（目標はサーバーと同じくソフトリミットの値に clamp されて届く）
+inline void test_playout_soft_limit_approach_stops_inside_reserve() {
+  for (double vel : {600.0, -600.0}) {
+    PlayoutScenario s;
+    s.vel = vel;
+    s.ramp_ms = 5500;  // 0 → ±2700 に 4.5 s
+    s.hold_ms = 1000;
+    s.jitter = true;
+    const PlayoutResult r = run_playout_scenario(s);
+    const v1::Config c = base_config();
+    CHECK(!r.left_active);
+    CHECK(r.max_dv <= 10.0 + 1e-6);
+    CHECK(r.final_zero);
+    if (vel > 0) {
+      CHECK(r.ref_max <= c.soft_max_count - V1_SOFT_RESERVE_COUNT + 0.5);
+      CHECK(r.final_ref >= c.soft_max_count - V1_SOFT_RESERVE_COUNT - 1);  // 手前すぎない
+      CHECK(r.act_max <= c.soft_max_count - V1_SOFT_RESERVE_COUNT + 1);
+    } else {
+      CHECK(r.ref_min >= c.soft_min_count + V1_SOFT_RESERVE_COUNT - 0.5);
+      CHECK(r.final_ref <= c.soft_min_count + V1_SOFT_RESERVE_COUNT + 1);
+      CHECK(r.act_min >= c.soft_min_count + V1_SOFT_RESERVE_COUNT - 1);
+    }
+  }
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -4485,6 +4748,11 @@ inline void run_all() {
   test_r9_v_fast_gap_startup_and_reset();
   test_r9_axis_hold_zero_and_protections_unchanged();
   test_r9_damping_reduces_velocity_ripple_in_delayed_plant();
+  test_playout_legacy_profile_reproduces_issue45_snaps();
+  test_playout_ramps_have_no_artificial_stops();
+  test_playout_reversal_is_smooth();
+  test_playout_dropped_frames();
+  test_playout_soft_limit_approach_stops_inside_reserve();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

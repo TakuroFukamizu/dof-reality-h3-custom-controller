@@ -60,6 +60,14 @@ struct V1Tuning {
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
   uint32_t status_period_ms = 20;
   uint32_t velocity_window_ms = 100;
+  // Issue #45（config.h V1_PLAYOUT）: 再生バッファの遅れ [ms]。0 なら従来の profile_step（目標ごとに行って止まる）
+  uint32_t playout_delay_ms = V1_PLAYOUT ? V1_PLAYOUT_DELAY_MS : 0;
+  uint32_t playout_window_ms = V1_PLAYOUT_WINDOW_MS;
+  uint32_t playout_extrap_ms = V1_PLAYOUT_EXTRAP_MS;
+  double playout_kp_per_s = V1_PLAYOUT_KP_PER_S;
+  // Issue #46: ソフトリミットに向かう参照速度の上限（再生バッファの経路だけ）。soft_brake_acc ≤ 0 で無効
+  double soft_brake_acc_count_s2 = V1_SOFT_BRAKE_ACC_COUNT_S2;
+  int32_t soft_reserve_count = V1_SOFT_RESERVE_COUNT;
   // Issue #25 r6（config.h V1_FF_DIRECTIONAL）: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス。
   // directional = false なら r5 までの経路（上の床 E・補助 T・不感帯 deadband/deadband_out・Ki 0.1）。
   bool ff_directional = V1_FF_DIRECTIONAL != 0;
@@ -449,19 +457,23 @@ class V1Axis {
   // --- 入力 ---------------------------------------------------------------
 
   // COBS 符号化済み（区切りなし）の 1 フレーム。復号できなければ rx_error を数えるだけで応答しない。
-  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us) {
+  // rx_us（Issue #45）: リンク層がフレームを受け取った時刻（≤ now_us）。再生バッファの時刻印だけに使う。期限（valid_for）・lease・
+  // 応答の時刻は従来どおり now_us（制御タスクが取り出した時刻）で数える（バッファに残っているからといって鮮度は延ばさない）。
+  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us) { handle_frame(encoded, n, now_us, now_us); }
+  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us, uint64_t rx_us) {
     v1::HostMsg m;
     if (!v1::decode_host_encoded(encoded, n, &m)) {
       record_rx_error();
       return;
     }
-    handle(m, now_us);
+    handle(m, now_us, rx_us);
   }
 
   // 復号済みメッセージ。物理は進めない（tick が進める）。ACK → STATUS の順で outbox に積む。
-  void handle(const v1::HostMsg& m, uint64_t now_us) {
+  void handle(const v1::HostMsg& m, uint64_t now_us) { handle(m, now_us, now_us); }
+  void handle(const v1::HostMsg& m, uint64_t now_us, uint64_t rx_us) {
     now_us_ = now_us;
-    dispatch(m, now_us);
+    dispatch(m, now_us, rx_us > now_us ? now_us : rx_us);
     emit_status_if_changed();
   }
 
@@ -574,6 +586,9 @@ class V1Axis {
   int32_t target_count() const { return to_count(setpoint_); }
   int32_t control_target_count() const { return to_count(control_target_); }
   int32_t velocity_count_s() const { return velocity_; }
+  // 参照（軌道）の速度 [count/s]。FF・r9 の減衰・保持／整定の判定・動き出しパルスが使う値そのもの（丸めない）
+  double setpoint_vel() const { return setpoint_vel_; }
+  double setpoint_pos() const { return setpoint_; }
   // r9（Issue #35）: 40 ms 窓の速い速度推定 [count/s]（生カウントの向き = カウント増が正）。推定が無ければ valid = false・値 0
   bool v_fast_valid() const { return v_fast_valid_; }
   double v_fast_count_s() const { return v_fast_valid_ ? v_fast_ : 0.0; }
@@ -865,13 +880,13 @@ class V1Axis {
   // 命令の振り分け（protocol.md §4）
   // ------------------------------------------------------------------------
 
-  void dispatch(const v1::HostMsg& m, uint64_t now) {
+  void dispatch(const v1::HostMsg& m, uint64_t now, uint64_t rx_us) {
     has_rx_ = true;
     last_rx_us_ = now;
     switch (m.type) {
       case v1::msg::HELLO_REQ: on_hello_req(m.hello_req.request_id); break;
       case v1::msg::CLOCK_SYNC: on_clock_sync(m.clock_sync, now); break;
-      case v1::msg::SET_POSITION: on_set_position(m.set_position, now); break;
+      case v1::msg::SET_POSITION: on_set_position(m.set_position, now, rx_us); break;
       case v1::msg::HOST_FAULT: on_host_fault(m.host_fault, now); break;
       case v1::msg::CONFIG: command(m, m.config.request_id, now); break;
       case v1::msg::ARM_PREPARE: command(m, m.arm_prepare.request_id, now); break;
@@ -1062,7 +1077,8 @@ class V1Axis {
 
   // SET_POSITION: ACK なし。古い → stale_drop、apply_at ≠ 0 → rx_error、有効 → lease。ACTIVE でだけ目標に反映。
   // 校正中は捨てる（数えない。protocol.md §1.2）。
-  void on_set_position(const v1::SetPosition& m, uint64_t now) {
+  void on_set_position(const v1::SetPosition& m, uint64_t now, uint64_t rx_us) {
+    (void)rx_us;
     if (state_ == v1::state::CALIBRATING) return;
     if (!has_config_ || m.session_epoch != config_.session_epoch || m.seq <= last_rx_seq_) {
       if (stale_drop_count_ < 0xFFFF) stale_drop_count_ += 1;
