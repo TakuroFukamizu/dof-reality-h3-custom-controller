@@ -66,6 +66,13 @@ $PIO device monitor -p /dev/cu.usbmodemXXXX -b 115200   # 従来 env のとき�
 
 ### 1.3 v1 env を書き込む（各台）
 
+> **どのファームを焼くか（2026-11-02 時点）**: 3 台で検証済みの既知の良品はタグ **`fw-v1-r3`**（914cee8、PR #19 の先頭）で、運用設定 `[limits]` の kp 6 / duty_min 9 / ff 100 と組。**main の既定は r8**（`V1_FF_DIRECTIONAL=1`、方向別 FF ＋ PI、床なし）で **kp 30 が前提**（kp 6 のままだと追従が柔らかすぎる。#1 で FE rms 15）。r8 は #1 でしか試しておらず、#2（Issue #23）では未検証。迷ったら `fw-v1-r3` を焼く（Issue #35）。
+>
+> ```sh
+> git worktree add ../fw-r3 fw-v1-r3      # main の作業ツリーを汚さない
+> cd ../fw-r3/moter-controler && $PIO run -e m5stack-cores3-v1 -t upload --upload-port /dev/cu.usbmodemXXXX
+> ```
+
 ```sh
 cd REPO/moter-controler
 $PIO run -e m5stack-cores3-v1-usbpower                                  # ビルドだけ
