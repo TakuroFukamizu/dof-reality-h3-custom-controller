@@ -430,11 +430,18 @@ constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以�
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
 constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
-constexpr uint32_t V1_OVERRUN_MS = 15;
+constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 // r10 統合: 参照の止まる位置の余裕は、最悪の tick の先読みの包絡線より大きくなければならない
 static_assert(static_cast<int64_t>(V1_SUP_END_MARGIN_COUNT) * 1000 >= static_cast<int64_t>(V1_SUP_ENV_COUNT_S) * V1_OVERRUN_MS,
-              "V1_SUP_END_MARGIN_COUNT must cover one worst-case tick of the blind-drive envelope");          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
-constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
+              "V1_SUP_END_MARGIN_COUNT must cover one worst-case tick of the blind-drive envelope");
+// ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで。2026-11-02: 300 ms では 24 V が立ち上がる前に HOLDING になり、
+// HOLDING 直後の START（ジョイスティックの自動開始）で 2 軸とも Duty 20 % で 0.47 s 動かず ENCODER_FAULT（ARM から 1.5 s 後でも
+// 動かなかった）。校正は CAL_POWER_SETTLE_MS 5000 で待っている。暫定 2500（BRAKE_RELEASE_WAIT_MS と合わせて ARM 全体 5000 ms の内側）。
+// 電圧の監視入力は使えない（操作者）ので待ち時間で対処。ホストテストは -DV1_ARM_POWER_SETTLE_MS=300 で従来の時刻のまま回す
+#ifndef V1_ARM_POWER_SETTLE_MS
+#define V1_ARM_POWER_SETTLE_MS 2500
+#endif
+constexpr uint32_t POWER_SETTLE_MS = V1_ARM_POWER_SETTLE_MS;
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）
