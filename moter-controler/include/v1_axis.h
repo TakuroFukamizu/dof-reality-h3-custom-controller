@@ -85,10 +85,17 @@ struct V1Tuning {
   uint32_t breakaway_band_pulse_ms = V1_BREAKAWAY_BAND_PULSE_MS;
   uint32_t breakaway_band_cooldown_ms = V1_BREAKAWAY_BAND_COOLDOWN_MS;
   int32_t breakaway_band_min_move = V1_BREAKAWAY_BAND_MIN_MOVE;
+  // r9（Issue #35。config.h V1_VEL_DAMPING）: 速度誤差の減衰項。kd = 0 で無効（r8 と同じ出力）。方向別の経路だけで効く
+  double vel_kd_permille_per_count_s = 0.0;           // Kd [permille / (count/s)]。コンストラクタで既定を入れる
+  int vel_d_max_permille = V1_VEL_D_MAX_PERMILLE;     // |u_d| の上限
+  uint32_t v_fast_window_ms = V1_V_FAST_WINDOW_MS;    // 速い速度推定の窓
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
-    if (directional) ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
+    if (directional) {
+      ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
+      vel_kd_permille_per_count_s = V1_VEL_DAMPING ? V1_VEL_KD_PERMILLE_PER_COUNT_S : 0.0;
+    }
   }
   // 静止の帯の入口／出口（r6 は hold_enter / hold_exit、従来は deadband / deadband_out）。v1_duty_command・整定判定・静止監視で共用
   int32_t band_enter() const { return ff_directional ? hold_enter : deadband; }
@@ -111,6 +118,9 @@ struct V1DutyTerms {
   bool assist_on = false;      // 追従中の動き出し補助（Issue #25 手順 9「T」）が床を掛けている
   int16_t cmd_permille = 0;    // v1_duty_command の結果（下限・上限を掛けた後）
   V1DutyMode mode = V1DutyMode::MOVE;  // r6 の状態（HOLD は in_band と同じ。BRK は動き出しパルスがこの tick の出力を決めた）
+  int16_t d_permille = 0;      // r9 の減衰項 u_d = clamp(Kd × (軌道速度 − v_fast), ±10)（四捨五入）。保持中・推定なし・kd 0 なら 0
+  int16_t v_fast_count_s = 0;  // r9 の速い速度推定 [count/s]（40 ms 窓。int16 に飽和）。推定なしなら 0
+  bool v_fast_valid = false;   // v_fast が使える（40 ms 分、起動直後は 20 ms 以上のサンプルがある）
 };
 
 inline int16_t v1_clamp_i16(double v) {
@@ -174,11 +184,16 @@ inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
 //    逆を向いていても目標から離れる側へ蹴らない）、|出力| = max(u が同じ向きなら |u|, 方向別の動き出し Duty)、duty_max 以内。この tick は I を凍結。
 // 4. 積分: dI = Ki × err × dt を |dI| ≤ rate × dt に制限。飽和（|u| ≥ duty_max）していて dI が u と同じ向きなら積まない（それ以外は
 //    常に積む。戻す向きは飽和中も許す）。|I| ≤ i_max。
+// 5. r9（Issue #35）の減衰項: has_v_fast（V1Axis の 40 ms 窓の速度推定が使える）かつ kd > 0 なら
+//    u_d = clamp(kd × (vel − v_fast), ±vel_d_max) を合成に足す（u = FF + P + I + u_d）。保持の中では足さない（出力 0 のまま）。
+//    飽和・アンチワインドアップ・動き出しパルスの「合成」は u_d 込みの u で見る（四捨五入は合成で 1 回）。
 inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
-                                       double dt_s, bool settle_ok, bool breakaway) {
+                                       double dt_s, bool settle_ok, bool breakaway, bool has_v_fast, double v_fast) {
   const int64_t err_abs = err < 0 ? -err : err;
   const long duty_max_pm = v1_permille(t.duty_max);
   st.floor_on = false;
+  o.v_fast_valid = has_v_fast;
+  o.v_fast_count_s = has_v_fast ? v1_clamp_i16(v_fast) : 0;
   if (vel == 0.0) {
     if (st.in_band) {
       if (err_abs > t.hold_exit) st.in_band = false;
@@ -200,8 +215,17 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
   o.i_permille = v1_clamp_i16(st.i_pm);
-  const double u_raw = ff_pm + p_pm + st.i_pm;
-  const long u = lround(u_raw);  // 四捨五入は 1 回
+  // r9: 速度誤差の減衰項（保持の外だけ。上の HOLD で 0 を返した後なので保持中は出ない）
+  double d_pm = 0.0;
+  if (has_v_fast && t.vel_kd_permille_per_count_s > 0.0) {
+    const double d_max = static_cast<double>(t.vel_d_max_permille < 0 ? -t.vel_d_max_permille : t.vel_d_max_permille);
+    d_pm = t.vel_kd_permille_per_count_s * (vel - v_fast);
+    if (d_pm > d_max) d_pm = d_max;
+    if (d_pm < -d_max) d_pm = -d_max;
+  }
+  o.d_permille = v1_clamp_i16(d_pm);
+  const double u_raw = ff_pm + p_pm + st.i_pm + d_pm;
+  const long u = lround(u_raw);  // 四捨五入は 1 回（u_d 込み）
   const bool saturated = (u >= duty_max_pm) || (u <= -duty_max_pm);
   long mag = u < 0 ? -u : u;
   if (mag > duty_max_pm) mag = duty_max_pm;
@@ -241,16 +265,20 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   return out;
 }
 
+// has_v_fast / v_fast: r9（Issue #35）の速い速度推定 [count/s]（V1Axis の 40 ms 窓）。方向別の経路の減衰項だけが使う
+//（従来の経路では無視）。has_v_fast = false（既定）なら減衰項は 0（直接呼ぶテストは r8 までと同じ出力）。
 inline int v1_duty_command(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, int boost_permille = 0,
                            V1DutyTerms* terms = nullptr, double dt_s = 0.0, bool settle_ok = true,
-                           bool assist = false) {
+                           bool assist = false, bool has_v_fast = false, double v_fast = 0.0) {
   V1DutyTerms scratch;
   V1DutyTerms& o = terms ? *terms : scratch;
   o = V1DutyTerms{};
   o.vel_count_s = v1_clamp_i16(vel);
   o.boost_permille = static_cast<int16_t>(boost_permille);
   // Issue #25 r6: 方向別 FF ＋ PI、床なし。boost は使わず、assist は動き出しパルス（V1Axis::update_breakaway）の意味になる
-  if (t.ff_directional) return v1_duty_command_directional(err, vel, st, t, o, dt_s, settle_ok, assist);
+  if (t.ff_directional) {
+    return v1_duty_command_directional(err, vel, st, t, o, dt_s, settle_ok, assist, has_v_fast, v_fast);
+  }
   const int64_t err_abs = err < 0 ? -err : err;
   const long duty_max_pm = v1_permille(t.duty_max);
   // 不感帯の中: 出力は I（保持バイアス）だけ。積まない。
@@ -386,6 +414,7 @@ class V1Axis {
     reference_offset_ = 0;
     vel_anchor_raw_ = raw;
     vel_anchor_us_ = now_us;
+    reset_v_fast();
     state_ = v1::state::DISARMED;
     cal_phase_ = CalPhase::Idle;
     cal_.cfg = cal_config;
@@ -444,6 +473,7 @@ class V1Axis {
     now_us_ = now_us;
     raw_ = raw;
     update_velocity(now_us);
+    update_v_fast(now_us);  // r9（Issue #35）: 40 ms 窓の速い速度推定。tick ごと
 
     // 制御周期の逸脱。止まっている状態（DISARMED / FAULT）では見ない（起動直後や待機中の間隔は制御に影響しない）。
     if (!parked() && dt_us > static_cast<uint64_t>(tuning.overrun_ms) * 1000ull) {
@@ -544,6 +574,9 @@ class V1Axis {
   int32_t target_count() const { return to_count(setpoint_); }
   int32_t control_target_count() const { return to_count(control_target_); }
   int32_t velocity_count_s() const { return velocity_; }
+  // r9（Issue #35）: 40 ms 窓の速い速度推定 [count/s]（生カウントの向き = カウント増が正）。推定が無ければ valid = false・値 0
+  bool v_fast_valid() const { return v_fast_valid_; }
+  double v_fast_count_s() const { return v_fast_valid_ ? v_fast_ : 0.0; }
   int32_t following_error_count() const {
     return clamp_count(static_cast<int64_t>(actual_count()) - static_cast<int64_t>(target_count()));
   }
@@ -688,6 +721,18 @@ class V1Axis {
   int64_t vel_anchor_raw_ = 0;
   uint64_t vel_anchor_us_ = 0;
   int32_t velocity_ = 0;
+
+  // 速い速度推定（r9、Issue #35。update_v_fast）: tick ごとの (時刻, 生カウント) のリング。5 ms 周期なら 155 ms 分
+  struct VFastSample {
+    uint64_t us;
+    int64_t raw;
+  };
+  static constexpr size_t kVFastCap = 32;
+  VFastSample vf_buf_[kVFastCap]{};
+  size_t vf_head_ = 0;   // 次に書く位置
+  size_t vf_count_ = 0;
+  bool v_fast_valid_ = false;
+  double v_fast_ = 0.0;  // [count/s]
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
@@ -1188,6 +1233,7 @@ class V1Axis {
     duty_permille_ = 0;  // 次の tick を待たず PWM 0
     terms_ = V1DutyTerms{};
     duty_state_ = V1DutyState{};  // 積分（保持バイアス）も捨てる（Issue #25 手順 9「F」）
+    reset_v_fast();               // r9: 速い速度推定も取り直す（積分と同じ契機）
     stall_running_ = false;
     hold_here();
     v1::McuMsg m;
@@ -1214,6 +1260,46 @@ class V1Axis {
       vel_anchor_raw_ = raw_;
       vel_anchor_us_ = now;
     }
+  }
+
+  void reset_v_fast() {
+    vf_head_ = 0;
+    vf_count_ = 0;
+    v_fast_valid_ = false;
+    v_fast_ = 0.0;
+  }
+
+  // r9（Issue #35）: 速い速度推定 v_fast = (いまの生カウント − 約 window 前の生カウント) / 実際の経過秒。tick ごとに 1 サンプル積む。
+  // 基準は「window 以上前のサンプルのうち最も新しいもの」。まだ無ければ（位置制御の開始直後・FAULT の後）最も古いサンプルが
+  // window / 2 以上前ならそれ、それも無ければ推定なし（valid = false → 減衰項 0）。前のサンプルから 2 × window を超えて空いた
+  //（または時刻が戻った）ら古いサンプルを捨てる。経過が 2 × window を超える基準は使わない（古すぎる平均で減衰させない）。
+  // 生カウント（reference_offset を引く前）で差を取るので SET_REFERENCE の座標移動は速度に出ない。
+  void update_v_fast(uint64_t now) {
+    const uint64_t win = ms_to_us(tuning.v_fast_window_ms);
+    if (win == 0) { reset_v_fast(); return; }
+    if (vf_count_ > 0) {
+      const VFastSample& last = vf_buf_[(vf_head_ + kVFastCap - 1) % kVFastCap];
+      if (now < last.us || now - last.us > 2 * win) reset_v_fast();
+    }
+    vf_buf_[vf_head_] = VFastSample{now, raw_};
+    vf_head_ = (vf_head_ + 1) % kVFastCap;
+    if (vf_count_ < kVFastCap) ++vf_count_;
+    v_fast_valid_ = false;
+    v_fast_ = 0.0;
+    const VFastSample* base = nullptr;
+    for (size_t k = 1; k < vf_count_; ++k) {  // k = 0 はいま積んだサンプル
+      const VFastSample& smp = vf_buf_[(vf_head_ + kVFastCap - 1 - k) % kVFastCap];
+      if (now - smp.us >= win) { base = &smp; break; }
+    }
+    if (!base && vf_count_ >= 2) {
+      const VFastSample& oldest = vf_buf_[(vf_head_ + kVFastCap - vf_count_) % kVFastCap];
+      if (now - oldest.us >= win / 2) base = &oldest;
+    }
+    if (!base) return;
+    const uint64_t dt = now - base->us;
+    if (dt == 0 || dt > 2 * win) return;
+    v_fast_ = static_cast<double>(raw_ - base->raw) * 1e6 / static_cast<double>(dt);
+    v_fast_valid_ = true;
   }
 
   void check_timers(uint64_t now) {
@@ -1510,6 +1596,7 @@ class V1Axis {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
       duty_state_ = V1DutyState{};
+      reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
       settle_dwell_us_ = 0;
       reset_track_assist();
       reset_breakaway();
@@ -1526,7 +1613,7 @@ class V1Axis {
     const bool settle_ok = update_settle_dwell(err, dt_us);
     const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
     const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
-                                    assist);  // カウント増の向きが正 [permille]
+                                    assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;

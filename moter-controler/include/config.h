@@ -232,6 +232,22 @@ constexpr uint32_t V1_BREAKAWAY_BAND_WINDOW_MS = 100;
 constexpr uint32_t V1_BREAKAWAY_BAND_PULSE_MS = 50;
 constexpr uint32_t V1_BREAKAWAY_BAND_COOLDOWN_MS = 200;
 constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
+// r9（Issue #35、Codex 案）: 速度誤差の減衰項。方向別の経路（V1_FF_DIRECTIONAL）だけで効く。既定 1、-DV1_VEL_DAMPING=0 で r8 と同じ出力。
+// 実機 11-02（#1、r8 kp 30）: FE rms 3.6 は良いが、軌道 50〜150 count/s の区間で 100 ms 窓の速度が約 3 Hz・±60 count/s で波打つ
+//（P だけの減衰不足と読んでいる）。そこで 40 ms の滑り窓の速い速度推定 v_fast を tick（5 ms）ごとに更新し、
+//   u_d = clamp(Kd × (v_traj − v_fast), −D_MAX, +D_MAX) [permille]、u = clamp(FF + P + I + u_d, ±duty_max)
+// を出す（v_traj は FF に使っている軌道の目標速度）。飽和・アンチワインドアップの判定は u_d 込みの合成で見る。保持（HOLD）の出力 0、
+// 動き出しパルス、保護（FOLLOWING_ERROR・走行中の無パルス・静止 2 s の監視・ソフトリミット）は変えない。
+// v_fast = (いまの生カウント − 約 40 ms 前の生カウント) / 実際の経過秒。40 ms 以上前のサンプルのうち最も新しいものを使う。
+// 起動直後（位置制御の開始・FAULT の後）で 40 ms 分のサンプルが無ければ、最も古いサンプルが窓の半分（20 ms）以上前なら
+// それで割り、それも無ければ推定なし（u_d = 0）。tick の間隔が 2 × 窓（80 ms）を超えて空いたらサンプルを捨てて取り直す。
+// 量子化: 40 ms に 1 count = 25 count/s → u_d は 1.25 permille 刻み。
+#ifndef V1_VEL_DAMPING
+#define V1_VEL_DAMPING 1
+#endif
+constexpr double V1_VEL_KD_PERMILLE_PER_COUNT_S = 0.05;  // Kd: 速度誤差 1 count/s あたり 0.05 permille（200 count/s で上限 10）
+constexpr int V1_VEL_D_MAX_PERMILLE = 10;                // |u_d| の上限 1 %
+constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定の窓
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

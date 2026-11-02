@@ -1322,15 +1322,17 @@ void renderV1() {
   // B = 停止ブーストの上乗せ、
   // O = 実際に出している値（pwm_permille）。通常 ≤ 50 文字（6 px × 53 = 318 < 320。超えれば切れる）
   // Issue #25 r6（V1_FF_DIRECTIONAL）: `FF +76 P +12 I +8 V +300 MOVE O +96`。F / A / B の代わりに状態 MOVE / HOLD / BRK。FF は方向別
+  // r9（Issue #35、V1_VEL_DAMPING）: 状態の後に減衰項 D（u_d、±10 permille）を足す: `FF +76 P +12 I +8 V +300 MOVE D -3 O +93`。
+  // 速い速度推定 v_fast は行に入らない（53 文字を超える）ので V1Snapshot.terms.v_fast_count_s にだけ置く
   {
     const V1DutyTerms& tm = vsnap.terms;
     char terms_text[64];
     // Issue #25 r6（V1_FF_DIRECTIONAL）: 床・補助・ブーストが無いので代わりに状態 M（MOVE / HOLD / BRK = 動き出しパルス）を出す
     const char* mode = tm.mode == V1DutyMode::HOLD ? "HOLD" : (tm.mode == V1DutyMode::BRK ? "BRK" : "MOVE");
     if (V1_FF_DIRECTIONAL) {
-      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d %s O %+d", static_cast<int>(tm.ff_permille),
+      snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d %s D %+d O %+d", static_cast<int>(tm.ff_permille),
                static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s), mode,
-               static_cast<int>(vsnap.pwm_permille));
+               static_cast<int>(tm.d_permille), static_cast<int>(vsnap.pwm_permille));
     } else {
       snprintf(terms_text, sizeof(terms_text), "FF %+d P %+d I %+d V %+d F%d A%d B %d O %+d", static_cast<int>(tm.ff_permille),
                static_cast<int>(tm.p_permille), static_cast<int>(tm.i_permille), static_cast<int>(tm.vel_count_s),
@@ -1367,6 +1369,7 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.terms.i_permille / 10) != (b.terms.i_permille / 10) || a.terms.assist_on != b.terms.assist_on ||
          (a.terms.vel_count_s / 50) != (b.terms.vel_count_s / 50) || a.terms.floor_on != b.terms.floor_on ||
          a.terms.in_band != b.terms.in_band || a.terms.boost_permille != b.terms.boost_permille || a.terms.mode != b.terms.mode ||
+         (a.terms.d_permille / 5) != (b.terms.d_permille / 5) ||  // r9 の減衰項（±10 permille）は 0.5 % 刻みで見る
          (a.pwm_permille / 10) != (b.pwm_permille / 10) ||
          a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
