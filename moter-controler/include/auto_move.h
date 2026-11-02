@@ -32,6 +32,7 @@ struct AutoConfig {
   int32_t arrival_min_travel = ARRIVAL_MIN_TRAVEL;
   int manual_min_duty = MANUAL_GUARD_MIN_DUTY;
   int32_t retreat_counts = RETREAT_COUNTS;
+  int32_t retreat_end_min_travel = RETREAT_END_MIN_TRAVEL;
 };
 
 struct AutoInputs {
@@ -335,6 +336,15 @@ struct AutoMachine {
       }
       compute_duty(in);
       if (stalled(in)) {
+        // 退避が retreat_end_min_travel 以上動いてから止まった = 動ける軸が反対の端に当たった（端の近くから始めると
+        // RETREAT_COUNTS に届く前に反対の端に着く。Issue #34）。そこを起点に改めて端へ向かう（退避はこの行程で済み扱い。
+        // そこからも移動量不足で止まれば従来どおり失敗）。遅すぎ（slow）はこの扱いにしない（片相断線などを到達とみなさない）。
+        if (llabs(in.raw_count - retreat_start_raw) >= cfg.retreat_end_min_travel) {
+          begin_leg(in);
+          retreat_done = true;
+          reason[0] = '\0';
+          return;
+        }
         finish(AutoPhase::Failed, "stall");
       } else if (slow_event) {
         finish(AutoPhase::Failed, "slow");
