@@ -516,6 +516,8 @@ class V1Axis {
     const uint8_t prev = selected_axis_;
     selected_axis_ = axis;
     has_config_ = false;
+    playout_clock_.reset();
+    playout_.clear();
     referenced_ = false;
     v1::McuMsg m;
     memset(&m, 0, sizeof(m));
@@ -593,6 +595,7 @@ class V1Axis {
   // Issue #45: 直近の tick の再生バッファの推定（has / starved / pos / vel / 点の数）と時刻の付け直しの周期 [us]（0 = 未確定）
   const V1PlayoutFit& playout_fit() const { return playout_fit_; }
   double playout_period_us() const { return playout_clock_.valid() ? playout_clock_.period_us() : 0.0; }
+  uint32_t playout_reseeds() const { return playout_clock_.reseeds(); }  // 周期の変化で時刻の付け直しを取り直した回数
   // r9（Issue #35）: 40 ms 窓の速い速度推定 [count/s]（生カウントの向き = カウント増が正）。推定が無ければ valid = false・値 0
   bool v_fast_valid() const { return v_fast_valid_; }
   double v_fast_count_s() const { return v_fast_valid_ ? v_fast_ : 0.0; }
@@ -1027,6 +1030,8 @@ class V1Axis {
       last_rx_seq_ = 0;  // seq の単調性は epoch ごと
     }
     config_ = c;
+    playout_clock_.reset();  // Issue #45（PR #49 レビュー P2b）: セッションが変わったら時刻の付け直しを取り直す
+    playout_.clear();
     if (config_.max_vel_count_s > V1_ABS_MAX_VEL_COUNT_S) config_.max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
     if (config_.max_acc_count_s2 > V1_ABS_MAX_ACC_COUNT_S2) config_.max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     has_config_ = true;
@@ -1105,7 +1110,7 @@ class V1Axis {
       if (target < config_.soft_min_count) target = config_.soft_min_count;
       if (target > config_.soft_max_count) target = config_.soft_max_count;
       control_target_ = static_cast<double>(target);
-      playout_.push(m.seq, rx_us, control_target_);  // Issue #45: 受信時刻で時刻印（再生バッファの経路だけが読む）
+      playout_.push(m.seq, rx_us, target);  // Issue #45: 受信時刻で時刻印（再生バッファの経路だけが読む）
       const uint32_t vmax = m.max_vel_count_s < config_.max_vel_count_s ? m.max_vel_count_s : config_.max_vel_count_s;
       const uint32_t amax =
           m.max_acc_count_s2 < config_.max_acc_count_s2 ? m.max_acc_count_s2 : config_.max_acc_count_s2;
@@ -1378,6 +1383,7 @@ class V1Axis {
   // ACTIVE の参照を playout_step で作るので、PC 側の参照モデルとは ACTIVE の軌道の時刻・形が違う（STOPPING 以降は同じ）
   void update_setpoint(double dt) {
     if (!has_config_) return;
+    playout_clock_.refit_if_dirty();  // Issue #45: 時刻の付け直しの当てはめは 1 tick に 1 回まで（push は O(1)）
     const double lo = static_cast<double>(config_.soft_min_count);
     const double hi = static_cast<double>(config_.soft_max_count);
     if (state_ == v1::state::ACTIVE && tuning.playout_delay_ms > 0) {
@@ -1392,7 +1398,9 @@ class V1Axis {
       // 減速は最後に適用したフレームの max_acc で（CONFIG には絶対上限が入るので、そちらでは 40000 count/s² の急減速になる。
       // motion-limits 設計 §4.4）。frame_max_acc_ は START で CONFIG の値から初期化され SET_POSITION ごとに更新されるが、
       // フレームが max_acc = 0 を運ぶと 0 になり減速できないので、そのときだけ CONFIG の値に戻す。
-      const double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      // PR #49 レビュー P1b: ごく小さい max_acc（1 など）でも止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする
+      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
       const double dv = amax * dt;
       double v = setpoint_vel_;
       if (fabs(v) <= dv) {
@@ -1408,78 +1416,113 @@ class V1Axis {
     }
   }
 
+  // 再生バッファの参照が減速に使う加速度 [count/s²]: 最後のフレームの max_acc（CONFIG で頭打ち済み）。0・ごく小さい値でも
+  // 止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする（PR #49 レビュー P1b）。加速はフレームの max_acc のまま（0 なら加速しない）
+  float playout_decel() const {
+    const float a = frame_max_acc_ > 0.0 ? static_cast<float>(frame_max_acc_) : 0.0f;
+    const float lo = static_cast<float>(V1_MIN_DECEL_COUNT_S2);
+    return a > lo ? a : lo;
+  }
+
   // Issue #45: 再生バッファの参照（ACTIVE、playout_delay_ms > 0）。playout 時刻 tp = いま − 遅れ での軌道の推定
   //（V1PlayoutBuffer::fit。位置 p_t と傾き v_t）に、参照（setpoint_ / setpoint_vel_）を速度・加速度の制限の中で追従させる:
-  //   v_des = v_t + 補正、補正 = 向き(e) × min(kp × |e|, sqrt(amax × |e|))（= max_acc / 2 の制動曲線）、e = p_t − 参照の次の位置
+  //   v_des = v_t + 補正、補正 = 向き(e) × min(kp × |e|, sqrt(a_dec × |e|))（= 減速度 / 2 の制動曲線）、e = p_t − 参照の次の位置
   //  （p_t はソフトリミットで clamp。kp は目標が止まっていれば KP_FLAT、動いていれば playout_kp_per_s）
-  //   v_des を ±max_vel と Issue #46 の端の制限で切り、Δv を ±max_acc × dt に制限して積分する（速度を一気に 0 にしない）。
+  //   v_des を ±max_vel と、次の 2 つの制動曲線で切る（どちらも減速度の 8 割。加速度制限いっぱいだと 1 tick 遅れて越える）:
+  //    - 途絶の上限（PR #49 レビュー P1a）: 受けた最新の目標 + V1_PLAYOUT_LOSS_MARGIN_COUNT の先へは止まれる速さまで。
+  //      フレームが途切れても（外挿 → 減速、期限切れ → STOPPING）参照は最新の目標を約 MARGIN 以上越えない。遅い軌道では
+  //      最新の目標は遅れ（40 ms）の分だけ先にあり効かないが、速い軌道（≳ 270 count/s）では参照の遅れが v² / (2 × 0.8 × a_dec)
+  //      まで増える（600 count/s・2000 count/s² で約 110 count。従来の profile_step も約 90 count 遅れていた）
+  //    - Issue #46: ソフトリミットに向かう速度は v ≤ sqrt(2 × a_brake × max(0, d − reserve))（d = 参照から進む向きの端まで）。
+  //      参照は端の reserve 手前で止まる（その内側にいれば端に向かっては動かない。離れる向きは制限しない）。
+  //   Δv は加速なら ±max_acc × dt、減速なら ±a_dec × dt に制限して積分する（速度を一気に 0 にしない）。
   // 目標が止まった（窓の中の目標がすべて同じ → v_t がちょうど 0）・参照が p_t の SNAP 以内・1 tick で止まれる速さなら、
-  // 参照を p_t に乗せて速度をちょうど 0 にする（保持・整定・停止の判定は setpoint_vel_ == 0.0 を見る）。
-  // まだ tp に届くフレームが無い（START 直後の遅れの間）・新しいフレームが外挿の上限を越えて途切れた → v_des = 0（max_acc で減速）。
+  // 参照を p_t に乗せて速度をちょうど 0 にする（保持・整定・停止の判定と、PR #48 の静止の監視は setpoint_vel_ == 0.0 を見る）。
+  // まだ tp に届くフレームが無い（START 直後の遅れの間）・新しいフレームが外挿の上限を越えて途切れた → v_des = 0（a_dec で減速）。
   // 期限（valid_for）・lease・STOP・FAULT はこれまでどおり状態機械が決める（バッファにフレームが残っていても鮮度は延びない）。
-  // 制限は最後に受けたフレームの max_vel / max_acc（CONFIG で頭打ち。従来の profile_step と同じ）。
+  // 単精度（ESP32-S3 の FPU）。位置は参照からの差で float にする。
   void playout_step(double dt, double lo, double hi) {
     const uint64_t delay = ms_to_us(tuning.playout_delay_ms);
     const uint64_t tp = now_us_ > delay ? now_us_ - delay : 0;
     const V1PlayoutFit f =
         playout_.fit(tp, ms_to_us(tuning.playout_window_ms), ms_to_us(tuning.playout_extrap_ms), playout_clock_);
     playout_fit_ = f;
-    const double vmax = frame_max_vel_ > 0.0 ? frame_max_vel_ : 0.0;
-    const double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : 0.0;
-    double p = setpoint_;
-    double v = setpoint_vel_;
-    const double v_before = v;
+    const float dtf = static_cast<float>(dt);
+    const float vmax = frame_max_vel_ > 0.0 ? static_cast<float>(frame_max_vel_) : 0.0f;
+    const float amax = frame_max_acc_ > 0.0 ? static_cast<float>(frame_max_acc_) : 0.0f;
+    const float adec = playout_decel();
+    const double p0 = setpoint_;
+    float v = static_cast<float>(setpoint_vel_);
+    const float v_before = v;
     const bool tracking = f.has && !f.starved;
-    double p_t = p;
-    double v_des = 0.0;
+    double p_t = p0;
+    float v_des = 0.0f;
     if (tracking) {
       p_t = f.pos < lo ? lo : (f.pos > hi ? hi : f.pos);
-      const double e = p_t - (p + v * dt);  // この tick で進む分を見込んで比べる（参照が 1 tick 先行しないように）
-      const double ea = fabs(e);
+      const float e = static_cast<float>(p_t - p0) - v * dtf;  // この tick で進む分を見込んで比べる（参照が 1 tick 先行しないように）
+      const float ea = fabsf(e);
       // 目標が止まっている（傾きちょうど 0）なら硬いゲインで寄せる（指数の尾を短く。ステップ目標でも従来の軌道と同程度で着く）。
-      // 動いている間は推定の量子化の揺れを拾わないよう柔らかいゲイン。どちらも max_acc / 2 の制動曲線で頭打ち（行き過ぎない）
-      const double kp = f.vel == 0.0 ? V1_PLAYOUT_KP_FLAT_PER_S : tuning.playout_kp_per_s;
-      double corr = kp * ea;
-      const double brake = sqrt(amax * ea);
+      // 動いている間は推定の量子化の揺れを拾わないよう柔らかいゲイン
+      const float kp = f.vel == 0.0 ? static_cast<float>(V1_PLAYOUT_KP_FLAT_PER_S) : static_cast<float>(tuning.playout_kp_per_s);
+      float corr = kp * ea;
+      const float brake = sqrtf(adec * ea);
       if (brake < corr) corr = brake;
-      v_des = f.vel + (e >= 0.0 ? corr : -corr);
+      v_des = static_cast<float>(f.vel) + (e >= 0.0f ? corr : -corr);
     }
     if (v_des > vmax) v_des = vmax;
     if (v_des < -vmax) v_des = -vmax;
-    // Issue #46: ソフトリミットに向かう速度は v ≤ sqrt(2 × a_brake × max(0, d − reserve))（d = 参照から進む向きの端まで）。
-    // 参照は端の reserve 手前で止まる（その内側にいれば端に向かっては動かない。離れる向きは制限しない）。
-    // 減速度はフレームの max_acc の 8 割を超えない（加速度制限いっぱいの曲線だと 1 tick 遅れて reserve を越える）。
-    if (tuning.soft_brake_acc_count_s2 > 0.0) {
-      const double a_lim = 0.8 * amax;
-      const double ab = tuning.soft_brake_acc_count_s2 < a_lim ? tuning.soft_brake_acc_count_s2 : a_lim;
-      const double r = static_cast<double>(tuning.soft_reserve_count);
-      const double d_up = hi - p - r;
-      const double d_dn = p - lo - r;
-      const double cap_up = d_up > 0.0 ? sqrt(2.0 * ab * d_up) : 0.0;
-      const double cap_dn = d_dn > 0.0 ? sqrt(2.0 * ab * d_dn) : 0.0;
+    const float a_cap = 0.8f * adec;
+    // 途絶の上限（P1a）: 受けた最新の目標 ± MARGIN まで止まれる速さ
+    if (!playout_.empty()) {
+      const float y = static_cast<float>(static_cast<double>(playout_.newest_pos()) - p0);
+      const float m = static_cast<float>(V1_PLAYOUT_LOSS_MARGIN_COUNT);
+      const float d_up = y + m;
+      const float d_dn = m - y;
+      const float cap_up = d_up > 0.0f ? sqrtf(2.0f * a_cap * d_up) : 0.0f;
+      const float cap_dn = d_dn > 0.0f ? sqrtf(2.0f * a_cap * d_dn) : 0.0f;
       if (v_des > cap_up) v_des = cap_up;
       if (v_des < -cap_dn) v_des = -cap_dn;
     }
-    const double dv_max = amax * dt;
-    double dv = v_des - v;
+    // Issue #46: ソフトリミットの手前
+    if (tuning.soft_brake_acc_count_s2 > 0.0) {
+      const float sb = static_cast<float>(tuning.soft_brake_acc_count_s2);
+      const float ab = sb < a_cap ? sb : a_cap;
+      const float r = static_cast<float>(tuning.soft_reserve_count);
+      const float d_up = static_cast<float>(hi - p0) - r;
+      const float d_dn = static_cast<float>(p0 - lo) - r;
+      const float cap_up = d_up > 0.0f ? sqrtf(2.0f * ab * d_up) : 0.0f;
+      const float cap_dn = d_dn > 0.0f ? sqrtf(2.0f * ab * d_dn) : 0.0f;
+      if (v_des > cap_up) v_des = cap_up;
+      if (v_des < -cap_dn) v_des = -cap_dn;
+    }
+    float dv = v_des - v;
+    const bool decelerating = (v > 0.0f && dv < 0.0f) || (v < 0.0f && dv > 0.0f);
+    const float dv_max = (decelerating ? adec : amax) * dtf;
     if (dv > dv_max) dv = dv_max;
     if (dv < -dv_max) dv = -dv_max;
-    v += dv;
-    p += v * dt;
-    if (tracking && f.vel == 0.0 && fabs(p_t - p) <= V1_PLAYOUT_SNAP_COUNT && fabs(v_before) <= dv_max) {
-      p = p_t;  // 目標が止まった: 参照を乗せて速度をちょうど 0（1 tick で止まれる速さのときだけ。加速度制限の中）
-      v = 0.0;
+    float v_new = v + dv;
+    if (decelerating && v_new != 0.0f && ((v_new > 0.0f) != (v > 0.0f))) {
+      // 0 を越えた分は逆向きの加速: max_acc × dt まで（max_acc 0 ならちょうど 0 で止まる。小さな残りの速度が消えなくなるのを防ぐ）
+      const float acc_lim = amax * dtf;
+      if (v_new > acc_lim) v_new = acc_lim;
+      if (v_new < -acc_lim) v_new = -acc_lim;
+    }
+    v = v_new;
+    double p = p0 + static_cast<double>(v) * dt;
+    if (tracking && f.vel == 0.0 && fabs(p_t - p) <= V1_PLAYOUT_SNAP_COUNT && fabsf(v_before) <= adec * dtf) {
+      p = p_t;  // 目標が止まった: 参照を乗せて速度をちょうど 0（1 tick で止まれる速さのときだけ。減速度の制限の中）
+      v = 0.0f;
     }
     if (p < lo) {
       p = lo;
-      if (v < 0.0) v = 0.0;
+      if (v < 0.0f) v = 0.0f;
     }
     if (p > hi) {
       p = hi;
-      if (v > 0.0) v = 0.0;
+      if (v > 0.0f) v = 0.0f;
     }
     setpoint_ = p;
-    setpoint_vel_ = v;
+    setpoint_vel_ = static_cast<double>(v);
   }
 
   // 目標へ向かって加速度制限で加減速、速度制限を超えない、到達（通過）で目標に乗せて速度 0。

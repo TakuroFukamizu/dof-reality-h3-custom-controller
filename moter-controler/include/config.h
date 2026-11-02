@@ -266,6 +266,10 @@ constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを�
 constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
 constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）。目標が動いている間
 constexpr double V1_PLAYOUT_KP_FLAT_PER_S = 40.0;         // 同、目標が止まっている（窓の目標がすべて同じ）とき
+// PR #49 レビュー P1a: フレームが途切れても参照が「受けた最新の目標」をこれ以上越えないよう、最新の目標 + これまでに止まれる速さに抑える
+constexpr int32_t V1_PLAYOUT_LOSS_MARGIN_COUNT = 5;
+// PR #49 レビュー P1b: 減速（再生バッファの制動・途切れ・STOPPING）に使う加速度の下限 [count/s²]。フレームの max_acc が 0・ごく小さくても止まる
+constexpr uint32_t V1_MIN_DECEL_COUNT_S2 = 500;
 constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
 // Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
 // ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。

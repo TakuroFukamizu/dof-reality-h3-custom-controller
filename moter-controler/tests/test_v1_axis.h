@@ -1014,8 +1014,8 @@ inline void test_host_fault_during_fault_stop_keeps_pending_code() {
 inline void test_stop_timeout_faults() {
   Harness h;
   v1::Config c = base_config();
-  c.max_acc_count_s2 = 100;  // 4000 count/s からの減速に 40 s
-  c.stop_timeout_ms = 300;
+  c.max_acc_count_s2 = 100;  // 1 s の加速で約 100 count/s。STOPPING の減速は下限 V1_MIN_DECEL_COUNT_S2（500）で約 200 ms
+  c.stop_timeout_ms = 60;    // （PR #49 レビュー P1b で減速度に下限ができたので、止まり切る前に切れるよう短く）
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
   h.set_position(0);
@@ -1028,8 +1028,8 @@ inline void test_stop_timeout_faults() {
   }
   CHECK(h.ax.state() == st::ACTIVE);
   Harness::accepted(h.stop());
-  CHECK(h.ax.state() == st::STOPPING);
-  h.drive(310, 2600);
+  CHECK(h.ax.state() == st::STOPPING && h.ax.setpoint_vel() > 50.0);
+  h.drive(70, 2600);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::STOP_TIMEOUT);
 }
 
@@ -4415,6 +4415,10 @@ struct PlayoutScenario {
   uint32_t delay_ms = V1_PLAYOUT_DELAY_MS;  // 0 = 従来の profile_step
   uint32_t warm_ms = 300;       // 定常区間の始まり（ランプの開始から。立ち上がりを除く）
   uint32_t pre_ms = 700;        // ランプの前に止まった目標を同じ間隔で送る時間（サーバーは HOLDING 中から一定周期で送り続ける）
+  uint32_t frame_ms2 = 0;       // ≠ 0 なら switch_ms（ランプの開始から）以降のフレーム間隔（周期の変化。PR #49 レビュー P2a）
+  uint32_t switch_ms = 0;
+  uint32_t stop_stream_ms = 0;  // ≠ 0 ならランプの開始からこの時刻以降は送らない（途絶。P1a）
+  uint16_t valid_for_ms = 100;
 };
 
 struct PlayoutResult {
@@ -4433,6 +4437,11 @@ struct PlayoutResult {
   bool hold_mode = false;   // 最後に保持（HOLD）に入っている
   double ref_min = 0.0, ref_max = 0.0;  // 参照位置の最小・最大
   int32_t act_min = 0, act_max = 0;     // 実位置の最小・最大
+  uint32_t reseeds = 0;     // 周期の変化で時刻の付け直しを取り直した回数
+  int starved_ticks = 0;    // ACTIVE 中に「途切れ」（starved）と判定した tick（送信を打ち切る前まで）
+  double max_vel_err = 0.0; // 定常区間の |参照速度 − 軌道の速度| の最大
+  double loss_excursion = 0.0;  // 送信を打ち切った後、参照が最後に送った目標を動きの向きへ越えた量の最大 [count]
+  int32_t last_sent = 0;    // 最後に送った目標
 };
 
 // サーバーの planner と同じく max_acc で加減速する軌道（1 ms 刻みで積分）。速度の指令は pre_ms まで 0、その後 ramp_ms の間 vel
@@ -4478,11 +4487,13 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
   std::vector<F> frames;
   const std::vector<double> traj = playout_traj_table(s, total_ms);
   uint64_t prev_del = t0;
-  for (uint32_t k = 0; k * s.frame_ms <= total_ms; ++k) {
-    const uint32_t tg_ms = k * s.frame_ms;
+  uint32_t tg_ms = 0;
+  for (uint32_t k = 0; tg_ms <= total_ms; ++k, tg_ms += (s.frame_ms2 && tg_ms >= s.pre_ms + s.switch_ms) ? s.frame_ms2 : s.frame_ms) {
+    if (s.stop_stream_ms && tg_ms >= s.pre_ms + s.stop_stream_ms) break;
     const int32_t target = static_cast<int32_t>(llround(traj[tg_ms]));
-    const v1::HostMsg m = h.set_position_msg(target, 100, s.max_acc);  // 落とすフレームも seq は進める
+    const v1::HostMsg m = h.set_position_msg(target, s.valid_for_ms, s.max_acc);  // 落とすフレームも seq は進める
     r.final_target = target;
+    r.last_sent = target;
     if (s.drop_every && k % s.drop_every == s.drop_every - 1) continue;
     int64_t lat_ms = 5;
     if (s.jitter) lat_ms += static_cast<int64_t>((k * 37u) % 11u) - 5;  // 0〜10 ms
@@ -4514,6 +4525,13 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
     }
     h.step(5);
     if (h.ax.state() != st::ACTIVE) r.left_active = true;
+    const bool streaming = fi < frames.size();
+    if (h.ax.state() == st::ACTIVE && streaming && h.ax.playout_fit().starved) ++r.starved_ticks;
+    if (!streaming) {
+      const double dir = s.vel > 0.0 ? 1.0 : -1.0;
+      const double ex = dir * (h.ax.setpoint_pos() - static_cast<double>(r.last_sent));
+      if (ex > r.loss_excursion) r.loss_excursion = ex;
+    }
     const double v = h.ax.setpoint_vel();
     const int ff = h.ax.duty_terms().ff_permille;
     const double t_ms = static_cast<double>(h.now - t0) / 1000.0 - s.pre_ms;  // ランプの開始から
@@ -4544,6 +4562,8 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
       dff.push_back(d < 0 ? -d : d);
       sum_v += v;
       ++n_v;
+      const double ve = fabs(v - s.vel);
+      if (ve > r.max_vel_err) r.max_vel_err = ve;
     }
     v_prev = v;
     ff_prev = ff;
@@ -4558,11 +4578,12 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
   r.final_zero = h.ax.setpoint_vel() == 0.0;
   r.final_ref = h.ax.target_count();
   r.hold_mode = h.ax.duty_terms().mode == V1DutyMode::HOLD;
+  r.reseeds = h.ax.playout_reseeds();
   if (getenv("V1_PLAYOUT_REPORT")) {
     std::printf("playout delay=%u vel=%+.0f frame=%u jit=%d bo=%d drop=%u rev=%d: snaps=%d zero=%d max_dv=%.2f "
-                "ff_p99=%d ff_max=%d mean_v=%.1f sign=%d os=%.2f left=%d final(v0=%d ref=%d tgt=%d hold=%d) ref[%.1f,%.1f]\n",
+                "ff_p99=%d ff_max=%d mean_v=%.1f sign=%d os=%.2f rs=%u starve=%d verr=%.1f loss=%.2f left=%d final(v0=%d ref=%d tgt=%d hold=%d) ref[%.1f,%.1f]\n",
                 s.delay_ms, s.vel, s.frame_ms, s.jitter, s.blackout, s.drop_every, s.reverse_half, r.snaps,
-                r.zero_ticks, r.max_dv, r.ff_p99, r.ff_max, r.mean_v, r.sign_changes, r.overshoot, r.left_active, r.final_zero,
+                r.zero_ticks, r.max_dv, r.ff_p99, r.ff_max, r.mean_v, r.sign_changes, r.overshoot, r.reseeds, r.starved_ticks, r.max_vel_err, r.loss_excursion, r.left_active, r.final_zero,
                 r.final_ref, r.final_target, r.hold_mode, r.ref_min, r.ref_max);
   }
   return r;
@@ -4600,7 +4621,7 @@ inline void test_playout_ramps_have_no_artificial_stops() {
         CHECK(!r.left_active);
         CHECK(r.snaps == 0);
         CHECK(r.zero_ticks == 0);
-        CHECK(r.max_dv <= 10.0 + 1e-6);
+        CHECK(r.max_dv <= 10.0 + 1e-3);
         CHECK(fabs(r.mean_v - vel) <= 0.1 * fabs(vel));
         CHECK(r.sign_changes == 0);
         // 止まるときの行き過ぎ: 途切れが無ければ 1 count 未満。止まる所に 40 ms の途切れが重なると、届いていない区間を直線で外挿する
@@ -4628,7 +4649,7 @@ inline void test_playout_reversal_is_smooth() {
     CHECK(r.sign_changes == 1);
     CHECK(r.overshoot <= 3.0);
     CHECK(r.snaps == 0);
-    CHECK(r.max_dv <= 10.0 + 1e-6);
+    CHECK(r.max_dv <= 10.0 + 1e-3);
     CHECK(r.final_zero);
     CHECK(r.final_ref == r.final_target);
   }
@@ -4644,7 +4665,7 @@ inline void test_playout_dropped_frames() {
     const PlayoutResult r = run_playout_scenario(s);
     CHECK(!r.left_active);
     CHECK(r.snaps == 0);
-    CHECK(r.max_dv <= 10.0 + 1e-6);
+    CHECK(r.max_dv <= 10.0 + 1e-3);
     CHECK(fabs(r.mean_v - vel) <= 0.1 * fabs(vel));
     CHECK(r.final_zero);
     CHECK(r.final_ref == r.final_target);
@@ -4666,8 +4687,9 @@ inline void test_playout_soft_limit_approach_stops_inside_reserve() {
     const PlayoutResult r = run_playout_scenario(s);
     const v1::Config c = base_config();
     CHECK(!r.left_active);
-    CHECK(r.max_dv <= s.max_acc * 0.005 + 1e-6);
-    CHECK(r.final_zero);
+    CHECK(r.max_dv <= s.max_acc * 0.005 + 1e-3);
+    CHECK(r.final_zero);  // PR #49 レビュー P1c: 端の手前で止まった参照の速度はちょうど 0（保持・PR #48 の静止の監視が効く）
+    if (s.max_acc == 2000) CHECK(r.hold_mode);
     if (vel > 0) {
       CHECK(r.ref_max <= c.soft_max_count - V1_SOFT_RESERVE_COUNT + 0.5);
       CHECK(r.final_ref >= c.soft_max_count - V1_SOFT_RESERVE_COUNT - 1);  // 手前すぎない
@@ -4690,8 +4712,10 @@ inline void test_playout_clock_and_fit_unit() {
     uint64_t rx = (k * 10 + 5) * MS;
     if (k >= 40 && k <= 43) rx = 445 * MS;
     clk.push(k, rx);
-    buf.push(k, rx, 2.0 * k);  // 200 count/s
+    buf.push(k, rx, static_cast<int32_t>(2 * k));  // 200 count/s
   }
+  CHECK(!clk.valid());  // 当てはめは refit_if_dirty() まで遅らせる（1 tick に 1 回）
+  clk.refit_if_dirty();
   CHECK(clk.valid());
   CHECK(fabs(clk.period_us() - 10000.0) < 300.0);
   CHECK(llabs(static_cast<long long>(clk.time_of(41, 445 * MS)) - static_cast<long long>(415 * MS)) <= 2000);
@@ -4705,7 +4729,7 @@ inline void test_playout_clock_and_fit_unit() {
   CHECK(fabs(g.vel - 200.0) > 30.0);
   // 止まった目標: 傾きちょうど 0、位置はその値
   V1PlayoutBuffer flat;
-  for (uint32_t k = 1; k <= 20; ++k) flat.push(k, (k * 10) * MS, 123.0);
+  for (uint32_t k = 1; k <= 20; ++k) flat.push(k, (k * 10) * MS, 123);
   const V1PlayoutFit h = flat.fit(150 * MS, 80 * MS, 40 * MS, none);
   CHECK(h.has && h.vel == 0.0 && h.pos == 123.0);
   // tp がまだ最初のフレームより前 → has なし。最新より extrap を越えて先 → starved
@@ -4715,6 +4739,116 @@ inline void test_playout_clock_and_fit_unit() {
   // seq が戻る（epoch が変わった）・500 ms 以上空く → 取り直し
   clk.push(5, 1000 * MS);
   CHECK(!clk.valid());
+}
+
+// PR #49 レビュー P1a: フレームが途絶しても、参照は最後に受けた目標を V1_PLAYOUT_LOSS_MARGIN_COUNT（5）＋ 量子化以上越えない。
+// 600 count/s のランプの途中で送信を打ち切る: 外挿 → 減速、期限切れ（valid_for 60 → STOPPING）・lease 切れ（valid_for 100 =
+// command_timeout → COMMAND_TIMEOUT の減速停止）のどちらの経路でも。遅い軌道（50 count/s）も
+inline void test_playout_stream_loss_excursion_is_bounded() {
+  for (double vel : {600.0, -600.0, 50.0}) {
+    for (uint16_t valid_for : {static_cast<uint16_t>(60), static_cast<uint16_t>(100)}) {
+      PlayoutScenario s;
+      s.vel = vel;
+      s.ramp_ms = 3000;
+      s.hold_ms = 1500;
+      s.jitter = true;
+      s.valid_for_ms = valid_for;
+      s.stop_stream_ms = 1500;  // 600 count/s の定常（約 0.8 s 走った所）で切る
+      const PlayoutResult r = run_playout_scenario(s);
+      CHECK(r.left_active);  // 期限切れ・lease 切れで ACTIVE を出る
+      CHECK(r.loss_excursion <= V1_PLAYOUT_LOSS_MARGIN_COUNT + 1.0);
+      CHECK(r.max_dv <= 10.0 + 1e-3);
+    }
+  }
+}
+
+// PR #49 レビュー P1b: フレームの max_acc が 0（やごく小さい値）でも参照は止まれる（減速は V1_MIN_DECEL_COUNT_S2 を下限）。
+// 動いている参照に max_acc 0 のフレームで止まった目標を送る → 速度はちょうど 0 に。途絶 → 止まる。STOPPING も止まり切る
+inline void test_playout_zero_max_acc_still_decelerates() {
+  // 止まった目標
+  {
+    Harness h;
+    h.ax.tuning = V1Tuning(true);
+    h.pos_max_vel = 600;
+    h.reach_active();
+    const int32_t from = h.ax.actual_count();
+    for (int i = 1; i <= 60; ++i) {
+      h.send(h.set_position_msg(from + i, 100, 2000));  // 100 count/s
+      h.idle(10);
+    }
+    CHECK(h.ax.setpoint_vel() > 50.0);
+    for (int i = 0; i < 100; ++i) {
+      h.send(h.set_position_msg(from + 60, 100, 0));  // max_acc 0
+      h.idle(10);
+    }
+    CHECK(h.ax.state() == st::ACTIVE && h.ax.setpoint_vel() == 0.0);
+    // 減速度が 2000 → 500（下限）に下がった分だけ最後の目標を越えて止まる。max_acc 0 の間は加速できないのでそこに留まる
+    CHECK(std::abs(h.ax.target_count() - (from + 60)) <= 12);
+  }
+  // max_acc 0 のまま途絶 → 外挿の後に減速、期限で STOPPING（CONFIG の max_acc に戻る）
+  {
+    Harness h;
+    h.ax.tuning = V1Tuning(true);
+    h.pos_max_vel = 600;
+    h.reach_active();
+    const int32_t from = h.ax.actual_count();
+    for (int i = 1; i <= 60; ++i) {
+      h.send(h.set_position_msg(from + i, 100, 2000));
+      h.idle(10);
+    }
+    for (int i = 61; i <= 63; ++i) {
+      h.send(h.set_position_msg(from + i, 60, 0));
+      h.idle(10);
+    }
+    CHECK(h.run_until([&] { return h.ax.setpoint_vel() == 0.0; }, 1000));
+    CHECK(h.ax.target_count() - (from + 63) <= 12);
+  }
+  // ごく小さい max_acc（1）で CONTROLLED_STOP → 下限 500 で止まり切る（STOP_TIMEOUT にならない）
+  {
+    Harness h;
+    h.ax.tuning = V1Tuning(true);
+    h.pos_max_vel = 600;
+    h.reach_active();
+    const int32_t from = h.ax.actual_count();
+    for (int i = 1; i <= 60; ++i) {
+      h.send(h.set_position_msg(from + i, 100, i < 58 ? 2000 : 1));
+      h.idle(10);
+    }
+    CHECK(h.ax.setpoint_vel() > 50.0);
+    Harness::accepted(h.stop());
+    for (int i = 0; i < 40; ++i) {
+      h.send(h.set_position_msg(from + 60, 100, 1));
+      h.idle(10);
+    }
+    CHECK(h.ax.state() == st::HOLDING && h.ax.setpoint_vel() == 0.0);
+  }
+}
+
+// PR #49 レビュー P2a: サーバーのフレーム周期が途中で変わっても（100 → 50 Hz、50 → 100 Hz）、届いている限り「途切れ」とは
+// 判定せず、時刻の付け直しを取り直して速度の誤差は有界、人工的な停止なし
+inline void test_playout_cadence_change_reseeds_clock() {
+  for (int dir = 0; dir < 2; ++dir) {
+    for (int noisy = 0; noisy < 2; ++noisy) {
+      PlayoutScenario s;
+      s.vel = 100.0;
+      s.frame_ms = dir == 0 ? 10 : 20;
+      s.frame_ms2 = dir == 0 ? 20 : 10;
+      s.switch_ms = 1500;
+      s.pre_ms = 700;
+      s.jitter = noisy != 0;
+      const PlayoutResult r = run_playout_scenario(s);
+      CHECK(!r.left_active);
+      CHECK(r.starved_ticks == 0);
+      CHECK(r.snaps == 0 && r.zero_ticks == 0);
+      CHECK(r.max_dv <= 10.0 + 1e-3);
+      // 取り直すまでの間（100 → 50 Hz で約 80 ms）は新しいフレームの時刻が詰まって傾きが大きく出る: 100 count/s に対し
+      // 最大約 57 count/s の誤差（加速度制限の中で戻る）。50 → 100 Hz は約 30。実運用では planner の周期を変えるには
+      // サーバーの再起動 → CONFIG が要り、CONFIG で時刻の付け直しは取り直す（P2b）
+      CHECK(r.max_vel_err <= 60.0);
+      if (dir == 0) CHECK(r.reseeds >= 1);
+      CHECK(r.final_zero && r.final_ref == r.final_target && r.hold_mode);
+    }
+  }
 }
 
 // 再生バッファでも期限・STOP・FAULT・epoch・再 START の扱いは従来どおり（バッファにフレームが残っていても鮮度は延びない）
@@ -4752,7 +4886,7 @@ inline void test_playout_expiry_stop_fault_epoch_unchanged() {
     while (h.ax.state() == st::STOPPING && h.now < t_last + 1000 * MS) {
       h.send(h.set_position_msg(from + 100, 60, 2000));  // lease だけ保つ（STOPPING では目標に使わない）
       h.step();
-      if (fabs(h.ax.setpoint_vel() - v_prev) > 10.0 + 1e-9) bounded = false;
+      if (fabs(h.ax.setpoint_vel() - v_prev) > 10.0 + 1e-3) bounded = false;
       v_prev = h.ax.setpoint_vel();
     }
     CHECK(bounded);
@@ -4785,7 +4919,7 @@ inline void test_playout_expiry_stop_fault_epoch_unchanged() {
     for (int i = 0; i < 60; ++i) {
       h.send(h.set_position_msg(from + 51 + i, 100, 2000));  // 送り続けても STOPPING の減速は変わらない
       h.idle(5);
-      if (fabs(h.ax.setpoint_vel() - v_prev) > 10.0 + 1e-9) bounded = false;
+      if (fabs(h.ax.setpoint_vel() - v_prev) > 10.0 + 1e-3) bounded = false;
       v_prev = h.ax.setpoint_vel();
     }
     CHECK(bounded);
@@ -4928,6 +5062,9 @@ inline void run_all() {
   test_playout_dropped_frames();
   test_playout_soft_limit_approach_stops_inside_reserve();
   test_playout_expiry_stop_fault_epoch_unchanged();
+  test_playout_stream_loss_excursion_is_bounded();
+  test_playout_zero_max_acc_still_decelerates();
+  test_playout_cadence_change_reseeds_clock();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();
