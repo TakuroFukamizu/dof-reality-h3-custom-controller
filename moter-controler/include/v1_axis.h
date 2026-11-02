@@ -742,6 +742,7 @@ class V1Axis {
   // ブレーキ駐車（PARKED）: 入りかけ（ブレーキが掴むまで保持出力）と駐車中。戻りかけ（ブレーキ解除待ち）は含めない
   bool brake_parked() const { return park_ == ParkPhase::Engaging || park_ == ParkPhase::Parked; }
   bool unparking() const { return park_ == ParkPhase::Releasing; }
+  int park_hold_permille() const { return park_hold_out_; }  // 駐車に入ったときの保持出力（戻るときに出す）
   int park_count() const { return park_count_; }
   // 持続する停止（FEEDBACK_UNCERTAIN / LOAD_LIMITED）: PWM 0 ＋ ブレーキ作動（主電源は保つ）。DISARMED に戻すまで続く
   bool supervisor_inhibited() const { return supervisor_on() && sup_.inhibited(); }
@@ -1495,6 +1496,15 @@ class V1Axis {
           return;
         }
         hold_here();  // 現在位置を保持目標にして位置制御開始
+        // r10（PR #50 の Codex 事前レビュー b472dee P0）: ブレーキを解除する前に、解除待ちの間の最悪の見えない走行を余裕から差し引けるか
+        if (supervisor_on() && has_config_) {
+          sup_.t = tuning.sup;
+          if (!sup_.reserve_ok(sup_ctx(now), 0, tuning.brake_release_wait_ms)) {
+            sup_.force_exhaustion();  // 解除しない（ARMING のままブレーキ作動）。基準を消す
+            if (sup_.take_reference_lost()) referenced_ = false;
+            return;
+          }
+        }
         brake_release_cmd_ = true;
         brake_release_at_us_ = now;
       }
@@ -1727,18 +1737,14 @@ class V1Axis {
     // 端の余裕 250 を使い切って停止した）
     const double sv_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
     c.stationary_near = tuning.hold_learn && sv_abs <= static_cast<double>(tuning.park_ref_vel_count_s) && ea <= escalation_floor();
-    c.park_ok = park_conditions(ea);
+    c.park_ok = park_conditions(ea, false);
     // 駐車から戻りかけ（ブレーキ解除待ち、参照は駐車した位置で止めている）: 動かないのが正しい。出力（駐車に入ったときの保持出力）は
-    // 学んだ保持出力として扱い（|誤差| が帯を超えていても）、期限の露出は積まない（実機 27eaf6b: 駐車中に 9 count ずれた軸が、
-    // 戻りかけの −1 permille を一律の包絡線で積まれて 0.3 s で FEEDBACK_UNCERTAIN → 参照だけ進んで FOLLOWING_ERROR）
-    if (park_ == ParkPhase::Releasing) {
-      c.stationary_near = tuning.hold_learn;
-      c.deadline_hold = true;
-    }
-    // ARMING のブレーキ解除待ち: 露出は積むが、止めるのは余裕 + arm_grace まで待つ（落ち着けば駐車に入る）。駐車の入りかけはブレーキを
-    // もう指令しているので期限では止めない（掴めば露出は止まる）
-    c.deadline_defer = state_ == v1::state::ARMING;
-    c.deadline_engaging = park_ == ParkPhase::Engaging;
+    // 学んだ保持出力として扱う（|誤差| が帯を超えていても。実機 27eaf6b）。期限の露出は積む（解除前に余裕を確かめてある。PR #50 の
+    // Codex 事前レビュー b472dee P0）
+    if (park_ == ParkPhase::Releasing) c.stationary_near = tuning.hold_learn;
+    // 露出を積む: ブレーキが掴んでいると言えない間（解除指令中・駐車の入りかけ）。駐車し切った状態と、戻りかけの最初の tick
+    //（まだ作動）は積まない
+    c.accrue = brake_release_cmd_ || park_ == ParkPhase::Engaging;
     // 駐車の入りかけ・戻りかけの出力は、駐車に入ったときに実際に出していた保持出力（それで保てていた）: 予算に積まない（実機 17d0282 の
     // 系統的な回帰: 上の止まる所で駐車・戻りを繰り返すうちに上の回の予算が尽き、戻りかけの保持出力で停止していた）
     c.park_transition = park_ == ParkPhase::Engaging || park_ == ParkPhase::Releasing;
@@ -1746,7 +1752,7 @@ class V1Axis {
     //（実機 17d0282・系統的な回帰: 端の近くや中ほどで、落ち着く前に期限・予算に届いて基準を消していた。参照が止まっているならブレーキで
     // 保つのが安全で、目標が動けば自動で戻る。参照が動いている間に尽きたら従来どおり停止）
     c.park_fallback = parking_enabled() && park_ == ParkPhase::None && brake_release_cmd_ && sv_abs <= static_cast<double>(tuning.park_ref_vel_count_s) &&
-                      (state_ == v1::state::ACTIVE || state_ == v1::state::HOLDING);
+                      (state_ == v1::state::ACTIVE || state_ == v1::state::HOLDING) && ref_at_frame_target();
     return c;
   }
 
@@ -2067,11 +2073,14 @@ class V1Axis {
       sup_.t = tuning.sup;
       cmd = sup_.filter(sup_ctx(now), cmd);
       if (sup_.take_reference_lost()) referenced_ = false;  // P0: 駐車できないまま期限の露出が余裕の全部に届いた → 基準を消す
-      if (sup_.take_park_fallback() && parking_enabled() && park_ == ParkPhase::None) {
-        // 予算・期限が尽きたが参照が止まっている: 停止ではなく駐車（直前の出力を保ってブレーキが掴むまで待つ）
-        enter_park(now);
-        apply_park_output(park_hold_out_, V1DutyMode::HOLD);
-        return;
+      if (sup_.take_park_fallback() && parking_enabled() && park_ == ParkPhase::None && !sup_.inhibited()) {
+        // 予算（積まれる駆動）が尽きたが参照が止まっている: 停止ではなく駐車。入る前に入りかけの間の見えない走行を余裕から差し引けるか
+        // 確かめる（足りなければ停止）
+        if (try_enter_park(now)) {
+          apply_park_output(park_hold_out_, V1DutyMode::HOLD);
+          return;
+        }
+        if (sup_.take_reference_lost()) referenced_ = false;
       }
       if (sup_.inhibited()) {
         // 持続する停止（PR #48 の Codex 事前レビュー P0）: PWM 0 ＋ ブレーキ作動（G13 を作動側へ）。主電源は保つ（powered_state のまま）。
@@ -2332,13 +2341,14 @@ class V1Axis {
 
   bool parking_enabled() const { return supervisor_on() && tuning.park; }
   // 駐車してよい瞬間の条件（時間を除く）: ACTIVE / HOLDING・ブレーキ解除中・参照が止まっている・目標の近く・実測で止まっている・戻した直後でない・停止でない
-  bool park_conditions(int64_t err_abs) const {
+  // cooldown = false: 戻した直後の待ちを見ない（期限の露出による駐車。露出は戻らないので駐車と戻りを繰り返しても見えない走行は増えない）
+  bool park_conditions(int64_t err_abs, bool cooldown = true) const {
     if (!parking_enabled() || park_ != ParkPhase::None) return false;
     if (state_ != v1::state::ACTIVE && state_ != v1::state::HOLDING) return false;
     const double sv = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
     const int32_t v = velocity_ < 0 ? -velocity_ : velocity_;
     return brake_release_cmd_ && sv <= static_cast<double>(tuning.park_ref_vel_count_s) && err_abs <= tuning.hold_exit &&
-           v <= tuning.settled_meas_vel && now_us_ >= park_cooldown_until_us_ && !sup_.inhibited();
+           v <= tuning.settled_meas_vel && (!cooldown || now_us_ >= park_cooldown_until_us_) && !sup_.inhibited() && ref_at_frame_target();
   }
   int holding_output_permille() const {
     long h = lround(duty_state_.bias_pm + duty_state_.i_pm);
@@ -2356,6 +2366,36 @@ class V1Axis {
     terms_.i_permille = v1_clamp_i16(duty_state_.bias_pm + duty_state_.i_pm);
   }
   enum class ParkAct : uint8_t { None, Transition, Parked };
+  // 駐車に入る前に、入りかけ（ブレーキが掴むまで直前の出力を保つ間）の最悪の見えない走行を余裕から差し引けるか確かめてから入る。
+  // 足りなければ入らずに停止（基準を消す）して false（PR #50 の Codex 事前レビュー b472dee P1c）
+  bool try_enter_park(uint64_t now) {
+    if (has_config_) {
+      sup_.t = tuning.sup;
+      if (!sup_.reserve_ok(sup_ctx(now), pwm_permille(), tuning.brake_engage_ms)) {
+        sup_.force_exhaustion();
+        return false;
+      }
+    }
+    enter_park(now);
+    return true;
+  }
+  // 駐車した目標から動いたか（参照の止まる所 = ソフトリミット ∓ soft_reserve_count で切った値で比べる。止まる所の先へ目標が動いても、
+  // 参照は動かないので戻らない）
+  double cap_to_stops(double v) const {
+    double lo = static_cast<double>(config_.soft_min_count), hi = static_cast<double>(config_.soft_max_count);
+    if (tuning.playout_delay_ms > 0 && tuning.soft_reserve_count > 0) {
+      lo += tuning.soft_reserve_count;
+      hi -= tuning.soft_reserve_count;
+    }
+    return v < lo ? lo : (v > hi ? hi : v);
+  }
+  double park_target_delta() const { return fabs(cap_to_stops(control_target_) - cap_to_stops(park_target_)); }
+  // 参照がフレームの目標（止まる所で切った値）に着いている: 駐車から戻った直後（参照はまだ駐車した位置で、これから目標へ動く）に
+  // 駐車し直さない（PR #50 の Codex 事前レビュー b472dee P0: 戻った直後、参照が動き出す前に駐車し直して目標へ着かないまま繰り返していた）
+  bool ref_at_frame_target() const {
+    if (!has_config_) return true;
+    return fabs(cap_to_stops(control_target_) - setpoint_) <= static_cast<double>(tuning.park_unpark_count);
+  }
   void enter_park(uint64_t now) {
     park_ = ParkPhase::Engaging;
     park_phase_us_ = now;
@@ -2393,7 +2433,6 @@ class V1Axis {
       park_phase_us_ = now;
       brake_release_cmd_ = false;
     }
-    const double ct_dev = fabs(control_target_ - park_target_);
     switch (park_) {
       case ParkPhase::None: {
         const bool ok = park_conditions(err_abs);
@@ -2414,9 +2453,12 @@ class V1Axis {
           still_running_ = false;
         }
         const bool timed = ok && still_running_ && now - still_start_us_ >= ms_to_us(tuning.park_still_ms);
-        const bool deadline = sup_.take_park_request() && ok;  // 期限の露出が半分に届いた
+        const bool deadline = sup_.take_park_request() && park_conditions(err_abs, false);  // 期限の露出が駐車を求める所に届いた
         if (!timed && !deadline) return ParkAct::None;
-        enter_park(now);
+        if (!try_enter_park(now)) {
+          if (sup_.take_reference_lost()) referenced_ = false;
+          return ParkAct::None;  // 余裕が足りない: 停止（以後の filter が PWM 0 ＋ ブレーキ）
+        }
         *out = park_hold_out_;
         return ParkAct::Transition;
       }
@@ -2429,9 +2471,27 @@ class V1Axis {
         }
         *out = park_hold_out_;
         return ParkAct::Transition;
-      case ParkPhase::Parked:
+      case ParkPhase::Parked: {
         brake_release_cmd_ = false;
-        if (ct_dev > static_cast<double>(tuning.park_unpark_count) && state_ == v1::state::ACTIVE) {
+        if (sup_.inhibited()) return ParkAct::Parked;  // 停止の後は自動で解除しない（位置を取り直すまで）
+        const double moved = park_target_delta();
+        if (moved > static_cast<double>(tuning.park_unpark_count) && state_ == v1::state::ACTIVE) {
+          // r10（PR #50 の Codex 事前レビュー b472dee P0）: ブレーキを解除する前に、戻りかけの間の最悪の見えない走行を余裕から差し引けるか。
+          // 足りなければ解除しない。目標のずれが目標の近く（escalation_floor = 6）以内なら駐車のまま（ブレーキで保つのが安全な状態。
+          // 端の参照の止まる所で +5 の小さな段に応えるために余裕を使い切らない）。それより大きければ停止して基準を消す（自動では戻らない）
+          if (has_config_) {
+            sup_.t = tuning.sup;
+            // 小さな段（目標の近く以内）は、戻りかけ ＋ すぐ駐車し直す入りかけの分まで要る（戻ってもすぐ駐車し直すだけになりやすい。
+            // 足りなければ駐車のまま）。大きな段は戻りかけの分だけ（その後は動いて確かな動きが出る。出なければ駐車に入る前の確認で停止）
+            const bool small = moved <= static_cast<double>(escalation_floor());
+            const uint32_t win = tuning.brake_release_wait_ms + (small ? tuning.brake_engage_ms : 0);
+            if (!sup_.reserve_ok(sup_ctx(now), park_hold_out_, win)) {
+              if (small) return ParkAct::Parked;
+              sup_.force_exhaustion();
+              if (sup_.take_reference_lost()) referenced_ = false;
+              return ParkAct::Parked;
+            }
+          }
           // 戻る: まず駐車に入ったときの保持出力を出す（ブレーキはこの tick はまだ作動）。次の tick でブレーキを解除する
           park_ = ParkPhase::Releasing;
           park_phase_us_ = now;
@@ -2441,6 +2501,7 @@ class V1Axis {
           return ParkAct::Transition;
         }
         return ParkAct::Parked;
+      }
       case ParkPhase::Releasing:
         if (!park_release_armed_) {
           park_release_armed_ = true;  // 保持出力は前の tick から出ている: ここでブレーキを解除し、解除待ちを数え始める
@@ -2451,7 +2512,6 @@ class V1Axis {
           park_ = ParkPhase::None;
           park_cooldown_until_us_ = now + ms_to_us(tuning.park_still_ms);
           still_running_ = false;
-          sup_.begin_fresh_window();  // 期限は通常の制御に入ってから新しい窓で（残りの予算までに抑える）
           return ParkAct::None;  // この tick から通常の制御（参照は次の tick から追いつく）
         }
         *out = park_hold_out_;
