@@ -65,7 +65,7 @@ set_position_valid_for_ms = 100   # USB の遅延揺らぎ（実測で数十 ms�
 mcu_command_timeout_ms = 200
 mcu_stop_timeout_ms = 1500
 axis_status_timeout_ms = 300
-source_freshness_ms = 250
+source_freshness_ms = 3000  # 11-02 15:3x 操作者の判断: 250 ms ではゲームの一瞬の詰まりで停止→自動 ARM でリレーが鳴る。旧 250
 arm_timeout_ms = 5000
 stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
@@ -97,7 +97,7 @@ max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
 duty_min_percent = 9             # 11-02: 7〜8 % では #2 が動かず、9 % で動き出した実測から
-kp_percent_per_100 = 30          # 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
+kp_percent_per_100 = 50          # 11-02 15:10 つなぎ: 乗員の荷重で戻れない（誤差 29 で 8.7 % 頭打ち）→ 50。旧 30。 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
 ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
 deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
 deadband_out_count = 20          # 同（出る側）
