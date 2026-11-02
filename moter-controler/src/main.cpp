@@ -1154,14 +1154,46 @@ void onV1Button(const V1Button& b) {
   }
 }
 
+// 画面の非常停止は、押し続けたときだけ効かせる。2026-11-02 19:15 / 19:36 に、誰も触れていないのに #2 で
+// 非常停止が入り（タッチの誤検出とみられる）、1 回のタップで入れる・外すが切り替わる作りだったので、誤検出で外れる恐れもあった。
+// 入れるのは 300 ms、外すのは 1500 ms 押し続けたとき。途中で指が離れるかボタンの外へ出たら取り消す。
+// 本命の非常停止は物理ボタン（主電源の遮断）で、これは補助。
+constexpr uint32_t V1_ESTOP_LATCH_HOLD_MS = 300;
+constexpr uint32_t V1_ESTOP_RELEASE_HOLD_MS = 1500;
+bool estop_press_active = false;
+bool estop_press_done = false;
+uint32_t estop_press_start_ms = 0;
+
 void pollTouchV1() {
   const auto touch = M5.Touch.getDetail();
+  const uint32_t now = millis();
+  if (estop_press_active) {
+    const V1Button* held = touch.isPressed() ? hitV1(touch.x, touch.y) : nullptr;
+    if (held == nullptr || held->action != V1Action::Estop) {
+      estop_press_active = false;
+      return;
+    }
+    const uint32_t need = vsnap.estop_latched ? V1_ESTOP_RELEASE_HOLD_MS : V1_ESTOP_LATCH_HOLD_MS;
+    if (!estop_press_done && now - estop_press_start_ms >= need) {
+      estop_press_done = true;
+      onV1Button(*held);
+    }
+    return;
+  }
   if (!touch.wasPressed()) return;
   // 同じ押下で wasPressed が 2 回成立することがある（実機で確認）。250 ms 以内の再押下は無視する。
-  const uint32_t now = millis();
   if (now - last_press_ms < 250) return;
   last_press_ms = now;
-  if (const V1Button* b = hitV1(touch.x, touch.y)) onV1Button(*b);
+  const V1Button* b = hitV1(touch.x, touch.y);
+  if (b == nullptr) return;
+  if (b->action == V1Action::Estop) {
+    estop_press_active = true;
+    estop_press_done = false;
+    estop_press_start_ms = now;
+    showNotice(vsnap.estop_latched ? "1.5 秒押し続けて解除" : "押し続けて非常停止");
+    return;
+  }
+  onV1Button(*b);
 }
 
 void renderV1() {
