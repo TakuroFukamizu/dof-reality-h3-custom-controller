@@ -760,6 +760,8 @@ pub struct Supervisor {
     /// 軸ごとの直近の STATUS（Issue #34）。primary の STATUS だけを積み、
     /// 切断・再接続では消さない（AxisDisconnected の直前も残すため）。
     traces: [StatusRing; AXIS_COUNT],
+    /// 今の（最後の）FAULT エピソードを始めたラッチの `at_ms`。
+    episode_at_ms: f64,
     t0: Option<Instant>,
     /// Link event ordinal: orders STATUS against ACKs regardless of timestamps.
     ev: u64,
@@ -845,6 +847,7 @@ impl Supervisor {
             fault: None,
             fault_history: VecDeque::new(),
             traces: Default::default(),
+            episode_at_ms: 0.0,
             t0: None,
             ev: 0,
             reset_ev: 0,
@@ -2916,9 +2919,11 @@ impl Supervisor {
         }
         let fault = RigFault::AxisFault { axis, code };
         if latched {
+            let episode_ms = self.episode_at_ms;
             if let Some(rec) = self.fault_history.iter_mut().rev().find(|r| r.fault == fault) {
-                // STATUS が先にラッチした記録へ、後から来た FAULT_EVENT を付ける。
-                if rec.fault_event.is_none() {
+                // STATUS が先にラッチした記録へ、後から来た FAULT_EVENT を付ける
+                // （今のエピソードの記録だけ。重複の判定そのものは従来どおり履歴全体）。
+                if rec.fault_event.is_none() && rec.at_ms >= episode_ms {
                     rec.fault_event = fault_event;
                 }
                 return;
@@ -2945,6 +2950,7 @@ impl Supervisor {
         let new_episode = !matches!(self.phase, Phase::Fault { .. });
         // 直前の経過は新しいエピソードの最初の記録だけに持たせる（Issue #34）。
         let prehistory = new_episode.then(|| {
+            self.episode_at_ms = at_ms;
             for r in self.fault_history.iter_mut() {
                 r.prehistory = None;
             }
