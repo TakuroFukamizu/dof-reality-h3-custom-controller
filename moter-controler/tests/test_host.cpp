@@ -142,6 +142,50 @@ void test_home_p_retreat_happens_once_per_leg() {
   CHECK(std::string(s.m.reason) == "stall");
 }
 
+void test_home_p_retreat_hits_opposite_end_then_arrives() {
+  // Issue #34: N 端の近くから「下限へ」。P 端側へ動かず（端と区別できない）退避したら、RETREAT_COUNTS に届く前に N 端に当たった。
+  // 退避が RETREAT_END_MIN_TRAVEL 以上動いて止まったので、そこから改めて P 端へ向かい到達する。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(8, 50, 0);                // 開始直後に止まる → 退避開始
+  CHECK(std::string(s.m.reason) == "retreat");
+  s.steps(10, 20, 12);              // 退避で +120 動いて
+  s.steps(8, 50, 0);                // N 端に当たって止まる
+  CHECK(s.m.phase == AutoPhase::Moving);
+  CHECK(s.m.duty_signed == HOME_DUTY);  // 改めて P 端へ
+  CHECK(std::string(s.m.reason) == "");
+  s.steps(60, 20, -12);             // P 端へ（720 count）
+  s.steps(6, 50, 0);
+  CHECK(s.m.phase == AutoPhase::Done);
+  CHECK(s.m.origin_valid);
+  CHECK(s.m.position(s.raw) == 0);
+}
+
+void test_home_p_retreat_hits_end_then_stuck_fails() {
+  // 退避で反対の端に当たったあと、P 端へも動かない（#2 の 11-02: 下向きに 13 % で動かない）なら、もう退避せず失敗にする。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(8, 50, 0);
+  s.steps(10, 20, 12);
+  s.steps(8, 50, 0);
+  CHECK(s.m.duty_signed == HOME_DUTY);
+  s.steps(12, 50, 0);               // P 端へ動かない
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "stall");
+  CHECK(s.m.duty_signed == 0);
+}
+
+void test_home_p_retreat_small_move_then_stall_still_fails() {
+  // 退避の動きが RETREAT_END_MIN_TRAVEL 未満（ちらつき・ガタ）で止まったら、端に当たったとはみなさず従来どおり失敗。
+  Sim s;
+  s.request(AutoKind::HomeP);
+  s.steps(8, 50, 0);
+  s.steps(2, 20, 12);               // +24 だけ
+  s.steps(8, 50, 0);
+  CHECK(s.m.phase == AutoPhase::Failed);
+  CHECK(std::string(s.m.reason) == "stall");
+}
+
 Sim calibrated_sim();
 
 void test_home_p_slow_counts_fails() {
@@ -622,6 +666,9 @@ int main() {
   test_home_p_stall_without_travel_retreats_then_fails_if_stuck();
   test_home_p_already_at_end_retreats_then_arrives();
   test_home_p_retreat_happens_once_per_leg();
+  test_home_p_retreat_hits_opposite_end_then_arrives();
+  test_home_p_retreat_hits_end_then_stuck_fails();
+  test_home_p_retreat_small_move_then_stall_still_fails();
   test_home_p_near_end_short_travel_is_arrival();
   test_home_p_slow_counts_fails();
   test_home_p_slow_after_real_travel_is_arrival();
