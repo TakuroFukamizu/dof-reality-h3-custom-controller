@@ -1331,11 +1331,17 @@ void renderV1() {
 
   // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す）。
   // gap = tick 間隔の最大、act = ACTIVE 中の間隔の最大、exe = 処理時間の最大 / 直近 1 s の最大 [us]
-  char tick_text[96];
-  snprintf(tick_text, sizeof(tick_text), "tick %lu gap %lu act %lu exe %lu/%lu us%s%s",
+  char tick_text[128];
+  // nvs = NVS の書き込みと重なった長い間隔を、止まっていたので異常にしなかった回数 / 最大 [ms]（0 回なら出さない）
+  char nvs_text[24] = "";
+  if (vsnap.flash_gap_count > 0) {
+    snprintf(nvs_text, sizeof(nvs_text), " nvs %lu/%lums", static_cast<unsigned long>(vsnap.flash_gap_count),
+             static_cast<unsigned long>(vsnap.flash_gap_max_us / 1000));
+  }
+  snprintf(tick_text, sizeof(tick_text), "tick %lu gap %lu act %lu exe %lu/%lu us%s%s%s",
            static_cast<unsigned long>(vsnap.tick_count), static_cast<unsigned long>(vsnap.max_tick_gap_us),
            static_cast<unsigned long>(vsnap.active_max_tick_gap_us), static_cast<unsigned long>(vsnap.exec_max_us),
-           static_cast<unsigned long>(vsnap.exec_recent_us), boot_error[0] ? " ERR " : "", boot_error);
+           static_cast<unsigned long>(vsnap.exec_recent_us), nvs_text, boot_error[0] ? " ERR " : "", boot_error);
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);
@@ -1389,6 +1395,18 @@ void renderV1() {
   canvas.pushSprite(0, 0);
 }
 
+// NVS（Preferences）を書いてよいか。フラッシュの書き込み中は両コアが止まり、制御タスクの tick が数十 ms 空く
+//（校正直後の保存で CONTROL_OVERRUN になった。2026-11-02）。止まっていて、次の tick までに駆動へ移らない状態でだけ書く:
+// DISARMED / FAULT / BOOT、または校正後の POWER_HOLD（ARM も校正も受け付けず、DISARMED を経ないと動かない）。
+// どれも PWM 0・ブレーキ作動。スナップショットは最大 50 ms 古いので、書く間に ARM が来ても制御タスクは書き込みと重なった
+// 間隔を知っていて（control_v1_nvs_write_begin / end）、PWM 0・ブレーキ作動のままなら異常にしない。
+// 書けないときは見送るだけ（profile_dirty は残り、止まったときに保存する。ARM 中ずっと「保存待ち」のこともある）。
+bool nvsWriteSafe(const V1Snapshot& s) {
+  if (s.duty_permille != 0 || s.brake_release_cmd) return false;
+  if (s.state == v1::state::DISARMED || s.state == v1::state::FAULT || s.state == v1::state::BOOT) return true;
+  return s.state == v1::state::CALIBRATING && s.cal_live_step == v1::cal_step::POWER_HOLD;
+}
+
 bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
   return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
          a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
@@ -1417,7 +1435,7 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
          strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||
          a.cal_result != b.cal_result || a.cal_n_end != b.cal_n_end || a.cal_neutral != b.cal_neutral ||
-         a.profile_dirty != b.profile_dirty;
+         a.profile_dirty != b.profile_dirty || a.flash_gap_count != b.flash_gap_count;
 }
 
 void noteBootError(const char* what) {
@@ -1489,15 +1507,23 @@ void loop() {
     const V1Snapshot previous = vsnap;
     vsnap = control_v1_snapshot();
     // 系統の選択は制御タスク（V1Axis）が DISARMED のときだけ受け付ける。受け付けられた値だけ NVS に保存する。
-    if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis)) {
+    // 書くのは止まっている間だけ（nvsWriteSafe。選択直後に ARM されていたら DISARMED に戻ってから書く）
+    const bool nvs_ok = nvsWriteSafe(vsnap);
+    if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis) && nvs_ok) {
+      control_v1_nvs_write_begin();
       profile_store_select_motor(vsnap.selected_axis);
+      control_v1_nvs_write_end();
       saved_motor = vsnap.selected_axis;
     }
     // 校正に成功した系統プロファイル（行程・中立・符号）を NVS に保存する。従来 env と同じく loop() 側で書く
     //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。失敗したら flag を残し 2 s 後に再試行する
     //（Issue #15 M6。以前は成否に関わらず下ろしていた）。保存は 1 キーの blob なので途中で切れても混ざらない（profile_blob.h）。
-    if (vsnap.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
-      if (profile_store_save(vsnap.profile)) {
+    // 止まっている間だけ書く（nvsWriteSafe）。校正の終了手順（ブレーキ作動待ち）の間は見送り、DISARMED か POWER_HOLD で書く。
+    if (vsnap.profile_dirty && nvs_ok && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
+      control_v1_nvs_write_begin();
+      const bool saved = profile_store_save(vsnap.profile);
+      control_v1_nvs_write_end();
+      if (saved) {
         showNotice("校正を保存");
         control_v1_clear_profile_dirty();
         nvs_save_failures = 0;

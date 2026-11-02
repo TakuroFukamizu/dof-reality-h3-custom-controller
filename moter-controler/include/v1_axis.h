@@ -572,7 +572,9 @@ class V1Axis {
   }
 
   // 5 ms ごと。タイマー → 軌道 → 異常検出 → Duty → STATUS。
-  void tick(uint64_t now_us, int64_t raw) {
+  // flash_write_in_gap: 前の tick からこの tick までの間に、main が NVS（フラッシュ）を書いていた（control_task が数える）。
+  // フラッシュの書き込み中はキャッシュが止まり、両コアの制御タスクが数十 ms 走れない（校正直後の保存で CONTROL_OVERRUN になった。2026-11-02）。
+  void tick(uint64_t now_us, int64_t raw, bool flash_write_in_gap = false) {
     if (!began_) return;
     const uint64_t dt_us = now_us > last_tick_us_ ? now_us - last_tick_us_ : 0;
     last_tick_us_ = now_us;
@@ -582,8 +584,16 @@ class V1Axis {
     update_v_fast(now_us);  // r9（Issue #35）: 40 ms 窓の速い速度推定。tick ごと
 
     // 制御周期の逸脱。止まっている状態（DISARMED / FAULT）では見ない（起動直後や待機中の間隔は制御に影響しない）。
+    // 間隔が NVS の書き込みと重なり、その間の出力が PWM 0・ブレーキ作動（前の tick の指令。この時点ではまだ書き換えていない）なら、
+    // 機構は動かしていないので異常にせず数えるだけにする（校正の終了手順・POWER_HOLD、ARMING の電源待ちなど）。
+    // 駆動中（PWM ≠ 0 またはブレーキ解除）に重なったら従来どおり CONTROL_OVERRUN（main は止まっている状態でしか書かない）。
     if (!parked() && dt_us > static_cast<uint64_t>(tuning.overrun_ms) * 1000ull) {
-      latch_fault(v1::fault::CONTROL_OVERRUN, now_us);
+      if (flash_write_in_gap && duty_permille_ == 0 && !brake_release_cmd_) {
+        flash_gap_count_ += 1;
+        if (dt_us > flash_gap_max_us_) flash_gap_max_us_ = static_cast<uint32_t>(dt_us > UINT32_MAX ? UINT32_MAX : dt_us);
+      } else {
+        latch_fault(v1::fault::CONTROL_OVERRUN, now_us);
+      }
     }
 
     check_timers(now_us);
@@ -673,6 +683,9 @@ class V1Axis {
   int16_t pwm_permille() const {                            // 正が count の増える向き。実際に出している permille そのもの
     return static_cast<int16_t>(-static_cast<int>(effective_sign()) * duty_permille_);
   }
+  // 止まっている間（PWM 0・ブレーキ作動）の NVS 書き込みで、CONTROL_OVERRUN にせず見逃した長い tick 間隔の回数と最大 [us]
+  uint32_t flash_gap_count() const { return flash_gap_count_; }
+  uint32_t flash_gap_max_us() const { return flash_gap_max_us_; }
 
   // --- 参照 -----------------------------------------------------------------
 
@@ -822,6 +835,8 @@ class V1Axis {
   uint64_t boot_origin_us_ = 0;
   uint64_t last_tick_us_ = 0;
   uint64_t now_us_ = 0;  // 直近に handle / tick へ渡された時刻（即時 STATUS の mcu_time_us 用）
+  uint32_t flash_gap_count_ = 0;   // NVS 書き込みと重なった長い間隔を、止まっていたので見逃した回数（起動から）
+  uint32_t flash_gap_max_us_ = 0;  // 同、間隔の最大
 
   // --- 状態 ---
   uint8_t state_ = v1::state::BOOT;

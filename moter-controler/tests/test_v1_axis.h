@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 
+#include "motor_dir_coast.h"
 #include "motor_output.h"
 #include "v1_axis.h"
 
@@ -85,6 +86,7 @@ struct Harness {
   bool brake_fails = false;
   bool brake_was_released = false;
   uint64_t brake_cmd_off_at = 0;
+  bool flash_next = false;  // 次の step の間隔は NVS の書き込みと重なった（V1Axis::tick の flash_write_in_gap。1 回で下ろす）
 
   explicit Harness(uint8_t axis = 1, int8_t sign = 1, int64_t raw0 = 0, bool reference = true) {
     V1Identity id;
@@ -266,7 +268,8 @@ struct Harness {
         raw += static_cast<int64_t>(delta);
       }
     }
-    ax.tick(now, raw);
+    ax.tick(now, raw, flash_next);
+    flash_next = false;
     drain();
   }
   // 条件が成り立つまで 5 ms ずつ進める（上限 max_ms）。成り立てば true。
@@ -3106,6 +3109,132 @@ inline void test_local_estop_and_overrun_during_calibration() {
   }
 }
 
+// NVS の書き込み（フラッシュでキャッシュが止まる）と重なった長い間隔（2026-11-02 の実機: 校正直後の保存で CONTROL_OVERRUN）:
+// その間の出力が PWM 0・ブレーキ作動なら異常にせず数える。駆動中（PWM ≠ 0 かブレーキ解除）なら従来どおり CONTROL_OVERRUN。
+inline void test_flash_write_gap_while_stopped_is_counted_not_faulted() {
+  {  // 校正の終了手順（ブレーキ作動待ち。CALIBRATING・PWM 0・プロファイル未保存）
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    h.start_calibration_and_reach_running();
+    CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL && !h.ax.brake_release_cmd(); },
+                      40000));
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_permille() == 0 && h.ax.profile_dirty());
+    h.flash_next = true;
+    h.step(50);
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.fault_code() == fc::NONE && h.fault_events().empty());
+    CHECK(h.ax.flash_gap_count() == 1 && h.ax.flash_gap_max_us() == 50 * MS);
+    CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 2000));
+    CHECK(h.cal_results().size() == 1 && h.cal_results()[0].result == v1::cal_result::OK && h.fault_events().empty());
+    // DISARMED では間隔を見ない（数えもしない）
+    h.flash_next = true;
+    h.step(80);
+    CHECK(h.ax.state() == st::DISARMED && h.ax.flash_gap_count() == 1);
+  }
+  {  // 同じ場面でも書き込みと重なっていなければ従来どおり異常
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    h.start_calibration_and_reach_running();
+    CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_NEUTRAL && !h.ax.brake_release_cmd(); },
+                      40000));
+    h.step(50);
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::CONTROL_OVERRUN && h.ax.flash_gap_count() == 0);
+  }
+  {  // KEEP_POWER の POWER_HOLD（main はここでも保存する）: 異常にしない。15 ms 以下の間隔は数えない
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.config());
+    Harness::accepted(h.calibrate(1, v1::cal_flags::KEEP_POWER));
+    CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::POWER_HOLD; }, 40000));
+    h.flash_next = true;
+    h.step(12);
+    CHECK(h.ax.flash_gap_count() == 0);
+    h.flash_next = true;
+    h.step(70);
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.cal_live_step() == v1::cal_step::POWER_HOLD &&
+          h.ax.fault_code() == fc::NONE && h.ax.flash_gap_count() == 1 && h.ax.power_on_cmd());
+  }
+  {  // ARMING の電源待ち（PWM 0・ブレーキ作動）: 選択の保存と ARM が重なっても異常にしない
+    Harness h;
+    Harness::accepted(h.config());
+    Harness::accepted(h.arm());
+    CHECK(h.ax.state() == st::ARMING && h.ax.duty_permille() == 0 && !h.ax.brake_release_cmd());
+    h.flash_next = true;
+    h.step(40);
+    CHECK(h.ax.state() == st::ARMING && h.ax.flash_gap_count() == 1 && h.fault_events().empty());
+  }
+}
+
+inline void test_flash_write_gap_while_driving_still_faults() {
+  {  // 校正の端当て中（ブレーキ解除・PWM ≠ 0）
+    Harness h(1, 1, 0, false);
+    h.start_calibration_and_reach_running();
+    CHECK(h.ax.brake_release_cmd() && h.ax.duty_permille() != 0);
+    h.flash_next = true;
+    h.step(16);
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::CONTROL_OVERRUN && h.ax.flash_gap_count() == 0);
+  }
+  {  // HOLDING（ブレーキ解除。PWM が 0 でも保持していれば駆動中）
+    Harness h;
+    h.reach_holding();
+    h.set_position(0);
+    CHECK(h.ax.brake_release_cmd());
+    h.flash_next = true;
+    h.step(16);
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::CONTROL_OVERRUN && h.ax.flash_gap_count() == 0);
+  }
+  {  // 校正の電源待ち（CAL_POWER_SETTLE、ブレーキ作動・PWM 0）は止まっている: 数える
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.calibrate(1));
+    h.idle(100);
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+    h.flash_next = true;
+    h.step(30);
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.flash_gap_count() == 1);
+  }
+}
+
+// 反転の順序（motor_dir_coast.h）: 逆向きは PWM 0 になってから DIR_COAST_MS 経つまで出さない。待ちでブロックしない
+inline void test_motor_dir_coast_reversal_without_blocking() {
+  const uint32_t coast = DIR_COAST_MS * 1000u;
+  CHECK(coast == 5000);
+  MotorDirCoast c;
+  // 起動後最初の出力は待たない（DIR を書く）
+  MotorDirCoast::Out o = c.step(70, 1000 * MS, coast);
+  CHECK(o.permille == 70 && o.write_dir && o.dir == 1);
+  // 同じ向きの変化は DIR を書かない
+  o = c.step(80, 1005 * MS, coast);
+  CHECK(o.permille == 80 && !o.write_dir && o.dir == 1);
+  // 5 ms tick での直接の反転: 1 tick 目は PWM 0（DIR はそのまま）、5 ms 後の tick で DIR → PWM
+  o = c.step(-70, 1010 * MS, coast);
+  CHECK(o.permille == 0 && !o.write_dir && o.dir == 1 && MotorDirCoast::coasting(-70, o));
+  o = c.step(-70, 1010 * MS + coast - 1, coast);
+  CHECK(o.permille == 0 && !o.write_dir);
+  o = c.step(-70, 1010 * MS + coast, coast);
+  CHECK(o.permille == -70 && o.write_dir && o.dir == -1 && !MotorDirCoast::coasting(-70, o));
+  // 0 を挟んだ反転: 0 の時間が足りなければ待つ（0 になった時刻から数える）
+  o = c.step(0, 1100 * MS, coast);
+  CHECK(o.permille == 0 && !o.write_dir && !MotorDirCoast::coasting(0, o));
+  o = c.step(70, 1103 * MS, coast);
+  CHECK(o.permille == 0 && !o.write_dir);
+  o = c.step(70, 1105 * MS, coast);
+  CHECK(o.permille == 70 && o.write_dir && o.dir == 1);
+  // 待っている間に元の向きへ戻った要求は、すぐ出す（DIR は変えていないので書かない）
+  o = c.step(-50, 1200 * MS, coast);
+  CHECK(o.permille == 0);
+  o = c.step(60, 1201 * MS, coast);
+  CHECK(o.permille == 60 && !o.write_dir && o.dir == 1);
+  // 長く 0 だった後の反転は待たない
+  o = c.step(0, 1300 * MS, coast);
+  o = c.step(-90, 1320 * MS, coast);
+  CHECK(o.permille == -90 && o.write_dir && o.dir == -1);
+  // 待っている間に 0 が来たら 0（待ちの起点は最初に 0 にした時刻のまま）
+  o = c.step(90, 1400 * MS, coast);
+  CHECK(o.permille == 0);
+  o = c.step(0, 1402 * MS, coast);
+  CHECK(o.permille == 0);
+  o = c.step(90, 1405 * MS, coast);
+  CHECK(o.permille == 90 && o.write_dir && o.dir == 1);
+}
+
 // 終了手順（ブレーキ作動待ち）の間の FAULT: 結果は確定済みなのでそのまま送る。成功なら基準・プロファイルも保つ。
 // 中止 "stop" の結果も "fault" に書き換えない。
 inline void test_fault_during_calibration_shutdown_keeps_final_result() {
@@ -5194,6 +5323,9 @@ inline void run_all() {
   test_host_fault_during_calibration();
   test_local_estop_and_overrun_during_calibration();
   test_fault_during_calibration_shutdown_keeps_final_result();
+  test_flash_write_gap_while_stopped_is_counted_not_faulted();
+  test_flash_write_gap_while_driving_still_faults();
+  test_motor_dir_coast_reversal_without_blocking();
 }
 
 }  // namespace v1axis_test
