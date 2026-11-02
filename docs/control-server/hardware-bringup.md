@@ -366,7 +366,7 @@ HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center`
 | 観察 | 停止距離（送信停止から静止までの count と秒）、HOLDING の `following_error_count` の幅、ブレーキ作動後の沈み、リレーの音、USB が応答しなくなった個体（§10） |
 | 未解決 | 再現しなかった事象、推定のまま残した値 |
 
-FAULT のたびに `fault_history`（status。最大 32 件）と `GET /v1/events` を取ってから `fault/reset` する。
+FAULT のたびに `fault_history`（status。最大 32 件）と `GET /v1/events` を取ってから `fault/reset` する。最新のエピソードの最初の記録には `prehistory`（ラッチ直前 2 s の全軸の STATUS、20 Hz）と、FAULT_EVENT が知らせた原因なら `fault_event` が付く（Issue #34。次の FAULT で古い記録からは外れるので、その前に status を保存する。`server.log` の `fault pre-history` 行にも残る）。
 
 ## 10. トラブル表
 

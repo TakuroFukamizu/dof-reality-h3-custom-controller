@@ -134,6 +134,7 @@
 //!   but a restart. `/v1/calibration/export` keeps working meanwhile.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -147,6 +148,7 @@ use crate::limits::{
     MotionLimitsSnapshot, OperatorCap,
 };
 use crate::planner::{AxisLimits, Planner};
+use crate::prehistory::{self, FaultEventRecord, FaultPrehistory, StatusRing, TraceSample};
 use crate::protocol::{
     self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
     CalResultCode, FaultEvent, Hello, HostMsg, Limits, SetPosition, Status,
@@ -339,6 +341,14 @@ pub struct FaultRecord {
     pub at_ms: f64,
     pub fault: RigFault,
     pub detail: Option<String>,
+    /// Issue #34: FAULT_EVENT の中身（軸の異常で、その軸の FAULT_EVENT が届いた
+    /// とき。STATUS で先にラッチした記録にも後から付く）。それ以外は null。
+    pub fault_event: Option<FaultEventRecord>,
+    /// Issue #34: ラッチ直前 2 s の全軸の STATUS（20 Hz に間引き）。新しい
+    /// エピソードを始めた記録（最初の原因）だけが持ち、次のエピソードが
+    /// ラッチすると古い記録からは外す（status を小さく保つ）。ラッチ中に
+    /// 重なった原因の記録は null。
+    pub prehistory: Option<Arc<FaultPrehistory>>,
 }
 
 /// Supervisor-side log entry for telemetry (`EventLog::push(at, kind, detail)`).
@@ -672,6 +682,9 @@ struct DriveView {
     virtual_targets: [f64; AXIS_COUNT],
     target_counts: [Counts; AXIS_COUNT],
     limits: Vec<LimitReason>,
+    /// 直近の tick で姿勢から求めた目標（planner 前、ACTIVE（game）中だけ）。
+    /// FAULT 直前の経過（Issue #34）に載せる。
+    requested_counts: Option<[f64; AXIS_COUNT]>,
 }
 
 /// The rig state machine. See the module docs.
@@ -744,6 +757,9 @@ pub struct Supervisor {
 
     fault: Option<RigFault>,
     fault_history: VecDeque<FaultRecord>,
+    /// 軸ごとの直近の STATUS（Issue #34）。primary の STATUS だけを積み、
+    /// 切断・再接続では消さない（AxisDisconnected の直前も残すため）。
+    traces: [StatusRing; AXIS_COUNT],
     t0: Option<Instant>,
     /// Link event ordinal: orders STATUS against ACKs regardless of timestamps.
     ev: u64,
@@ -828,6 +844,7 @@ impl Supervisor {
             outbox: Default::default(),
             fault: None,
             fault_history: VecDeque::new(),
+            traces: Default::default(),
             t0: None,
             ev: 0,
             reset_ev: 0,
@@ -838,6 +855,7 @@ impl Supervisor {
                 virtual_targets: [VIRTUAL_CENTER; AXIS_COUNT],
                 target_counts: neutral,
                 limits: Vec::new(),
+                requested_counts: None,
             },
             last_frame_skew: None,
             events: VecDeque::new(),
@@ -1198,6 +1216,7 @@ impl Supervisor {
         self.check_frame_skew(now);
 
         let mut drive_limits = Vec::new();
+        self.drive.requested_counts = None;
         match self.phase {
             Phase::Active {
                 source: ActiveSource::Game,
@@ -1802,6 +1821,10 @@ impl Supervisor {
         t.status_at = Some(received_at);
         t.status_ev = self.ev;
         t.status_frame = self.group_frame_id;
+        // FAULT 直前の経過（Issue #34）: 固定リングへ上書きするだけ。
+        let server_target = self.is_armed().then(|| self.drive.target_counts[i]);
+        let requested = self.drive.requested_counts.map(|c| c[i].round() as Counts);
+        self.traces[i].push(TraceSample::new(received_at, &status, server_target, requested));
         if rebooted {
             self.event(
                 now,
@@ -1817,7 +1840,7 @@ impl Supervisor {
             }
         }
         if let Some(code) = self.axes[i].status_fault() {
-            self.latch_axis_fault(axis, code, "STATUS", now);
+            self.latch_axis_fault(axis, code, "STATUS", None, now);
         }
         self.check_axis_state(i, now);
     }
@@ -1834,7 +1857,18 @@ impl Supervisor {
         } else {
             ev.fault_code
         };
-        self.latch_axis_fault(axis, code, "FAULT_EVENT", now);
+        let rec = FaultEventRecord {
+            axis,
+            boot_id: ev.boot_id,
+            mcu_time_us: ev.mcu_time_us,
+            fault_code: ev.fault_code,
+            mcu_state_before: McuState::from_u8(ev.mcu_state_before),
+            mcu_state_before_raw: ev.mcu_state_before,
+            actual_count: ev.actual_count,
+        };
+        // HOST_FAULT の折り返しなど、記録に残らない FAULT_EVENT もイベントには残す。
+        self.event(now, "fault_event", serde_json::json!(rec));
+        self.latch_axis_fault(axis, code, "FAULT_EVENT", Some(rec), now);
     }
 
     fn on_cal_result(&mut self, i: usize, r: CalResult, now: Instant) {
@@ -2867,23 +2901,55 @@ impl Supervisor {
 
     // ------------------------------------------------------------ faults
 
-    fn latch_axis_fault(&mut self, axis: AxisId, code: FaultCode, source: &str, now: Instant) {
+    fn latch_axis_fault(
+        &mut self,
+        axis: AxisId,
+        code: FaultCode,
+        source: &str,
+        fault_event: Option<FaultEventRecord>,
+        now: Instant,
+    ) {
         let latched = matches!(self.phase, Phase::Fault { .. });
         // HOST_FAULT on an axis is the echo of our own latch; already recorded.
         if latched && code == FaultCode::HostFault {
             return;
         }
         let fault = RigFault::AxisFault { axis, code };
-        if latched && self.fault_history.iter().any(|r| r.fault == fault) {
-            return;
+        if latched {
+            if let Some(rec) = self.fault_history.iter_mut().rev().find(|r| r.fault == fault) {
+                // STATUS が先にラッチした記録へ、後から来た FAULT_EVENT を付ける。
+                if rec.fault_event.is_none() {
+                    rec.fault_event = fault_event;
+                }
+                return;
+            }
         }
-        self.latch(fault, Some(format!("reported in {source}")), now);
+        self.latch_record(fault, Some(format!("reported in {source}")), fault_event, now);
     }
 
     /// Latch FAULT_LATCHED. The first latch of an episode sends HOST_FAULT to
     /// every connected axis; later causes only go to the history.
     fn latch(&mut self, fault: RigFault, detail: Option<String>, now: Instant) {
+        self.latch_record(fault, detail, None, now);
+    }
+
+    /// [`Self::latch`] with the axis's FAULT_EVENT (if that is what reported it).
+    fn latch_record(
+        &mut self,
+        fault: RigFault,
+        detail: Option<String>,
+        fault_event: Option<FaultEventRecord>,
+        now: Instant,
+    ) {
         let at_ms = self.at_ms(now);
+        let new_episode = !matches!(self.phase, Phase::Fault { .. });
+        // 直前の経過は新しいエピソードの最初の記録だけに持たせる（Issue #34）。
+        let prehistory = new_episode.then(|| {
+            for r in self.fault_history.iter_mut() {
+                r.prehistory = None;
+            }
+            Arc::new(self.capture_prehistory(now))
+        });
         if self.fault_history.len() >= FAULT_HISTORY_LEN {
             self.fault_history.pop_front();
         }
@@ -2891,13 +2957,23 @@ impl Supervisor {
             at_ms,
             fault: fault.clone(),
             detail: detail.clone(),
+            fault_event,
+            prehistory: prehistory.clone(),
         });
-        self.event(
-            now,
-            "fault",
-            serde_json::json!({"fault": fault, "detail": detail}),
-        );
-        if let Phase::Fault { .. } = self.phase {
+        let mut ev = serde_json::json!({"fault": fault, "detail": detail});
+        if let Some(fe) = fault_event {
+            ev["fault_event"] = serde_json::json!(fe);
+        }
+        self.event(now, "fault", ev);
+        if let Some(p) = prehistory {
+            // ログに 1 回だけ JSON で残す（server.rs が warn で出す）。
+            self.event(
+                now,
+                "fault_prehistory",
+                serde_json::json!({"at_ms": at_ms, "fault": fault, "fault_event": fault_event, "prehistory": p}),
+            );
+        }
+        if !new_episode {
             return;
         }
         self.fault = Some(fault);
@@ -2915,6 +2991,21 @@ impl Supervisor {
             }
         }
         self.note_state(now);
+    }
+
+    /// 全軸の直前 2 s（20 Hz に間引き）とラッチ直前のリグの様子（Issue #34）。
+    fn capture_prehistory(&self, now: Instant) -> FaultPrehistory {
+        FaultPrehistory {
+            window_ms: prehistory::WINDOW.as_millis() as u64,
+            interval_ms: prehistory::INTERVAL.as_millis() as u64,
+            rig_state_before: self.state(),
+            requested_pose: self.requested.pose,
+            effective_gain: self.requested.effective_gain,
+            axes: AxisId::ALL
+                .into_iter()
+                .map(|a| self.traces[a.index()].prehistory(a, now))
+                .collect(),
+        }
     }
 
     /// HOST_FAULT to one axis (idempotent on the MCU); FaultReset waits for a
@@ -3056,6 +3147,7 @@ impl Supervisor {
         let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
         limits.extend(out.limits);
         self.drive.virtual_targets = virt;
+        self.drive.requested_counts = Some(targets);
         limits
     }
 

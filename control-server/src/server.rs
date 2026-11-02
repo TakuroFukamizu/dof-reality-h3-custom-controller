@@ -578,6 +578,8 @@ impl ControlLoop {
             for e in events {
                 match e.kind {
                     "fault" => tracing::error!(detail = %e.detail, "rig fault"),
+                    // FAULT 直前 2 s の全軸の経過（Issue #34）。エピソードごとに 1 回。
+                    "fault_prehistory" => tracing::warn!(detail = %e.detail, "fault pre-history"),
                     // Logged as "rig state" by note_state.
                     "rig_state" => tracing::debug!(detail = %e.detail, "supervisor event"),
                     kind => tracing::info!(kind, detail = %e.detail, "supervisor event"),
