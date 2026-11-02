@@ -61,7 +61,9 @@ struct Harness {
   // r10（Issue #44・#46）: PWM で動くプラント（pwm_plant = true のとき、位置制御中は上の「目標に追従する」プラントの代わり）。
   // 物理位置 phys（小数）とエンコーダの値 raw を分ける: enc_connected = false なら raw は止まったまま（テストが手で書き換えてもよい）、
   // phys だけが動く。速度 = pwm_permille（カウント増が正）× pwm_count_s_per_permille を ±plant_max_vel で頭打ち（荷重で遅い）、
-  // |pwm| ≤ pwm_deadband_permille は 0、held なら 0（乗員が押さえている）、ext_vel（外力。count/s）を足す。ブレーキ作動中は ext_vel だけ。
+  // |pwm| ≤ pwm_deadband_permille は 0、held なら 0（乗員が押さえている）、ext_vel（外力・重力。count/s）を足す。
+  // ブレーキ: 解除指令が落ちてから brake_delay_ms 経つと機械のブレーキが効いて止まる（ext_vel も効かない）。その間は ext_vel だけで動く。
+  // brake_fails = true ならブレーキが効かない（PWM 0 だけの退避と同じ）。
   bool pwm_plant = false;
   bool enc_connected = true;
   bool held = false;
@@ -70,6 +72,10 @@ struct Harness {
   double plant_max_vel = 1e9;
   int pwm_deadband_permille = 0;
   double ext_vel = 0.0;
+  uint32_t brake_delay_ms = 0;
+  bool brake_fails = false;
+  bool brake_was_released = false;
+  uint64_t brake_cmd_off_at = 0;
 
   explicit Harness(uint8_t axis = 1, int8_t sign = 1, int64_t raw0 = 0, bool reference = true) {
     V1Identity id;
@@ -208,12 +214,21 @@ struct Harness {
     if (pwm_plant && ax.state() != st::CALIBRATING) {
       double v = 0.0;
       const int u = ax.pwm_permille();
-      if (ax.brake_release_cmd() && !held && (u > pwm_deadband_permille || u < -pwm_deadband_permille)) {
+      const bool released = ax.brake_release_cmd();
+      if (released) {
+        brake_was_released = true;
+      } else if (brake_was_released) {
+        brake_was_released = false;
+        brake_cmd_off_at = now - dt_ms * MS;  // この区間の始まりに指令が落ちた
+      }
+      const bool engaged = !released && !brake_fails && now - brake_cmd_off_at >= brake_delay_ms * MS;
+      if (released && !held && (u > pwm_deadband_permille || u < -pwm_deadband_permille)) {
         v = static_cast<double>(u) * pwm_count_s_per_permille;
         if (v > plant_max_vel) v = plant_max_vel;
         if (v < -plant_max_vel) v = -plant_max_vel;
       }
       v += ext_vel;
+      if (engaged) v = 0.0;
       phys += v * static_cast<double>(dt_ms) / 1000.0;
       if (enc_connected) raw = static_cast<int64_t>(floor(phys));
     } else if (!stall && ax.brake_release_cmd()) {
@@ -3973,6 +3988,9 @@ inline void test_r8_band_stuck_assist_short_pulses_with_cooldown() {
   Harness a;
   active(a);
   a.ax.tuning.kp_percent_per_100 = 10;  // kp 30 では止まったまま約 0.5 s で P が 15 % を超え無パルス保護が先に働く（それは正しい）
+  // r10: 監視 ON（一律の包絡線）では止まったまま 0.4 s 弱で見えない走行の予算が尽きて停止する（それは正しい。test_r10_*）。
+  // ここはパルスの間隔を見る試験なので監視を切る
+  a.ax.tuning.supervisor = false;
   a.stall = true;
   const int32_t sa = a.ax.actual_count();
   int onsets = 0, run = 0, max_run = 0;

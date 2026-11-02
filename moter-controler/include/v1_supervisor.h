@@ -7,40 +7,38 @@
 // 静止 2 s の監視 B）。電流検出が無いので「エンコーダは生きているが乗員の荷重で完全に止まっている」と「エンコーダ断」は区別できない。
 // そこで ENCODER_FAULT はラッチせず、次の 2 つで「見えない走行」と過負荷を抑える。
 //
+// 持続する停止（inhibited = FEEDBACK_UNCERTAIN か LOAD_LIMITED。PR #48 の Codex 事前レビュー P0）: 入った tick に PWM 0、V1Axis が
+// ブレーキ解除指令を落とす（G13 → ブレーキ作動。主電源は保つ）。状態（mcu_state）は変えず FAULT にもしない。自動では戻らない:
+// DISARM（ACTIVE なら減速 → DISARMING → DISARMED）か FAULT → FAULT_RESET で DISARMED に戻したときだけ解除し（clear_episode）、
+// 改めて ARM_PREPARE の通常の手順（主電源 → power settle → ブレーキ解除 → 解除待ち → HOLDING）で再開する。再開の目標は ARM_PREPARE の
+// 現在位置（停止前の古い目標・フレームは使わない）、制御器の状態（積分・動き出しパルス・速度推定）は DISARMED で捨てる。位置の上限
+//（下の env_cum）は残す。
+//
 // 1. 見えない走行の予算（FEEDBACK_UNCERTAIN。常に優先）
 //    - 包絡線: 実際に出した PWM（前の tick の出力。この tick までの区間に効いていた）の向きへ、v_env(|u|) × dt だけ「見えないまま
-//      動けたかもしれない」距離を積む。v_env = V1_SUP_ENV_COUNT_S × |u| / V1_SUP_ENV_REF_PERMILLE（ref = 0 なら一律 2500）。
-//      上（カウント増）と下を別々に積む。向きの反転・PWM 0 の隙間では減らさない（反転や隙間で予算を洗い直せない）。
+//      動けたかもしれない」距離を積む。既定は一律 v_env = 2500 count/s（|u| > 0）。V1_SUP_ENV_PROPORTIONAL で |u| に比例（20 % で 2500）。
+//      上（カウント増）と下を別々に積む。向きの反転・PWM 0 の隙間では減らさない。端の手前の制動の出力も同じに積む（P1a）。
 //    - 2 つの上限（どちらかを超える出力は出さない）:
-//        回の上限  env_ep[d]  ≤ V1_SUP_BUDGET_MAX_COUNT（1000）                         … DISARMED まで戻せば 0 に戻る
-//        位置の上限 env_cum[d] ≤ max(D_d − 400, min(50, max(0, D_d − 20)), 0)          … 「確かな動き」か基準の取り直しまで戻らない
-//      最初の回の予算は min(1000, max(0, D − 400)) = Issue #44 の式。中央付近（D ≈ 2750）なら再 ARM で 2 回強まで出せ、その後は
-//      確かな動きか基準の取り直し（SET_REFERENCE / 校正）が要る
-//      D_d = 最後に信用できた位置（trusted）から向き d の機械端までの距離。機械端 = CONFIG のソフトリミット ± V1_MECH_DECEL_ZONE_COUNT。
-//      位置の上限を再 ARM で戻さないので、エンコーダが死んだまま ARM を繰り返しても「端から 400 count 以内へ見えないまま入る」ことは無い
-//     （最小予算 50 の分を除く。下記）。荷重で押さえられただけなら、再 ARM の後に一度でも確かに動けば全部戻る。
-//    - 判定は先読み: この tick の出力を出すと次の tick までに上限を超える（env + v_env × max(dt, 5 ms) > 上限）なら出力 0 にして
-//      FEEDBACK_UNCERTAIN を立てる。以後は位置制御の出力を常に 0（ブレーキは触らない。下の「未決」）。
-//    - 戻す唯一の根拠（確かな動き）: 出している向きへ、窓（200 ms）の中で最も戻った所から 2 count 以上の正味の移動。±1 のちらつき・
-//      片相のトグル（n ↔ n+1）は 1 にしかならない。出力と逆向きの動き（押し戻された）は戻さない（Issue #44 の指示）。±2 以上の
-//      大きい往復は戻してしまう（残る穴。PCNT のフィルタと A/B 遷移の妥当性の計数は後続 = encoder_pcnt.cpp:56）。
-//    - FEEDBACK_UNCERTAIN の解除は明示的な操作だけ: DISARM（ブレーキ作動 → DISARMED）か FAULT → FAULT_RESET で DISARMED に戻ったとき
-//     （= 再 ARM が要る）。確かな動きでは自動で解除しない（出力 0 なので確かな動きは起こらない）。
-//    - 最小予算（仕様からの逸脱、sup.min_budget_count = 0 で仕様どおり）: D ≤ 400 で 0 だと端から 400 以内では端へ向かう出力を
-//      1 tick も出せず、PC の目標（soft + 150〜350）に着けない。
-// 2. 過負荷（LOAD_LIMITED、ラッチしない）: 飽和（|出力| ≥ duty_max × 99 %、誤差の向き）のまま 100 ms の窓ごとの「進み」（向きへ 5 count
-//    または |誤差| が 3 減る）が無いまま 1 s → 出力 0。|誤差| ≤ hold_exit・誤差の向きの反転・2 s 休んだら解除。
-//    中央付近で完全に押さえられた場合は 400 ms で予算が先に尽きる（FEEDBACK_UNCERTAIN）。LOAD_LIMITED は「向きへ少しずつは動いている
-//    （予算は戻る）が誤差を詰められない」場面のもの。
+//        回の上限  env_ep[d]  ≤ V1_SUP_BUDGET_MAX_COUNT（1000）                          … DISARMED に戻せば 0 に戻る
+//        位置の上限 env_cum[d] ≤ max(D_d − 400, 0)（V1_SUP_MIN_BUDGET で min(50, D_d − 20) を下限に） … 確かな動きか基準の取り直しまで戻らない
+//      最初の回の予算は min(1000, max(0, D − 400)) = Issue #44 の式。D_d = 最後に信用できた位置（trusted）から向き d の機械端までの
+//      距離、機械端 = CONFIG のソフトリミット ∓ V1_MECH_DECEL_ZONE_COUNT。位置の上限を再 ARM で戻さないので、エンコーダが死んだまま
+//      ARM を繰り返しても端から 400 count 以内へ見えないまま入らない。中央付近（D ≈ 2750）なら再 ARM で 2 回強まで出せ、その後は
+//      確かな動きか基準の取り直し（SET_REFERENCE / 校正）が要る。荷重で押さえられただけなら、再 ARM の後に一度でも確かに動けば全部戻る。
+//    - 判定は先読み: この tick の出力を出すと次の tick までに上限を超える（env + v_env × max(前の dt, projection_ms) > 上限）なら
+//      出力 0 にして FEEDBACK_UNCERTAIN（停止）。projection_ms は最悪の tick 間隔 = V1_OVERRUN_MS（15 ms。超えれば CONTROL_OVERRUN）。
+//    - 戻す唯一の根拠（確かな動き）: 出している向きへ、滑り窓（実効 100〜200 ms）の中で最も戻った所から 2 count 以上の正味の移動。
+//      ±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならない。出力と逆向きの動き（押し戻された）は戻さない（Issue #44 の指示）。
+//      既知の穴: ±2 以上の雑音の往復は戻してしまう（PCNT のフィルタが無効 = encoder_pcnt.cpp:56。A/B 遷移の妥当性の計数は後続）。
+// 2. 過負荷（LOAD_LIMITED）: 飽和（|出力| ≥ duty_max × 99 %、誤差の向き）のまま 100 ms の窓ごとの「進み」（向きへ 5 count または
+//    |誤差| が 3 減る）が無いまま 1 s → 停止（上の持続する停止。自動の再試行はしない）。中央付近で完全に押さえられた場合は 400 ms で
+//    予算が先に尽きる（FEEDBACK_UNCERTAIN）。LOAD_LIMITED は「向きへ少しずつは動いている（予算は戻る）が誤差を詰められない」場面のもの。
 // 3. 端の手前の制動（END_BRAKING、Issue #46、ラッチしない）: 実測速度で止まれない（v² / 2a > ソフトリミットまでの残り）なら反対向きに
-//    duty_max。実測で動いていることが前提なので、この出力は包絡線に積まない（エンコーダが死ねば v_fast は 40 ms で 0 になり解除）。
-// 4. ソフトリミットの外（LIMIT_RECOVERY、Issue #46）: 外向きの出力は 0 にし、内側の目標へ戻す。ラッチの判定は V1Axis::check_motion_faults
-//   （decide_soft_limit）。
-// 5. FOLLOWING_ERROR の猶予（LIMIT_RECOVERY、Issue #46）: 上限を超えてもエンコーダが生きていて |誤差| が減っている間は最長 2 s ラッチしない
-//   （fe_may_wait。超えた直後の 200 ms は減り始めるのを待つ。上限 × 1.5 で猶予なし）。
-//
-// 未決（実機）: FEEDBACK_UNCERTAIN / LOAD_LIMITED の退避先は PWM 0 だけで、ブレーキは解除指令のまま（ACTIVE 中にブレーキを切り替えると
-// 動き出しパルス等の条件と STATUS の BRAKE_RELEASE_CMD の意味が変わり、戻すときに解除待ちが要る）。乗員が乗ったまま PWM 0 で下がるかは要確認。
+//    duty_max。この出力も予算に積み、尽きれば停止。
+// 4. ソフトリミットの外（LIMIT_RECOVERY、Issue #46。既定 OFF = 即ラッチ。t.soft_grace）: 外向きの出力は 0 にし、内側の目標へ戻す。
+//    ラッチの判定は V1Axis::check_motion_faults（decide_soft_limit）。
+// 5. FOLLOWING_ERROR の猶予（LIMIT_RECOVERY、Issue #46。既定 OFF = 即ラッチ。t.fe_grace_max_ms = 0）: ON なら上限を超えてもエンコーダが
+//    生きていて |誤差| が減っている間は最長 2 s ラッチしない（fe_may_wait。超えた直後の 200 ms は減り始めるのを待つ。上限 × 1.5 で猶予なし）。
 
 #include <math.h>
 #include <stdint.h>
@@ -57,16 +55,16 @@ struct V1SupTuning {
   int32_t end_hard_margin_count = V1_END_HARD_MARGIN_COUNT;
   int32_t renew_move_count = V1_SUP_RENEW_MOVE_COUNT;
   uint32_t renew_window_ms = V1_SUP_RENEW_WINDOW_MS;
-  uint32_t projection_ms = 5;  // 先読みの最小の刻み（制御周期）
+  uint32_t projection_ms = V1_OVERRUN_MS;  // 先読みの刻み: 次の tick までの最悪の間隔（これを超えれば CONTROL_OVERRUN）
   int load_sat_ratio_permille = V1_LOAD_SAT_RATIO_PERMILLE;
   uint32_t load_sat_max_ms = V1_LOAD_SAT_MAX_MS;
   uint32_t load_window_ms = V1_LOAD_WINDOW_MS;
   int32_t load_progress_count = V1_LOAD_PROGRESS_COUNT;
   int32_t load_err_drop_count = V1_LOAD_ERR_DROP_COUNT;
-  uint32_t load_rest_ms = V1_LOAD_REST_MS;
   int32_t brake_acc_count_s2 = V1_BRAKE_GUARD_ACC_COUNT_S2;  // 0 で制動の監視なし
   int32_t brake_min_vel_count_s = V1_BRAKE_GUARD_MIN_VEL_COUNT_S;
   int32_t brake_hyst_count = V1_BRAKE_GUARD_HYST_COUNT;
+  bool soft_grace = V1_SOFT_GRACE != 0;  // false = ソフトリミットを外れたら即ラッチ（従来どおり）
   int32_t soft_out_vel_count_s = V1_SOFT_OUT_VEL_COUNT_S;
   uint32_t soft_outward_grace_ms = V1_SOFT_OUTWARD_GRACE_MS;
   uint32_t soft_recover_max_ms = V1_SOFT_RECOVER_MAX_MS;
@@ -121,19 +119,18 @@ class V1Supervisor {
     last_change_us_ = now_us;
     ren_dir_ = 0;
   }
-  // DISARMED に戻った（DISARM の完了・FAULT_RESET）: 明示的な解除。FEEDBACK_UNCERTAIN と回の上限を戻す（位置の上限は戻さない）
+  // DISARMED に戻った（DISARM の完了・FAULT_RESET）: 明示的な解除。FEEDBACK_UNCERTAIN / LOAD_LIMITED と回の上限を戻す（位置の上限は戻さない）
   void clear_episode() {
     feedback_uncertain_ = false;
+    load_limited_ = false;
     env_ep_[0] = env_ep_[1] = 0.0;
   }
   // 位置制御が止まった（DISARMED / FAULT / 校正 / ARMING のブレーキ解除前）: その回だけの状態を捨てる
   void end_session(int64_t raw, uint64_t now_us) {
     last_out_ = 0;
-    last_out_guard_ = false;
     have_last_us_ = false;
     ren_dir_ = 0;
-    sat_running_ = false;
-    load_limited_ = false;
+    sat_running_ = false;  // LOAD_LIMITED は持続する停止なのでここでは消さない（clear_episode まで）
     braking_ = false;
     soft_out_ = false;
     fe_over_ = false;
@@ -156,9 +153,9 @@ class V1Supervisor {
       last_change_us_ = c.now_us;
       last_raw_ = c.raw;
     }
-    // 包絡線（制動の出力は積まない: 実測で動いていることが前提の出力）
+    // 包絡線（出したものはすべて積む。端の手前の制動も含む）
     const int d = last_out_ > 0 ? 1 : (last_out_ < 0 ? -1 : 0);
-    if (d != 0 && !last_out_guard_ && dt_us > 0) {
+    if (d != 0 && dt_us > 0) {
       const double add = env_speed(last_out_) * static_cast<double>(dt_us) / 1e6;
       env_ep_[idx(d)] += add;
       env_cum_[idx(d)] += add;
@@ -266,11 +263,11 @@ class V1Supervisor {
   }
 
   // 位置ループの指令 cmd（permille、カウント増が正）に保護を掛けた出力を返す。observe の後に 1 回。
+  // 停止（inhibited）の間は常に 0。V1Axis はこれを見てブレーキを作動させる（PWM 0 ＋ ブレーキ、主電源は保つ）。
   int filter(const Ctx& c, int cmd) {
     const int32_t actual = clamp32(c.raw - c.ref_offset);
     int out = cmd;
-    bool guard = false;
-    if (feedback_uncertain_) {
+    if (inhibited()) {
       out = 0;
       braking_ = false;
       sat_running_ = false;
@@ -279,37 +276,37 @@ class V1Supervisor {
       update_braking(c, actual);
       if (braking_) {
         out = static_cast<int>(-brake_dir_ * c.duty_max_pm);
-        guard = true;
         sat_running_ = false;
       } else {
-        // ソフトリミットの外: 外向きには出さない
+        // ソフトリミットの外（猶予 ON のときだけここまで来る）: 外向きには出さない
         if ((actual > c.soft_max && out > 0) || (actual < c.soft_min && out < 0)) out = 0;
         out = update_load(c, out);
-        // 見えない走行の予算（先読み）
-        if (out != 0) {
-          const int d = out > 0 ? 1 : -1;
-          uint64_t step_us = last_dt_us_;
-          if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
-          const double proj = env_speed(out) * static_cast<double>(step_us) / 1e6;
-          const double eps = 1e-9;
-          if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
-              env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
-            feedback_uncertain_ = true;
-            out = 0;
-            sat_running_ = false;
-            load_limited_ = false;
-          }
+      }
+      // 見えない走行の予算（先読み）。制動の出力も含めて、出す出力はすべてここを通す（P1a）
+      if (out != 0) {
+        const int d = out > 0 ? 1 : -1;
+        uint64_t step_us = last_dt_us_;
+        if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
+        const double proj = env_speed(out) * static_cast<double>(step_us) / 1e6;
+        const double eps = 1e-9;
+        if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
+            env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
+          feedback_uncertain_ = true;
+          out = 0;
+          braking_ = false;
+          sat_running_ = false;
         }
       }
     }
     last_out_ = out;
-    last_out_guard_ = guard;
     last_ctx_ = c;
     has_ctx_ = true;
     return out;
   }
 
   bool feedback_uncertain() const { return feedback_uncertain_; }
+  // 持続する停止（PWM 0 ＋ ブレーキ）: FEEDBACK_UNCERTAIN か LOAD_LIMITED。DISARMED に戻す（clear_episode）まで続く
+  bool inhibited() const { return feedback_uncertain_ || load_limited_; }
   bool load_limited() const { return load_limited_; }
   bool end_braking() const { return braking_; }
   bool soft_recovery() const { return soft_recovery_; }
@@ -362,7 +359,6 @@ class V1Supervisor {
   uint64_t last_change_us_ = 0;
   // --- その回だけ ---
   int last_out_ = 0;
-  bool last_out_guard_ = false;
   bool have_last_us_ = false;
   uint64_t last_us_ = 0;
   uint64_t last_dt_us_ = 0;
@@ -376,8 +372,6 @@ class V1Supervisor {
   int64_t load_win_raw_ = 0;
   int64_t load_win_err_abs_ = 0;
   bool load_limited_ = false;
-  uint64_t load_since_us_ = 0;
-  int load_dir_ = 0;
   bool braking_ = false;
   int brake_dir_ = 0;  // 動いている向き（制動はその反対）
   bool soft_out_ = false;
@@ -440,14 +434,7 @@ class V1Supervisor {
   int update_load(const Ctx& c, int out) {
     const int64_t err_abs = c.err < 0 ? -c.err : c.err;
     const int err_dir = c.err > 0 ? 1 : (c.err < 0 ? -1 : 0);
-    if (load_limited_) {
-      if (err_abs <= c.hold_exit || err_dir != load_dir_ || c.now_us - load_since_us_ >= ms(t.load_rest_ms)) {
-        load_limited_ = false;  // 誤差が無くなった・向きが変わった・休んだ: もう一度 1 s まで許す
-        sat_running_ = false;
-      } else {
-        return 0;
-      }
-    }
+    if (load_limited_) return 0;  // 持続する停止（自動では戻らない。P0）
     const long mag = out < 0 ? -out : out;
     const int out_dir = out > 0 ? 1 : (out < 0 ? -1 : 0);
     const bool sat = out_dir != 0 && out_dir == err_dir &&
@@ -474,8 +461,6 @@ class V1Supervisor {
     }
     if (c.now_us - sat_start_us_ >= ms(t.load_sat_max_ms)) {
       load_limited_ = true;
-      load_since_us_ = c.now_us;
-      load_dir_ = err_dir;
       sat_running_ = false;
       return 0;
     }

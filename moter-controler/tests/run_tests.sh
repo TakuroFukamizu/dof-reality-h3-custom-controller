@@ -10,3 +10,6 @@ c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_VEL_DAMPING=0 -I../inclu
 # 焼く既定（V1_VEL_DAMPING=1）でも同じテストが通ること（減衰を前提にしない試験は Kd を明示的に 0 にしている）
 c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -I../include test_host.cpp -o /tmp/moter_controler_host_damping
 /tmp/moter_controler_host_damping
+# r10（Issue #44・#46）: 監視を切った焼き方（-DV1_SUPERVISOR=0 = r9 と同じ判定）でも全テストが通ること（r10 の試験は監視を明示的に ON にしている）
+c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_SUPERVISOR=0 -I../include test_host.cpp -o /tmp/moter_controler_host_nosup
+/tmp/moter_controler_host_nosup

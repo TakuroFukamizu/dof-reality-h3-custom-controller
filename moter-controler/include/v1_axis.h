@@ -619,6 +619,8 @@ class V1Axis {
   // r10（Issue #44・#46）: 保護の監視が効いているか（方向別の経路かつ tuning.supervisor）と、その計器（画面・テスト用）
   bool supervisor_on() const { return tuning.ff_directional && tuning.supervisor; }
   V1SupInfo supervisor_info() const { return sup_.info(now_us_, supervisor_on()); }
+  // 持続する停止（FEEDBACK_UNCERTAIN / LOAD_LIMITED）: PWM 0 ＋ ブレーキ作動（主電源は保つ）。DISARMED に戻すまで続く
+  bool supervisor_inhibited() const { return supervisor_on() && sup_.inhibited(); }
   const V1Supervisor& supervisor() const { return sup_; }
   // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
   // 整数 % で切り捨ててから permille にするので効き目は整数 % のときと同じ: duty_max 20 → 150、14 → 10 % → 100（下限）
@@ -1330,7 +1332,8 @@ class V1Axis {
   void check_timers(uint64_t now) {
     if (state_ == v1::state::ARMING) {
       const uint64_t t = now - arming_started_us_;
-      if (!brake_release_cmd_ && t >= ms_to_us(tuning.power_settle_ms)) {
+      // r10: 持続する停止の間はブレーキを解除し直さない（解除は DISARMED → ARM_PREPARE の手順だけ）
+      if (!brake_release_cmd_ && !supervisor_inhibited() && t >= ms_to_us(tuning.power_settle_ms)) {
         // 電源が落ち着いた。ソフトリミット外ではブレーキを解除しない（解除直後に SOFT_LIMIT になるパルスを避ける）
         if (!inside_soft_window()) {
           latch_fault(v1::fault::SOFT_LIMIT, now);
@@ -1445,11 +1448,12 @@ class V1Axis {
     return c;
   }
 
-  // FOLLOWING_ERROR → OVERSPEED → SOFT_LIMIT の順。r10（Issue #46、supervisor_on のときだけ）:
-  //  - FOLLOWING_ERROR: 上限そのものは変えない。超えていても、エンコーダが生きていて（直近 100 ms にカウント変化）|誤差| が減っている
+  // FOLLOWING_ERROR → OVERSPEED → SOFT_LIMIT の順。r10（Issue #46、supervisor_on のときだけ。どちらの猶予も既定 OFF = 従来どおり即ラッチ。
+  // -DV1_FE_GRACE=1 / -DV1_SOFT_GRACE=1、または tuning.sup.fe_grace_max_ms / soft_grace で ON。PR #48 の Codex 事前レビュー P1c）:
+  //  - FOLLOWING_ERROR（ON のとき）: 上限そのものは変えない。超えていても、エンコーダが生きていて（直近 100 ms にカウント変化）|誤差| が減っている
   //    （100 ms ごとに 2 以上）間は最長 2 s ラッチしない（LIMIT_RECOVERY）。超えた直後の 200 ms は減り始めるのを待つ（超えた瞬間は
   //    必ず増えている）。減らなくなった・2 s 経った・|誤差| ≥ 上限 × 1.5・カウントが 100 ms 動かない・FEEDBACK_UNCERTAIN ならラッチ。
-  //  - SOFT_LIMIT: 少し越えただけで目標が内側なら内側へ戻す（外向きの出力は V1Supervisor::filter が 0 にする。LIMIT_RECOVERY）。
+  //  - SOFT_LIMIT（ON のとき）: 少し越えただけで目標が内側なら内側へ戻す（外向きの出力は V1Supervisor::filter が 0 にする。LIMIT_RECOVERY）。
   //    機械端（ソフトリミット ∓ 50）から 20 以内・外向きに 200 ms 動き続けた・2 s 外に居続けた・目標が外ならラッチ。
   //  - OVERSPEED は変えない。
   void check_motion_faults(uint64_t now) {
@@ -1476,7 +1480,7 @@ class V1Axis {
       latch_fault(v1::fault::FOLLOWING_ERROR, now);
     } else if (vel_abs > static_cast<int64_t>(config_.overspeed_count_s)) {
       latch_fault(v1::fault::OVERSPEED, now);
-    } else if (sup) {
+    } else if (sup && tuning.sup.soft_grace) {
       if (sup_.decide_soft_limit(c, actual_count(), target_count()) == V1SoftDecision::Latch) {
         latch_fault(v1::fault::SOFT_LIMIT, now);
       }
@@ -1687,6 +1691,17 @@ class V1Axis {
     if (supervisor_on() && has_config_) {
       sup_.t = tuning.sup;
       cmd = sup_.filter(sup_ctx(now), cmd);
+      if (sup_.inhibited()) {
+        // 持続する停止（PR #48 の Codex 事前レビュー P0）: PWM 0 ＋ ブレーキ作動（G13 を作動側へ）。主電源は保つ（powered_state のまま）。
+        // 制御器の状態（積分・動き出しパルス・補助）も捨てる（再開は DISARMED → ARM_PREPARE の通常の手順で、目標は現在位置から）
+        cmd = 0;
+        brake_release_cmd_ = false;
+        duty_state_ = V1DutyState{};
+        reset_breakaway();
+        reset_track_assist();
+        reset_stall_boost();
+        terms_.cmd_permille = 0;
+      }
     }
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
