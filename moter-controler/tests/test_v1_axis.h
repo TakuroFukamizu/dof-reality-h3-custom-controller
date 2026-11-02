@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 
+#include "motor_output.h"
 #include "v1_axis.h"
 
 namespace v1axis_test {
@@ -45,6 +46,7 @@ struct Harness {
   uint32_t frame = 0;
   int64_t raw = 0;
   bool stall = false;             // プラントが動かない
+  uint32_t pos_max_vel = 4000;    // set_position の max_vel_count_s（T のテストで遅い軌道にする）
   double plant_vel = 4000.0;      // count/s
   // 校正（CALIBRATING）の模擬機構: Duty（MD13S の符号付き %）に比例した速度で raw が動き、端 [end_lo, end_hi] で止まる
   // （止まる＝無パルス。AutoMachine の端検出がこれを拾う）。plant_sign = +1 は「Duty + でカウント減」（#1 の実測。
@@ -179,7 +181,7 @@ struct Harness {
     m.set_position.seq = ++seq;
     m.set_position.group_frame_id = ++frame;
     m.set_position.target_count = target;
-    m.set_position.max_vel_count_s = 4000;
+    m.set_position.max_vel_count_s = pos_max_vel;
     m.set_position.max_acc_count_s2 = 20000;
     m.set_position.valid_for_ms = valid_for_ms;
     m.set_position.apply_at_us = 0;
@@ -192,7 +194,7 @@ struct Harness {
     now += dt_ms * MS;
     if (!stall && ax.brake_release_cmd()) {
       if (ax.state() == st::CALIBRATING) {
-        const double v = -static_cast<double>(plant_sign) * ax.duty_percent() * cal_count_s_per_percent;  // count/s
+        const double v = -static_cast<double>(plant_sign) * ax.duty_permille() / 10.0 * cal_count_s_per_percent;  // count/s（Duty は permille）
         raw += llround(v * static_cast<double>(dt_ms) / 1000.0);
         if (raw < end_lo) raw = end_lo;
         if (raw > end_hi) raw = end_hi;
@@ -263,7 +265,7 @@ struct Harness {
   void start_calibration_and_reach_running() {
     accepted(calibrate(1));
     CHECK(ax.state() == st::CALIBRATING);
-    CHECK(run_until([&] { return ax.duty_percent() != 0; }, 6000));
+    CHECK(run_until([&] { return ax.duty_permille() != 0; }, 6000));
   }
   void idle(uint32_t ms) {
     while (ms >= 5) {
@@ -349,7 +351,7 @@ inline void test_boots_disarmed_with_safe_outputs() {
   CHECK(h.ax.state() == st::DISARMED);
   CHECK(!h.ax.power_on_cmd());
   CHECK(!h.ax.brake_release_cmd());
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   CHECK(!h.ax.configured());
   CHECK(!h.ax.referenced());
   CHECK(h.statuses().size() >= 1);  // 最初の tick で STATUS
@@ -580,7 +582,7 @@ inline void test_arming_sequence_power_then_brake_then_holding() {
   CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::ARMING);
   CHECK(h.ax.power_on_cmd());
   CHECK(!h.ax.brake_release_cmd());
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   v1::Status s = h.status();
   CHECK((s.flags & fl::POWER_ON_CMD) != 0 && (s.flags & fl::BRAKE_RELEASE_CMD) == 0 && s.pwm_permille == 0);
   // POWER_SETTLE_MS の直前はまだブレーキ作動
@@ -809,7 +811,7 @@ inline void test_disarm_from_holding() {
   h.idle(10);
   CHECK(h.ax.state() == st::DISARMED);
   CHECK(!h.ax.power_on_cmd());
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   CHECK(h.ax.fault_code() == fc::NONE);
   CHECK(h.fault_events().empty());  // DISARM の減速は lease の対象外
 }
@@ -936,7 +938,7 @@ inline void test_command_timeout_in_holding_faults() {
   CHECK(ev[0].boot_id == 2309737967u);
   const v1::Status s = h.status();
   CHECK(s.pwm_permille == 0 && (s.flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0);
-  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   // 同じ FAULT に居る間 FAULT_EVENT は増えない
   h.idle(200);
   CHECK(h.fault_events().size() == 1);
@@ -1154,7 +1156,7 @@ inline void test_set_limits_accepted_in_active_and_takes_effect() {
   h.raw = -2500;  // 誤差 2500 × 2 / 100 = 50 % → 既定の上限 20 %
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -20);
+  CHECK(h.ax.duty_permille() == -200);
   const std::vector<v1::McuMsg> r = h.send(h.set_limits_msg(h.next_rid(), 40, 3, 2, 100, 10, 20));
   CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED &&
         r[0].ack.acked_type == v1::msg::SET_LIMITS);
@@ -1162,11 +1164,11 @@ inline void test_set_limits_accepted_in_active_and_takes_effect() {
   CHECK(h.ax.state() == st::ACTIVE);
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -40);  // 新しい上限がすぐ効く
+  CHECK(h.ax.duty_permille() == -400);  // 新しい上限がすぐ効く
   h.raw = -100;  // 2 % → 新しい下限 3 %
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -3);
+  CHECK(h.ax.duty_permille() == -30);
   // HOLDING / ARMING / STOPPING / DISARMING / CALIBRATING でも受理
   Harness g;
   g.reach_holding();
@@ -1250,7 +1252,7 @@ inline void test_set_limits_clamps_duty_to_absolute_max() {
   h.set_position(0);
   h.step();
   CHECK(h.ax.state() == st::HOLDING);
-  CHECK(h.ax.duty_percent() == -60);
+  CHECK(h.ax.duty_permille() == -600);
   CHECK(h.ax.pwm_permille() == 600);
 }
 
@@ -1387,13 +1389,13 @@ inline void test_encoder_fault_on_no_pulses_while_driving() {
   h.stall = true;  // カウントが止まる
   // 軌道が動き出してフィードフォワードが |duty| ≥ しきい値 15 %（max(10, duty_max 20 × 75 %)。Issue #15 M2）に届いてから
   // STALL_MS（200 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
-  CHECK(h.ax.encoder_fault_duty_threshold() == 15);
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150);
   h.drive(150, 2000);
   CHECK(h.ax.state() == st::ACTIVE);
-  CHECK(h.ax.duty_percent() != 0);
+  CHECK(h.ax.duty_permille() != 0);
   h.drive(150, 2000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   // FAULT_RESET は通るが POSITION_REFERENCED が消える
   Harness::accepted(h.fault_reset());
   CHECK(h.ax.state() == st::DISARMED);
@@ -1422,7 +1424,7 @@ inline void test_disarm_with_residual_error_reaches_disarmed_not_encoder_fault()
   h.stall = true;  // ブレーキ作動後はカウントが変わらない
   h.raw -= 25;     // 保持目標から 25 count ずれた残り誤差（不感帯の出る側 20 を超え、|duty| = 7 % が出る）
   h.step();
-  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_percent() != 0);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_permille() != 0);
   Harness::accepted(h.disarm());
   CHECK(h.ax.state() == st::DISARMING && !h.ax.brake_release_cmd());
   h.idle(250);  // STALL_MS（200 ms）を超えて DISARMING のまま
@@ -1446,8 +1448,8 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   h.drive(400, h.ax.actual_count() + 25);  // 保持目標はそのまま（HOLDING では目標を使わない）。lease を保つ
   CHECK(h.ax.state() == st::HOLDING);
   // 動かないので停止ブースト（Issue #15 H4）が 200 ms ごとに下限を 1 % 上げる: 400 ms で 7 → 8 %（ENCODER_FAULT にはしない）
-  CHECK(h.ax.stall_boost() == 1);
-  CHECK(h.ax.duty_percent() == 8 || h.ax.duty_percent() == -8);
+  CHECK(h.ax.stall_boost_permille() == 10);
+  CHECK(h.ax.duty_permille() == 80 || h.ax.duty_permille() == -80);
   CHECK(h.ax.fault_code() == fc::NONE);
   CHECK(h.ax.referenced());
   // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路）
@@ -1466,7 +1468,7 @@ inline void test_active_settled_with_residual_error_is_not_encoder_fault() {
   h.raw -= 25;  // 到達後に 25 count ずれて止まった（不感帯の出る側 20 を超え、|duty| = 7 %。目標は止まっているので無パルス判定なし）
   h.drive(400, 100);
   CHECK(h.ax.state() == st::ACTIVE);
-  CHECK(h.ax.duty_percent() != 0);
+  CHECK(h.ax.duty_permille() != 0);
   CHECK(h.ax.fault_code() == fc::NONE);
 }
 
@@ -1478,26 +1480,26 @@ inline void test_stall_boost_ramps_while_stuck_and_resets_in_band() {
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
-  CHECK(h.ax.stall_boost() == 0);
+  CHECK(h.ax.stall_boost_permille() == 0);
   h.stall = true;
   h.raw -= 25;  // 不感帯の出る側（20）を超える静的な誤差（sign +1 → duty + でカウント減なので、カウントを増やすには duty −）
   h.step();     // 窓の開始
-  CHECK(h.ax.duty_percent() == -7 && h.ax.stall_boost() == 0);
+  CHECK(h.ax.duty_permille() == -70 && h.ax.stall_boost_permille() == 0);
   h.drive(200, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 1);
+  CHECK(h.ax.stall_boost_permille() == 10);
   h.step();
-  CHECK(h.ax.duty_percent() == -8);
+  CHECK(h.ax.duty_permille() == -80);
   h.drive(1000, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 6);
+  CHECK(h.ax.stall_boost_permille() == 60);
   h.step();
-  CHECK(h.ax.duty_percent() == -13);
+  CHECK(h.ax.duty_permille() == -130);
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
   // 動き出して不感帯に入れば 0 に戻り、Duty も 0
   h.stall = false;
   h.drive(50, h.ax.target_count());
   CHECK(h.ax.following_error_count() == 0);
-  CHECK(h.ax.stall_boost() == 0);
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.stall_boost_permille() == 0);
+  CHECK(h.ax.duty_permille() == 0);
 }
 
 // 上乗せの上限（Codex レビュー HIGH）: 詰まった機構を duty_max で押し続けない。対象になってから V1_STALL_BOOST_MAX_MS（2 s）
@@ -1512,11 +1514,11 @@ inline void test_stall_boost_times_out_to_encoder_fault() {
   h.raw -= 25;
   h.step();  // 対象になった（t0）
   h.drive(1990, h.ax.actual_count() + 25);
-  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost() == 9);  // 200 ms × 9 = 1.8 s。2 s の窓はまだ
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost_permille() == 90);  // 200 ms × 9 = 1.8 s。2 s の窓はまだ
   h.drive(20, h.ax.actual_count() + 25);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
-  CHECK(h.ax.duty_percent() == 0 && !h.ax.brake_release_cmd() && !h.ax.power_on_cmd());
-  CHECK(h.ax.stall_boost() == 0);
+  CHECK(h.ax.duty_permille() == 0 && !h.ax.brake_release_cmd() && !h.ax.power_on_cmd());
+  CHECK(h.ax.stall_boost_permille() == 0);
   const std::vector<v1::FaultEvent> ev = h.fault_events();
   CHECK(ev.size() == 1 && ev[0].fault_code == fc::ENCODER_FAULT && ev[0].mcu_state_before == st::HOLDING);
   Harness::accepted(h.fault_reset());
@@ -1535,12 +1537,12 @@ inline void test_stall_boost_at_cap_without_motion_is_encoder_fault() {
   h.raw -= 25;
   h.step();
   h.drive(600, h.ax.actual_count() + 25);
-  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost() == 3);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost_permille() == 30);
   h.step();
-  CHECK(h.ax.duty_percent() == -10);  // duty_max
+  CHECK(h.ax.duty_permille() == -100);  // duty_max
   h.drive(200, h.ax.actual_count() + 25);  // 頭打ちのまま 1 窓
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
 }
 
 // 動けば時間の起点も取り直す: ゆっくりでも 3 count 以上/窓 動いていれば 2 s を超えても FAULT にしない
@@ -1559,7 +1561,7 @@ inline void test_stall_boost_timer_restarts_on_motion() {
     if (i % 5 == 4) h.raw += 3;
   }
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
-  CHECK(h.ax.stall_boost() == 0);  // 窓が完了する前に動くので上乗せも増えない
+  CHECK(h.ax.stall_boost_permille() == 0);  // 窓が完了する前に動くので上乗せも増えない
 }
 
 // duty_max < V1_STALL_DUTY で無パルス判定を無効にしている構成では、上乗せの上限でも FAULT にせず頭打ちのまま
@@ -1575,14 +1577,15 @@ inline void test_stall_boost_cap_without_encoder_fault_when_check_disabled() {
   h.raw -= 25;
   h.drive(3000, h.ax.actual_count() + 25);
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
-  CHECK(h.ax.stall_boost() == 1);
-  CHECK(h.ax.duty_percent() == -8);
+  CHECK(h.ax.stall_boost_permille() == 10);
+  CHECK(h.ax.duty_permille() == -80);
 }
 
 // 対象は |誤差| > deadband_out を明示的に見る（Codex レビュー）: 動いた後（in_band = false）の 10 < |誤差| ≤ 20 の静止誤差は
 // 下限 Duty は出るが上乗せしない。不感帯に入ってから（in_band = true）出た 25 は上乗せする
 inline void test_stall_boost_requires_error_outside_outer_band() {
   Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // E と H4 の境界を見る試験。積分（F）が生の P を動かさないよう切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -1590,16 +1593,16 @@ inline void test_stall_boost_requires_error_outside_outer_band() {
   h.stall = true;
   h.raw -= 25;  // 不感帯の外 → in_band = false、下限 7 %、上乗せ開始
   h.drive(420, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 2);
-  h.raw += 10;  // 10 count だけ動いて誤差 15: 入る側 10 より大きいので in_band = false のまま → 下限 7 % は出続ける
+  CHECK(h.ax.stall_boost_permille() == 20);
+  h.raw += 10;  // 10 count だけ動いて誤差 15: 入る側 10 より大きいので in_band = false のまま。床は |誤差| ≤ 15 で OFF → 生の P 3 permille
   h.drive(1000, h.ax.actual_count() + 15);
   CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == fc::NONE);
-  CHECK(h.ax.duty_percent() == -7);
-  CHECK(h.ax.stall_boost() == 0);  // 20 以下なので上乗せしない（cmd ≠ 0 だけを見ていると 2 s で ENCODER_FAULT になる）
+  CHECK(h.ax.duty_permille() == -3 && !h.ax.duty_terms().floor_on);
+  CHECK(h.ax.stall_boost_permille() == 0);  // 20 以下なので上乗せしない（cmd ≠ 0 だけを見ていると 2 s で ENCODER_FAULT になる）
   // 25 に広がれば対象
   h.raw -= 10;
   h.drive(420, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 2);
+  CHECK(h.ax.stall_boost_permille() == 20);
   // 不感帯に入ってから出た履歴（in_band = true → 25 で出る）でも同じ
   Harness g;
   Harness::accepted(g.config_with(c));
@@ -1607,10 +1610,10 @@ inline void test_stall_boost_requires_error_outside_outer_band() {
   g.stall = true;
   g.raw -= 15;
   g.drive(600, g.ax.actual_count() + 15);
-  CHECK(g.ax.duty_percent() == 0 && g.ax.stall_boost() == 0);  // 出る側 20 以下: 不感帯の中
+  CHECK(g.ax.duty_permille() == 0 && g.ax.stall_boost_permille() == 0);  // 出る側 20 以下: 不感帯の中
   g.raw -= 10;
   g.drive(420, g.ax.actual_count() + 25);
-  CHECK(g.ax.duty_percent() == -9 && g.ax.stall_boost() == 2);
+  CHECK(g.ax.duty_permille() == -90 && g.ax.stall_boost_permille() == 20);
 }
 
 // 窓の間に stall_boost_min_move（3）以上動けば窓を取り直す（上乗せは保つ）。それ未満のちらつき（±1）では取り直さない。
@@ -1629,14 +1632,14 @@ inline void test_stall_boost_window_restarts_on_motion_but_ignores_jitter() {
     h.set_position(h.ax.actual_count());
     h.step();
   }
-  CHECK(h.ax.stall_boost() == 1);
+  CHECK(h.ax.stall_boost_permille() == 10);
   // 3 count 動いた直後に窓を取り直す: その後 150 ms では上がらない、200 ms で上がる
   h.raw += 3;
   h.step();
   h.drive(150, h.ax.actual_count());
-  CHECK(h.ax.stall_boost() == 1);
+  CHECK(h.ax.stall_boost_permille() == 10);
   h.drive(60, h.ax.actual_count());
-  CHECK(h.ax.stall_boost() == 2);
+  CHECK(h.ax.stall_boost_permille() == 20);
 }
 
 // 誤差の符号が反転したら 0 に戻す（反対側へ上乗せを持ち越さない）
@@ -1649,11 +1652,11 @@ inline void test_stall_boost_resets_on_error_sign_flip() {
   h.stall = true;
   h.raw -= 25;
   h.drive(620, h.ax.actual_count() + 25);
-  CHECK(h.ax.stall_boost() == 3);
+  CHECK(h.ax.stall_boost_permille() == 30);
   h.raw += 50;  // 誤差 +25 → −25
   h.step();     // 反転した tick の Duty から上乗せ無し（反対向きに 10 % のパルスを出さない。Codex レビュー MEDIUM）
-  CHECK(h.ax.stall_boost() == 0);
-  CHECK(h.ax.duty_percent() == 7);
+  CHECK(h.ax.stall_boost_permille() == 0);
+  CHECK(h.ax.duty_permille() == 70);
   // 軌道が動き出す tick も同じ: 上乗せ付きの床を 1 tick 持ち越さない
   Harness g;
   v1::Config c2 = base_config();
@@ -1664,14 +1667,14 @@ inline void test_stall_boost_resets_on_error_sign_flip() {
   g.stall = true;
   g.raw -= 25;
   g.drive(620, g.ax.actual_count() + 25);
-  CHECK(g.ax.stall_boost() == 3);
+  CHECK(g.ax.stall_boost_permille() == 30);
   g.set_position(g.ax.actual_count() + 25);
   Harness::accepted(g.start());
   g.set_position(g.ax.actual_count() + 2000);  // 軌道が動き出す
   g.step();
   CHECK(g.ax.state() == st::ACTIVE && g.ax.target_count() > g.ax.actual_count() + 25);
-  CHECK(g.ax.stall_boost() == 0);
-  CHECK(g.ax.duty_percent() == -7);  // P 0.5 + FF 0.01 → 下限 7（上乗せ 3 を持ち越せば −10）
+  CHECK(g.ax.stall_boost_permille() == 0);
+  CHECK(g.ax.duty_permille() == -70);  // P 0.5 + FF 0.01 → 下限 7（上乗せ 3 を持ち越せば −10）
 }
 
 // 軌道が動いている間（FF が効く）とブレーキ作動中（DISARMING）は上乗せしない。duty_max を下げれば上乗せもそこで止まる。
@@ -1687,66 +1690,178 @@ inline void test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_lim
   h.stall = true;
   h.drive(600, 2000);  // 軌道が動く（200 count/s）。誤差は増えるが上乗せはしない
   CHECK(h.ax.state() == st::ACTIVE && h.ax.target_count() > 100);
-  CHECK(h.ax.stall_boost() == 0);
+  CHECK(h.ax.stall_boost_permille() == 0);
   // 止めて HOLDING に戻し、残り誤差で上乗せが始まる
   Harness::accepted(h.stop());
   h.drive(200, h.ax.target_count());
   CHECK(h.ax.state() == st::HOLDING);
   h.drive(620, h.ax.target_count());
-  CHECK(h.ax.stall_boost() >= 3);
+  CHECK(h.ax.stall_boost_permille() >= 30);
   // duty_max 10 / duty_min 7 に下げれば上乗せはその場で 3 に切り詰め、Duty は duty_max
   Harness::accepted(h.set_limits(10, 7, 2, 100, 10, 20));
   h.drive(50, h.ax.target_count());
-  CHECK(h.ax.stall_boost() == 3);
-  CHECK(h.ax.duty_percent() == 10 || h.ax.duty_percent() == -10);
+  CHECK(h.ax.stall_boost_permille() == 30);
+  CHECK(h.ax.duty_permille() == 100 || h.ax.duty_permille() == -100);
   // DISARM → ブレーキ作動指令で 0 に戻り（その tick の Duty から）、DISARMING 中に上がらない
   Harness::accepted(h.disarm());
   CHECK(h.ax.state() == st::DISARMING);
   h.step();
-  CHECK(h.ax.stall_boost() == 0 && (h.ax.duty_percent() == 7 || h.ax.duty_percent() == -7));
+  CHECK(h.ax.stall_boost_permille() == 0 && (h.ax.duty_permille() == 70 || h.ax.duty_permille() == -70));
   h.idle(245);
-  CHECK(h.ax.state() == st::DISARMING && h.ax.stall_boost() == 0);
+  CHECK(h.ax.state() == st::DISARMING && h.ax.stall_boost_permille() == 0);
   h.idle(60);
   CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
 }
 
-// Issue #15 M1: Duty 下限は「目標へ向かう向き」のときだけ。FF と P の合成が下限未満で誤差と逆向きなら 0（惰行）。
-inline void test_duty_command_floor_only_toward_target() {
+// Issue #25 手順 8 (c)「E」: 床（Duty 下限）はヒステリシス付きの適用状態が ON のときだけ。ON = |誤差| > deadband_out（20）かつ
+// 合成と P の向きが一致、OFF = |誤差| ≤ 15 または向きの不一致（即時）。OFF のときは有界の生の FF + P（0 にしない。旧 M1 の 0 置換に代わる）。
+inline void test_duty_command_floor_gate_with_hysteresis() {
   V1Tuning t;
   t.kp_percent_per_100 = 6;
   t.duty_min = 9;
   t.duty_max = 20;
-  t.floor_sign_gate = true;
-  bool band = false;
-  // Issue の例: err +50（P +3 %）・vel −200（FF −2 %）→ 合成 +1 % → 目標向き → 下限 9
-  CHECK(v1_duty_command(50, -200.0, band, t) == 9);
-  // err +50（P +3）・vel −600（FF −6）→ 合成 −3 % → 目標から離れる向き → 0（旧: −9 のバースト）
-  CHECK(v1_duty_command(50, -600.0, band, t) == 0);
-  CHECK(v1_duty_command(-50, 600.0, band, t) == 0);
-  // 合成が下限以上なら向きに関わらずそのまま（減速中に実位置が先行: P −18 + FF +2 = −16）
-  CHECK(v1_duty_command(-300, 200.0, band, t) == -16);
-  // 誤差 0 は向きの一致とみなし下限を掛ける（軌道だけが動いている立ち上がり）
-  CHECK(v1_duty_command(0, 200.0, band, t) == 9);
-  // 目標向きの小さい合成は下限（従来どおり）
-  CHECK(v1_duty_command(50, 0.0, band, t) == 9);
-  CHECK(v1_duty_command(-50, 0.0, band, t) == -9);
-  // gate を切れば旧動作（合成値に下限を掛ける）
-  t.floor_sign_gate = false;
-  CHECK(v1_duty_command(50, -600.0, band, t) == -9);
-  CHECK(v1_duty_command(-50, 600.0, band, t) == 9);
-  CHECK(v1_duty_command(-300, 200.0, band, t) == -16);
+  V1DutyState st;
+  // Issue の例: err +50（P +30）・vel −200（FF −20）→ 合成 +10 → 向き一致・|誤差| > 20 → 床 ON → 90
+  CHECK(v1_duty_command(50, -200.0, st, t) == 90 && st.floor_on);
+  // err +50（P +30）・vel −600（FF −60）→ 合成 −30 → 向き不一致 → 即 OFF → 生の −30（旧 M1: 0、それより前: −90 のバースト）
+  CHECK(v1_duty_command(50, -600.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(-50, 600.0, st, t) == 30 && !st.floor_on);
+  // 合成が床以上なら状態に依らずそのまま（減速中に実位置が先行: P −180 + FF +20 = −160）
+  CHECK(v1_duty_command(-300, 200.0, st, t) == -160 && st.floor_on);
+  // 誤差 0（軌道だけが動いている立ち上がり）: 床 OFF → 生の FF 20（旧: 下限 90）
+  CHECK(v1_duty_command(0, 200.0, st, t) == 20 && !st.floor_on);
+  // FF だけの追従（小さい誤差）: 生の FF + P。err 5・vel 400 → 40 + 3 = 43
+  CHECK(v1_duty_command(5, 400.0, st, t) == 43 && !st.floor_on);
+  CHECK(v1_duty_command(-5, -400.0, st, t) == -43 && !st.floor_on);
+  // 静止で目標向きの小さい合成: |誤差| > 20 → 床 ON → ±90
+  CHECK(v1_duty_command(50, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(-50, 0.0, st, t) == -90 && st.floor_on);
+  // ヒステリシス 15 < |誤差| ≤ 20: ON の履歴なら ON のまま（18 → P 10.8 → 11 < 90 → 90）、15 で OFF（生の 9）、
+  // OFF の履歴なら 18 でも OFF（生の 11）、21 で ON
+  CHECK(v1_duty_command(18, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(20, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(15, 0.0, st, t) == 9 && !st.floor_on);
+  CHECK(v1_duty_command(18, 0.0, st, t) == 11 && !st.floor_on);
+  CHECK(v1_duty_command(20, 0.0, st, t) == 12 && !st.floor_on);
+  CHECK(v1_duty_command(21, 0.0, st, t) == 90 && st.floor_on);
+  // 向きの不一致は |誤差| > 20 でも即 OFF。向きが戻れば次の tick で ON
+  CHECK(v1_duty_command(50, -600.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(50, -200.0, st, t) == 90 && st.floor_on);
+  // 合成 0（打ち消し）は向きが無いので OFF、出力 0
+  CHECK(v1_duty_command(50, -300.0, st, t) == 0 && !st.floor_on);  // P +30・FF −30
+  // 静止の不感帯に入れば床の状態も OFF に戻る。出る側 20 までは 0、21 で床 ON
+  CHECK(v1_duty_command(50, 0.0, st, t) == 90 && st.floor_on);
+  CHECK(v1_duty_command(5, 0.0, st, t) == 0 && st.in_band && !st.floor_on);
+  CHECK(v1_duty_command(18, 0.0, st, t) == 0 && st.in_band && !st.floor_on);
+  CHECK(v1_duty_command(21, 0.0, st, t) == 90 && !st.in_band && st.floor_on);
+  // 停止ブーストは床が ON のときだけ効く
+  CHECK(v1_duty_command(50, 0.0, st, t, 20) == 110 && st.floor_on);
+  CHECK(v1_duty_command(50, -600.0, st, t, 20) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(0, 200.0, st, t, 20) == 20 && !st.floor_on);
+  CHECK(v1_duty_command(50, 0.0, st, t, 500) == 200);  // 床 ＋ 上乗せは上限で頭打ち
+  // 生の合成も上限で飽和
+  CHECK(v1_duty_command(50, -5000.0, st, t) == -200 && !st.floor_on);
+  // 計器: floor_on は状態、cmd は生の値
+  V1DutyTerms o;
+  CHECK(v1_duty_command(50, -600.0, st, t, 20, &o) == -30);
+  CHECK(!o.floor_on && o.p_permille == 30 && o.ff_permille == -60 && o.cmd_permille == -30 && o.boost_permille == 20);
+}
+
+// Codex レビュー（PR #28）P2: (1) 向きは P と比べる。kp = 0（SET_LIMITS で受理される）なら P = 0 で床は決して ON にならず、
+// FF だけが床まで持ち上がらない。(2) OFF のしきい値は min(15, deadband_out − 1): deadband_out < 15 でも ON と OFF の領域が重ならない。
+inline void test_duty_command_floor_requires_p_and_respects_small_deadband_out() {
+  V1Tuning t;  // kp 2、ff 100、下限 7、上限 20、deadband 10 / 20
+  t.kp_percent_per_100 = 0;
+  V1DutyState st;
+  // err 21・vel 300: FF 30、P 0 → 床 OFF → 生の 30（旧: 誤差の向きと一致とみなして 70）
+  CHECK(v1_duty_command(21, 300.0, st, t) == 30 && !st.floor_on);
+  CHECK(v1_duty_command(500, 300.0, st, t) == 30 && !st.floor_on);
+  CHECK(v1_duty_command(-500, -300.0, st, t) == -30 && !st.floor_on);
+  CHECK(v1_duty_command(500, 0.0, st, t) == 0 && !st.floor_on);  // 静止で kp 0 → 出力 0
+  // kp を戻せば従来どおり
+  t.kp_percent_per_100 = 2;
+  CHECK(v1_duty_command(21, 300.0, st, t) == 70 && st.floor_on);
+  // deadband_out 12（deadband 10）: ON は > 12、OFF は ≤ 11（min(15, 12 − 1)）。14 は ON の履歴を保つ、ON 無しなら OFF のまま
+  t.deadband_out = 12;
+  CHECK(v1_duty_command(14, 0.0, st, t) == 70 && st.floor_on);  // 直前の ON を保つ（12 ≥ 14 ではないので ON の条件は満たさないが OFF にもならない）
+  CHECK(v1_duty_command(11, 0.0, st, t) == 2 && !st.floor_on);  // ≤ 11 → OFF → 生の P 2.2 → 2
+  CHECK(v1_duty_command(12, 0.0, st, t) == 2 && !st.floor_on);  // OFF の履歴なので OFF のまま
+  CHECK(v1_duty_command(13, 0.0, st, t) == 70 && st.floor_on);  // > 12 → ON
+  CHECK(v1_duty_command(12, 0.0, st, t) == 70 && st.floor_on);  // 1 count のヒステリシス
+  CHECK(v1_duty_command(11, 0.0, st, t) == 2 && !st.floor_on);
+  // deadband_out 16: OFF は ≤ 15（既定の floor_off のまま）
+  t.deadband_out = 16;
+  CHECK(v1_duty_command(17, 0.0, st, t) == 70 && st.floor_on);
+  CHECK(v1_duty_command(16, 0.0, st, t) == 70 && st.floor_on);
+  CHECK(v1_duty_command(15, 0.0, st, t) == 3 && !st.floor_on);
+  // 軸を通して: SET_LIMITS kp 0・deadband_out 12 を受理し、追従中の FF だけ（max_vel 300 → 30 permille）に床が掛からない
+  Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // kp 0 で FF だけが出ることを見る試験。積分（F）は切る
+  h.ax.tuning.assist_ms = 0;  // 模擬プラントは 100 count/s（0.5 count/tick）では動けない＝止まったままなので動き出し補助（T）も切る
+  v1::Config c = base_config();
+  c.max_vel_count_s = 300;
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(20, 7, 0, 100, 10, 12));
+  CHECK(h.ax.tuning.kp_percent_per_100 == 0 && h.ax.tuning.deadband_out == 12);
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.plant_vel = 100.0;  // プラントが遅く誤差が増えても（P 0）床は掛からない
+  h.drive(600, 5000);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.following_error_count() < -20);
+  CHECK(h.ax.pwm_permille() == 30 && !h.ax.duty_terms().floor_on && h.ax.duty_terms().p_permille == 0);
+}
+
+// 軸を通した E: 追従中（誤差が小さい）は床ではなく生の FF が出る。静止の残り誤差 15 では床 OFF で生の P、25 で床 ON。
+inline void test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis() {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_vel_count_s = 400;  // FF 4 % = 40 permille（床 70 未満）
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.drive(600, 5000);  // 速度 400 count/s で追従（プラントは毎 tick 追いつく）
+  CHECK(h.ax.state() == st::ACTIVE);
+  const V1DutyTerms& tm = h.ax.duty_terms();
+  CHECK(tm.vel_count_s == 400 && tm.ff_permille == 40 && !tm.floor_on && !tm.in_band);
+  CHECK(h.ax.pwm_permille() >= 38 && h.ax.pwm_permille() <= 46);  // 生の FF（＋小さい P）。旧: 下限 70 のバースト
+  CHECK(h.ax.pwm_permille() == tm.cmd_permille);
+  // 止めて HOLDING。残り誤差 25 → 床 ON（70）、誤差 15 → OFF（生の P 3）、18 → OFF のまま（4）、25 → ON
+  Harness::accepted(h.stop());
+  h.drive(200, h.ax.target_count());
+  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_permille() == 0);
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  h.raw += 10;  // 誤差 15
+  h.step();
+  CHECK(h.ax.duty_permille() == -3 && !h.ax.duty_terms().floor_on);
+  h.raw -= 3;  // 誤差 18: OFF の履歴なので OFF のまま
+  h.step();
+  CHECK(h.ax.duty_permille() == -4 && !h.ax.duty_terms().floor_on);
+  h.raw -= 7;  // 誤差 25
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  h.raw += 7;  // 誤差 18: ON の履歴なので ON のまま
+  h.step();
+  CHECK(h.ax.duty_permille() == -70 && h.ax.duty_terms().floor_on);
+  CHECK(h.ax.fault_code() == fc::NONE);
 }
 
 // Issue #15 M2: ENCODER_FAULT のしきい値は max(V1_STALL_DUTY, duty_max × 75 %)。duty_max < 10 なら検出が無効（警告）。
 inline void test_encoder_fault_threshold_follows_duty_max() {
   Harness h;
-  CHECK(h.ax.encoder_fault_duty_threshold() == 15 && !h.ax.encoder_fault_check_disabled());  // 20 × 75 % = 15
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150 && !h.ax.encoder_fault_check_disabled());  // 20 × 75 % = 15
   Harness::accepted(h.set_limits(40, 3, 2, 100, 10, 20));
-  CHECK(h.ax.encoder_fault_duty_threshold() == 30);
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 300);
   Harness::accepted(h.set_limits(12, 3, 2, 100, 10, 20));
-  CHECK(h.ax.encoder_fault_duty_threshold() == 10 && !h.ax.encoder_fault_check_disabled());  // 9 → 下限 10
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 100 && !h.ax.encoder_fault_check_disabled());  // 9 → 下限 10
   Harness::accepted(h.set_limits(8, 3, 2, 100, 10, 20));
-  CHECK(h.ax.encoder_fault_duty_threshold() == 10 && h.ax.encoder_fault_check_disabled());   // 受理はするが検出は出ない
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 100 && h.ax.encoder_fault_check_disabled());   // 受理はするが検出は出ない
 }
 
 // kp 6 で動けない軸: 誤差 170 で 10 % には届くが 15 %（duty_max 20 の 75 %）には届かず、FOLLOWING_ERROR で止まる
@@ -1765,7 +1880,7 @@ inline void test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault() 
   // 旧しきい値 10 % には err ≈ 134（P 8 + FF 2）で届く（t ≈ 0.67 s）→ 旧なら 0.87 s で ENCODER_FAULT
   h.drive(900, 2000);
   CHECK(h.ax.state() == st::ACTIVE);
-  CHECK(h.ax.duty_percent() <= -10);
+  CHECK(h.ax.duty_permille() <= -100);
   // 新しきい値 15 % には err ≈ 217（t ≈ 1.08 s）→ 1.28 s。FOLLOWING_ERROR 240 は t = 1.2 s で先に出る
   //（SET_POSITION を送り続けて lease を保つ。止めると COMMAND_TIMEOUT が先に出る）
   h.drive(500, 2000);
@@ -1821,7 +1936,7 @@ inline void test_host_fault_latches_immediately_from_active() {
   }
   CHECK(ack_seen && status_after);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::HOST_FAULT);
-  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   const std::vector<v1::FaultEvent> ev = h.fault_events();
   CHECK(ev.size() == 1 && ev[0].fault_code == fc::HOST_FAULT && ev[0].mcu_state_before == st::ACTIVE);
   // 2 回目の HOST_FAULT は ACCEPTED だが FAULT_EVENT は増えない
@@ -2087,13 +2202,13 @@ inline void test_duty_sign_follows_profile_sign() {
   h.raw = -100;  // actual が目標 0 より下 → カウントを増やしたい
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() < 0);
+  CHECK(h.ax.duty_permille() < 0);
   CHECK(h.ax.pwm_permille() > 0);
-  CHECK(h.ax.duty_percent() == -V1_DUTY_MIN);  // |err| 100 × 2 / 100 = 2 % → 下限 7 %
+  CHECK(h.ax.duty_permille() == -V1_DUTY_MIN_PERMILLE);  // |err| 100 × 2 / 100 = 2 % → 下限 7 %
   h.raw = 100;
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() > 0 && h.ax.pwm_permille() < 0);
+  CHECK(h.ax.duty_permille() > 0 && h.ax.pwm_permille() < 0);
   // sign = −1 では逆
   Harness g(1, -1);
   g.reach_holding();
@@ -2101,41 +2216,180 @@ inline void test_duty_sign_follows_profile_sign() {
   g.raw = -100;
   g.set_position(0);
   g.step();
-  CHECK(g.ax.duty_percent() > 0);
+  CHECK(g.ax.duty_permille() > 0);
   CHECK(g.ax.pwm_permille() > 0);
 }
 
 // フィードフォワード（docs/multi_axis_20261031.md の実測: 1 % ≈ 100〜130 count/s）。純粋関数を直接検査する。
 inline void test_duty_command_feed_forward() {
   V1Tuning t;
-  bool band = false;
-  CHECK(v1_duty_command(0, 600.0, band, t) == V1_DUTY_MIN);   // 6 % → 下限 7 %
-  CHECK(v1_duty_command(0, 1500.0, band, t) == 15);            // 速度だけで 15 %
-  CHECK(v1_duty_command(0, 2500.0, band, t) == V1_DUTY_MAX);   // 25 % → 上限 20 %
-  CHECK(v1_duty_command(300, 600.0, band, t) == 12);           // 6 + 6
+  V1DutyState band;
+  CHECK(v1_duty_command(0, 600.0, band, t) == 60);   // FF 6 %。誤差 0 なので床は OFF → 生の 60 permille（旧: 下限 7 %）
+  CHECK(v1_duty_command(0, 1500.0, band, t) == 150);            // 速度だけで 15 %
+  CHECK(v1_duty_command(0, 2500.0, band, t) == V1_DUTY_MAX_PERMILLE);   // 25 % → 上限 20 %
+  CHECK(v1_duty_command(300, 600.0, band, t) == 120);           // 6 + 6
   CHECK(v1_duty_command(-300, 600.0, band, t) == 0);           // 誤差が速度と逆向きで打ち消し → 0
-  CHECK(v1_duty_command(0, -600.0, band, t) == -V1_DUTY_MIN);  // 向きは速度の符号
-  CHECK(v1_duty_command(-100, -1000.0, band, t) == -12);       // −2 − 10
+  CHECK(v1_duty_command(0, -600.0, band, t) == -60);  // 向きは速度の符号
+  CHECK(v1_duty_command(-100, -1000.0, band, t) == -120);       // −2 − 10
   // 目標が動いている間は不感帯を使わない
-  band = true;
-  CHECK(v1_duty_command(3, 600.0, band, t) == V1_DUTY_MIN);
-  CHECK(!band);
+  band.in_band = true;
+  CHECK(v1_duty_command(3, 600.0, band, t) == 61);  // 60 + 0.6 → 61。床は OFF（|誤差| 3 ≤ 15）
+  CHECK(!band.in_band);
   // 止まったら不感帯（入る 10 / 出る 20）
-  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band);
-  CHECK(v1_duty_command(20, 0.0, band, t) == 0 && band);
-  CHECK(v1_duty_command(21, 0.0, band, t) == V1_DUTY_MIN && !band);
-  CHECK(v1_duty_command(11, 0.0, band, t) == V1_DUTY_MIN && !band);
-  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band);
+  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band.in_band);
+  CHECK(v1_duty_command(20, 0.0, band, t) == 0 && band.in_band);
+  CHECK(v1_duty_command(21, 0.0, band, t) == V1_DUTY_MIN_PERMILLE && !band.in_band && band.floor_on);  // 床 ON
+  CHECK(v1_duty_command(11, 0.0, band, t) == 2 && !band.in_band && !band.floor_on);  // 不感帯の外だが |誤差| ≤ 15 で床 OFF → 生の P 2.2 → 2
+  CHECK(v1_duty_command(10, 0.0, band, t) == 0 && band.in_band);
   // ff = 0 なら比例だけ
   V1Tuning p;
   p.ff_count_s_per_percent = 0;
-  bool b2 = false;
+  V1DutyState b2;
   CHECK(v1_duty_command(0, 600.0, b2, p) == 0);
-  CHECK(v1_duty_command(500, 600.0, b2, p) == 10);
+  CHECK(v1_duty_command(500, 600.0, b2, p) == 100);
+}
+
+// Issue #25 手順 8 (a): 位置ループの各項の計器。v1_duty_command の結果は変えず、FF / P / 軌道速度 / 下限の適用 / 不感帯を書く。
+inline void test_duty_terms_report_ff_p_floor_and_band() {
+  V1Tuning t;  // kp 2、ff 100、下限 7、上限 20
+  V1DutyState band;
+  V1DutyTerms o;
+  // FF 6 % + P 6 % = 12 %。床の状態は ON（|誤差| > 20・向き一致）だが合成が床以上なのでそのまま
+  CHECK(v1_duty_command(300, 600.0, band, t, 0, &o) == 120);
+  CHECK(o.ff_permille == 60 && o.p_permille == 60 && o.vel_count_s == 600 && o.floor_on && !o.in_band &&
+        o.cmd_permille == 120);
+  // FF 2 % だけ（誤差 0）→ 床は OFF → 生の 20
+  CHECK(v1_duty_command(0, 200.0, band, t, 0, &o) == 20);
+  CHECK(o.ff_permille == 20 && o.p_permille == 0 && !o.floor_on && o.cmd_permille == 20);
+  // 負の向き: P −1.2 %・FF −2 % → 合成 −3.2 % → 下限 −7 %
+  CHECK(v1_duty_command(-60, -200.0, band, t, 0, &o) == -70);
+  CHECK(o.ff_permille == -20 && o.p_permille == -12 && o.floor_on && o.cmd_permille == -70 && o.vel_count_s == -200);
+  // 誤差と逆向きの合成 → 床 OFF → 生の −50
+  CHECK(v1_duty_command(50, -600.0, band, t, 0, &o) == -50);
+  CHECK(o.ff_permille == -60 && o.p_permille == 10 && !o.floor_on && o.cmd_permille == -50);
+  // 上限で飽和: FF 25 % → 20 %
+  CHECK(v1_duty_command(0, 2500.0, band, t, 0, &o) == 200);
+  CHECK(o.ff_permille == 250 && o.cmd_permille == 200 && !o.floor_on);
+  // 静止の不感帯の中: in_band が立ち、各項は 0
+  CHECK(v1_duty_command(5, 0.0, band, t, 0, &o) == 0 && band.in_band);
+  CHECK(o.in_band && o.ff_permille == 0 && o.p_permille == 0 && o.cmd_permille == 0 && !o.floor_on);
+  // 軌道速度は int16 に飽和
+  CHECK(v1_duty_command(0, 40000.0, band, t, 0, &o) == 200);
+  CHECK(o.vel_count_s == 32767);
+  // 軸経由: 位置制御が止まっていれば全部 0、HOLDING で誤差 25（静止）なら P 0.5 % → 下限 7 %、floor_on
+  Harness h;
+  CHECK(h.ax.duty_terms().cmd_permille == 0 && !h.ax.duty_terms().floor_on);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  const V1DutyTerms& a = h.ax.duty_terms();
+  CHECK(a.p_permille == 5 && a.ff_permille == 0 && a.vel_count_s == 0 && a.floor_on && !a.in_band &&
+        a.cmd_permille == 70 && a.boost_permille == 0);
+  CHECK(h.ax.pwm_permille() == 70);  // sign +1: duty −7 % → カウント増の向きに +70
+  // 停止ブーストが 1 % 乗れば boost_permille 10、cmd 80
+  h.drive(200, h.ax.actual_count() + 25);
+  h.step();
+  CHECK(h.ax.duty_terms().boost_permille == 10 && h.ax.duty_terms().cmd_permille == 80 && h.ax.duty_terms().floor_on);
+  // 位置制御が切れれば 0 に戻る
+  Harness::accepted(h.host_fault());
+  CHECK(h.ax.duty_terms().cmd_permille == 0 && h.ax.duty_terms().boost_permille == 0 && !h.ax.duty_terms().floor_on);
+}
+
+// Issue #25 手順 8 (b): 位置ループは permille で運ぶ。5.3 % は 53 permille、四捨五入、±duty_max で飽和、向きは変えない。
+inline void test_duty_command_permille_resolution_and_saturation() {
+  V1Tuning t;  // kp 2、ff 100、下限 7 %、上限 20 %
+  t.duty_min = 0;  // 下限なしで生の分解能を見る
+  V1DutyState band;
+  CHECK(v1_duty_command(265, 0.0, band, t) == 53);    // P 5.3 % → 53 permille（旧: 5 %）
+  CHECK(v1_duty_command(-265, 0.0, band, t) == -53);
+  CHECK(v1_duty_command(0, 530.0, band, t) == 53);    // FF 5.3 %
+  CHECK(v1_duty_command(345, 0.0, band, t) == 69);    // 6.9 %
+  CHECK(v1_duty_command(0, 5.0, band, t) == 1);       // 0.05 % = 0.5 permille → 四捨五入で 1
+  CHECK(v1_duty_command(0, 4.0, band, t) == 0);       // 0.4 permille → 0
+  CHECK(v1_duty_command(0, -5.0, band, t) == -1);     // 0 から遠い側へ
+  // 飽和: ±duty_max × 10
+  CHECK(v1_duty_command(100000, 0.0, band, t) == V1_DUTY_MAX_PERMILLE);
+  CHECK(v1_duty_command(-100000, 0.0, band, t) == -V1_DUTY_MAX_PERMILLE);
+  CHECK(v1_duty_command(0, 100000.0, band, t) == 200 && v1_duty_command(0, -100000.0, band, t) == -200);
+  t.duty_max = 60;
+  CHECK(v1_duty_command(100000, 0.0, band, t) == 600 && v1_duty_command(-100000, 0.0, band, t) == -600);
+  // 下限の境界（permille で比較）: 69 → 70 に持ち上げ、70 はそのまま、71 もそのまま
+  V1Tuning f;  // 下限 7 % = 70 permille
+  CHECK(v1_duty_command(345, 0.0, band, f) == 70);
+  CHECK(v1_duty_command(350, 0.0, band, f) == 70);
+  CHECK(v1_duty_command(355, 0.0, band, f) == 71);
+  CHECK(v1_duty_command(-355, 0.0, band, f) == -71);
+  // 上乗せも permille: 下限 70 + 25 = 95（上限を超えれば上限）
+  CHECK(v1_duty_command(100, 0.0, band, f, 25) == 95);
+  CHECK(v1_duty_command(100, 0.0, band, f, 500) == 200);
+  // 軸を通して: SET_LIMITS で下限 0 % → 誤差 265 の P 5.3 % が pwm_permille 53 で出る（sign +1 なので Duty は −53）
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  Harness::accepted(h.set_limits(20, 0, 2, 100, 10, 20));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 265;
+  h.step();
+  CHECK(h.ax.duty_permille() == -53 && h.ax.pwm_permille() == 53);
+  CHECK(h.status().pwm_permille == 53);  // STATUS も実際の permille（旧: 整数 % × 10 = 50）
+  h.raw += 530;  // 誤差 −265 → 向きが変わる
+  h.set_position(h.ax.target_count());
+  h.step();
+  CHECK(h.ax.duty_permille() == 53 && h.ax.pwm_permille() == -53);
+  // 符号 −1 の系統では Duty の向きが逆
+  Harness g(1, -1);
+  Harness::accepted(g.config_with(c));
+  Harness::accepted(g.set_limits(20, 0, 2, 100, 10, 20));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 265;
+  g.step();
+  CHECK(g.ax.duty_permille() == 53 && g.ax.pwm_permille() == 53);
+}
+
+// ENCODER_FAULT のしきい値は permille でも整数 % のときと同じ効き目（整数 % で切り捨ててから × 10。duty_max 14 → 10 % → 100）
+inline void test_encoder_fault_threshold_permille_matches_percent() {
+  Harness h;
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150);
+  Harness::accepted(h.set_limits(14, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 100 && !h.ax.encoder_fault_check_disabled());
+  Harness::accepted(h.set_limits(15, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 110);  // 11.25 → 11 %
+  Harness::accepted(h.set_limits(60, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 450);
+  Harness::accepted(h.set_limits(9, 3, 2, 100, 10, 20));
+  CHECK(h.ax.encoder_fault_duty_threshold_permille() == 100 && h.ax.encoder_fault_check_disabled());
+}
+
+// motor_output の純粋関数: ±1000 permille がフルスケール、53 permille は 54 / 1023、反転の判定は符号が違うときだけ
+inline void test_motor_output_permille_mapping() {
+  const uint32_t full = (1u << PWM_BITS) - 1;  // 1023
+  CHECK(full == 1023);
+  CHECK(motor_output_pwm_ticks(1000, full) == 1023 && motor_output_pwm_ticks(-1000, full) == 1023);
+  CHECK(motor_output_pwm_ticks(0, full) == 0);
+  CHECK(motor_output_pwm_ticks(53, full) == 54 && motor_output_pwm_ticks(-53, full) == 54);  // 53 × 1023 / 1000 = 54.2
+  CHECK(motor_output_pwm_ticks(500, full) == 511);
+  CHECK(motor_output_pwm_ticks(70, full) == 71);    // 旧 7 %: 7 × 1023 / 100 = 71（同じ）
+  CHECK(motor_output_pwm_ticks(200, full) == 204);  // 旧 20 %: 204（同じ）
+  CHECK(motor_output_pwm_ticks(1500, full) == 1023);  // 範囲外は飽和
+  CHECK(motor_output_pwm_ticks(1, full) == 1);
+  CHECK(motor_output_reverses(70, -70) && motor_output_reverses(-1, 1));
+  CHECK(!motor_output_reverses(0, -70) && !motor_output_reverses(70, 0) && !motor_output_reverses(70, 80) &&
+        !motor_output_reverses(-70, -1) && !motor_output_reverses(0, 0));
+  CHECK(PERMILLE_MIN == -1000 && PERMILLE_MAX == 1000 && V1_ABS_DUTY_MAX_PERMILLE == 600 &&
+        V1_STALL_DUTY_PERMILLE == 100 && V1_STALL_BOOST_STEP_PERMILLE == 10 && V1_DUTY_MIN_PERMILLE == 70 &&
+        V1_DUTY_MAX_PERMILLE == 200);
 }
 
 inline void test_duty_deadband_and_clamp() {
   Harness h;
+  h.ax.tuning.settled_ms = 0;  // 不感帯のヒステリシスそのものを見る試験。整定判定（S）の 200 ms は test_settled_* で
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -2144,35 +2398,35 @@ inline void test_duty_deadband_and_clamp() {
   h.raw = -5;  // デッドバンド内（入る側 10）
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == 0 && h.ax.pwm_permille() == 0);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.pwm_permille() == 0);
   h.raw = -15;  // 出る側 20 までは再駆動しない（ヒステリシス）
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   h.raw = -25;  // 出る側を超えた → 下限 7 %
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -V1_DUTY_MIN);
-  h.raw = -15;  // 駆動中は入る側 10 まで続ける
+  CHECK(h.ax.duty_permille() == -V1_DUTY_MIN_PERMILLE);
+  h.raw = -15;  // 駆動中は入る側 10 まで不感帯に入らないが、床は |誤差| ≤ 15 で OFF → 生の P 3 permille（Issue #25 手順 8 c）
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -V1_DUTY_MIN);
+  CHECK(h.ax.duty_permille() == -3);
   h.raw = -10;
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   h.raw = -800;  // 800 × 2 / 100 = 16 %
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -16);
+  CHECK(h.ax.duty_permille() == -160);
   h.raw = -2500;  // 50 % → 上限 20 %
   h.set_position(0);
   h.step();
-  CHECK(h.ax.duty_percent() == -V1_DUTY_MAX);
+  CHECK(h.ax.duty_permille() == -V1_DUTY_MAX_PERMILLE);
   CHECK(h.ax.pwm_permille() == V1_DUTY_MAX * 10);
   // 位置制御が切れれば 0
   Harness::accepted(h.host_fault());
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
 }
 
 // ---- LOCAL_ESTOP ------------------------------------------------------------------
@@ -2183,7 +2437,7 @@ inline void test_local_estop_latches_and_blocks_reset_until_released() {
   h.ax.set_local_estop(true, h.now);
   h.drain();
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
-  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   const std::vector<v1::FaultEvent> ev = h.fault_events();
   CHECK(ev.size() == 1 && ev[0].fault_code == fc::LOCAL_ESTOP && ev[0].mcu_state_before == st::HOLDING);
   CHECK(h.statuses().back().mcu_state == st::FAULT && h.statuses().back().fault_code == fc::LOCAL_ESTOP);
@@ -2349,21 +2603,21 @@ inline void test_calibration_success_on_power_axis() {
   CHECK((r[1].status.flags & fl::POWER_ON_CMD) != 0 && (r[1].status.flags & fl::BRAKE_RELEASE_CMD) == 0 &&
         (r[1].status.flags & fl::POSITION_REFERENCED) == 0 && r[1].status.pwm_permille == 0 &&
         r[1].status.fault_code == fc::NONE);
-  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   // HELLO も CALIBRATING
   for (const v1::McuMsg& m : h.hello(5)) {
     if (m.type == v1::msg::HELLO) CHECK(m.hello.mcu_state == st::CALIBRATING);
   }
   // CAL_POWER_SETTLE_MS（5000）の直前はまだブレーキ作動
   h.idle(4995);
-  CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   h.idle(10);
-  CHECK(h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   // BRAKE_RELEASE_WAIT_MS（300）の後に端当てが始まる: P 端向き = Duty +V1_CAL_HOME_DUTY
   h.idle(290);
-  CHECK(h.ax.duty_percent() == 0);
+  CHECK(h.ax.duty_permille() == 0);
   h.idle(10);
-  CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY);
+  CHECK(h.ax.duty_permille() == v1_permille(V1_CAL_HOME_DUTY));
   CHECK(h.ax.cal_live_step() == v1::cal_step::TO_P);
   const v1::Status running = h.status();
   CHECK(running.mcu_state == st::CALIBRATING && (running.flags & fl::BRAKE_RELEASE_CMD) != 0 &&
@@ -2371,7 +2625,7 @@ inline void test_calibration_success_on_power_axis() {
   CHECK(running.pwm_permille == -V1_CAL_HOME_DUTY * 10);  // sign +1: Duty + はカウント減
   // 端当て → N 端 → 中立 → 終了手順 → DISARMED
   CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
-  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   CHECK(h.ax.fault_code() == fc::NONE && h.fault_events().empty());
   // CAL_RESULT は 1 回、DISARMED の STATUS より前
   cal_result_precedes_disarmed_status(h.out, from);
@@ -2413,7 +2667,7 @@ inline void test_calibration_negative_sign_plant_reports_negative_n_end() {
   Harness h(2, 1, 300, false);
   h.plant_sign = -1;
   h.start_calibration_and_reach_running();
-  CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY);  // 端当ての Duty は機構の符号に依らず +（P 端向き）
+  CHECK(h.ax.duty_permille() == v1_permille(V1_CAL_HOME_DUTY));  // 端当ての Duty は機構の符号に依らず +（P 端向き）
   CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 40000));
   const std::vector<v1::CalResult> res = h.cal_results();
   CHECK(res.size() == 1 && res[0].result == v1::cal_result::OK);
@@ -2434,7 +2688,7 @@ inline void test_calibration_negative_sign_plant_reports_negative_n_end() {
   h.raw -= 100;
   h.set_position(h.ax.actual_count());
   h.step();
-  CHECK(h.ax.duty_percent() > 0 && h.ax.pwm_permille() > 0);
+  CHECK(h.ax.duty_permille() > 0 && h.ax.pwm_permille() > 0);
 }
 
 // 電源担当でない軸（CONFIG なしでも受理する）: 主電源 ON 指令は出さず、同じ settle 時間を待ってからブレーキを解除する。
@@ -2468,12 +2722,12 @@ inline void test_calibration_fails_on_stall_before_min_travel() {
   const size_t from = h.out.size();
   Harness::accepted(h.calibrate(1));
   CHECK(!h.ax.referenced());
-  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  CHECK(h.run_until([&] { return h.ax.duty_permille() != 0; }, 6000));
   // 開始猶予 300 + 無パルス 200 → 退避（反対向き）→ 猶予 300 + 無パルス 200 → 失敗
-  CHECK(h.run_until([&] { return h.ax.duty_percent() == -V1_CAL_HOME_DUTY; }, 1000));
+  CHECK(h.run_until([&] { return h.ax.duty_permille() == -v1_permille(V1_CAL_HOME_DUTY); }, 1000));
   CHECK(h.ax.state() == st::CALIBRATING && strcmp(h.ax.cal_live_reason(), "retreat") == 0);
   CHECK(h.run_until([&] { return !h.ax.brake_release_cmd(); }, 1000));
-  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() == 0);  // 終了手順: ブレーキ給電 OFF、PWM 0、主電源はまだ ON
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_permille() == 0);  // 終了手順: ブレーキ給電 OFF、PWM 0、主電源はまだ ON
   CHECK(h.ax.power_on_cmd());
   h.idle(295);
   CHECK(h.ax.state() == st::CALIBRATING);
@@ -2536,14 +2790,14 @@ inline void test_calibrate_cancel_before_and_during_motion() {
     const size_t from = h.out.size();
     h.start_calibration_and_reach_running();
     h.idle(500);  // P 端へ動いている途中
-    CHECK(h.ax.duty_percent() == V1_CAL_HOME_DUTY && h.raw < 0 && h.raw > h.end_lo);
+    CHECK(h.ax.duty_permille() == v1_permille(V1_CAL_HOME_DUTY) && h.raw < 0 && h.raw > h.end_lo);
     const int64_t at_cancel = h.raw;
     const std::vector<v1::McuMsg> r = h.send(h.calibrate_msg(0, h.next_rid()));
     // ACK の時点でブレーキ給電 OFF・PWM 0（ACK の後の STATUS がそれを示す）
     CHECK(r.size() == 2 && r[0].type == v1::msg::ACK && r[0].ack.result == ar::ACCEPTED);
     CHECK(r[1].type == v1::msg::STATUS && r[1].status.mcu_state == st::CALIBRATING &&
           (r[1].status.flags & fl::BRAKE_RELEASE_CMD) == 0 && r[1].status.pwm_permille == 0);
-    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_percent() == 0 && h.ax.power_on_cmd());
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0 && h.ax.power_on_cmd());
     // 終了手順中の 2 回目の中止は何もせず ACCEPTED
     Harness::accepted(h.calibrate(0));
     h.idle(400);
@@ -2577,7 +2831,7 @@ inline void test_calibration_keep_power_holds_main_power_until_release() {
   CHECK(res[0].n_end_count == 5551 && res[0].neutral_count == 2775);
   // POWER_HOLD: CALIBRATING のまま、主電源 ON 指令あり、ブレーキ作動、PWM 0、基準・プロファイルは確定済み
   CHECK(h.ax.state() == st::CALIBRATING && h.ax.cal_live_step() == v1::cal_step::POWER_HOLD);
-  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   CHECK(h.ax.referenced() && h.ax.profile_dirty());
   const v1::Status hold = h.status();
   CHECK(hold.mcu_state == st::CALIBRATING && (hold.flags & fl::POWER_ON_CMD) != 0 &&
@@ -2632,10 +2886,10 @@ inline void test_calibration_keep_power_cancel_during_motion_goes_to_disarmed() 
   Harness h(1, 1, 0, false);
   Harness::accepted(h.config());
   Harness::accepted(h.calibrate(1, v1::cal_flags::KEEP_POWER));
-  CHECK(h.run_until([&] { return h.ax.duty_percent() != 0; }, 6000));
+  CHECK(h.run_until([&] { return h.ax.duty_permille() != 0; }, 6000));
   h.idle(500);  // P 端へ動いている途中
   Harness::accepted(h.calibrate(0));
-  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);  // 終了手順
+  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);  // 終了手順
   h.idle(400);
   CHECK(h.ax.state() == st::DISARMED && !h.ax.power_on_cmd());
   const std::vector<v1::CalResult> res = h.cal_results();
@@ -2677,9 +2931,9 @@ inline void test_disarm_cancels_calibration() {
   h.start_calibration_and_reach_running();
   CHECK(h.run_until([&] { return h.ax.cal_live_step() == v1::cal_step::TO_N; }, 10000));
   h.idle(300);
-  CHECK(h.ax.duty_percent() == -V1_CAL_HOME_DUTY);  // N 端向き（校正中は保存ストロークを信じず低速）
+  CHECK(h.ax.duty_permille() == -v1_permille(V1_CAL_HOME_DUTY));  // N 端向き（校正中は保存ストロークを信じず低速）
   Harness::accepted(h.disarm());
-  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(h.ax.state() == st::CALIBRATING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   h.idle(400);
   CHECK(h.ax.state() == st::DISARMED);
   cal_result_precedes_disarmed_status(h.out, from);
@@ -2704,7 +2958,7 @@ inline void test_calibrating_rejects_or_drops_other_commands() {
   Harness::rejected(h.set_reference(0), rs::BAD_STATE);
   Harness::rejected(h.fault_reset(), rs::BAD_STATE);
   Harness::accepted(h.stop());
-  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_percent() != 0);  // 止まらない
+  CHECK(h.ax.state() == st::CALIBRATING && h.ax.duty_permille() != 0);  // 止まらない
   // SET_POSITION（有効・古い・apply_at ≠ 0）はどれも数えない
   const uint16_t stale = h.ax.stale_drop_count();
   const uint16_t rxerr = h.ax.rx_error_count();
@@ -2736,7 +2990,7 @@ inline void test_host_fault_during_calibration() {
   Harness::accepted(h.config());
   h.start_calibration_and_reach_running();
   h.idle(200);
-  CHECK(h.ax.power_on_cmd() && h.ax.brake_release_cmd() && h.ax.duty_percent() != 0);
+  CHECK(h.ax.power_on_cmd() && h.ax.brake_release_cmd() && h.ax.duty_permille() != 0);
   const std::vector<v1::McuMsg> r = h.send(h.host_fault_msg(h.next_rid()));
   CHECK(r.size() == 4 && r[0].type == v1::msg::CAL_RESULT && r[1].type == v1::msg::FAULT_EVENT &&
         r[2].type == v1::msg::ACK && r[3].type == v1::msg::STATUS);
@@ -2745,7 +2999,7 @@ inline void test_host_fault_during_calibration() {
   CHECK(r[1].fault_event.fault_code == fc::HOST_FAULT && r[1].fault_event.mcu_state_before == st::CALIBRATING);
   CHECK(r[3].status.mcu_state == st::FAULT && r[3].status.fault_code == fc::HOST_FAULT &&
         (r[3].status.flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0 && r[3].status.pwm_permille == 0);
-  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
   CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
   h.idle(1000);
   CHECK(h.ax.state() == st::FAULT && h.cal_results().size() == 1);  // 終了手順は踏まない（CAL_RESULT は増えない）
@@ -2766,7 +3020,7 @@ inline void test_local_estop_and_overrun_during_calibration() {
     h.ax.set_local_estop(true, h.now);
     h.drain();
     CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
-    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_percent() == 0);
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
     const std::vector<v1::CalResult> res = h.cal_results();
     CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && reason_is(res[0], "estop"));
     const std::vector<v1::FaultEvent> ev = h.fault_events();
@@ -2826,6 +3080,931 @@ inline void test_fault_during_calibration_shutdown_keeps_final_result() {
     CHECK(res.size() == 1 && res[0].result == v1::cal_result::CANCELLED && reason_is(res[0], "stop"));
     CHECK(!h.ax.referenced() && !h.ax.profile_dirty());
   }
+}
+
+
+// ---- Issue #25 手順 9「F」: 有界の積分と保持バイアス --------------------------------------------------------
+
+// 飽和と変化率: 誤差 400（P 80 ≥ 床 70 なので床は持ち上げず、|出力| < duty_max 60 %）で dt 5 ms を回すと
+// dI = 0.1 × 400 × 0.005 = 0.2 だが変化率 10 permille/s → 0.05 / tick に制限。1 s で 10、3 s で 30 で頭打ち。
+inline void test_integral_rate_limit_and_saturation() {
+  V1Tuning t;
+  t.duty_max = 60;
+  CHECK(t.ki_permille_per_count_s > 0.0);  // 既定 ON（config.h V1_INTEGRAL）
+  V1DutyState st;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  V1DutyTerms o;
+  CHECK(v1_duty_command(400, 0.0, st, t, 0, &o, 0.005) == 90 && o.i_permille == 10 && o.p_permille == 80);
+  for (int i = 0; i < 1000; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 30.0) < 1e-9);  // |I| ≤ 30
+  CHECK(v1_duty_command(400, 0.0, st, t) == 110);
+  // 小さい誤差では Ki × err が変化率より下: 誤差 20 → 0.1 × 20 × 0.005 = 0.01 / tick（2 permille/s）
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(20, 100.0, st2, t, 0, nullptr, 0.005);  // 軌道が動いている（不感帯に入らない）
+  CHECK(fabs(st2.i_pm - 2.0) < 1e-6);
+  // 負の誤差は負に積む
+  V1DutyState st3;
+  for (int i = 0; i < 200; ++i) v1_duty_command(-400, 0.0, st3, t, 0, nullptr, 0.005);
+  CHECK(fabs(st3.i_pm + 10.0) < 1e-6);
+  // dt 0（直接呼ぶ従来のテスト）と ki 0（-DV1_INTEGRAL=0 相当）では積まない
+  V1DutyState st4;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st4, t);
+  CHECK(st4.i_pm == 0.0);
+  t.ki_permille_per_count_s = 0.0;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st4, t, 0, nullptr, 0.005);
+  CHECK(st4.i_pm == 0.0);
+}
+
+// アンチワインドアップは実出力で見る: duty_max で飽和している向きには積まない。床（duty_min ＋ ブースト）が合成を持ち上げて
+// いるときも積まない。どちらも戻す向き（|I| を減らす）は許す。
+inline void test_integral_anti_windup_on_applied_output() {
+  V1Tuning t;  // kp 2、床 7、上限 20
+  V1DutyState st;
+  // 誤差 1500 → P 300 > 200 で飽和 → I は 0 のまま
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(1500, 0.0, st, t, 0, nullptr, 0.005) == 200);
+  CHECK(st.i_pm == 0.0);
+  // 誤差 400（P 80、床 70 を持ち上げない、飽和もしない）で 1 s → I = 10
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  // 再び飽和（同じ向き）: 増えない
+  for (int i = 0; i < 200; ++i) v1_duty_command(1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 10.0) < 1e-6);
+  // 反対向きに飽和（誤差 −1500 → −200）: I を戻す向きは許す → 1 s で 10 → 0 → 負に積まれる前に反対の飽和で止まる
+  for (int i = 0; i < 200; ++i) v1_duty_command(-1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);
+  for (int i = 0; i < 200; ++i) v1_duty_command(-1500, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);  // 0 から負へは「増やす向き」なので飽和中は積まない
+  // 床が持ち上げているとき: 誤差 25（P 5）静止 → 床 ON → 出力 70。I は増えない
+  V1DutyState st2;
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(25, 0.0, st2, t, 0, nullptr, 0.005) == 70);
+  CHECK(st2.i_pm == 0.0);
+  // ブースト込みの床（70 + 30 = 100）も同じ
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(25, 0.0, st2, t, 30, nullptr, 0.005) == 100);
+  CHECK(st2.i_pm == 0.0);
+  // 床が持ち上げていても、I が反対符号なら戻す向きは積む（I +2 を持ったまま誤差 −25: P −5 + I 2 = −3 → 床 −70 → I は減る）
+  st2.i_pm = 2.0;
+  for (int i = 0; i < 100; ++i) CHECK(v1_duty_command(-25, 0.0, st2, t, 0, nullptr, 0.005) == -70);
+  CHECK(st2.i_pm < 2.0 && st2.i_pm > 0.0);  // 0.1 × 25 × 0.005 = 0.0125 / tick × 100 = 1.25 → 0.75
+}
+
+// 床の向き不一致（E の抑制中: 合成が P と逆）では |I| を増やさない。戻す向きは許す。
+inline void test_integral_blocked_during_floor_sign_mismatch_but_unwinds() {
+  V1Tuning t;  // kp 2、ff 100
+  V1DutyState st;
+  // 誤差 +50（P +10）・軌道 −600（FF −60）→ 合成 −50 → 不一致。I = 0 → 正に積むのは「増やす」→ 止める
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005) == -50);
+  CHECK(st.i_pm == 0.0);
+  // I = −5 を持っていれば、正に積むのは戻す向き → 許す（0.025 / tick × 200 = 5 → 0 に戻り、0 からは「増やす」なので止まる）
+  st.i_pm = -5.0;
+  for (int i = 0; i < 100; ++i) v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm + 2.5) < 1e-6);
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, -600.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm) < 1e-6);
+  // 向きが一致していれば普通に積む（誤差 +50・軌道 +600 → 合成 +70、床 ON だが持ち上げない）
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, 600.0, st2, t, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 5.0) < 1e-6);  // 0.1 × 50 × 0.005 = 0.025 / tick × 200 = 5（変化率 10/s 未満）
+}
+
+// 不感帯の中では I を凍結し、出力は I（保持バイアス）。0 に落とさない。
+inline void test_integral_holding_bias_retained_in_band() {
+  V1Tuning t;
+  t.duty_max = 60;
+  V1DutyState st;
+  for (int i = 0; i < 400; ++i) v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005);  // I = 20
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  V1DutyTerms o;
+  // 静止・誤差 5 → 不感帯に入る → 出力 = I = 20（従来は 0）、床 OFF、積まない
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 20 && o.in_band && !o.floor_on && o.i_permille == 20);
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(-8, 0.0, st, t, 0, nullptr, 0.005) == 20);  // 誤差の符号に依らず凍結
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  // 出る側（> 20）で抜ければ普通の P + I（誤差 25 → P 5 + I 20 = 25 → 床 ON → 70。床が持ち上げるので I は増えない）
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o, 0.005) == 70 && !o.in_band && o.floor_on);
+  CHECK(fabs(st.i_pm - 20.0) < 1e-6);
+  // ki 0（-DV1_INTEGRAL=0）なら不感帯の中は従来どおり 0
+  t.ki_permille_per_count_s = 0.0;
+  V1DutyState st2;
+  CHECK(v1_duty_command(5, 0.0, st2, t, 0, &o, 0.005) == 0 && o.in_band);
+  // I が duty_max を超えることは無い（|I| ≤ 30 < duty_max）が、SET_LIMITS で duty_max 2 % にされれば保持も 20 で頭打ち
+  t.ki_permille_per_count_s = V1_KI_PERMILLE_PER_COUNT_S;
+  t.duty_max = 2;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 20);
+  t.duty_max = 1;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 10);
+}
+
+// 軸を通して: 止まったまま誤差 15（床 OFF・P 3）で I が積まれ、出力に足される。DISARM（DISARMED）/ FAULT / SET_REFERENCE で 0。
+inline void test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference() {
+  Harness h;
+  h.ax.tuning.settled_ms = 0;  // ここは F だけを見る（S は test_settled_* で）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.integral_permille() == 0);
+  h.stall = true;
+  h.raw -= 25;  // 不感帯の外へ → 床 ON（70）→ I は増えない（床が持ち上げている）
+  h.drive(100, h.ax.actual_count() + 25);
+  CHECK(h.ax.duty_permille() == -70 && h.ax.integral_permille() == 0);
+  h.raw += 10;  // 誤差 15: 床 OFF、生の P 3。ここで I が 0.1 × 15 × dt = 1.5 permille/s で積まれる
+  h.drive(2000, h.ax.actual_count() + 15);
+  CHECK(h.ax.state() == st::HOLDING);
+  CHECK(h.ax.integral_permille() == 3);  // 2 s × 1.5 = 3.0
+  CHECK(h.ax.duty_permille() == -6);     // P 3 + I 3（カウント増の向き → MD13S 符号で −）
+  CHECK(h.ax.duty_terms().i_permille == 3 && h.ax.duty_terms().p_permille == 3);
+  // 不感帯に入れば（誤差 5）出力は I だけ（保持バイアス）、凍結
+  h.raw += 10;
+  h.drive(200, h.ax.actual_count() + 5);
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == -3 && h.ax.integral_permille() == 3);
+  // DISARM → DISARMED で 0
+  Harness::accepted(h.disarm());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
+  // SET_REFERENCE も（DISARMED でしか通らないので 0 のまま 0）
+  Harness::accepted(h.set_reference(0));
+  CHECK(h.ax.integral_permille() == 0);
+  // FAULT: 積んだ I は latch_fault で即 0
+  Harness g;
+  g.ax.tuning.settled_ms = 0;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 25;  // いったん不感帯を出てから誤差 15 へ（15 のままでは出る側 20 の内側で凍結）
+  g.step();
+  g.raw += 10;
+  g.drive(2000, g.ax.actual_count() + 15);
+  CHECK(g.ax.integral_permille() == 3);
+  Harness::accepted(g.host_fault());
+  CHECK(g.ax.state() == st::FAULT && g.ax.integral_permille() == 0 && g.ax.duty_permille() == 0);
+  g.idle(50);
+  CHECK(g.ax.integral_permille() == 0);
+}
+
+
+// ---- Issue #25 手順 10「S」: 整定判定 ----------------------------------------------------------------------
+
+// 不感帯に入るのは「軌道速度 0・|誤差| ≤ 10・|実測速度| ≤ 10」が 200 ms 続いたとき。実測速度は 100 ms 窓なので、
+// 25 count 飛んで戻った直後は窓が 250 count/s を示す間（≤ 100 ms）は数えず、その後 200 ms で入る。
+inline void test_settled_entry_requires_dwell_with_measured_rest() {
+  Harness h;
+  CHECK(h.ax.tuning.settled_ms == V1_SETTLED_MS && h.ax.tuning.settled_ms == 200);  // 既定 ON（config.h V1_SETTLED_MEASURED）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.duty_terms().in_band);  // ARMING のブレーキ解除から HOLDING まで 300 ms 静止 → 入っている
+  h.stall = true;
+  h.raw -= 25;  // 出る側を超えて抜ける
+  h.step();
+  CHECK(!h.ax.duty_terms().in_band && h.ax.duty_permille() == -70);
+  h.raw += 25;  // 誤差 0 に戻る。実測速度の窓（100 ms）が更新されるまで 250 count/s を示し、その後 200 ms 待つ
+  h.step();
+  CHECK(!h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);  // 入っていないが P = 0 なので出力 0
+  h.drive(150, h.ax.actual_count());
+  CHECK(!h.ax.duty_terms().in_band);  // 150 ms ではまだ
+  h.drive(200, h.ax.actual_count());
+  CHECK(h.ax.duty_terms().in_band);  // 遅くとも 100 + 200 = 300 ms で入る
+  // 中では誤差 15 でも出力は I（0）のまま（出る側 20 まで）
+  h.raw -= 15;
+  h.step();
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);
+  // 軌道が動けば即抜ける
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = false;
+  h.drive(50, h.ax.actual_count() + 500);
+  CHECK(!h.ax.duty_terms().in_band);
+}
+
+// 実測速度が 10 count/s を超えている間（1 count / 25 ms = 40 count/s）は |誤差| ≤ 10 でも入らず、生の P を出す。止まれば
+// （窓が 0 を示してから）200 ms で入る。settled_ms = 0（-DV1_SETTLED_MEASURED=0）なら従来どおり即入る。
+inline void test_settled_blocked_by_measured_motion_and_legacy_immediate() {
+  Harness h;
+  h.ax.tuning.ki_permille_per_count_s = 0.0;  // 生の P を見やすく
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.raw += 25;
+  h.step();
+  // 25 ms ごとに 1 count ずつずれる（誤差 −1 … −8、|誤差| ≤ 10）: 実測 40 count/s → 入らない → 生の P（誤差 −8 → −1.6 → −2 permille → MD13S +2）
+  for (int i = 0; i < 8; ++i) {
+    h.raw += 1;
+    h.drive(25, h.ax.actual_count() - (i + 1));  // 目標は元の位置（actual が +1 ずつ増えているので −(i+1)）
+  }
+  CHECK(!h.ax.duty_terms().in_band);
+  CHECK(h.ax.following_error_count() == 8 && h.ax.duty_permille() == 2);
+  // 止まる: 窓が 0 になってから 200 ms 以内に入る（上限 300 ms）
+  h.drive(300, h.ax.target_count());
+  CHECK(h.ax.duty_terms().in_band && h.ax.duty_permille() == 0);
+  // settled_ms = 0: 即入る
+  Harness g;
+  g.ax.tuning.settled_ms = 0;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 25;
+  g.step();
+  CHECK(!g.ax.duty_terms().in_band);
+  g.raw += 25;
+  g.step();
+  CHECK(g.ax.duty_terms().in_band);
+}
+
+// S が ON でも停止ブースト（H4）の 2 s の上限 → ENCODER_FAULT はそのまま（|誤差| > 20 で止まったまま）。
+inline void test_settled_on_keeps_stationary_stall_fault() {
+  Harness h;
+  CHECK(h.ax.tuning.settled_ms > 0 && h.ax.tuning.ki_permille_per_count_s > 0.0);  // 既定（全部 ON）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.drive(1990, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(20, h.ax.actual_count() + 25);
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
+}
+
+
+// ---- Issue #25 手順 9「T」: 追従中の動き出し補助 ----------------------------------------------------------------
+
+// 軌道 110 count/s で動いているのにカウントが動かず |誤差| が増え続けて 150 ms → |誤差| ≈ 17（床の 20 未満）でも床 7 % を掛ける。
+// カウントが 3 以上動けば即解除。
+inline void test_track_assist_triggers_after_150ms_and_releases_on_motion() {
+  Harness h;
+  CHECK(h.ax.tuning.assist_ms == V1_ASSIST_MS && h.ax.tuning.assist_ms == 150);  // 既定 ON（config.h V1_TRACK_ASSIST）
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 110;
+  const int32_t start = h.ax.actual_count();
+  h.drive(140, start + 5000);
+  // 140 ms: |誤差| ≈ 15、FF 11 + P 3 → 生の 14（床 OFF、補助もまだ）
+  CHECK(!h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on);
+  CHECK(h.ax.duty_permille() < 0 && h.ax.duty_permille() > -30);
+  h.drive(30, start + 5000);
+  // 170 ms: 補助 ON → 床 70（|誤差| ≈ 18 < 20 なので E の床ではない）
+  const int32_t fe = -h.ax.following_error_count();
+  CHECK(fe > 10 && fe < 20);
+  CHECK(h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on && h.ax.duty_permille() == -70);
+  CHECK(h.ax.state() == st::ACTIVE);
+  // 動き出す（3 count 以上）→ 次の tick で解除、生の FF + P に戻る
+  h.stall = false;
+  h.plant_vel = 2000.0;
+  h.drive(10, start + 5000);
+  CHECK(!h.ax.duty_terms().assist_on);
+  CHECK(h.ax.duty_permille() > -70 && h.ax.duty_permille() < 0);
+}
+
+// 軌道が 100 count/s 以下なら対象外（80 count/s: 150 ms 後も生の出力。誤差が 20 を超えれば E の床）。assist_ms = 0
+// （-DV1_TRACK_ASSIST=0）なら 110 count/s でも掛けない。
+inline void test_track_assist_requires_trajectory_speed_and_can_be_disabled() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 80;
+  const int32_t start = h.ax.actual_count();
+  h.drive(200, start + 5000);  // |誤差| ≈ 16
+  CHECK(!h.ax.duty_terms().assist_on && !h.ax.duty_terms().floor_on && h.ax.duty_permille() > -30);
+  h.drive(100, start + 5000);  // |誤差| ≈ 24 → E の床
+  CHECK(!h.ax.duty_terms().assist_on && h.ax.duty_terms().floor_on && h.ax.duty_permille() == -70);
+  Harness g;
+  g.ax.tuning.assist_ms = 0;
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 110;
+  g.drive(170, g.ax.actual_count() + 5000);
+  CHECK(!g.ax.duty_terms().assist_on && !g.ax.duty_terms().floor_on && g.ax.duty_permille() > -30);
+}
+
+// 補助は保護を妨げない: 軌道 600 count/s で止まったままなら FOLLOWING_ERROR（400）は従来どおり約 0.7 s で出る。
+// kp 6 で FF + P が 15 %（duty_max 20 の 75 %）に届けば 200 ms の無パルスで ENCODER_FAULT。
+inline void test_track_assist_does_not_block_following_error_or_moving_stall_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 400;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 600;
+  const int32_t start = h.ax.actual_count();
+  const uint64_t t0 = h.now;
+  h.drive(200, start + 5000);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.duty_terms().assist_on);  // 補助は対象（|誤差| > 20 なので E の床も ON）
+  CHECK(h.ax.duty_permille() <= -70 && h.ax.duty_permille() > -150);  // FF 60 + P（誤差 ≈ 110 → 22）。15 % 未満: 無パルス判定は回らない
+  for (int i = 0; i < 80 && h.ax.state() != st::FAULT; ++i) h.drive(10, start + 5000);  // SET_POSITION を送り続ける（lease を切らさない）
+  CHECK(h.ax.state() == st::FAULT && h.now - t0 <= 1000 * MS);  // 400 / 600 ≈ 0.67 s ＋ 加速ぶん
+  CHECK(h.ax.fault_code() == fc::FOLLOWING_ERROR);
+  CHECK(h.ax.duty_permille() == 0 && !h.ax.duty_terms().assist_on && h.ax.integral_permille() == 0);
+  // 移動中の無パルス（ENCODER_FAULT）: kp 6・duty_min 9・duty_max 20 → 誤差 150 で FF 60 + P 90 = 150 ≥ 150 → 200 ms で FAULT
+  Harness g;
+  v1::Config c2 = base_config();
+  c2.following_error_limit_count = 100000;
+  Harness::accepted(g.config_with(c2));
+  Harness::accepted(g.set_limits(20, 9, 6, 100, 10, 20));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 600;
+  const int32_t gstart = g.ax.actual_count();
+  const uint64_t gt0 = g.now;
+  g.drive(160, gstart + 5000);
+  CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().assist_on && g.ax.duty_permille() <= -90);
+  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= 900 * MS);  // 誤差 150 まで ≈ 0.25 s ＋ 無パルス 200 ms
+  CHECK(g.ax.fault_code() == fc::ENCODER_FAULT);
+}
+
+
+// 床の向きと ON/OFF は FF + P で決め、I は入れない（Codex/Fable レビュー）: 保持で学んだ I = +30 を持ったまま目標が下に
+// 25 count 動く（誤差 −25、P −5）と、I 込みの合成は +25 だが床は −70（ON、誤差の向き）。I が床を消して停止ブースト対象のまま
+// 2 s で ENCODER_FAULT になる経路を塞ぐ。I は戻す向き（負）なので減っていく。
+inline void test_integral_does_not_flip_floor_direction_when_stationary() {
+  V1Tuning t;  // kp 2、床 7
+  V1DutyState st;
+  st.i_pm = 30.0;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(-25, 0.0, st, t, 0, &o, 0.005) == -70 && o.floor_on && o.i_permille == 30);
+  CHECK(st.i_pm < 30.0 && st.i_pm > 29.9);  // 戻す向き: 0.1 × 25 × 0.005 = 0.0125 減る
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(-25, 0.0, st, t, 0, nullptr, 0.005) == -70);
+  CHECK(st.i_pm < 25.0 + 1e-6 && st.i_pm > 24.9);  // 2 s で 5 減る
+  // I と同じ向きの合成は従来どおり: 誤差 +25（P +5）・I +30 → +35 < 床 70 → 70
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o, 0.0) == 70 && o.floor_on);
+  // 床 OFF（|誤差| ≤ 15）なら I 込みの生の合成（P −3 + I 25 = +22）がそのまま出る
+  CHECK(v1_duty_command(-15, 0.0, st, t, 0, &o, 0.0) == 22 && !o.floor_on);
+  // 軸を通して: 保持で I を持ったまま目標が逆へ 25 動いても停止ブーストが効き、2 s で ENCODER_FAULT にならず動けば抜ける
+  Harness h;
+  h.ax.tuning.settled_ms = 0;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 25;
+  h.step();
+  h.raw += 10;  // 誤差 15 で 2 s → I = 3
+  h.drive(2000, h.ax.actual_count() + 15);
+  CHECK(h.ax.integral_permille() == 3);
+  h.raw += 40;  // 誤差 −25（I は +3 のまま）→ 床 +70（MD13S −→ +）、停止ブーストが上がる
+  h.drive(100, h.ax.actual_count() - 25);
+  CHECK(h.ax.duty_permille() == 70 && h.ax.duty_terms().floor_on);
+  h.drive(400, h.ax.actual_count() - 25);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.stall_boost_permille() == 20);
+}
+
+
+// ---- Issue #25 r6: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス（config.h V1_FF_DIRECTIONAL） ----------------
+// ホストテストは -DV1_FF_DIRECTIONAL=0 で組む（run_tests.sh）ので、既定の V1Tuning は従来の経路。r6 は V1Tuning(true) で選ぶ。
+
+inline V1Tuning r6_tuning(int kp = 6, int duty_max = 20) {
+  V1Tuning t(true);
+  t.kp_percent_per_100 = kp;
+  t.duty_min = 9;
+  t.duty_max = duty_max;
+  return t;
+}
+
+// 方向別 FF の値（実測 11-02: 上 46 + 0.10 v、下 −7 + 0.107 v [permille]）とテーパ（|v| < 30 で切片を w = |v|/30 倍）。
+// 旧 ff_count_s_per_percent は無視する。
+inline void test_r6_ff_directional_values_and_taper() {
+  CHECK(V1Tuning{}.ff_directional == (V1_FF_DIRECTIONAL != 0));  // 既定はコンパイルスイッチ（テストは 0 で組む）
+  CHECK(!V1Tuning{}.ff_directional && fabs(V1Tuning{}.ki_permille_per_count_s - (V1_INTEGRAL ? V1_KI_PERMILLE_PER_COUNT_S : 0.0)) < 1e-12);
+  V1Tuning t = r6_tuning();
+  CHECK(t.ff_directional && fabs(t.ki_permille_per_count_s - 0.2) < 1e-12);  // Ki 0.02 %/(count·s)
+  CHECK(t.ff_a_up_permille == 46 && t.ff_a_down_permille == -7 && t.ff_taper_count_s == 30);
+  CHECK(fabs(t.ff_b_up_permille_per_count_s - 0.10) < 1e-12 && fabs(t.ff_b_down_permille_per_count_s - 0.107) < 1e-12);
+  CHECK(v1_ff_directional_pm(0.0, t) == 0.0);
+  CHECK(fabs(v1_ff_directional_pm(300.0, t) - 76.0) < 1e-9);     // 46 + 30
+  CHECK(fabs(v1_ff_directional_pm(-300.0, t) + 39.1) < 1e-9);    // −7 − 32.1
+  CHECK(fabs(v1_ff_directional_pm(600.0, t) - 106.0) < 1e-9);    // 46 + 60
+  CHECK(fabs(v1_ff_directional_pm(-600.0, t) + 71.2) < 1e-9);    // −7 − 64.2
+  CHECK(fabs(v1_ff_directional_pm(30.0, t) - 49.0) < 1e-9);      // w = 1 ちょうど
+  CHECK(fabs(v1_ff_directional_pm(-30.0, t) + 10.21) < 1e-9);
+  CHECK(fabs(v1_ff_directional_pm(15.0, t) - 24.5) < 1e-9);      // w = 0.5: 23 + 1.5
+  CHECK(fabs(v1_ff_directional_pm(-15.0, t) + 5.105) < 1e-9);    // −3.5 − 1.605
+  CHECK(fabs(v1_ff_directional_pm(3.0, t) - 4.9) < 1e-9);        // w = 0.1: 4.6 + 0.3
+  // v1_duty_command 経由（誤差 0、I 0）: FF がそのまま出る（床なし、四捨五入 1 回）
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(0, 300.0, st, t, 0, &o) == 76 && o.ff_permille == 76 && o.mode == V1DutyMode::MOVE && !o.floor_on);
+  CHECK(v1_duty_command(0, -300.0, st, t, 0, &o) == -39 && o.ff_permille == -39);
+  CHECK(v1_duty_command(0, 600.0, st, t, 0, &o) == 106);
+  CHECK(v1_duty_command(0, -600.0, st, t, 0, &o) == -71);
+  CHECK(v1_duty_command(0, 15.0, st, t, 0, &o) == 25);   // 24.5 → 25（0 から遠い側）
+  CHECK(v1_duty_command(0, -15.0, st, t, 0, &o) == -5);
+  // 旧 ff は無視（1 にしても同じ）。boost・assist=false も無関係
+  t.ff_count_s_per_percent = 1;
+  CHECK(v1_duty_command(0, 300.0, st, t, 50, &o) == 76 && o.boost_permille == 50);
+  // 係数を変えれば追従する（コンサルの更新に備える）
+  t.ff_a_up_permille = 60;
+  t.ff_b_up_permille_per_count_s = 0.03;
+  CHECK(v1_duty_command(0, 300.0, st, t, 0, &o) == 69);  // 60 + 9
+}
+
+// 走行中に床は無い: 1〜5 % の生の FF + P + I がそのまま出る。duty_min 9 は関係しない。
+inline void test_r6_no_floor_while_moving() {
+  V1Tuning t = r6_tuning();  // kp 6、duty_min 9、duty_max 20
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(0, 15.0, st, t, 0, &o) == 25 && !o.floor_on && o.mode == V1DutyMode::MOVE);  // 2.5 %
+  CHECK(v1_duty_command(3, 0.0, st, t, 0, &o, 0.0, false) == 2 && o.p_permille == 2 && !o.in_band);  // P 1.8 → 2（0.2 %）
+  CHECK(v1_duty_command(10, 0.0, st, t, 0, &o, 0.0, false) == 6);   // 誤差 10 → 0.6 %（旧: 不感帯で 0 か床 9 %）
+  CHECK(v1_duty_command(25, 0.0, st, t, 0, &o) == 15 && !o.floor_on);  // 誤差 25 → 1.5 %（旧: 床 ON で 90）
+  CHECK(v1_duty_command(-25, 0.0, st, t, 0, &o) == -15);
+  // 軌道と逆向きの誤差（先行）: 合成は生のまま（符号不一致の抑制なし）。誤差 −50・軌道 +300 → FF 76 + P −30 = 46
+  CHECK(v1_duty_command(-50, 300.0, st, t, 0, &o) == 46);
+  // 上限は duty_max で 1 回だけ飽和
+  CHECK(v1_duty_command(300, 600.0, st, t, 0, &o) == 200);   // 106 + 180 → 200
+  CHECK(v1_duty_command(-300, -600.0, st, t, 0, &o) == -200);
+}
+
+// PI: Ki 0.2 permille/(count·s)、|I| ≤ 30、|dI/dt| ≤ 10/s。アンチワインドアップは「飽和した向きへ積み増さない」だけ。
+// 符号不一致の抑制は無い（先行して逆向きに補正するのは正当）。戻す向きは飽和中も許す。
+inline void test_r6_pi_anti_windup_at_duty_max() {
+  V1Tuning t = r6_tuning();  // kp 6、duty_max 20
+  V1DutyState st;
+  // 誤差 400 静止: P 240 → 200 で飽和。I は 2 s 経っても 0
+  for (int i = 0; i < 400; ++i) CHECK(v1_duty_command(400, 0.0, st, t, 0, nullptr, 0.005) == 200);
+  CHECK(st.i_pm == 0.0);
+  // 誤差 30: P 18（飽和しない）→ 0.2 × 30 × 0.005 = 0.03 / tick、1 s で 6 → 出力 24
+  for (int i = 0; i < 200; ++i) v1_duty_command(30, 0.0, st, t, 0, nullptr, 0.005);
+  CHECK(fabs(st.i_pm - 6.0) < 1e-9);
+  V1DutyTerms o;
+  CHECK(v1_duty_command(30, 0.0, st, t, 0, &o) == 24 && o.i_permille == 6 && o.p_permille == 18);
+  // 変化率の上限: 誤差 400 で duty_max 60（飽和しない）→ 0.4 / tick が 0.05 / tick に → 1 s で 10。上限 30
+  V1Tuning t60 = r6_tuning(6, 60);
+  V1DutyState st2;
+  for (int i = 0; i < 200; ++i) v1_duty_command(400, 0.0, st2, t60, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 10.0) < 1e-9);
+  for (int i = 0; i < 1000; ++i) v1_duty_command(400, 0.0, st2, t60, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm - 30.0) < 1e-9);
+  // 戻す向きは飽和中も許す: I +30 のまま誤差 −400（飽和 −200）→ I は 1 s で 10 減る
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(-400, 0.0, st2, t, 0, nullptr, 0.005) == -200);
+  CHECK(fabs(st2.i_pm - 20.0) < 1e-9);
+  // 0 を越えて負（飽和した向きへ積み増す）には行かない
+  for (int i = 0; i < 1000; ++i) v1_duty_command(-400, 0.0, st2, t, 0, nullptr, 0.005);
+  CHECK(fabs(st2.i_pm) < 1e-9);
+  // 符号不一致でも積む: 誤差 +50・軌道 −600（FF −71 + P 30 = −41）→ I は正に育つ（旧 E の抑制は無い）
+  V1DutyState st3;
+  for (int i = 0; i < 200; ++i) CHECK(v1_duty_command(50, -600.0, st3, t, 0, nullptr, 0.005) < 0);
+  CHECK(fabs(st3.i_pm - 10.0) < 1e-9);  // 0.2 × 50 × 0.005 = 0.05 / tick（変化率の上限ちょうど）× 200
+  // I は小数のまま持ち、出力は 1 回だけ四捨五入: I 0.6 + P 0 → 1
+  V1DutyState st4;
+  st4.i_pm = 0.6;
+  CHECK(v1_duty_command(0, 0.0, st4, t, 0, &o, 0.0, false) == 1 && o.i_permille == 1);
+}
+
+// 保持: 軌道速度 0・|誤差| ≤ 2・settle_ok で入る（I と出力を 0）。|誤差| ≤ 4 の間とどまり、> 4 か軌道が動けば出る。
+// settle_ok = false（整定の 200 ms がまだ）なら |誤差| ≤ 2 でも入らず生の P + I。
+inline void test_r6_hold_entry_exit_and_zeroing() {
+  V1Tuning t = r6_tuning();
+  V1DutyState st;
+  st.i_pm = 12.0;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005, false) == 13 && !o.in_band && o.mode == V1DutyMode::MOVE);  // P 1.2 + I 12
+  CHECK(v1_duty_command(3, 0.0, st, t, 0, &o, 0.005, true) != 0 && !o.in_band);  // 3 > 2: 入らない
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005, true) == 0 && o.in_band && o.mode == V1DutyMode::HOLD);
+  CHECK(st.i_pm == 0.0 && o.i_permille == 0 && !o.floor_on);
+  CHECK(v1_duty_command(4, 0.0, st, t, 0, &o, 0.005) == 0 && o.in_band);   // 出口 4 まではとどまる（settle_ok は見ない）
+  CHECK(v1_duty_command(-4, 0.0, st, t, 0, &o, 0.005, false) == 0 && o.in_band);
+  CHECK(st.i_pm == 0.0);  // 保持中は積まない
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005) == 3 && !o.in_band && o.mode == V1DutyMode::MOVE);  // 5 > 4: 出る、P 3
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005) == 0 && o.in_band);  // 再び入る
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.005) == 56 && !o.in_band);  // 軌道が動けば出る（FF 46 + 10）
+  // 従来の deadband / deadband_out（10 / 20）は r6 では使わない
+  CHECK(v1_duty_command(8, 0.0, st, t, 0, &o, 0.005) == 5 && !o.in_band);
+}
+
+// 動き出しパルス（v1_duty_command 側）: breakaway = true のとき、誤差の向きに方向別の動き出し Duty と |合成|（同じ向きのとき）の
+// 大きい方。duty_max 以内。I は凍結。
+inline void test_r6_breakaway_pulse_output() {
+  V1Tuning t = r6_tuning();
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005, true, true) == 90 && o.mode == V1DutyMode::BRK && !o.floor_on);
+  CHECK(st.i_pm == 0.0);  // 凍結
+  CHECK(v1_duty_command(-5, 0.0, st, t, 0, &o, 0.005, true, true) == -60 && o.mode == V1DutyMode::BRK);
+  CHECK(v1_duty_command(300, 0.0, st, t, 0, &o, 0.0, true, true) == 180);  // 合成 180 > 90 → 合成
+  CHECK(v1_duty_command(0, 0.0, st, t, 0, &o, 0.0, false, true) == 0 && o.mode == V1DutyMode::MOVE);  // 向きが無い
+  st.i_pm = -20.0;  // 古い I で合成が逆（P 3 − 20 = −17）でも、パルスは誤差の向き（上 +90。目標から離れる側へ蹴らない）
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 90);
+  st.i_pm = 20.0;   // 合成が同じ向きで大きければ合成（P 3 + 20 = 23 < 90 → 90。誤差 300: 180 + 20 = 200 → 上限 200）
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 90);
+  CHECK(v1_duty_command(300, 0.0, st, t, 0, &o, 0.0, true, true) == 200);
+  st.i_pm = 0.0;
+  t.duty_max = 5;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 50);  // duty_max で頭打ち
+  t.breakaway_up_permille = 120;
+  t.duty_max = 20;
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.0, true, true) == 120);
+}
+
+// 軸を通して: 保持に入るのは「軌道完了・|誤差| ≤ 2・|実測速度| ≤ 10 が 200 ms」。入れば出力 0・I 0。|誤差| 3〜4 ではとどまり、5 で出る。
+inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0 && h.ax.duty_terms().in_band);
+  h.stall = true;
+  h.raw += 3;  // 誤差 −3
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+  h.raw += 2;  // 誤差 −5 → 出る。P = −1 permille（kp 2）→ duty +1（sign 1）
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == 1 && !h.ax.duty_terms().in_band);
+  // 戻る（誤差 −2）: 実測速度（100 ms 窓、最長 200 ms 古い）が ≤ 10 になってから 200 ms → 入るまで最長 400 ms。50 ms では入らない
+  h.raw -= 3;
+  h.drive(50, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.duty_terms().in_band);  // P −0.4 → 0 だが保持ではない
+  h.drive(450, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);
+  CHECK(h.ax.state() == st::HOLDING);
+}
+
+// 軸を通して: 静止で |誤差| 10 のまま進まない → 100 ms 後に動き出しパルス（上 90 → duty −90）を 100 ms、進まなければ 100 ms 空けて
+// 次のパルス。5 回で打ち切り。パルスは静止 2 s の監視の時計を戻さず、2 s で ENCODER_FAULT。
+inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10（上へ）
+  h.step();     // 対象になる（窓の開始・監視の起点）
+  const uint64_t t0 = h.now;
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == -2);  // 生の P 2
+  h.drive(90, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active());
+  h.drive(20, h.ax.target_count());  // 110 ms: パルス ON
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == -90 && h.ax.breakaway_active());
+  h.drive(80, h.ax.target_count());  // 190 ms: まだパルス
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK);
+  h.drive(30, h.ax.target_count());  // 220 ms: 終わって 1 回目を数えた。生の P に戻る
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && h.ax.duty_permille() == -2 && h.ax.breakaway_pulses() == 1);
+  // 5 回まで（1 回目は上で観測済み）。1.1 s 時点で 5 回、以後は打たない
+  int brk_ticks = 0;
+  while (h.now - t0 < 1900 * MS) {
+    h.drive(10, h.ax.target_count());
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) ++brk_ticks;
+  }
+  CHECK(h.ax.breakaway_pulses() == 5 && !h.ax.breakaway_active());
+  CHECK(brk_ticks >= 36 && brk_ticks <= 44);  // 残り 4 回 × 100 ms = 400 ms ≈ 40 回（10 ms 刻みの観測）
+  CHECK(h.ax.state() == st::HOLDING && h.ax.duty_permille() <= -2 && h.ax.duty_permille() >= -5);  // 生の P 2 ＋ 育った I（≤ 3）
+  h.drive(120, h.ax.target_count());  // 2 s
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0 && h.ax.breakaway_pulses() == 0);
+  CHECK(h.now - t0 <= 2100 * MS);
+}
+
+// パルス中に 3 count 進めば次の tick で解除され、数は 0 に戻る。下向きの要求は −60（duty +60）。
+// パルスを切った構成（breakaway_window_ms = 0）でも 2 s の監視はそのまま。
+inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw += 10;  // 誤差 −10（下へ）
+  h.step();
+  h.drive(110, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == 60);
+  h.raw -= 3;  // 下へ 3 進んだ
+  h.drive(10, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active() && h.ax.breakaway_pulses() == 0);
+  CHECK(h.ax.duty_permille() > 0 && h.ax.duty_permille() < 10);  // 生の P（誤差 −7 → −1.4 → −1 → duty +1）
+  // 自重で逆へ動くのは「進み」ではない: 上の要求（誤差 +10）でカウントが下がっても窓は取り直されずパルスが出る
+  Harness g;
+  g.ax.tuning = r6_tuning(2);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 10;
+  g.step();
+  g.raw -= 5;  // 逆向きに 5
+  g.drive(110, g.ax.target_count());
+  CHECK(g.ax.duty_terms().mode == V1DutyMode::BRK && g.ax.duty_permille() == -90);
+  // パルス無効でも監視は 2 s
+  Harness k;
+  k.ax.tuning = r6_tuning(2);
+  k.ax.tuning.breakaway_window_ms = 0;
+  Harness::accepted(k.config_with(c));
+  k.reach_holding_from_configured();
+  k.stall = true;
+  k.raw -= 10;
+  k.step();
+  const uint64_t t0 = k.now;
+  k.drive(1900, k.ax.target_count());
+  CHECK(k.ax.state() == st::HOLDING && k.ax.duty_terms().mode == V1DutyMode::MOVE && k.ax.breakaway_pulses() == 0);
+  k.drive(120, k.ax.target_count());
+  CHECK(k.ax.state() == st::FAULT && k.ax.fault_code() == fc::ENCODER_FAULT && k.now - t0 <= 2100 * MS);
+}
+
+// 追従（プラントが付いてくる）では床もパルスも出ず、出力は FF（300 count/s 上り → 76）± 小さい P + I。到着後に保持。
+inline void test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.pos_max_vel = 300;
+  const int32_t start = h.ax.actual_count();
+  bool any_brk = false, any_floor = false;
+  int min_mag = 1000, max_mag = 0;
+  for (int i = 0; i < 100; ++i) {  // 1 s: 加速 15 ms の後 300 count/s で約 290 count
+    h.drive(10, start + 2000);
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) any_brk = true;
+    if (h.ax.duty_terms().floor_on) any_floor = true;
+    if (i >= 5) {
+      const int mag = -h.ax.duty_permille();  // 上り（カウント増）は sign 1 で負
+      if (mag < min_mag) min_mag = mag;
+      if (mag > max_mag) max_mag = mag;
+    }
+  }
+  CHECK(!any_brk && !any_floor && h.ax.state() == st::ACTIVE);
+  CHECK(min_mag >= 70 && max_mag <= 85);  // FF 76（旧: 床 90 か生の 30）
+  CHECK(h.ax.actual_count() - start > 250);
+  // 下り: FF −39 → duty +39 前後
+  h.drive(1000, start);
+  CHECK(h.ax.duty_permille() >= 33 && h.ax.duty_permille() <= 46 && h.ax.duty_terms().mode == V1DutyMode::MOVE);
+  // 到着して止まれば保持（出力 0）
+  h.drive(1500, start);
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+}
+
+// 保護は変わらない: 600 count/s で止まったままなら FOLLOWING_ERROR 400 は約 0.7 s。kp 6 / duty_max 20 なら FF 106 + P が 15 %
+// に届いた所から 200 ms の無パルスで ENCODER_FAULT（動き出しパルス 90 は 15 % 未満で判定に入らない）。
+inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2, 40);  // duty_max 40 → 無パルスのしきい値 30 %。FF 106 + P 80 = 186 はそれ未満なので FOLLOWING_ERROR 側
+  v1::Config c = base_config();
+  c.following_error_limit_count = 400;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 600;
+  const int32_t start = h.ax.actual_count();
+  const uint64_t t0 = h.now;
+  for (int i = 0; i < 100 && h.ax.state() != st::FAULT; ++i) h.drive(10, start + 5000);
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::FOLLOWING_ERROR && h.now - t0 <= 1000 * MS);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  v1::Config c2 = base_config();
+  c2.following_error_limit_count = 100000;
+  Harness::accepted(g.config_with(c2));
+  Harness::accepted(g.set_limits(20, 9, 6, 100, 10, 20));  // ff 100 は受理されるが無視
+  CHECK(g.ax.tuning.ff_count_s_per_percent == 100 && g.ax.tuning.ff_directional);
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 600;
+  const int32_t gstart = g.ax.actual_count();
+  const uint64_t gt0 = g.now;
+  g.drive(60, gstart + 5000);
+  CHECK(g.ax.duty_permille() <= -106 && g.ax.state() == st::ACTIVE);  // FF 106 ＋ P
+  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 600 * MS);
+}
+
+// PR #33 Codex P1: 遅い軌道（25 count/s）に 8 count 遅れて付いていく（100 ms に 2〜3 count）だけでは動き出しパルスを打たない。
+// 軌道が速い（300 count/s）のに軸が止まったまま |誤差| が増え続ければ 200 ms の窓の後に打つ（合成が 90 を超えていればその値）。
+inline void test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;  // プラントはテストが手で動かす
+  h.pos_max_vel = 25;
+  const int32_t start = h.ax.actual_count();
+  int brk_ticks = 0;
+  uint64_t next_move = h.now + 320 * MS;  // 8 count 遅れてから 40 ms に 1 count（25 count/s）で付いていく
+  for (int i = 0; i < 200; ++i) {  // 2 s
+    h.drive(10, start + 2000);
+    if (h.now >= next_move) {
+      h.raw += 1;
+      next_move += 40 * MS;
+    }
+    if (h.ax.duty_terms().mode == V1DutyMode::BRK) ++brk_ticks;
+  }
+  CHECK(h.ax.state() == st::ACTIVE && brk_ticks == 0 && h.ax.breakaway_pulses() == 0);
+  const int64_t lag = static_cast<int64_t>(h.ax.target_count()) - h.ax.actual_count();
+  CHECK(lag >= 5 && lag <= 12);  // 遅れは保たれている（対象外なのは遅れが小さいからではない）
+  // 速い軌道で止まったまま: 200 ms の窓の後にパルス
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.set_position(g.ax.actual_count());
+  Harness::accepted(g.start());
+  g.stall = true;
+  g.pos_max_vel = 300;
+  const int32_t gstart = g.ax.actual_count();
+  g.drive(150, gstart + 2000);  // 加速 15 ms の後 300 count/s。150 ms では窓（200 ms）の途中
+  CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().mode == V1DutyMode::MOVE && !g.ax.breakaway_active());
+  g.drive(100, gstart + 2000);  // 250 ms
+  CHECK(g.ax.duty_terms().mode == V1DutyMode::BRK && g.ax.breakaway_active() && g.ax.duty_permille() <= -90);
+}
+
+// PR #33 Codex P2: 静止 2 s の監視は「誤差の向きへ 3 count 進んだ」ときだけ時計を戻す。自重で目標から離れる動きでは戻さず、
+// 2 s で ENCODER_FAULT。従来経路（directional = false）は向きを問わない（既存テストのまま）。
+inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
+  Harness h;
+  h.ax.tuning = r6_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10（上へ）
+  h.step();
+  const uint64_t t0 = h.now;
+  while (h.now - t0 < 1900 * MS) {
+    h.drive(150, h.ax.target_count());
+    h.raw -= 3;  // 150 ms ごとに目標から 3 count 離れる（従来の向きを問わない判定なら時計が戻っていた）
+  }
+  CHECK(h.ax.state() == st::HOLDING);
+  h.drive(200, h.ax.target_count());
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT && h.now - t0 <= 2300 * MS);
+  // 誤差の向きへ 3 count 進めば時計は戻る
+  Harness g;
+  g.ax.tuning = r6_tuning(2);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 30;
+  g.step();
+  const uint64_t gt0 = g.now;
+  while (g.now - gt0 < 2500 * MS) {
+    g.drive(150, g.ax.target_count());
+    g.raw += 3;
+  }
+  CHECK(g.ax.state() == st::HOLDING && g.ax.fault_code() == 0);
+}
+
+// r7: 静止目標で |誤差| = 3（保持に入れず、r6 ではパルスも監視も対象外だった帯）→ 100 ms 後に動き出しパルス、進めば保持へ。
+// 進まなければ 5 回で打ち切り、2 s で ENCODER_FAULT（監視も > 2 から）。
+inline void test_r7_stationary_error_3_gets_breakaway_and_watchdog() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10 で保持から出る（保持中は |誤差| > 4 まで保持のまま: ヒステリシス）
+  h.step();
+  h.raw += 7;   // 誤差 +3 まで戻って止まる（r6 ではここで P ＋ I が流れたまま止まった）
+  h.step();
+  h.drive(90, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active());
+  h.drive(20, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == -90);
+  h.raw += 3;  // 進んだ → 誤差 0
+  h.drive(10, h.ax.target_count());
+  CHECK(!h.ax.breakaway_active() && h.ax.breakaway_pulses() == 0);
+  h.drive(450, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 10;
+  g.step();
+  g.raw += 7;
+  g.step();
+  const uint64_t t0 = g.now;
+  g.drive(1900, g.ax.target_count());
+  CHECK(g.ax.state() == st::HOLDING && g.ax.breakaway_pulses() == 5);
+  g.drive(200, g.ax.target_count());
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - t0 <= 2300 * MS);
+}
+
+// r8: 軌道速度 50〜150 count/s の帯では「引っかかった時だけ短く押す」。
+// (A) 100 count/s で軸が止まったまま → 100 ms の窓の後に 50 ms のパルス、その後 200 ms は押さない（次は ~350 ms 後）。
+// (B) 1 count 進めばパルスは次の tick で終わり、休みに入る。(C) 普通に付いてきている（10 ms に 1 count）なら押さない。
+inline void test_r8_band_stuck_assist_short_pulses_with_cooldown() {
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  auto active = [&](Harness& h) {
+    h.ax.tuning = r6_tuning(30);
+    Harness::accepted(h.config_with(c));
+    h.reach_holding_from_configured();
+    h.set_position(h.ax.actual_count());
+    Harness::accepted(h.start());
+    h.pos_max_vel = 100;
+  };
+  // (A)
+  Harness a;
+  active(a);
+  a.ax.tuning.kp_percent_per_100 = 10;  // kp 30 では止まったまま約 0.5 s で P が 15 % を超え無パルス保護が先に働く（それは正しい）
+  a.stall = true;
+  const int32_t sa = a.ax.actual_count();
+  int onsets = 0, run = 0, max_run = 0;
+  bool prev = false;
+  std::vector<uint64_t> onset_t;
+  const uint64_t t0 = a.now;
+  for (int i = 0; i < 80; ++i) {  // 0.8 s
+    a.drive(10, sa + 2000);
+    const bool brk = a.ax.duty_terms().mode == V1DutyMode::BRK;
+    if (brk && !prev) { ++onsets; onset_t.push_back(a.now - t0); run = 0; }
+    if (brk) { ++run; if (run > max_run) max_run = run; }
+    prev = brk;
+  }
+  CHECK(a.ax.state() == st::ACTIVE);
+  CHECK(onsets >= 2 && onsets <= 4);
+  CHECK(max_run <= 6);  // 50 ms（10 ms 刻みの観測で 5〜6）
+  CHECK(onset_t.size() >= 2 && onset_t[0] >= 100 * MS && onset_t[0] <= 200 * MS);
+  CHECK(onset_t.size() >= 2 && onset_t[1] - onset_t[0] >= 330 * MS && onset_t[1] - onset_t[0] <= 400 * MS);
+  // (B)
+  Harness b;
+  active(b);
+  b.stall = true;
+  const int32_t sb = b.ax.actual_count();
+  for (int i = 0; i < 30 && b.ax.duty_terms().mode != V1DutyMode::BRK; ++i) b.drive(10, sb + 2000);
+  CHECK(b.ax.duty_terms().mode == V1DutyMode::BRK && b.ax.duty_permille() <= -90);
+  b.raw += 1;  // 上へ 1 count
+  b.drive(10, sb + 2000);
+  CHECK(b.ax.duty_terms().mode != V1DutyMode::BRK && b.ax.breakaway_pulses() == 0);
+  bool brk_in_cooldown = false;
+  for (int i = 0; i < 18; ++i) {  // 休み 200 ms の間（止まったままでも）押さない
+    b.drive(10, sb + 2000);
+    if (b.ax.duty_terms().mode == V1DutyMode::BRK) brk_in_cooldown = true;
+  }
+  CHECK(!brk_in_cooldown);
+  // (C)
+  Harness d;
+  active(d);
+  d.stall = true;
+  const int32_t sd = d.ax.actual_count();
+  bool any_brk = false;
+  d.drive(50, sd + 2000);  // 5 count ほど遅れる（> 2）
+  for (int i = 0; i < 100; ++i) {
+    d.raw += 1;  // 10 ms に 1 count = 100 count/s で付いていく
+    d.drive(10, sd + 2000);
+    if (d.ax.duty_terms().mode == V1DutyMode::BRK) any_brk = true;
+  }
+  CHECK(!any_brk && d.ax.state() == st::ACTIVE);
+}
+
+// SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
+inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
+  V1Tuning a = r6_tuning(6, 20);
+  V1Tuning b = a;
+  b.ff_count_s_per_percent = 50;
+  b.duty_min = 3;
+  b.deadband = 1;
+  b.deadband_out = 2;
+  V1DutyState sa, sb;
+  for (int err = -60; err <= 60; err += 7) {
+    for (double v : {0.0, 20.0, -200.0, 600.0}) {
+      CHECK(v1_duty_command(err, v, sa, a, 0, nullptr, 0.005, false) == v1_duty_command(err, v, sb, b, 0, nullptr, 0.005, false));
+    }
+  }
+  b.kp_percent_per_100 = 12;
+  CHECK(v1_duty_command(50, 0.0, sa, a, 0, nullptr, 0.0, false) != v1_duty_command(50, 0.0, sb, b, 0, nullptr, 0.0, false));
+  b.kp_percent_per_100 = 6;
+  b.duty_max = 5;
+  CHECK(v1_duty_command(0, 600.0, sa, a, 0, nullptr, 0.0, false) == 106 && v1_duty_command(0, 600.0, sb, b, 0, nullptr, 0.0, false) == 50);
 }
 
 inline void run_all() {
@@ -2892,9 +4071,38 @@ inline void run_all() {
   test_stall_boost_window_restarts_on_motion_but_ignores_jitter();
   test_stall_boost_resets_on_error_sign_flip();
   test_stall_boost_not_while_moving_or_brake_applied_and_capped_by_limits();
-  test_duty_command_floor_only_toward_target();
+  test_duty_command_floor_gate_with_hysteresis();
+  test_axis_tracking_uses_raw_ff_and_floor_follows_hysteresis();
+  test_duty_command_floor_requires_p_and_respects_small_deadband_out();
   test_encoder_fault_threshold_follows_duty_max();
   test_stuck_axis_with_high_kp_is_following_error_not_encoder_fault();
+  test_integral_rate_limit_and_saturation();
+  test_integral_anti_windup_on_applied_output();
+  test_integral_blocked_during_floor_sign_mismatch_but_unwinds();
+  test_integral_holding_bias_retained_in_band();
+  test_integral_in_axis_accumulates_and_resets_on_disarm_fault_reference();
+  test_integral_does_not_flip_floor_direction_when_stationary();
+  test_settled_entry_requires_dwell_with_measured_rest();
+  test_settled_blocked_by_measured_motion_and_legacy_immediate();
+  test_settled_on_keeps_stationary_stall_fault();
+  test_track_assist_triggers_after_150ms_and_releases_on_motion();
+  test_track_assist_requires_trajectory_speed_and_can_be_disabled();
+  test_track_assist_does_not_block_following_error_or_moving_stall_fault();
+  test_r6_ff_directional_values_and_taper();
+  test_r6_no_floor_while_moving();
+  test_r6_pi_anti_windup_at_duty_max();
+  test_r6_hold_entry_exit_and_zeroing();
+  test_r6_breakaway_pulse_output();
+  test_r6_axis_hold_requires_dwell_and_holds_to_4();
+  test_r6_breakaway_pulses_then_stall_watchdog_at_2s();
+  test_r6_breakaway_releases_on_progress_and_down_direction();
+  test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse();
+  test_r6_following_error_and_moving_stall_fault_unchanged();
+  test_r6_set_limits_ff_and_floor_fields_are_ignored();
+  test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall();
+  test_r6_stall_watchdog_ignores_motion_away_from_target();
+  test_r7_stationary_error_3_gets_breakaway_and_watchdog();
+  test_r8_band_stuck_assist_short_pulses_with_cooldown();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();
@@ -2915,6 +4123,10 @@ inline void run_all() {
   test_duty_sign_follows_profile_sign();
   test_duty_deadband_and_clamp();
   test_duty_command_feed_forward();
+  test_duty_terms_report_ff_p_floor_and_band();
+  test_duty_command_permille_resolution_and_saturation();
+  test_encoder_fault_threshold_permille_matches_percent();
+  test_motor_output_permille_mapping();
   test_local_estop_latches_and_blocks_reset_until_released();
   test_local_estop_in_disarmed_and_during_other_fault();
   test_bad_frames_counted_and_unanswered();
