@@ -1816,6 +1816,7 @@ fn snapshot_json_shape() {
         "feedback_uncertain",
         "end_braking",
         "limit_recovery",
+        "parked",
         "current_a",
         "last_applied_frame",
         "status_age_ms",

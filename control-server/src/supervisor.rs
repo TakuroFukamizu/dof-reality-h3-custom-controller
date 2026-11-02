@@ -419,6 +419,8 @@ pub struct AxisSnapshot {
     pub feedback_uncertain: Option<bool>,
     pub end_braking: Option<bool>,
     pub limit_recovery: Option<bool>,
+    /// STATUS flag PARKED (protocol §3.4 bit 11): still hold parked on the brake.
+    pub parked: Option<bool>,
     /// Amperes, only when the MCU sets CURRENT_VALID.
     pub current_a: Option<f64>,
     pub last_applied_frame: Option<u32>,
@@ -1370,6 +1372,7 @@ impl Supervisor {
                     feedback_uncertain: s.map(|s| s.flags & status_flags::FEEDBACK_UNCERTAIN != 0),
                     end_braking: s.map(|s| s.flags & status_flags::END_BRAKING != 0),
                     limit_recovery: s.map(|s| s.flags & status_flags::LIMIT_RECOVERY != 0),
+                    parked: s.map(|s| s.flags & status_flags::PARKED != 0),
                     current_a: s
                         .filter(|s| s.flags & status_flags::CURRENT_VALID != 0)
                         .map(|s| f64::from(s.current_ma) / 1000.0),

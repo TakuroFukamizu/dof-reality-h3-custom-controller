@@ -92,6 +92,7 @@ struct V1SupInfo {
   bool fe_recovery = false;
   uint32_t activity_age_ms = 0;  // 最後にカウントが（どちら向きでも）変わってから
   uint32_t saturation_ms = 0;    // 飽和が続いている時間（進めば取り直す）
+  bool parked = false;           // ブレーキで駐車している（V1Axis が埋める）
   int32_t budget_up = 0;         // 上（カウント増）へ見えないまま出せる残り [count]（回と位置の上限の小さい方）
   int32_t budget_down = 0;
 };
@@ -115,6 +116,7 @@ class V1Supervisor {
     double i_pm = 0.0;            // 保持の偏り（bias）[permille]。確かな動きの後に位置が保てたとき（certify_ms）の値を「学んだ保持出力」とする
     bool stationary_near = false; // 軌道が止まっていて目標の近く（学んだ保持出力の分を包絡線に積まない）
     bool brake_released = true;   // ブレーキ解除指令中（露出を積むのはこの間だけ）
+    bool park_ok = false;         // 目標の近くで静止して落ち着いている（期限の露出が半分に届いたら駐車を求める）
   };
 
   V1SupTuning t;
@@ -241,18 +243,22 @@ class V1Supervisor {
         cert_pending_ = false;
       }
     }
-    // P0: 期限。露出が端までの余裕（1 回目は半分）を超える前に停止（先読みは最悪の tick 間隔ぶん）
+    // P0: 期限（先読みは最悪の tick 間隔ぶん）。目標の近くで静止して落ち着いていれば余裕の半分で駐車を求める（ブレーキが保つ）。
+    // そうでなければ余裕の全部で停止（FEEDBACK_UNCERTAIN）し、基準を消す
     if (t.deadline && c.brake_released && !inhibited()) {
       uint64_t step_us = last_dt_us_;
       if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
       for (int k = 0; k < 2; ++k) {
         const int dd = k == 0 ? 1 : -1;
-        const double thr = static_cast<double>(position_limit(dd, c)) * (strikes_ == 0 ? 0.5 : 1.0);
-        if (exp_[idx(dd)] + exposure_rate(dd) * static_cast<double>(step_us) / 1e6 > thr + 1e-9) {
+        const double lim = static_cast<double>(position_limit(dd, c));
+        const double next = exp_[idx(dd)] + exposure_rate(dd) * static_cast<double>(step_us) / 1e6;
+        if (c.park_ok && next > 0.5 * lim + 1e-9) {
+          park_request_ = true;
+        } else if (next > lim + 1e-9) {
           feedback_uncertain_ = true;
           deadline_tripped_ = true;
           ++strikes_;
-          if (strikes_ >= 2) reference_lost_ = true;
+          reference_lost_ = true;
           break;
         }
       }
@@ -394,6 +400,19 @@ class V1Supervisor {
   bool deadline_tripped() const { return deadline_tripped_; }  // いまの停止は期限による（予算・過負荷ではない）
   double verified_hold_permille() const { return i_verified_; }  // P1c: 認定された保持出力
   // P0: 2 回目の期限の停止で基準を消すよう求める（V1Axis が POSITION_REFERENCED を落とす）。読んだら消える
+  // 期限の露出が半分に届き、駐車を求める（V1Axis が駐車に入る）。読んだら消える
+  bool take_park_request() {
+    const bool r = park_request_;
+    park_request_ = false;
+    return r;
+  }
+  // 駐車中（ブレーキ作動・PWM 0）: 出力を 0 として扱い、予算・露出を積まない
+  void note_parked() {
+    last_out_ = 0;
+    last_charge_ = 0;
+    sat_running_ = false;
+    braking_ = false;
+  }
   bool take_reference_lost() {
     const bool r = reference_lost_;
     reference_lost_ = false;
@@ -442,6 +461,7 @@ class V1Supervisor {
   int strikes_ = 0;                // P0: 確かな動きが無いままの期限の停止の回数
   bool deadline_tripped_ = false;
   bool reference_lost_ = false;
+  bool park_request_ = false;
   bool cert_pending_ = false;      // P1c: 保持出力の認定待ち
   uint64_t cert_start_us_ = 0;
   int64_t cert_raw_ = 0;

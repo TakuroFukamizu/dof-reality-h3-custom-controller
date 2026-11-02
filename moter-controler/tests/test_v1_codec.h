@@ -452,6 +452,16 @@ inline void test_vectors_mcu() {
         "FF FF D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 8F 3A 00",
         m, eq_status);
   }
+  {  // 7.24 STATUS（ブレーキ駐車 PARKED、bit 11。2026-11-02 の操作者の決定）: flags = 0x081D（ブレーキ作動・主電源 ON・PWM 0）
+    v1::McuMsg m{};
+    m.type = v1::msg::STATUS;
+    m.status = {2309737967u, 1234567890ull, 4, 1, v1::fault::NONE, 0x081D, 0, -1230, -1230, 0, 0, 1234, 1000, 1000, 0, 1, 2};
+    CHECK(v1::flags::PARKED == 0x0800);
+    check_mcu_vector(
+        "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 1D 08 00 00 32 FB FF FF 32 FB FF FF 00 00 00 00 00 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 00 E6",
+        "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 03 1D 08 01 09 32 FB FF FF 32 FB FF FF 01 01 01 01 01 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 01 02 E6 00",
+        m, eq_status);
+  }
   {  // 7.22 LIMITS（boot_id 0x89ABCDEF、duty_max 40、duty_min 3、kp 2、abs_duty_max 60、ff 100、deadband 10、
      // deadband_out 20、abs_max_vel 6000、abs_max_acc 40000。motion-limits 設計 §4.5）。CRC は Python でも確認した値
     v1::McuMsg m{};

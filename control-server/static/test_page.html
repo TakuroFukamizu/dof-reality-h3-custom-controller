@@ -112,7 +112,7 @@
     <tbody id="axes"></tbody>
   </table>
   </div>
-  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller（r10 の保護: LL=load_limited FU=feedback_uncertain EB=end_braking LR=limit_recovery。立っているときだけ出る）。REFERENCE は DISARMED 時だけ（現在位置を count とみなす）。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral。この boot のもの）。</div>
+  <div class="dim small">flags: P=power_on_cmd B=brake_release_cmd C=configured R=referenced PC=power_controller（r10 の保護: LL=load_limited FU=feedback_uncertain EB=end_braking LR=limit_recovery、PK=parked（ブレーキで駐車中）。立っているときだけ出る）。REFERENCE は DISARMED 時だけ（現在位置を count とみなす）。校正列: CALIBRATING か最後の CAL_RESULT（result / reason / n_end / neutral。この boot のもの）。</div>
 </section>
 
 <section>
@@ -428,7 +428,7 @@
     set(c[7], claimants.map((x) => x.port + '(' + x.device_id + ')').join(', ') || '—', claimants.length > 1 ? 'bad' : '');
     set(c[8], fmt(a.mcu_state), a.mcu_state === 'FAULT' ? 'bad' : '');
     set(c[9], fmt(a.fault_code), (a.fault_code && a.fault_code !== 'NONE') ? 'bad' : '');
-    set(c[10], [a.power_on_cmd ? 'P' : '-', a.brake_release_cmd ? 'B' : '-', a.configured ? 'C' : '-', a.referenced ? 'R' : '-', a.power_controller ? 'PC' : '--', a.load_limited ? 'LL' : '', a.feedback_uncertain ? 'FU' : '', a.end_braking ? 'EB' : '', a.limit_recovery ? 'LR' : ''].filter((x) => x !== '').join(' '));
+    set(c[10], [a.power_on_cmd ? 'P' : '-', a.brake_release_cmd ? 'B' : '-', a.configured ? 'C' : '-', a.referenced ? 'R' : '-', a.power_controller ? 'PC' : '--', a.load_limited ? 'LL' : '', a.feedback_uncertain ? 'FU' : '', a.end_braking ? 'EB' : '', a.limit_recovery ? 'LR' : '', a.parked ? 'PK' : ''].filter((x) => x !== '').join(' '));
     set(c[11], fmt(a.actual_count), 'num');
     set(c[12], fmt(a.target_count), 'num');
     set(c[13], fmt(a.velocity_count_s), 'num');

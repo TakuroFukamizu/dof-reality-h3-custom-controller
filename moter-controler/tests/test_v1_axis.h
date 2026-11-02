@@ -230,7 +230,9 @@ struct Harness {
       }
       const bool engaged = !released && !brake_fails && now - brake_cmd_off_at >= brake_delay_ms * MS;
       const int un = u - load_permille;
-      if (released && !held && (un > pwm_deadband_permille || un < -pwm_deadband_permille)) {
+      // ブレーキが掴んでいない間（解除中、または作動指令から brake_delay_ms まで）は PWM と荷重で動く
+      const bool engaged_now = !released && !brake_fails && now - brake_cmd_off_at >= brake_delay_ms * MS;
+      if (!engaged_now && !held && (un > pwm_deadband_permille || un < -pwm_deadband_permille)) {
         v = static_cast<double>(un) * pwm_count_s_per_permille;
         if (pwm_deadband_subtract) v = static_cast<double>(un > 0 ? un - pwm_deadband_permille : un + pwm_deadband_permille) * pwm_count_s_per_permille;
         if (v > plant_max_vel) v = plant_max_vel;
@@ -3538,6 +3540,7 @@ inline void test_integral_does_not_flip_floor_direction_when_stationary() {
 inline V1Tuning r6_tuning(int kp = 6, int duty_max = 20) {
   V1Tuning t(true);
   t.hold_learn = false;  // r10（実測 2）の保持出力の学習は test_r10_* で見る。r6〜r9 の試験はその版の振る舞い（HOLD で出力 0・I を捨てる）
+  t.park = false;        // ブレーキ駐車（2026-11-02）も test_r10_* で見る
   t.kp_percent_per_100 = kp;
   t.duty_min = 9;
   t.duty_max = duty_max;
@@ -4545,6 +4548,7 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
   Harness h;
   h.ax.tuning = V1Tuning(true);
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // FF の落ちをそのまま見る（r9 の減衰も同じ参照速度を使う）
+  h.ax.tuning.park = false;  // 参照の作り方を見る試験（ブレーキ駐車は参照を止めるので、ここでは切る。駐車は test_r10_park_*）
   h.ax.tuning.playout_delay_ms = s.delay_ms;
   h.pos_max_vel = s.max_vel;
   h.reach_active();

@@ -342,4 +342,8 @@ pub mod status_flags {
     /// error over the limit that is shrinking (grace instead of a latch). Both
     /// graces are off in the default firmware.
     pub const LIMIT_RECOVERY: u16 = 1 << 10;
+    /// Still hold parked on the mechanical brake (brake applied, PWM 0, main
+    /// power kept, learned holding bias kept). Not a fault; the MCU resumes
+    /// automatically when the target moves (operator decision 2026-11-02).
+    pub const PARKED: u16 = 1 << 11;
 }

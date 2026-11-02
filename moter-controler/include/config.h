@@ -438,13 +438,33 @@ constexpr uint32_t V1_HOLD_CERTIFY_MS = 300;
 //（FEEDBACK_UNCERTAIN）。目標・状態の変化や ±1 のちらつきでは戻さず、確かな動き（その向き）と基準の取り直しだけが戻す。
 //  - 露出の速さ: 出力の向きに、出力の包絡線（既定は Duty に比例: 20 % で 2500 count/s。-DV1_SUP_DEADLINE_PROPORTIONAL=0 で一律 2500）。
 //    下向き（カウント減 = FF の向きの決め方で「下」）には、出力に関係なく V1_SUP_BACKDRIVE_COUNT_S（荷重で逆に回る速さ、仮値）を足す
-//  - 1 回目の停止は余裕の半分で、DISARM → 再 ARM で残りの半分を使える（露出は再 ARM でも戻さない）。2 回目の停止では基準を消す
-//   （POSITION_REFERENCED を落とし、ARM_PREPARE は NOT_REFERENCED。SET_REFERENCE か校正が要る）。見えない走行は合わせて余裕以内
-//  - 生きたエンコーダでも、完全に静止した保持（2 count の動きが無い）はこの期限で停止する（ブレーキが座席を保つ）
+//  - 2026-11-02 の操作者の決定（静止した保持が数秒で止まるのは不可）: 目標の近くで静止して落ち着いているなら、露出が余裕の半分に届く前に
+//    ブレーキで駐車する（下の V1_PARK_*。FAULT でも停止でもなく、目標が動けば自動で戻る）。駐車できない状態（動いている・誤差が大きい）
+//    で露出が余裕の全部に届いたら PWM 0 ＋ ブレーキの停止（FEEDBACK_UNCERTAIN）にし、基準を消す（見えないまま余裕の全部を動いたかも
+//    しれないので位置を信用しない。ARM_PREPARE は NOT_REFERENCED、SET_REFERENCE か校正が要る）。露出は再 ARM でも駐車でも戻さない
 #ifndef V1_SUP_DEADLINE_PROPORTIONAL
 #define V1_SUP_DEADLINE_PROPORTIONAL 1
 #endif
 constexpr int32_t V1_SUP_BACKDRIVE_COUNT_S = 200;
+// 2026-11-02 の操作者の決定: 静止した保持はブレーキで駐車する（PARKED。FAULT でも停止でもない。主電源は保つ。自動で戻る）。監視 ON の方向別の経路だけ。
+//  - 入る: 参照が止まっている（|参照速度| ≤ V1_PARK_REF_VEL_COUNT_S）・目標（フレームの目標）の幅が V1_PARK_TARGET_SPAN_COUNT 以内・
+//    |誤差| ≤ 保持の出口（4）・|実測速度| ≤ 10 が V1_PARK_STILL_MS 続いた（ACTIVE でも HOLDING でも）。または期限の露出が余裕の半分に届く
+//    とき（上の V1_SUP_DEADLINE）。戻した直後の V1_PARK_STILL_MS は入らない
+//  - 入るとき: ブレーキ解除指令を落とし、いまの保持出力を V1_BRAKE_ENGAGE_MS 出し続けてから（ブレーキが掴むまで沈まないように）PWM 0。
+//    学んだ保持の偏り（bias）は捨てない。駐車中は見えない走行の予算・期限の露出を積まない（ブレーキ作動・PWM 0）。参照は駐車した位置で止める
+//  - 戻る: フレームの目標が駐車した目標から V1_PARK_UNPARK_COUNT を超えて離れたら、保持出力（bias）を出してからブレーキを解除し、
+//    BRAKE_RELEASE_WAIT_MS の間は参照を駐車した位置に止めたまま（再生バッファにはフレームが溜まる）、その後は通常の制御（参照は
+//    max_vel / max_acc の中で追いつく）。戻った後は通常の予算・期限が効く
+//  - 参照速度「ちょうど 0」ではなく ≤ 30 count/s、目標「±1」ではなく幅 2 にしたのは、フレームの ±1 の揺れで再生バッファの参照速度が
+//    0 にならず駐車できない（期限まで止まらない）のを避けるため。戻る判定は駐車した目標（幅の中央）からの距離だけ（±1 の揺れでは戻らない）
+#ifndef V1_PARK
+#define V1_PARK 1
+#endif
+constexpr uint32_t V1_PARK_STILL_MS = 500;
+constexpr uint32_t V1_BRAKE_ENGAGE_MS = 150;  // ブレーキが掴むまでの時間（仮値、要計測）
+constexpr int32_t V1_PARK_REF_VEL_COUNT_S = 30;
+constexpr int32_t V1_PARK_TARGET_SPAN_COUNT = 2;
+constexpr int32_t V1_PARK_UNPARK_COUNT = 2;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

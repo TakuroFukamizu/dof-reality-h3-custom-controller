@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -29,11 +31,14 @@ constexpr int ticks_for_budget(double b, double proj_count = 37.5) {
 // 実位置をそこにしてから（信用の起点もそこ）、ARM → HOLDING → START（ACTIVE、目標 = いま）まで進める。
 // deadline = false: 確かな動きの無い期限（PR #50 の Codex 事前レビュー P0）を切る。予算・引き上げ・追従など別の仕組みだけを見る試験用
 //（期限は test_r10_deadline_* で見る）
+// park: ブレーキ駐車（2026-11-02）。既定 false（駐車の試験 test_r10_park_* 以外は、静止の区間で駐車しないようにして各仕組みを見る）
 inline void r10_active(Harness& h, int32_t ref = 0, uint32_t fe_limit = 100000, int kp = 30, int duty_max = 20,
-                       bool pwm_plant = true, bool deadline = true) {
+                       bool pwm_plant = true, bool deadline = true, bool park = false) {
   h.ax.tuning = r6_tuning(kp, duty_max);
   h.ax.tuning.supervisor = true;
   h.ax.tuning.sup.deadline = deadline;
+  h.ax.tuning.park = park;
+  if (park) h.ax.tuning.playout_delay_ms = V1_PLAYOUT_DELAY_MS;  // 駐車は焼く既定の参照（再生バッファ）で見る（-DV1_PLAYOUT=0 の構成でも）
   h.ax.tuning.hold_learn = true;  // r10（実測 2）: 保持出力の学習
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // 減衰（r9）は保護に関係しない。手で動かすカウントで v_fast が跳ねるので切る
   h.pwm_plant = pwm_plant;
@@ -79,6 +84,8 @@ inline void test_r10_conservative_defaults() {
   CHECK(V1Tuning(true).supervisor == (V1_SUPERVISOR != 0) && !V1Tuning(false).supervisor);
   CHECK(!t.renew_directional && t.hold_allow_trim_permille == 40);  // どちら向きでも確かな動き、保持出力 + 4 % は積まない（実測 2）
   CHECK(t.deadline && t.deadline_proportional && t.backdrive_count_s == 200 && t.certify_ms == 300);  // P0 / P1c
+  CHECK(V1Tuning(true).park == (V1_PARK != 0) && !V1Tuning(false).park && V1Tuning(true).park_still_ms == 500 &&
+        V1Tuning(true).brake_engage_ms == 150 && fl::PARKED == 0x800);
   CHECK(V1Tuning(true).hold_learn == (V1_HOLD_LEARN != 0) && !V1Tuning(false).hold_learn);
 }
 
@@ -1016,70 +1023,79 @@ inline void test_r10_integrated_playout_stops_outside_no_drive_zone() {
 
 // --- PR #50 の Codex 事前レビュー（b6a93fb）: P0 期限・P1a bias と追従の I・P1b 上書き中の凍結・P1c 認定 -------------------------------
 
-// P0 単体: エンコーダが止まったまま（確かな動きなし）、PWM 0 でも下向きの逆回り（200 count/s）を露出として積み、余裕の半分で停止。
-// DISARMED に戻しても露出は残り、2 回目は余裕の全部で停止して基準を消すよう求める。確かな動きで露出と回数は戻る
+// P0 単体（駐車の決定の後）: エンコーダが止まったまま（確かな動きなし）、PWM 0 でも下向きの逆回り（200 count/s）を露出として積む。
+// 駐車できない（park_ok = false）なら余裕の全部で停止して基準を消すよう求める。駐車できる（park_ok）なら余裕の半分で駐車を求める（停止しない）。
+// ±1 のちらつきでは戻らず、下へ 2 count の確かな動きで下の露出が戻る
 inline void test_r10_deadline_unit() {
-  V1Supervisor s;
-  V1Supervisor::Ctx c;
-  c.soft_min = -2700;
-  c.soft_max = 2700;
-  c.duty_max_pm = 200;
-  c.hold_exit = 4;
-  c.brake_released = true;
-  s.t.brake_acc_count_s2 = 0;
-  s.reset_trust(0, 0);
-  s.end_session(0, 0);
-  // 中央: 下の余裕 = 2750 − 400 = 2350、半分 1175、200 count/s → 5.875 s（先読み 15 ms ぶん手前）
-  const double half = 2350.0 / 2.0;
-  int ticks = 0;
-  while (!s.feedback_uncertain() && ticks < 3000) {
+  auto rig = [](V1Supervisor& s, V1Supervisor::Ctx& c) {
+    c.soft_min = -2700;
+    c.soft_max = 2700;
+    c.duty_max_pm = 200;
+    c.hold_exit = 4;
+    c.brake_released = true;
+    s.t.brake_acc_count_s2 = 0;
+    s.reset_trust(0, 0);
+    s.end_session(0, 0);
+  };
+  {  // 駐車できない: 余裕の全部（中央 2350、200 count/s → 11.75 s）で停止 ＋ 基準を消す要求
+    V1Supervisor s;
+    V1Supervisor::Ctx c;
+    rig(s, c);
+    int ticks = 0;
+    while (!s.feedback_uncertain() && ticks < 4000) {
+      c.now_us += 5 * MS;
+      s.observe(c);
+      s.filter(c, 0);
+      ++ticks;
+    }
+    CHECK(s.feedback_uncertain() && s.deadline_tripped() && s.take_reference_lost() && !s.take_park_request());
+    CHECK(fabs(ticks * 0.005 - (2350.0 / 200.0 - 0.015)) <= 0.011 && s.exposure(-1) <= 2350.0 + 1e-6 && s.exposure(1) == 0.0);
+    // DISARMED → 再 ARM でも露出は戻らない: すぐまた止まる
+    s.end_session(0, c.now_us);
+    s.clear_episode();
     c.now_us += 5 * MS;
     s.observe(c);
-    s.filter(c, 0);
-    ++ticks;
+    CHECK(s.feedback_uncertain());
   }
-  const double t1 = ticks * 0.005;
-  CHECK(s.feedback_uncertain() && s.deadline_tripped() && s.deadline_strikes() == 1);
-  CHECK(fabs(t1 - (half / 200.0 - 0.015)) <= 0.011);
-  CHECK(s.exposure(-1) <= half + 1e-6 && s.exposure(1) == 0.0);  // PWM 0 なら上向きの露出は無い
-  CHECK(!s.take_reference_lost());
-  // DISARMED → 再 ARM（露出は残る）: 残りの半分で 2 回目 → 基準を消す
-  s.end_session(0, c.now_us);
-  s.clear_episode();
-  CHECK(!s.feedback_uncertain() && s.exposure(-1) > half - 13.0);
-  ticks = 0;
-  while (!s.feedback_uncertain() && ticks < 3000) {
-    c.now_us += 5 * MS;
-    s.observe(c);
-    s.filter(c, 0);
-    ++ticks;
+  {  // 駐車できる: 余裕の半分（5.875 s）で駐車を求める。停止はしない
+    V1Supervisor s;
+    V1Supervisor::Ctx c;
+    rig(s, c);
+    c.park_ok = true;
+    int ticks = 0;
+    bool req = false;
+    while (!req && ticks < 4000) {
+      c.now_us += 5 * MS;
+      s.observe(c);
+      s.filter(c, 0);
+      req = s.take_park_request();
+      ++ticks;
+    }
+    CHECK(req && !s.feedback_uncertain() && fabs(ticks * 0.005 - (1175.0 / 200.0 - 0.015)) <= 0.011);
   }
-  CHECK(s.feedback_uncertain() && s.deadline_strikes() == 2 && s.take_reference_lost() && !s.take_reference_lost());
-  CHECK(s.exposure(-1) <= 2350.0 + 1e-6 && fabs(ticks * 0.005 - half / 200.0) <= 0.03);
-  // ±1 のちらつき・時間の経過では戻らない。下へ 2 count の確かな動きで下の露出と回数が戻る
-  V1Supervisor q;
-  q.t.brake_acc_count_s2 = 0;
-  q.reset_trust(0, 0);
-  q.end_session(0, 0);
-  V1Supervisor::Ctx d = c;
-  d.now_us = 0;
-  for (int i = 0; i < 400; ++i) {
+  {  // ±1 のちらつき・時間の経過では戻らない。下へ 2 count の確かな動きで下の露出が戻る
+    V1Supervisor q;
+    V1Supervisor::Ctx d;
+    rig(q, d);
+    q.t.deadline = false;
+    for (int i = 0; i < 400; ++i) {
+      d.now_us += 5 * MS;
+      d.raw = i % 2;
+      q.observe(d);
+      q.filter(d, 0);
+    }
+    CHECK(q.exposure(-1) >= 400 * 0.005 * 200.0 - 2.0);
+    d.raw = -2;
     d.now_us += 5 * MS;
-    d.raw = i % 2;
     q.observe(d);
-    q.filter(d, 0);
+    CHECK(q.exposure(-1) == 0.0);
   }
-  CHECK(q.exposure(-1) >= 400 * 0.005 * 200.0 - 2.0);
-  d.raw = -2;
-  d.now_us += 5 * MS;
-  q.observe(d);
-  CHECK(q.exposure(-1) == 0.0 && q.deadline_strikes() == 0);
 }
 
-// P0 軸: 荷重で沈む軸（外力 −150 count/s）が保持中にエンコーダを失う。PWM 0 / 保持出力のまま物理だけが沈むが、期限で PWM 0 ＋ ブレーキ。
-// 見えない走行は余裕の半分以下。保持出力 60 を学んだ後に荷重が無くなる（保持出力で上へ動く）場合も同じ
+// P0 軸: 荷重で沈む軸（外力 −150 count/s）が保持中にエンコーダを失う。駐車なし: 期限（余裕の全部）で PWM 0 ＋ ブレーキ・基準を消す。
+// 見えない走行は余裕以下。駐車あり: 静止の窓（500 ms）で駐車してブレーキが沈みを止める
 inline void test_r10_deadline_bounds_dead_encoder_hold() {
-  {  // 下へ沈む
+  {  // 駐車なし
     Harness h;
     r10_active(h, 0, 100000, 30, 20, true, false);
     h.pwm_count_s_per_permille = 4.0;
@@ -1091,63 +1107,245 @@ inline void test_r10_deadline_bounds_dead_encoder_hold() {
     int n = 0;
     while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
     const double blind = fabs(h.phys - phys0);
-    if (std::getenv("R10_PRINT")) std::printf("deadline sag: %.2f s blind %.1f\n", n * 0.005, blind);
-    CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && no_fault_events(h));
-    CHECK(blind <= (2750.0 - 400.0) / 2.0);
+    if (std::getenv("R10_PRINT")) std::printf("deadline sag (no park): %.2f s blind %.1f\n", n * 0.005, blind);
+    CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && !h.ax.referenced() && no_fault_events(h));
+    CHECK(blind <= 2750.0 - 400.0);
   }
-  {  // 荷重 6 % の保持を（体重移動のある生きたエンコーダで）学んでから、エンコーダが死んで荷重が無くなる（保持出力 60 が上へ押す）
+  {  // 駐車あり: 沈みはブレーキが止める（ブレーキが掴むまでの間だけ）
     Harness h;
-    r10_active(h, 0, 100000);
+    r10_active(h, 0, 100000, 30, 20, true, true, true);
     h.pwm_count_s_per_permille = 4.0;
-    h.load_permille = 60;
-    for (int i = 0; i < 300; ++i) {
-      h.ext_vel = ((i / 60) % 2 == 0) ? 60.0 : -60.0;
-      drive_count_nonzero(h, 10, 0);
-    }
-    h.ext_vel = 0.0;
     drive_count_nonzero(h, 300, 0);
-    CHECK(!h.ax.supervisor_inhibited() && std::abs(h.ax.bias_permille() - 60) <= 15);
     h.enc_connected = false;
-    h.load_permille = 0;
+    h.ext_vel = -150.0;
     const double phys0 = h.phys;
-    int n = 0;
-    while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+    drive_count_nonzero(h, 5000, 0);
     const double blind = fabs(h.phys - phys0);
-    if (std::getenv("R10_PRINT")) std::printf("deadline load removed: %.2f s blind %.1f\n", n * 0.005, blind);
-    CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && no_fault_events(h));
-    CHECK(blind <= (2750.0 - 400.0) / 2.0);
+    if (std::getenv("R10_PRINT")) std::printf("deadline sag (park): parked %d blind %.1f\n", h.ax.brake_parked() ? 1 : 0, blind);
+    CHECK(h.ax.brake_parked() && !h.ax.supervisor_inhibited() && h.ax.referenced() && no_fault_events(h));
+    CHECK(blind <= 150.0 * 0.7);  // 静止の窓 500 ms ＋ 掴むまで（ブレーキの遅れ 0 の模型）
   }
 }
 
-// P0 軸: 生きたエンコーダでも完全に静止した保持は期限で停止する（ブレーキが座席を保つ）。DISARM → 再 ARM で残りの半分を使って再開でき、
-// まだ静止のままなら 2 回目で基準が消え、ARM_PREPARE は NOT_REFERENCED（SET_REFERENCE か校正が要る）。乗員の体重移動（±60 count/s）が
-// あれば確かな動きで戻り続け、30 s 停止しない
-inline void test_r10_deadline_static_hold_and_resume() {
+// P0 軸（駐車なし）: 生きたエンコーダでも完全に静止した保持は、駐車が無ければ期限（余裕の全部）で停止して基準を消す。ARM_PREPARE は NOT_REFERENCED
+inline void test_r10_deadline_static_hold_without_parking() {
   Harness h;
   r10_active(h, 0, 100000);
   int n = 0;
-  while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
-  const double t1 = n * 0.005;
-  CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && h.ax.state() == st::ACTIVE && h.ax.referenced());
-  Harness::accepted(h.disarm());
-  h.idle(400);
-  CHECK(h.ax.state() == st::DISARMED && !h.ax.supervisor_inhibited());
-  h.reach_holding_from_configured();
-  h.set_position(h.ax.actual_count());
-  Harness::accepted(h.start());
-  n = 0;
-  while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
-  const double t2 = n * 0.005;
-  if (std::getenv("R10_PRINT")) std::printf("deadline static hold: 1st %.2f s, 2nd %.2f s\n", t1, t2);
-  CHECK(braked_inhibit(h) && !h.ax.referenced());
+  while (!h.ax.supervisor_inhibited() && n < 6000) { drive_count_nonzero(h, 5, 0); ++n; }
+  if (std::getenv("R10_PRINT")) std::printf("deadline static hold (no park): %.2f s\n", n * 0.005);
+  CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && h.ax.state() == st::ACTIVE && !h.ax.referenced());
   Harness::accepted(h.disarm());
   h.idle(400);
   Harness::rejected(h.arm(), rs::NOT_REFERENCED);
-  // 体重移動のある保持（荷重 6 %）は止まらない
+}
+
+// --- ブレーキ駐車（2026-11-02 の操作者の決定） ------------------------------------------------------------
+
+struct ParkRun {
+  int parks = 0;
+  double first_park_s = -1.0;  // 静止してから駐車（ブレーキ指令）まで
+  double max_sag = 0.0;        // 駐車中の物理位置のずれ
+  bool inhibited = false;
+  bool fault = false;
+};
+
+// 着座（荷重 6 %、沈む）・無負荷で 60 s 静止。ブレーキの遅れ brake_delay（brake_engage 150 ms 以下なら沈まない）
+inline ParkRun park_still_run(Harness& h, int load, uint32_t brake_delay, uint32_t seconds) {
+  r10_active(h, 0, 400, 30, 20, true, true, true);
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = load;
+  h.pwm_deadband_permille = 15;
+  h.pwm_deadband_subtract = true;
+  h.brake_delay_ms = brake_delay;
+  // 荷重の下で保持出力を学ぶ間は体重移動で確かな動きを出す（駐車しない）
+  for (int i = 0; i < 300; ++i) {
+    h.ext_vel = ((i / 30) % 2 == 0) ? 40.0 : -40.0;
+    drive_count_nonzero(h, 10, 0);
+  }
+  h.ext_vel = 0.0;
+  ParkRun r;
+  const uint64_t t0 = h.now;
+  double park_pos = 0.0;
+  bool was = h.ax.brake_parked();
+  if (was) park_pos = h.phys;
+  for (uint32_t t = 0; t < seconds * 1000; t += 10) {
+    drive_count_nonzero(h, 10, 0);
+    const bool p = h.ax.brake_parked();
+    if (p && !was) {
+      ++r.parks;
+      park_pos = h.phys;
+      if (r.first_park_s < 0) r.first_park_s = (h.now - t0) / 1e6;
+    }
+    if (p) r.max_sag = std::max(r.max_sag, fabs(h.phys - park_pos));
+    was = p;
+    if (h.ax.supervisor_inhibited()) r.inhibited = true;
+  }
+  r.fault = h.ax.state() == st::FAULT || !no_fault_events(h);
+  return r;
+}
+
+inline void test_r10_park_still_hold_seated_and_unloaded() {
+  struct Case { int load; uint32_t delay; };
+  for (const Case& k : {Case{60, 0}, Case{60, 100}, Case{60, 150}, Case{0, 100}}) {
+    Harness h;
+    const ParkRun r = park_still_run(h, k.load, k.delay, 60);
+    if (std::getenv("R10_PRINT")) {
+      std::printf("park still load %d brake delay %u: first park %.2f s parks %d sag %.2f inhibited %d fault %d bias %d\n", k.load,
+                  k.delay, r.first_park_s, r.parks, r.max_sag, r.inhibited ? 1 : 0, r.fault ? 1 : 0, h.ax.bias_permille());
+    }
+    CHECK(r.first_park_s >= 0.0 && r.first_park_s <= 0.8);  // 落ち着いてから 500 ms（＋ 速度窓の遅れ）
+    CHECK(r.parks == 1 && !r.inhibited && !r.fault && h.ax.brake_parked() && h.ax.power_on_cmd() && !h.ax.brake_release_cmd());
+    CHECK((h.status().flags & fl::PARKED) != 0 && h.ax.state() == st::ACTIVE && h.ax.pwm_permille() == 0);
+    CHECK(r.max_sag <= 1.0);  // ブレーキが掴むまで（遅れ ≤ 150 ms）は保持出力を出しているので沈まない
+    if (k.load == 60) CHECK(std::abs(h.ax.bias_permille() - 60) <= 20);  // 学んだ bias は捨てない
+  }
+  {  // ブレーキの遅れ 300 ms > 掴むまでの 150 ms: 150 ms 分だけ沈む（荷重 6 % の不足分 × 4 count/s/permille）
+    Harness h;
+    const ParkRun r = park_still_run(h, 60, 300, 5);
+    if (std::getenv("R10_PRINT")) std::printf("park still brake delay 300: sag %.1f parks %d first %.2f\n", r.max_sag, r.parks, r.first_park_s);
+    CHECK(r.max_sag > 1.0 && r.max_sag <= 60.0 * 4.0 * 0.15 + 2.0 && !r.inhibited);
+  }
+}
+
+// 駐車中に目標が動く: 保持出力を出してブレーキ解除 → 300 ms は参照を止めたまま → 参照が追いつく。遅れは 300 ms ＋ 追いつき
+inline void test_r10_park_unpark_latency_and_tracking() {
+  Harness h;
+  r10_active(h, 0, 400, 30, 20, true, true, true);
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = 60;
+  h.pos_max_vel = 300;
+  drive_count_nonzero(h, 3000, 0);
+  drive_count_nonzero(h, 7000, 0);
+  CHECK(h.ax.brake_parked());
+  const uint64_t t0 = h.now;
+  double t_release = -1, t_move = -1;
+  int32_t ref_at_release_end = 0;
+  bool released_seen = false;
+  int max_fe_after = 0;
+  for (int i = 0; i < 300; ++i) {
+    h.set_position(i < 2 ? 3 : 300);  // ±2 を超えて動く
+    h.idle(10);
+    if (t_release < 0 && h.ax.brake_release_cmd()) t_release = (h.now - t0) / 1e6;
+    if (h.ax.unparking()) {
+      released_seen = true;
+      ref_at_release_end = h.ax.target_count();
+    }
+    if (t_move < 0 && h.ax.actual_count() >= 5) t_move = (h.now - t0) / 1e6;
+    if (t_move >= 0) max_fe_after = std::max(max_fe_after, std::abs(h.ax.following_error_count()));
+  }
+  if (std::getenv("R10_PRINT")) std::printf("unpark: release %.3f s, motion %.3f s, ref during release %d, FE max %d, final %d\n", t_release, t_move, ref_at_release_end, max_fe_after, h.ax.actual_count());
+  CHECK(released_seen && ref_at_release_end == 0);  // 解除待ちの間は参照を駐車した位置に止める
+  CHECK(t_release >= 0.0 && t_release <= 0.03);
+  CHECK(t_move >= 0.3 && t_move <= 0.45);
+  CHECK(std::abs(h.ax.actual_count() - 300) <= 4 && !h.ax.supervisor_inhibited() && no_fault_events(h));
+  CHECK(max_fe_after <= 120);
+}
+
+// 駐車中にエンコーダが死んでから目標が動く: 戻ってから動かそうとしても確かな動きが無いので、予算で PWM 0 ＋ ブレーキ（見えない走行 ≤ 1000）
+inline void test_r10_park_unpark_with_dead_encoder() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, true, true, true);
+  drive_count_nonzero(h, 2000, 0);
+  CHECK(h.ax.brake_parked());
+  h.enc_connected = false;
+  const double phys0 = h.phys;
+  for (int i = 0; i < 300 && !h.ax.supervisor_inhibited(); ++i) { h.set_position(800); h.idle(10); }
+  const double blind = fabs(h.phys - phys0);
+  if (std::getenv("R10_PRINT")) std::printf("unpark dead: blind %.1f\n", blind);
+  CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && blind <= 1000.0 && no_fault_events(h));
+}
+
+// ゲームのような動き（正弦波、400 ms 以下の止まり）では駐車しない。±1 の揺れのある静止は 1 回だけ駐車して戻らない。
+// ゆっくり流れる目標（0.5 count/s）は、駐車 → 2 count を超えたら戻る、を繰り返すが、間隔は静止の窓＋解除待ちより長い
+inline void test_r10_park_hysteresis() {
+  {  // 正弦波と 400 ms の止まり
+    Harness h;
+    r10_active(h, 0, 100000, 30, 20, true, true, true);
+    const double pi = 3.14159265358979323846;
+    int parks = 0;
+    bool was = false;
+    double tgt = 0;
+    for (int i = 0; i < 1000; ++i) {  // 10 s: 1 s 動いて 0.4 s 止まる
+      const int ph = i % 140;
+      if (ph < 100) tgt = 200.0 * sin(2.0 * pi * i / 300.0);
+      h.set_position(static_cast<int32_t>(lround(tgt)));
+      h.idle(10);
+      const bool p = h.ax.brake_parked();
+      if (p && !was) ++parks;
+      was = p;
+    }
+    if (std::getenv("R10_PRINT")) std::printf("park game-like: parks %d\n", parks);
+    CHECK(parks == 0 && !h.ax.supervisor_inhibited());
+  }
+  {  // ±1 の揺れ
+    Harness h;
+    r10_active(h, 0, 100000, 30, 20, true, true, true);
+    int parks = 0, unparks = 0;
+    bool was = false;
+    for (int i = 0; i < 2000; ++i) {  // 20 s
+      h.set_position((i * 7 % 3) - 1);
+      h.idle(10);
+      const bool p = h.ax.brake_parked();
+      if (p && !was) ++parks;
+      if (!p && was) ++unparks;
+      was = p;
+    }
+    if (std::getenv("R10_PRINT")) std::printf("park noise: parks %d unparks %d\n", parks, unparks);
+    CHECK(parks == 1 && unparks == 0 && !h.ax.supervisor_inhibited());
+  }
+  {  // 0.5 count/s で流れる目標
+    Harness h;
+    r10_active(h, 0, 100000, 30, 20, true, true, true);
+    int parks = 0;
+    bool was = false;
+    uint64_t last_park = 0, min_gap = UINT64_MAX;
+    for (int i = 0; i < 3000; ++i) {  // 30 s
+      h.set_position(static_cast<int32_t>(i * 0.005));
+      h.idle(10);
+      const bool p = h.ax.brake_parked();
+      if (p && !was) {
+        if (parks > 0) min_gap = std::min(min_gap, h.now - last_park);
+        last_park = h.now;
+        ++parks;
+      }
+      was = p;
+    }
+    if (std::getenv("R10_PRINT")) std::printf("park drift: parks %d min gap %.2f s\n", parks, min_gap == UINT64_MAX ? 0.0 : min_gap / 1e6);
+    CHECK(parks >= 1 && parks <= 6 && (parks < 2 || min_gap >= 800 * MS) && !h.ax.supervisor_inhibited() && no_fault_events(h));
+  }
+}
+
+// 期限からの駐車: 静止の窓を長くしても（駐車の時刻にしない）、期限の露出が半分に届いた所で停止ではなく駐車する
+inline void test_r10_park_from_deadline_instead_of_inhibit() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, true, true, true);
+  h.ax.tuning.park_still_ms = 100000;
+  int n = 0;
+  while (!h.ax.brake_parked() && !h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+  if (std::getenv("R10_PRINT")) std::printf("park from deadline: %.2f s\n", n * 0.005);
+  CHECK(h.ax.brake_parked() && !h.ax.supervisor_inhibited() && h.ax.referenced());
+}
+
+// 駐車中の STOP / DISARM / FAULT は従来どおり（ブレーキはどのみち作動）
+inline void test_r10_park_stop_disarm_fault() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, true, true, true);
+  drive_count_nonzero(h, 1500, 0);
+  CHECK(h.ax.brake_parked());
+  Harness::accepted(h.stop());
+  h.drive(200, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd());
+  Harness::accepted(h.disarm());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.brake_parked() && (h.status().flags & fl::PARKED) == 0);
   Harness g;
-  const HoldResult r = hold_run(g, 60, 15, 30, true, true, 60.0);
-  if (std::getenv("R10_PRINT")) std::printf("deadline sway hold: inhibited %d err max %d pulses %d\n", r.inhibited ? 1 : 0, r.max_abs_err, r.pulse_onsets);
-  CHECK(!r.inhibited && !r.fault && no_fault_events(g));
+  r10_active(g, 0, 100000, 30, 20, true, true, true);
+  drive_count_nonzero(g, 1500, 0);
+  CHECK(g.ax.brake_parked());
+  g.host_fault();
+  g.step();
+  CHECK(g.ax.state() == st::FAULT && !g.ax.brake_parked() && !g.ax.brake_release_cmd());
 }
 
 // P1a: bias（8 %）を学んだ後に反転・大きな目標の跳び。追従の I は反転で 0 になり、古い向きの I が残る tick は無い。FE の山を出す
@@ -1318,7 +1516,13 @@ inline void run_all() {
   test_r10_integrated_playout_stops_outside_no_drive_zone();
   test_r10_deadline_unit();
   test_r10_deadline_bounds_dead_encoder_hold();
-  test_r10_deadline_static_hold_and_resume();
+  test_r10_deadline_static_hold_without_parking();
+  test_r10_park_still_hold_seated_and_unloaded();
+  test_r10_park_unpark_latency_and_tracking();
+  test_r10_park_unpark_with_dead_encoder();
+  test_r10_park_hysteresis();
+  test_r10_park_from_deadline_instead_of_inhibit();
+  test_r10_park_stop_disarm_fault();
   test_r10_bias_and_tracking_i_separate_on_reversal();
   test_r10_integrators_frozen_while_overridden();
   test_r10_hold_certification_requires_stable_window();
