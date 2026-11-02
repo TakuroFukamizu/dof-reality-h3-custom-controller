@@ -86,6 +86,32 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 - **telemetry の不足**（計画 §8・§11 との差。未実装）: SET_POSITION の送信→MCU 適用の遅延、ゲーム側の source age の分布、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。§8 のベンチ目標（サーバー受信→MCU 適用 p99 20 ms）は今の telemetry では評価できない。ファイルへの JSONL 記録も未配線（イベントはメモリ上のリング `GET /v1/events` と標準エラーだけ）。
 - **CoreS3 側の規則への適合**: ACK と STATUS の順序（protocol.md §1）、ACTIVE 以外での停止命令の扱い、CONFIG の検査範囲などは、PC が依存していることを模擬軸の試験で確かめただけ。実ファームウェアがそうなっているかは CoreS3 側の実装・試験で確かめる。
 
+## 2026-11-02 の結果（Issue #36 と自動開始（PR #47）の統合: main を取り込んだあと）
+
+環境: 下の節と同じ。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 439 passed、0 failed、1 ignored（`api.rs` の `joystick_page_is_served_and_self_contained` は PR #47 の検査と Issue #36 の検査の両方、`autoRefused`・「CENTER ボタン」・自動開始中は案内を出さないことを追加） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| ページの JS | 構文・id の検査と `H3Joy` の 24 項目（`pose_not_near_hold` の案内はこのページの CENTER ボタンを指し、オペレーター用試験ページを指さない） |
+| ジョイスティック試験ページ（ヘッドレス Chromium、sim、空きポート 18936。`start_max_offset_count = 50` の複製設定、`kind = "sim"`） | 手で書いた Playwright スクリプト（リポジトリには入れていない）。**79 項目すべて通過**、ページエラー・console エラー 0。下の節の手動の流れ（自動開始を切にしたページ）52 項目に加えて、自動開始: 手動で ACTIVE にして roll を倒し STOP（axis1 が中立から 250 count 超離れて停止）→ **自動開始のページを開くと 送信 → ARM → START が `pose_not_near_hold` → ボタンの下に黄で「自動開始の START 拒否: 409 pose_not_near_hold」とサーバーの blockers（`axis1 target … counts from hold … (max 50)`）と「自動で CENTER を送り…START し直す」→ CENTER → START → ACTIVE（game）で表示が消える**（赤は一度も出ない）→ トークン違いのページでは自動開始の ARM が 401 → 自動開始は中止、赤で「自動開始の ARM 拒否: 401 unauthorized — 管理トークンが無いか違う」→ スティックを倒したまま開いたページは HOLDING で「スティックを中央に戻すと START」を待ち、そのあいだ「中央へ」の案内は出ない → 別のクライアントの `POST /v1/session` で `stale_session`、自動開始は中止、バナー「…もう一度「送信開始」を押してください（…自動で START まで進め直すなら「リセット」）」、中止後は「中央へ」の案内が出る → 「リセット」でバナーが消え自動開始がやり直される |
+
+変えたこと: `static/joystick_page.html`（自動開始の ARM / START / CENTER の拒否も `#opResult` に出す（`autoRefused`）、START の `pose_not_near_hold` で自動の CENTER に回るときは黄、自動開始の操作が通れば消す（CENTER は START が通るまで残す）、自動開始が走っているあいだは「中央へ」の案内を出さない、CENTER の案内はこのページの CENTER ボタンへ、`bCenterRig` も拒否を表示、「リセット」でもバナーを消す、バナーに「リセット」を併記）、`tests/api.rs`、`DESIGN.md` §7.5、`hardware-bringup.md`。サーバーは変えていない。実機ではまだ使っていない。
+
+## 2026-11-02 の結果（Issue #36: ジョイスティックページで START などの拒否理由・「中央へ」の案内・session 切れのバナーを出す）
+
+環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、node 26.3、Playwright 1.65 alpha（npx のキャッシュ）＋ chromium_headless_shell 1243 を `executablePath` で指定。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 439 passed、0 failed、1 ignored（`api.rs` 37: `joystick_page_is_served_and_self_contained` に `#opResult` / `#startHint` / `#sessionBanner`・`adminReject` / `startGateHint`・`j.blockers`・`pose_not_near_hold`・`stale_session`・案内文の検査と「`innerHTML =` を使わない」を追加） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| ページの JS | 2 つの `<script>` を `vm.Script` で構文検査、id の重複なし、`$()` の id は全部存在。`H3Joy` を node で評価（24 項目）: `adminReject` は成功で null、409 `pose_not_near_hold` で 1 行目「START 拒否: 409 pose_not_near_hold — 説明」・blockers をそのまま 1 行ずつ・速度モードは「速度モードは「中央へ」で姿勢を 0 に戻してから START」、位置モードは「スティックを中央」、指令姿勢がもう 0（または 0 固定）なら「CENTER で中立へ」の案内、401 `unauthorized`（blockers なし）はトークンの説明、503 `control_loop_unavailable` は「実行されていない」、JSON でない本文（502 Bad Gateway）は本文をそのまま、届かない（`netError`）は「サーバーに届かない」、未知の符号と配列でない blockers でも落ちない。`startGateHint` は速度モード・START の前の状態（HOLDING / READY_TO_ARM など）・姿勢あり・0 固定でない・gain > 0・\|pitch\| か \|roll\| が 0.02 超のときだけ文を返す（位置モード・ACTIVE・FAULT_LATCHED・姿勢なし・0 固定・gain 0・0.02 ちょうどは null） |
+| ジョイスティック試験ページ（ヘッドレス Chromium、sim、空きポート） | 手で書いた Playwright スクリプト（リポジトリには入れていない。`navigator.getGamepads` を差し替え。`config/sim.toml` を作業用ディレクトリに複製して `start_max_offset_count = 50` にしたもの（`kind = "sim"`、シリアルポートは開かない）。サーバーはスクリプトが起動・強制終了・再起動する）。52 項目すべて通過、ページエラー・console エラー 0（サーバー停止中の接続失敗は除く）: 読み込みだけでは何も出ない → トークン無しの ARM → ボタンの下に赤で「ARM 拒否: 401 unauthorized — 管理トークンが無いか違う」→ トークンを入れて ARM 200 で消える → HOLDING → 速度モードで roll を 0.7 s 倒して離す（指令 roll 0.40）→ START の下に黄で「指令姿勢が中央から離れている（roll +0.40 / pitch +0.00）。速度モードは「中央へ」で姿勢を 0 に戻してから START」、START の title も同じ文、START は押せる → **START → 「START 拒否: 409 pose_not_near_hold」とサーバーの blockers（`axis1 target 403 is +403 counts from hold 0 (max 50)`、axis2 も）が 1 行ずつ、「→ 速度モードは「中央へ」で…」**、HOLDING のまま → 「中央へ」で黄の「中央へ: 指令姿勢を 0 にした → START を押し直す」に置き換わり、案内が消え、サーバーの `requested_pose` が 0 → START 200 で消え ACTIVE（案内は出ない）→ 別のクライアントの `POST /v1/session` → `stale_session` で送信停止と赤いバナー「session が無効になった（stale_session: …）。もう一度「送信開始」を押してください」→ 送信開始でバナーが消える → **送信中にサーバーを強制終了** → バナー「WS が切れた（close 1006。サーバーの再起動か接続断）…「送信開始」」、WS は赤の `closed (close 1006)` → 停止中の STOP は「STOP: サーバーに届かない（TypeError: Failed to fetch）」→ サーバー再起動で status のバナーは消えるが session のバナーは残る → 送信開始で ack accepted、バナーが消える → STOP 200 で拒否表示が消える → 操作者の「送信停止」ではバナーを出さない → **スティックの無いページ**で送信開始（姿勢が無いので何も送らず ack も来ない）→ 別のクライアントが session を発行 → status の確認（2 回続けて）で送信が止まり（`closed (stale_session (status))`、ボタン「送信開始」）バナー「サーバーの session がこのページのものでなくなった…送信は止めた」→ 「送信開始」1 回で開きバナーが消える |
+
+変えたこと: `static/joystick_page.html`（`#opResult`・`#startHint`・`#sessionBanner`、`H3Joy.adminReject` / `H3Joy.startGateHint`、STOP の結果も表示、送信中の意図しない WS close を赤に）、`tests/api.rs`（ページの文字列検査）、`DESIGN.md` §7.5。サーバーも WS の約束も変えていない。実機ではまだ使っていない。
+
 ## 2026-11-02 の結果（Issue #15: ゲーム経路の制限値の上限・模擬軸の開け直し・StartTimeout）
 
 環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、Python 3.14.4 ＋ websockets 17（`clients/python/.venv`）。サーバーだけの変更（ファームは触っていない）。
