@@ -27,10 +27,13 @@ constexpr int ticks_for_budget(double b, double proj_count = 37.5) {
 
 // r10 の軸: r6 の経路（方向別 FF）＋監視 ON。kp 30 / duty_max 20 は 11-02 の運用設定。ref を渡せば SET_REFERENCE で
 // 実位置をそこにしてから（信用の起点もそこ）、ARM → HOLDING → START（ACTIVE、目標 = いま）まで進める。
+// deadline = false: 確かな動きの無い期限（PR #50 の Codex 事前レビュー P0）を切る。予算・引き上げ・追従など別の仕組みだけを見る試験用
+//（期限は test_r10_deadline_* で見る）
 inline void r10_active(Harness& h, int32_t ref = 0, uint32_t fe_limit = 100000, int kp = 30, int duty_max = 20,
-                       bool pwm_plant = true) {
+                       bool pwm_plant = true, bool deadline = true) {
   h.ax.tuning = r6_tuning(kp, duty_max);
   h.ax.tuning.supervisor = true;
+  h.ax.tuning.sup.deadline = deadline;
   h.ax.tuning.hold_learn = true;  // r10（実測 2）: 保持出力の学習
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // 減衰（r9）は保護に関係しない。手で動かすカウントで v_fast が跳ねるので切る
   h.pwm_plant = pwm_plant;
@@ -75,6 +78,7 @@ inline void test_r10_conservative_defaults() {
   CHECK(!t.soft_grace && t.fe_grace_max_ms == 0);           // SOFT_LIMIT / FOLLOWING_ERROR の猶予は OFF
   CHECK(V1Tuning(true).supervisor == (V1_SUPERVISOR != 0) && !V1Tuning(false).supervisor);
   CHECK(!t.renew_directional && t.hold_allow_trim_permille == 40);  // どちら向きでも確かな動き、保持出力 + 4 % は積まない（実測 2）
+  CHECK(t.deadline && t.deadline_proportional && t.backdrive_count_s == 200 && t.certify_ms == 300);  // P0 / P1c
   CHECK(V1Tuning(true).hold_learn == (V1_HOLD_LEARN != 0) && !V1Tuning(false).hold_learn);
 }
 
@@ -85,6 +89,7 @@ struct SupRig {
   V1Supervisor::Ctx c;
   SupRig() {
     s.t.projection_ms = 5;
+    s.t.deadline = false;  // 予算の単体試験（期限は test_r10_deadline_unit）
     s.t.brake_acc_count_s2 = 0;  // 制動は別に見る
     c.soft_min = -2700;
     c.soft_max = 2700;
@@ -147,10 +152,15 @@ inline void test_r10_renewal_rules_unit() {
   CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>((i / 2) % 2); }, [](int) { return 200; }, &up, &down) == 80);  // 片相
   up = down = 0;
   CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>(-i); }, [](int) { return 200; }, &up, &down, true) == 80);  // 逆向き（向きつき）
-  {  // 逆向き（既定）: 2 count ごとに戻るので止まらない
+  {  // 逆向き（既定、P1c）: 下向きの確かな動きは下の予算だけを戻す。出している上向きの予算は戻らず 80 tick で止まる
+    up = down = 0;
+    CHECK(ticks_until_inhibit([](int i) { return static_cast<int64_t>(-i); }, [](int) { return 200; }, &up, &down) == 80);
     SupRig r;
-    for (int i = 0; i < 400; ++i) r.tick(200, -i);
-    CHECK(!r.s.feedback_uncertain() && r.s.envelope_episode(1) <= 25.0);
+    for (int i = 0; i < 40; ++i) r.tick(-200, 0);  // 下に 40 tick 出してから
+    r.tick(0, 0);                                  // 最後の出力の区間を積む
+    const double down_env = r.s.envelope_episode(-1);
+    for (int i = 1; i <= 3; ++i) r.tick(0, i);     // 上へ 3 count 動いた
+    CHECK(down_env > 400.0 && r.s.envelope_episode(-1) == down_env && r.s.trusted_raw(1) == 2 && r.s.trusted_raw(-1) == 0);
   }
   up = down = 0;
   CHECK(ticks_until_inhibit([](int) { return int64_t{0}; }, [](int i) { return (i / 10) % 2 == 0 ? 200 : 0; }, &up, &down) == 80);  // 隙間
@@ -164,7 +174,7 @@ inline void test_r10_renewal_rules_unit() {
   r.tick(200, 1);
   CHECK(r.s.envelope_episode(1) > 400.0);  // 1 では戻らない
   r.tick(200, 2);
-  CHECK(r.s.envelope_episode(1) == 0.0 && r.s.trusted_raw() == 2);
+  CHECK(r.s.envelope_episode(1) == 0.0 && r.s.trusted_raw(1) == 2);
   // 既知の穴（PCNT のフィルタ・A/B 遷移の妥当性の計数が後続）: ±2 以上の往復は戻してしまう
   SupRig k;
   for (int i = 0; i < 40; ++i) k.tick(200, 0);
@@ -235,7 +245,7 @@ inline void test_r10_dead_encoder_near_end_budgets() {
       for (Mode mode : {Default, Projection5, MinBudget}) {
         Harness h;
         const int32_t ref = dir > 0 ? 2700 + 50 - k.d : -2700 - 50 + k.d;
-        r10_active(h, ref);
+        r10_active(h, ref, 100000, 30, 20, true, false);
         h.ax.tuning.soft_reserve_count = 0;  // 参照の端の手前の減速（Issue #45 / #46）を外し、監視の予算だけを見る（参照は既定では監視の帯の外で止まる）
         int expect = ticks_for_budget(k.budget);
         double bound = k.budget;
@@ -265,7 +275,7 @@ inline void test_r10_irregular_ticks_stay_within_budget() {
   const uint32_t pattern[] = {5, 9, 14, 7, 12, 6, 14, 5, 11};
   for (int32_t ref : {0, 2100}) {
     Harness h;
-    r10_active(h, ref);
+    r10_active(h, ref, 100000, 30, 20, true, false);
     h.ax.tuning.soft_reserve_count = 0;  // 参照の端の手前の減速を外し、監視の予算だけを見る
     h.enc_connected = false;
     const double phys0 = h.phys;
@@ -496,14 +506,18 @@ inline void test_r10_inhibit_during_arming_keeps_brake_applied() {
 inline void test_r10_end_braking_guard() {
   Harness h;
   r10_active(h, 2400, 100000, 6, 20, false);
-  h.ax.tuning.sup.renew_directional = true;  // 外向きの動きで予算が戻らないようにして、制動の出力が積まれることを見る
+  int guard_ticks = 0;
+  const double env0 = h.ax.supervisor().envelope_episode(-1);
   for (int i = 0; i < 12; ++i) {  // 1200 count/s で上へ（停止距離 720 > 残り 300〜240）
     h.raw += 6;
     h.set_position(2400);
     h.step();
+    if (h.ax.supervisor().end_braking()) ++guard_ticks;
   }
   CHECK(h.ax.supervisor().end_braking() && h.ax.pwm_permille() == -200 && (h.status().flags & fl::END_BRAKING) != 0);
-  CHECK(h.ax.supervisor().envelope_episode(-1) > 0.0);  // 制動の出力も積む
+  // 制動の出力は割り引かずに一律の包絡線で積む（PR #50 の Codex 事前レビュー P2）: 制動の tick ごとに 12.5 count（最後の tick は次で積む）。
+  // 上向きの確かな動きは上の予算だけを戻すので、下（制動の向き）の包絡線は戻らない（P1c）
+  CHECK(guard_ticks >= 3 && h.ax.supervisor().envelope_episode(-1) - env0 >= 12.5 * (guard_ticks - 1) - 1e-6);
   h.drive(80, 2400);  // 止まった: v_fast は 40 ms で 0
   CHECK(!h.ax.supervisor().end_braking() && h.ax.pwm_permille() != -200);
   Harness g;  // 止まれる速さ（200 count/s、停止距離 20 < 残り 300）
@@ -710,7 +724,7 @@ struct EscResult {
 };
 inline EscResult escalation_run(Harness& h, int load_pm, int deadband_pm, int32_t err0, uint32_t ms, bool disconnect = false,
                                 double creep = 0.0) {
-  r10_active(h, 0, 400);
+  r10_active(h, 0, 400, 30, 20, true, false);  // 引き上げと予算を見る（静止の保持で期限が先に来ないように切る）
   h.pwm_count_s_per_permille = 4.0;
   h.load_permille = load_pm;
   h.pwm_deadband_permille = deadband_pm;
@@ -794,8 +808,9 @@ struct HoldResult {
   bool fault = false;
 };
 // 荷重 load（back-drive、静止摩擦 deadband）の軸を 0 → 300 へ動かし、hold_s 秒保持する
-inline HoldResult hold_run(Harness& h, int load_pm, int deadband_pm, uint32_t hold_s, bool learn = true) {
-  r10_active(h, 0, 400);
+inline HoldResult hold_run(Harness& h, int load_pm, int deadband_pm, uint32_t hold_s, bool learn = true, bool deadline = false,
+                           double sway = 0.0) {
+  r10_active(h, 0, 400, 30, 20, true, deadline);
   h.ax.tuning.hold_learn = learn;
   h.pwm_count_s_per_permille = 4.0;
   h.load_permille = load_pm;
@@ -809,6 +824,8 @@ inline HoldResult hold_run(Harness& h, int load_pm, int deadband_pm, uint32_t ho
   int n = 0;
   for (uint32_t t = 0; t < hold_s * 1000 && h.ax.state() != st::FAULT; t += 5) {
     if ((t % 10) == 0) h.set_position(300);
+    // 乗員の体重移動（sway [count/s] の外力、1.2 s 周期の矩形）: 生きたエンコーダの保持で見える小さな動き
+    if (sway != 0.0) h.ext_vel = ((t / 600) % 2 == 0) ? sway : -sway;
     h.step();
     const bool brk = h.ax.duty_terms().mode == V1DutyMode::BRK;
     if (brk && !prev) ++r.pulse_onsets;
@@ -841,8 +858,8 @@ inline void test_r10_hold_learns_holding_duty_against_backdrive() {
     CHECK(!r.fault && !r.inhibited && no_fault_events(h) && h.ax.state() == st::ACTIVE);
     CHECK(r.max_abs_err <= 2);
     CHECK(r.pulse_onsets == 0);
-    // 保持 Duty（静止摩擦があればその帯 60 ± deadband のどこでも保てる）に収まり、出力は揺れない
-    CHECK(std::abs(r.out_mean - 60.0) <= deadband + 5.0 && r.out_max - r.out_min <= 10);
+    // 保持 Duty（静止摩擦があればその帯 60 ± deadband のどこでも保てる）に収まる。出力が動くのは静止摩擦の帯の中だけ（軸は動かない）
+    CHECK(std::abs(r.out_mean - 60.0) <= deadband + 5.0 && r.out_max - r.out_min <= 2 * deadband + 10);
   }
   {  // 無負荷・静止摩擦 3 %: 出力はほぼ 0 で止まっている
     Harness h;
@@ -878,7 +895,7 @@ inline void test_r10_hold_learn_tracking_fe_before_after() {
     double stop_over[2] = {0, 0};
     for (int learn = 0; learn < 2; ++learn) {
       Harness h;
-      r10_active(h, 0, 100000);
+      r10_active(h, 0, 100000, 30, 20, true, false);  // 追従の比較（静止の区間で期限が先に来ないように切る）
       h.ax.tuning.hold_learn = learn != 0;
       h.pwm_count_s_per_permille = 4.0;
       h.load_permille = load;
@@ -962,7 +979,7 @@ inline void test_r10_integrated_playout_stops_outside_no_drive_zone() {
   for (int dir : {1, -1}) {
     for (int32_t reserve : {V1_SOFT_RESERVE_COUNT, int32_t{100}, int32_t{450}}) {
       Harness h;
-      r10_active(h, 0, 400);
+      r10_active(h, 0, 400, 30, 20, true, false);  // 端の余裕の一元化を見る（着いた後の静止の保持の期限は test_r10_deadline_*）
       h.ax.tuning.soft_reserve_count = reserve;
       h.ax.tuning.playout_delay_ms = 40;  // 再生バッファの参照（-DV1_PLAYOUT=0 の構成でも明示的に使う。端の手前の減速はこの経路だけ）
       h.pos_max_vel = 600;
@@ -994,6 +1011,259 @@ inline void test_r10_integrated_playout_stops_outside_no_drive_zone() {
       }
     }
   }
+}
+
+
+// --- PR #50 の Codex 事前レビュー（b6a93fb）: P0 期限・P1a bias と追従の I・P1b 上書き中の凍結・P1c 認定 -------------------------------
+
+// P0 単体: エンコーダが止まったまま（確かな動きなし）、PWM 0 でも下向きの逆回り（200 count/s）を露出として積み、余裕の半分で停止。
+// DISARMED に戻しても露出は残り、2 回目は余裕の全部で停止して基準を消すよう求める。確かな動きで露出と回数は戻る
+inline void test_r10_deadline_unit() {
+  V1Supervisor s;
+  V1Supervisor::Ctx c;
+  c.soft_min = -2700;
+  c.soft_max = 2700;
+  c.duty_max_pm = 200;
+  c.hold_exit = 4;
+  c.brake_released = true;
+  s.t.brake_acc_count_s2 = 0;
+  s.reset_trust(0, 0);
+  s.end_session(0, 0);
+  // 中央: 下の余裕 = 2750 − 400 = 2350、半分 1175、200 count/s → 5.875 s（先読み 15 ms ぶん手前）
+  const double half = 2350.0 / 2.0;
+  int ticks = 0;
+  while (!s.feedback_uncertain() && ticks < 3000) {
+    c.now_us += 5 * MS;
+    s.observe(c);
+    s.filter(c, 0);
+    ++ticks;
+  }
+  const double t1 = ticks * 0.005;
+  CHECK(s.feedback_uncertain() && s.deadline_tripped() && s.deadline_strikes() == 1);
+  CHECK(fabs(t1 - (half / 200.0 - 0.015)) <= 0.011);
+  CHECK(s.exposure(-1) <= half + 1e-6 && s.exposure(1) == 0.0);  // PWM 0 なら上向きの露出は無い
+  CHECK(!s.take_reference_lost());
+  // DISARMED → 再 ARM（露出は残る）: 残りの半分で 2 回目 → 基準を消す
+  s.end_session(0, c.now_us);
+  s.clear_episode();
+  CHECK(!s.feedback_uncertain() && s.exposure(-1) > half - 13.0);
+  ticks = 0;
+  while (!s.feedback_uncertain() && ticks < 3000) {
+    c.now_us += 5 * MS;
+    s.observe(c);
+    s.filter(c, 0);
+    ++ticks;
+  }
+  CHECK(s.feedback_uncertain() && s.deadline_strikes() == 2 && s.take_reference_lost() && !s.take_reference_lost());
+  CHECK(s.exposure(-1) <= 2350.0 + 1e-6 && fabs(ticks * 0.005 - half / 200.0) <= 0.03);
+  // ±1 のちらつき・時間の経過では戻らない。下へ 2 count の確かな動きで下の露出と回数が戻る
+  V1Supervisor q;
+  q.t.brake_acc_count_s2 = 0;
+  q.reset_trust(0, 0);
+  q.end_session(0, 0);
+  V1Supervisor::Ctx d = c;
+  d.now_us = 0;
+  for (int i = 0; i < 400; ++i) {
+    d.now_us += 5 * MS;
+    d.raw = i % 2;
+    q.observe(d);
+    q.filter(d, 0);
+  }
+  CHECK(q.exposure(-1) >= 400 * 0.005 * 200.0 - 2.0);
+  d.raw = -2;
+  d.now_us += 5 * MS;
+  q.observe(d);
+  CHECK(q.exposure(-1) == 0.0 && q.deadline_strikes() == 0);
+}
+
+// P0 軸: 荷重で沈む軸（外力 −150 count/s）が保持中にエンコーダを失う。PWM 0 / 保持出力のまま物理だけが沈むが、期限で PWM 0 ＋ ブレーキ。
+// 見えない走行は余裕の半分以下。保持出力 60 を学んだ後に荷重が無くなる（保持出力で上へ動く）場合も同じ
+inline void test_r10_deadline_bounds_dead_encoder_hold() {
+  {  // 下へ沈む
+    Harness h;
+    r10_active(h, 0, 100000, 30, 20, true, false);
+    h.pwm_count_s_per_permille = 4.0;
+    drive_count_nonzero(h, 500, 0);
+    h.ax.tuning.sup.deadline = true;
+    h.enc_connected = false;
+    h.ext_vel = -150.0;
+    const double phys0 = h.phys;
+    int n = 0;
+    while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+    const double blind = fabs(h.phys - phys0);
+    if (std::getenv("R10_PRINT")) std::printf("deadline sag: %.2f s blind %.1f\n", n * 0.005, blind);
+    CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && no_fault_events(h));
+    CHECK(blind <= (2750.0 - 400.0) / 2.0);
+  }
+  {  // 荷重 6 % の保持を（体重移動のある生きたエンコーダで）学んでから、エンコーダが死んで荷重が無くなる（保持出力 60 が上へ押す）
+    Harness h;
+    r10_active(h, 0, 100000);
+    h.pwm_count_s_per_permille = 4.0;
+    h.load_permille = 60;
+    for (int i = 0; i < 300; ++i) {
+      h.ext_vel = ((i / 60) % 2 == 0) ? 60.0 : -60.0;
+      drive_count_nonzero(h, 10, 0);
+    }
+    h.ext_vel = 0.0;
+    drive_count_nonzero(h, 300, 0);
+    CHECK(!h.ax.supervisor_inhibited() && std::abs(h.ax.bias_permille() - 60) <= 15);
+    h.enc_connected = false;
+    h.load_permille = 0;
+    const double phys0 = h.phys;
+    int n = 0;
+    while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+    const double blind = fabs(h.phys - phys0);
+    if (std::getenv("R10_PRINT")) std::printf("deadline load removed: %.2f s blind %.1f\n", n * 0.005, blind);
+    CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && no_fault_events(h));
+    CHECK(blind <= (2750.0 - 400.0) / 2.0);
+  }
+}
+
+// P0 軸: 生きたエンコーダでも完全に静止した保持は期限で停止する（ブレーキが座席を保つ）。DISARM → 再 ARM で残りの半分を使って再開でき、
+// まだ静止のままなら 2 回目で基準が消え、ARM_PREPARE は NOT_REFERENCED（SET_REFERENCE か校正が要る）。乗員の体重移動（±60 count/s）が
+// あれば確かな動きで戻り続け、30 s 停止しない
+inline void test_r10_deadline_static_hold_and_resume() {
+  Harness h;
+  r10_active(h, 0, 100000);
+  int n = 0;
+  while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+  const double t1 = n * 0.005;
+  CHECK(braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && h.ax.state() == st::ACTIVE && h.ax.referenced());
+  Harness::accepted(h.disarm());
+  h.idle(400);
+  CHECK(h.ax.state() == st::DISARMED && !h.ax.supervisor_inhibited());
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  n = 0;
+  while (!h.ax.supervisor_inhibited() && n < 4000) { drive_count_nonzero(h, 5, 0); ++n; }
+  const double t2 = n * 0.005;
+  if (std::getenv("R10_PRINT")) std::printf("deadline static hold: 1st %.2f s, 2nd %.2f s\n", t1, t2);
+  CHECK(braked_inhibit(h) && !h.ax.referenced());
+  Harness::accepted(h.disarm());
+  h.idle(400);
+  Harness::rejected(h.arm(), rs::NOT_REFERENCED);
+  // 体重移動のある保持（荷重 6 %）は止まらない
+  Harness g;
+  const HoldResult r = hold_run(g, 60, 15, 30, true, true, 60.0);
+  if (std::getenv("R10_PRINT")) std::printf("deadline sway hold: inhibited %d err max %d pulses %d\n", r.inhibited ? 1 : 0, r.max_abs_err, r.pulse_onsets);
+  CHECK(!r.inhibited && !r.fault && no_fault_events(g));
+}
+
+// P1a: bias（8 %）を学んだ後に反転・大きな目標の跳び。追従の I は反転で 0 になり、古い向きの I が残る tick は無い。FE の山を出す
+inline void test_r10_bias_and_tracking_i_separate_on_reversal() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, true, false);
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = 80;
+  h.pwm_deadband_permille = 15;
+  h.pwm_deadband_subtract = true;
+  drive_count_nonzero(h, 3000, 0);
+  const int bias0 = h.ax.bias_permille();
+  CHECK(std::abs(bias0 - 80) <= 20 && std::abs(h.ax.integral_permille()) <= 1);
+  h.pos_max_vel = 300;
+  int stale = 0, fe_peak = 0;
+  int prev_dir = 0;
+  for (int i = 0; i < 300; ++i) {  // 上へ 1 s、下へ 1 s、上へ 1 s（反転 2 回）
+    const int32_t tgt = i < 100 ? 600 : (i < 200 ? -600 : 600);
+    h.set_position(tgt);
+    h.idle(10);
+    const double v = h.ax.setpoint_vel();
+    const int vd = v > 0 ? 1 : (v < 0 ? -1 : 0);
+    const int ip = h.ax.integral_permille();
+    if (vd != 0 && prev_dir != 0 && vd == prev_dir && ip != 0 && (ip > 0) != (vd > 0) && std::abs(ip) > 5) ++stale;
+    if (vd != 0) prev_dir = vd;
+    fe_peak = std::max(fe_peak, std::abs(h.ax.following_error_count()));
+    CHECK(std::abs(ip) <= V1_I_MAX_PERMILLE);  // 追従の I は 3 % まで
+  }
+  if (std::getenv("R10_PRINT")) std::printf("bias reversal: bias %d -> %d, stale I ticks %d, FE peak %d\n", bias0, h.ax.bias_permille(), stale, fe_peak);
+  CHECK(h.ax.bias_permille() == bias0);  // 走行中は bias を動かさない
+  CHECK(stale == 0 && h.ax.state() == st::ACTIVE && no_fault_events(h));
+}
+
+// P1b: 上書き（引き上げ・端の手前の制動）が出力を決めている間は bias も追従の I も積まない
+inline void test_r10_integrators_frozen_while_overridden() {
+  {  // 引き上げ: bias 80 を学んでから、静止摩擦 25 % で動かない軸の目標を 26 上へ
+    Harness h;
+    r10_active(h, 0, 100000, 30, 20, true, false);
+    h.pwm_count_s_per_permille = 4.0;
+    h.load_permille = 80;
+    drive_count_nonzero(h, 3000, 0);
+    const int b0 = h.ax.bias_permille();
+    h.pwm_deadband_permille = 250;
+    h.pwm_deadband_subtract = true;
+    int esc_ticks = 0;
+    int b_at_first_esc = 0;
+    bool frozen = true;
+    for (int i = 0; i < 300 && !h.ax.supervisor_inhibited(); ++i) {
+      if ((i % 2) == 0) h.set_position(26);
+      const double b_before = h.ax.supervisor_info().enabled ? h.ax.bias_permille() : 0;
+      h.step();
+      // 引き上げが出力を決めた tick（出力 = 引き上げの量）
+      if (h.ax.escalation_permille() > 0 && h.ax.pwm_permille() == std::min(h.ax.escalation_permille(), 200)) {
+        if (esc_ticks == 0) b_at_first_esc = static_cast<int>(b_before);
+        ++esc_ticks;
+        if (h.ax.bias_permille() != static_cast<int>(b_before)) frozen = false;
+      }
+    }
+    if (std::getenv("R10_PRINT")) std::printf("freeze esc: bias %d -> %d at first esc, esc ticks %d\n", b0, b_at_first_esc, esc_ticks);
+    CHECK(esc_ticks > 5 && frozen);
+  }
+  {  // 端の手前の制動: bias（荷重 6 % で学ぶ）を持ったまま制動に入って出る間、bias と I は変わらない
+    Harness h;
+    r10_active(h, 1800, 100000, 6, 20, true, false);  // 参照の端の手前の止まる位置（ソフトリミットから 600）より内側
+    h.pwm_count_s_per_permille = 4.0;
+    h.load_permille = 60;
+    drive_count_nonzero(h, 3000, 1800);
+    h.pwm_plant = false;  // ここからはカウントを手で動かす
+    h.stall = true;
+    const int b0 = h.ax.bias_permille();
+    const int i0 = h.ax.integral_permille();
+    bool frozen = true;
+    int guard = 0;
+    for (int i = 0; i < 30; ++i) {
+      if (i < 12) h.raw += 8;  // 1600 count/s で上へ（停止距離 1280 > 残り 900）
+      h.set_position(1800);
+      const int bb = h.ax.bias_permille(), ib = h.ax.integral_permille();
+      h.step();
+      if (h.ax.supervisor().end_braking()) {
+        ++guard;
+        if (h.ax.bias_permille() != bb || h.ax.integral_permille() != ib) frozen = false;
+      }
+    }
+    if (std::getenv("R10_PRINT")) std::printf("freeze guard: bias %d I %d guard ticks %d\n", b0, i0, guard);
+    CHECK(guard >= 3 && frozen && b0 > 0);
+  }
+}
+
+// P1c: bias を保持出力として認めるのは、確かな動きの後に位置が ±1 の中に 300 ms 留まったときだけ
+inline void test_r10_hold_certification_requires_stable_window() {
+  V1Supervisor s;
+  V1Supervisor::Ctx c;
+  c.soft_min = -2700;
+  c.soft_max = 2700;
+  c.duty_max_pm = 200;
+  c.brake_released = true;
+  s.t.deadline = false;
+  s.t.brake_acc_count_s2 = 0;
+  s.reset_trust(0, 0);
+  s.end_session(0, 0);
+  auto tick = [&](int64_t raw, double bias) {
+    c.now_us += 5 * MS;
+    c.raw = raw;
+    c.i_pm = bias;
+    s.observe(c);
+    s.filter(c, 0);
+  };
+  tick(0, 10.0);
+  tick(2, 20.0);  // 確かな動き: 認定待ち
+  for (int i = 0; i < 50; ++i) tick(2 + (i % 2), 30.0 + i);  // ±1 で 250 ms: まだ
+  CHECK(s.verified_hold_permille() == 0.0);
+  for (int i = 0; i < 12; ++i) tick(2, 60.0);  // 300 ms を越えた
+  CHECK(s.verified_hold_permille() == 60.0);
+  tick(4, 90.0);  // また動いた: 認定は前のまま
+  tick(4, 95.0);
+  CHECK(s.verified_hold_permille() == 60.0);
 }
 
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
@@ -1046,6 +1316,12 @@ inline void run_all() {
   test_r10_hold_learn_tracking_fe_before_after();
   test_r10_residual_pulses_limited_then_zero_output_without_learning();
   test_r10_integrated_playout_stops_outside_no_drive_zone();
+  test_r10_deadline_unit();
+  test_r10_deadline_bounds_dead_encoder_hold();
+  test_r10_deadline_static_hold_and_resume();
+  test_r10_bias_and_tracking_i_separate_on_reversal();
+  test_r10_integrators_frozen_while_overridden();
+  test_r10_hold_certification_requires_stable_window();
   test_r10_status_flags_bits();
 }
 

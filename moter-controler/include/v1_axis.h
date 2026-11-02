@@ -165,7 +165,9 @@ struct V1DutyState {
   bool in_band = false;   // 静止の不感帯の中（入る側 deadband / 出る側 deadband_out）
   bool floor_on = false;  // 床（Duty 下限）の適用状態（ON: |誤差| > deadband_out かつ向き一致 / OFF: |誤差| ≤ floor_off か向き不一致）
   double i_pm = 0.0;      // 積分項 [permille]（Issue #25 手順 9「F」。|i_pm| ≤ i_max_permille。位置制御が止まれば 0）
-  int64_t hold_best_abs = 0;  // r10（hold_learn）: この保持の間に一番目標に近かった |誤差|（そこから 1 count 離れたら I を詰める）
+  int64_t hold_best_abs = 0;  // r10（hold_learn）: この保持の間に一番目標に近かった |誤差|（そこから 1 count 離れたら bias を詰める）
+  double bias_pm = 0.0;       // r10（hold_learn、P1a）: 保持の偏り（荷重・乗員の補償）[permille]。止まっている間だけ学ぶ。|bias| ≤ duty_max × 90 %
+  int last_vel_sign = 0;      // r10（hold_learn）: 直前の軌道速度の向き（反転で追従の I を 0 に）
 };
 
 // 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
@@ -216,8 +218,12 @@ inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
 // 5. r9（Issue #35）の減衰項: has_v_fast（V1Axis の 40 ms 窓の速度推定が使える）かつ kd > 0 なら
 //    u_d = clamp(kd × (vel − v_fast), ±vel_d_max) を合成に足す（u = FF + P + I + u_d）。保持の中では足さない（出力 0 のまま）。
 //    飽和・アンチワインドアップ・動き出しパルスの「合成」は u_d 込みの u で見る（四捨五入は合成で 1 回）。
-// 6. r10（Issue #44 の実測 2、t.hold_learn）: 保持出力の学習。保持に入っても I を捨てず、出力 = I（P なし）。保持の中でも |誤差| ≥ hold_enter
-//    なら Ki_hold で I を詰める。|I| ≤ duty_max × hold_i_max_ratio。軌道が止まっている間は Ki_hold / hold_i_rate、走行中は従来の Ki / rate。
+// 6. r10（Issue #44 の実測 2、t.hold_learn）: 保持出力の学習。PR #50 の Codex 事前レビュー P1a で「保持の偏り bias」と「追従の I」を分けた:
+//    - bias: 軌道速度 0 のとき（保持の中を含む）だけ Ki_hold / hold_i_rate で積む。|bias| ≤ duty_max × hold_i_max_ratio。走行中は凍結。
+//      保持の中では、その保持で一番近かった所から 1 count 離れた（沈んだ）ときだけ詰める
+//    - 追従の I: 走行中だけ従来の Ki / i_rate で積み、|I| ≤ i_max_permille（3 %）。|I| を減らす向きは V1_TRACK_I_UNWIND_RATE で速く。
+//      軌道速度の向きが反転したら 0。止まっている間は同じ速さで 0 へ戻す
+//    - 出力 = FF + P + bias + I + u_d（保持の中は bias + I）。動き出しパルスの tick は両方凍結
 inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
                                        double dt_s, bool settle_ok, bool breakaway, bool has_v_fast, double v_fast) {
   const int64_t err_abs = err < 0 ? -err : err;
@@ -236,11 +242,23 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   } else {
     st.in_band = false;
   }
-  const double i_cap = t.hold_learn ? static_cast<double>(duty_max_pm) * t.hold_i_max_ratio_percent / 100.0
-                                    : static_cast<double>(t.i_max_permille);
-  const bool still = t.hold_learn && vel == 0.0;  // 軌道が止まっている: 保持出力を速く学ぶ
-  const double ki = still ? t.hold_ki_permille_per_count_s : t.ki_permille_per_count_s;
-  const double i_rate = still ? static_cast<double>(t.hold_i_rate_permille_per_s) : static_cast<double>(t.i_rate_permille_per_s);
+  if (t.hold_learn) {
+    // 軌道速度の向きの反転: 追従の I を 0（古い向きの誤差を持ち越さない）
+    const int vs = vel > 0.0 ? 1 : (vel < 0.0 ? -1 : 0);
+    if (vs != 0 && st.last_vel_sign != 0 && vs != st.last_vel_sign) st.i_pm = 0.0;
+    if (vs != 0) st.last_vel_sign = vs;
+  }
+  const double bias_cap = static_cast<double>(duty_max_pm) * t.hold_i_max_ratio_percent / 100.0;
+  const double i_cap = static_cast<double>(t.i_max_permille);
+  const bool still = t.hold_learn && vel == 0.0;  // 軌道が止まっている: bias を学ぶ・追従の I は 0 へ
+  // 追従の I を 0 へ戻す（止まっている間、速い戻し）
+  auto decay_i = [&]() {
+    if (dt_s <= 0.0) return;
+    const double step = static_cast<double>(V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S) * dt_s;
+    if (st.i_pm > step) st.i_pm -= step;
+    else if (st.i_pm < -step) st.i_pm += step;
+    else st.i_pm = 0.0;
+  };
   if (st.in_band) {
     o.in_band = true;
     o.mode = V1DutyMode::HOLD;
@@ -248,23 +266,23 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
       o.cmd_permille = 0;
       return 0;
     }
-    // r10: 保持の出力 = I（保持出力）。この保持の間に一番近かった所から 1 count 以上離れた（荷重で沈んだ）ときだけ I を詰める。
-    // 静止摩擦で目標の 1〜2 count 手前に止まっている無負荷の軸では I を育てない（育てると静止摩擦が切れた所で I が余って向こう側まで
-    // 動き続ける往復になる）。沈む軸は離れた分だけ詰めて、戻り始めて一番近い所まで来れば止まる
+    // r10: 保持の出力 = bias（＋戻りきっていない追従の I）。この保持の間に一番近かった所から 1 count 以上離れた（荷重で沈んだ）ときだけ
+    // bias を詰める（静止摩擦で目標の 1〜2 count 手前に止まっている無負荷の軸では育てない）
     if (err_abs < st.hold_best_abs) st.hold_best_abs = err_abs;
-    if (dt_s > 0.0 && ki > 0.0 && err_abs >= 1 && err_abs >= st.hold_best_abs + 1) {
-      double di = ki * static_cast<double>(err) * dt_s;
-      const double di_max = i_rate * dt_s;
-      if (di > di_max) di = di_max;
-      if (di < -di_max) di = -di_max;
-      st.i_pm += di;
-      if (st.i_pm > i_cap) st.i_pm = i_cap;
-      if (st.i_pm < -i_cap) st.i_pm = -i_cap;
+    if (dt_s > 0.0 && t.hold_ki_permille_per_count_s > 0.0 && err_abs >= 1 && err_abs >= st.hold_best_abs + 1) {
+      double db = t.hold_ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const double db_max = static_cast<double>(t.hold_i_rate_permille_per_s) * dt_s;
+      if (db > db_max) db = db_max;
+      if (db < -db_max) db = -db_max;
+      st.bias_pm += db;
+      if (st.bias_pm > bias_cap) st.bias_pm = bias_cap;
+      if (st.bias_pm < -bias_cap) st.bias_pm = -bias_cap;
     }
-    long h = lround(st.i_pm);
+    decay_i();
+    long h = lround(st.bias_pm + st.i_pm);
     if (h > duty_max_pm) h = duty_max_pm;
     if (h < -duty_max_pm) h = -duty_max_pm;
-    o.i_permille = static_cast<int16_t>(h);
+    o.i_permille = v1_clamp_i16(st.i_pm + st.bias_pm);
     o.cmd_permille = static_cast<int16_t>(h);
     return static_cast<int>(h);
   }
@@ -272,8 +290,8 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   const double ff_pm = v1_ff_directional_pm(vel, t);
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
-  o.i_permille = v1_clamp_i16(st.i_pm);
-  // r9: 速度誤差の減衰項（保持の外だけ。上の HOLD で 0 を返した後なので保持中は出ない）
+  o.i_permille = v1_clamp_i16(st.i_pm + st.bias_pm);  // 計器の I は bias 込み
+  // r9: 速度誤差の減衰項（保持の外だけ。上の HOLD で返した後なので保持中は出ない）
   double d_pm = 0.0;
   if (has_v_fast && t.vel_kd_permille_per_count_s > 0.0) {
     const double d_max = static_cast<double>(t.vel_d_max_permille < 0 ? -t.vel_d_max_permille : t.vel_d_max_permille);
@@ -282,7 +300,7 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
     if (d_pm < -d_max) d_pm = -d_max;
   }
   o.d_permille = v1_clamp_i16(d_pm);
-  const double u_raw = ff_pm + p_pm + st.i_pm + d_pm;
+  const double u_raw = ff_pm + p_pm + st.i_pm + st.bias_pm + d_pm;
   const long u = lround(u_raw);  // 四捨五入は 1 回（u_d 込み）
   const bool saturated = (u >= duty_max_pm) || (u <= -duty_max_pm);
   long mag = u < 0 ? -u : u;
@@ -306,19 +324,37 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   const int out = static_cast<int>(dir * mag);
   o.cmd_permille = static_cast<int16_t>(out);
   // 積分の更新（次の tick のため）。パルス中は凍結
-  if (dt_s > 0.0 && ki > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
-    double di = ki * static_cast<double>(err) * dt_s;
-    const double di_max = i_rate * dt_s;
-    if (di > di_max) di = di_max;
-    if (di < -di_max) di = -di_max;
-    const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
-    const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
-    if (!deeper || unwinding) {
-      st.i_pm += di;
-      if (st.i_pm > i_cap) st.i_pm = i_cap;
-      if (st.i_pm < -i_cap) st.i_pm = -i_cap;
+  if (dt_s > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
+    if (still) {
+      // bias（止まっている間）: Ki_hold・hold_i_rate。飽和した向きへは積み増さない
+      double db = t.hold_ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const double db_max = static_cast<double>(t.hold_i_rate_permille_per_s) * dt_s;
+      if (db > db_max) db = db_max;
+      if (db < -db_max) db = -db_max;
+      const bool deeper = saturated && ((db > 0.0) == (u > 0));
+      if (!deeper) {
+        st.bias_pm += db;
+        if (st.bias_pm > bias_cap) st.bias_pm = bias_cap;
+        if (st.bias_pm < -bias_cap) st.bias_pm = -bias_cap;
+      }
+    } else if (t.ki_permille_per_count_s > 0.0) {
+      // 追従の I（走行中、または学習 OFF のとき）: 増やす向きは i_rate、戻す向きは（学習 ON なら）速く
+      double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
+      const double rate = (unwinding && t.hold_learn) ? static_cast<double>(V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S)
+                                                       : static_cast<double>(t.i_rate_permille_per_s);
+      const double di_max = rate * dt_s;
+      if (di > di_max) di = di_max;
+      if (di < -di_max) di = -di_max;
+      const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
+      if (!deeper || unwinding) {
+        st.i_pm += di;
+        if (st.i_pm > i_cap) st.i_pm = i_cap;
+        if (st.i_pm < -i_cap) st.i_pm = -i_cap;
+      }
     }
   }
+  if (still && o.mode != V1DutyMode::BRK) decay_i();
   return out;
 }
 
@@ -674,6 +710,8 @@ class V1Axis {
   int stall_boost_permille() const { return stall_boost_; }
   // 積分項（Issue #25 手順 9「F」）の現在値 [permille]（四捨五入前の値を丸めたもの）。画面の計器行 `I`。STATUS には載せない
   int integral_permille() const { return static_cast<int>(lround(duty_state_.i_pm)); }
+  // r10（hold_learn、P1a）: 保持の偏り（荷重・乗員の補償）[permille]。画面の I は追従の I と bias の和
+  int bias_permille() const { return static_cast<int>(lround(duty_state_.bias_pm)); }
   // r10: 静止目標での引き上げ [permille]（0 = なし）と、小さな残り誤差を受け入れて出力 0 にしているか（画面・テスト用）
   int escalation_permille() const { return esc_level_; }
   bool residual_accepted() const { return residual_accepted_; }
@@ -1647,7 +1685,8 @@ class V1Axis {
     c.duty_max_pm = v1_permille(tuning.duty_max);
     c.hold_exit = tuning.hold_exit;
     // r10（実測 2）: 保持出力の扱い。軌道が止まっていて目標の近くなら、学んだ保持出力（I）の分は包絡線に積まない（V1Supervisor）
-    c.i_pm = duty_state_.i_pm;
+    c.i_pm = duty_state_.bias_pm;  // P1a: 保持の偏り（追従の I は含めない）
+    c.brake_released = brake_release_cmd_;
     const int64_t ea = c.err < 0 ? -c.err : c.err;
     c.stationary_near = tuning.hold_learn && setpoint_vel_ == 0.0 && ea <= escalation_floor();
     return c;
@@ -1902,9 +1941,14 @@ class V1Axis {
     const bool settle_ok = update_settle_dwell(err, dt_us);
     const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
     update_escalation(err, now);  // r10: 静止目標での引き上げ（esc_level_）
+    // r10（PR #50 の Codex 事前レビュー P1b）: 積分のアンチワインドアップは実際に出した出力で見る。引き上げ・端の手前の制動・ソフトリミットの
+    // 外の外向き 0・過負荷・予算・停止が出力を決めた tick は、bias も追従の I も積まない（ここで取っておいた値に戻す）
+    const double i_before = duty_state_.i_pm;
+    const double bias_before = duty_state_.bias_pm;
     int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
                               assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
     last_combined_pm_ = cmd;
+    const int cmd_ctrl = cmd;  // 位置ループが出した値（上書きの判定用）
     // r10（supervisor_on）: 静止目標（軌道速度 0・保持でない）での出力の形
     //  - |誤差| ≤ residual_band か残り誤差の受け入れ中: 動き出しパルスの間だけ出す。それ以外は 0（I も 0）。受け入れ中はパルスも無い
     //  - |誤差| > residual_band で進まない: 誤差の向きに max(合成, 引き上げ) を出す（duty_max まで）
@@ -1931,6 +1975,7 @@ class V1Axis {
     if (supervisor_on() && has_config_) {
       sup_.t = tuning.sup;
       cmd = sup_.filter(sup_ctx(now), cmd);
+      if (sup_.take_reference_lost()) referenced_ = false;  // P0: 期限の停止が 2 回続いた（確かな動きなし）→ 基準を消す
       if (sup_.inhibited()) {
         // 持続する停止（PR #48 の Codex 事前レビュー P0）: PWM 0 ＋ ブレーキ作動（G13 を作動側へ）。主電源は保つ（powered_state のまま）。
         // 制御器の状態（積分・動き出しパルス・補助）も捨てる（再開は DISARMED → ARM_PREPARE の通常の手順で、目標は現在位置から）
@@ -1942,6 +1987,10 @@ class V1Axis {
         reset_stall_boost();
         terms_.cmd_permille = 0;
       }
+    }
+    if (tuning.hold_learn && cmd != cmd_ctrl && !sup_.inhibited()) {  // 停止のときは上で捨てている（学習 OFF は従来どおり）
+      duty_state_.i_pm = i_before;
+      duty_state_.bias_pm = bias_before;
     }
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty

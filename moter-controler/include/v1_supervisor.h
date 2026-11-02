@@ -56,6 +56,10 @@ struct V1SupTuning {
   int32_t renew_move_count = V1_SUP_RENEW_MOVE_COUNT;
   bool renew_directional = V1_SUP_RENEW_DIRECTIONAL != 0;  // false（既定）: どちら向きの正味の移動でも数える
   int hold_allow_trim_permille = V1_HOLD_ALLOW_TRIM_PERMILLE;
+  uint32_t certify_ms = V1_HOLD_CERTIFY_MS;                       // P1c
+  bool deadline = true;                                           // P0（false で期限なし。試験用）
+  bool deadline_proportional = V1_SUP_DEADLINE_PROPORTIONAL != 0; // P0: 露出の速さを Duty に比例（false で一律 env_count_s）
+  int32_t backdrive_count_s = V1_SUP_BACKDRIVE_COUNT_S;           // P0: 下向きに足す逆回りの速さ
   uint32_t renew_window_ms = V1_SUP_RENEW_WINDOW_MS;
   uint32_t projection_ms = V1_OVERRUN_MS;  // 先読みの刻み: 次の tick までの最悪の間隔（これを超えれば CONTROL_OVERRUN）
   int load_sat_ratio_permille = V1_LOAD_SAT_RATIO_PERMILLE;
@@ -108,16 +112,20 @@ class V1Supervisor {
     double vel = 0.0;            // 実測速度 [count/s]
     long duty_max_pm = 0;
     int32_t hold_exit = 0;
-    double i_pm = 0.0;            // 位置ループの積分（保持出力）[permille]。確かな動きを見た時点の値を「学んだ保持出力」として持つ
-    bool stationary_near = false; // 軌道が止まっていて目標の近く（保持出力の分を包絡線に積まない）
+    double i_pm = 0.0;            // 保持の偏り（bias）[permille]。確かな動きの後に位置が保てたとき（certify_ms）の値を「学んだ保持出力」とする
+    bool stationary_near = false; // 軌道が止まっていて目標の近く（学んだ保持出力の分を包絡線に積まない）
+    bool brake_released = true;   // ブレーキ解除指令中（露出を積むのはこの間だけ）
   };
 
   V1SupTuning t;
 
   // 基準を取り直した（begin / SET_REFERENCE / 校正の成功 / 系統の切替）: 信用できる位置 = いま、包絡線をすべて 0、FEEDBACK_UNCERTAIN も解除
   void reset_trust(int64_t raw, uint64_t now_us) {
-    trusted_raw_ = raw;
-    for (int i = 0; i < 2; ++i) { env_ep_[i] = 0.0; env_cum_[i] = 0.0; }
+    for (int i = 0; i < 2; ++i) { trusted_[i] = raw; env_ep_[i] = 0.0; env_cum_[i] = 0.0; exp_[i] = 0.0; }
+    strikes_ = 0;
+    deadline_tripped_ = false;
+    reference_lost_ = false;
+    cert_pending_ = false;
     feedback_uncertain_ = false;
     last_raw_ = raw;
     last_change_us_ = now_us;
@@ -127,13 +135,15 @@ class V1Supervisor {
   void clear_episode() {
     feedback_uncertain_ = false;
     load_limited_ = false;
-    env_ep_[0] = env_ep_[1] = 0.0;
+    deadline_tripped_ = false;
+    env_ep_[0] = env_ep_[1] = 0.0;  // 露出（exp_）と期限の回数（strikes_）は戻さない（P0）
   }
   // 位置制御が止まった（DISARMED / FAULT / 校正 / ARMING のブレーキ解除前）: その回だけの状態を捨てる
   void end_session(int64_t raw, uint64_t now_us) {
     last_out_ = 0;
     last_charge_ = 0;
-    i_verified_ = 0.0;
+    i_verified_ = 0.0;  // bias も DISARM などで捨てられる
+    cert_pending_ = false;
     any_win_ = false;
     have_last_us_ = false;
     ren_dir_ = 0;
@@ -167,8 +177,14 @@ class V1Supervisor {
       env_ep_[idx(d)] += add;
       env_cum_[idx(d)] += add;
     }
+    // P0: 露出（確かな動きが無いまま見えないまま動けたかもしれない距離）。出力の向きに出力の包絡線、下向きに逆回りの速さ。
+    // 積分しない保持出力・PWM 0 の間も積む（ブレーキ解除中だけ）
+    if (dt_us > 0 && c.brake_released) {
+      exp_[0] += exposure_rate(1) * static_cast<double>(dt_us) / 1e6;
+      exp_[1] += exposure_rate(-1) * static_cast<double>(dt_us) / 1e6;
+    }
     if (!t.renew_directional) {
-      // どちら向きでも: 半分の窓 2 つの中の最小・最大から renew_move 以上離れた
+      // どちら向きでも: 半分の窓 2 つの中の最小・最大から renew_move 以上離れた（その向きだけ戻す。P1c）
       const uint64_t half = ms(t.renew_window_ms) / 2;
       if (!any_win_) {
         any_win_ = true;
@@ -182,8 +198,10 @@ class V1Supervisor {
       }
       const int64_t lo = any_min_ < any_min_prev_ ? any_min_ : any_min_prev_;
       const int64_t hi = any_max_ > any_max_prev_ ? any_max_ : any_max_prev_;
-      if (c.raw - lo >= t.renew_move_count || hi - c.raw >= t.renew_move_count) {
-        renew(c);
+      if (c.raw - lo >= t.renew_move_count) {
+        renew(c, 1);
+      } else if (hi - c.raw >= t.renew_move_count) {
+        renew(c, -1);
       } else {
         if (c.raw < any_min_) any_min_ = c.raw;
         if (c.raw > any_max_) any_max_ = c.raw;
@@ -210,7 +228,34 @@ class V1Supervisor {
       if ((d > 0 && c.raw < ren_ext_) || (d < 0 && c.raw > ren_ext_)) ren_ext_ = c.raw;  // 最も戻った所
       const int64_t lowest = d > 0 ? (ren_ext_ < ren_ext_prev_ ? ren_ext_ : ren_ext_prev_)
                                    : (ren_ext_ > ren_ext_prev_ ? ren_ext_ : ren_ext_prev_);
-      if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) renew(c);
+      if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) renew(c, d);
+    }
+    // P1c: 保持出力の認定。確かな動きの後、位置が ±1 の中に certify_ms 留まった（保てている）ら、そのときの bias を学んだ保持出力にする
+    if (cert_pending_) {
+      const int64_t dv = c.raw - cert_raw_;
+      if (dv > 1 || dv < -1) {
+        cert_raw_ = c.raw;  // まだ動いている（2 count 未満の動きの途中）: 取り直す
+        cert_start_us_ = c.now_us;
+      } else if (c.now_us - cert_start_us_ >= ms(t.certify_ms)) {
+        i_verified_ = c.i_pm;
+        cert_pending_ = false;
+      }
+    }
+    // P0: 期限。露出が端までの余裕（1 回目は半分）を超える前に停止（先読みは最悪の tick 間隔ぶん）
+    if (t.deadline && c.brake_released && !inhibited()) {
+      uint64_t step_us = last_dt_us_;
+      if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
+      for (int k = 0; k < 2; ++k) {
+        const int dd = k == 0 ? 1 : -1;
+        const double thr = static_cast<double>(position_limit(dd, c)) * (strikes_ == 0 ? 0.5 : 1.0);
+        if (exp_[idx(dd)] + exposure_rate(dd) * static_cast<double>(step_us) / 1e6 > thr + 1e-9) {
+          feedback_uncertain_ = true;
+          deadline_tripped_ = true;
+          ++strikes_;
+          if (strikes_ >= 2) reference_lost_ = true;
+          break;
+        }
+      }
     }
     // FOLLOWING_ERROR の猶予に使う |誤差| の傾向（fe_window ごとに比べる）
     const int64_t fe_abs = c.err < 0 ? -c.err : c.err;
@@ -292,6 +337,7 @@ class V1Supervisor {
   int filter(const Ctx& c, int cmd) {
     const int32_t actual = clamp32(c.raw - c.ref_offset);
     int out = cmd;
+    bool guard = false;
     if (inhibited()) {
       out = 0;
       braking_ = false;
@@ -302,17 +348,21 @@ class V1Supervisor {
       if (braking_) {
         out = static_cast<int>(-brake_dir_ * c.duty_max_pm);
         sat_running_ = false;
+        guard = true;
       } else {
         // ソフトリミットの外（猶予 ON のときだけここまで来る）: 外向きには出さない
         if ((actual > c.soft_max && out > 0) || (actual < c.soft_min && out < 0)) out = 0;
         out = update_load(c, out);
       }
       // 見えない走行の予算（先読み）。制動の出力も含めて、出す出力はすべてここを通す（P1a）
-      if (out != 0 && charge_of(out, c) != 0) {
+      // 端の手前の制動の出力は割り引かない（保持出力の分を引かず、一律の包絡線で全部積む。PR #50 の Codex 事前レビュー P2）
+      const int chg = guard ? out : charge_of(out, c);
+      const bool near = guard ? false : c.stationary_near;
+      if (out != 0 && chg != 0) {
         const int d = out > 0 ? 1 : -1;
         uint64_t step_us = last_dt_us_;
         if (step_us < ms(t.projection_ms)) step_us = ms(t.projection_ms);
-        const double proj = charge_speed(charge_of(out, c), c.stationary_near) * static_cast<double>(step_us) / 1e6;
+        const double proj = charge_speed(chg, near) * static_cast<double>(step_us) / 1e6;
         const double eps = 1e-9;
         if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
             env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
@@ -324,8 +374,8 @@ class V1Supervisor {
       }
     }
     last_out_ = out;
-    last_charge_ = charge_of(out, c);
-    last_charge_near_ = c.stationary_near;
+    last_charge_ = guard ? out : charge_of(out, c);
+    last_charge_near_ = guard ? false : c.stationary_near;
     last_ctx_ = c;
     has_ctx_ = true;
     return out;
@@ -338,7 +388,17 @@ class V1Supervisor {
   bool end_braking() const { return braking_; }
   bool soft_recovery() const { return soft_recovery_; }
   bool fe_recovery() const { return fe_recovery_; }
-  int64_t trusted_raw() const { return trusted_raw_; }
+  int64_t trusted_raw(int dir = 1) const { return trusted_[idx(dir)]; }
+  double exposure(int dir) const { return exp_[idx(dir)]; }   // P0: 露出 [count]
+  int deadline_strikes() const { return strikes_; }
+  bool deadline_tripped() const { return deadline_tripped_; }  // いまの停止は期限による（予算・過負荷ではない）
+  double verified_hold_permille() const { return i_verified_; }  // P1c: 認定された保持出力
+  // P0: 2 回目の期限の停止で基準を消すよう求める（V1Axis が POSITION_REFERENCED を落とす）。読んだら消える
+  bool take_reference_lost() {
+    const bool r = reference_lost_;
+    reference_lost_ = false;
+    return r;
+  }
   double envelope_episode(int dir) const { return env_ep_[idx(dir)]; }
   double envelope_cumulative(int dir) const { return env_cum_[idx(dir)]; }
 
@@ -363,7 +423,7 @@ class V1Supervisor {
   // 位置の上限（向き d）[count]: max(max(0, D − reserve), min(min_budget, max(0, D − hard_margin)))。回の上限（budget_max）との小さい方が
   // その回の予算 = min(1000, max(0, D − 400))（最小予算を除く）
   int32_t position_limit(int d, const Ctx& c) const {
-    const int64_t trusted_actual = trusted_raw_ - c.ref_offset;
+    const int64_t trusted_actual = trusted_[idx(d)] - c.ref_offset;
     const int64_t mech = d > 0 ? static_cast<int64_t>(c.soft_max) + t.mech_decel_zone_count
                                : static_cast<int64_t>(c.soft_min) - t.mech_decel_zone_count;
     const int64_t dist = d > 0 ? mech - trusted_actual : trusted_actual - mech;
@@ -377,7 +437,14 @@ class V1Supervisor {
 
  private:
   // --- 信用（DISARM をまたいで残る） ---
-  int64_t trusted_raw_ = 0;
+  int64_t trusted_[2] = {0, 0};   // 向きごとの信用できる位置（P1c: その向きの確かな動きでだけ取り直す）
+  double exp_[2] = {0.0, 0.0};     // P0: 露出 [count]
+  int strikes_ = 0;                // P0: 確かな動きが無いままの期限の停止の回数
+  bool deadline_tripped_ = false;
+  bool reference_lost_ = false;
+  bool cert_pending_ = false;      // P1c: 保持出力の認定待ち
+  uint64_t cert_start_us_ = 0;
+  int64_t cert_raw_ = 0;
   double env_ep_[2] = {0.0, 0.0};   // [0] = 上（カウント増）、[1] = 下
   double env_cum_[2] = {0.0, 0.0};
   bool feedback_uncertain_ = false;
@@ -430,16 +497,34 @@ class V1Supervisor {
     return static_cast<int32_t>(v);
   }
 
-  // 確かな動き: 信用できる位置をいまにし、包絡線を 0 に。そのときの I を学んだ保持出力として持つ
-  void renew(const Ctx& c) {
-    trusted_raw_ = c.raw;
-    for (int i = 0; i < 2; ++i) { env_ep_[i] = 0.0; env_cum_[i] = 0.0; }
+  // 確かな動き（向き dir に 2 count 以上）: その向きの信用できる位置をいまにし、その向きの包絡線・露出を 0 に（反対向きは残す。P1c）。
+  // 期限の回数は戻す（エンコーダが生きている）。保持出力の認定は位置が保てるまで待つ（cert）
+  void renew(const Ctx& c, int dir) {
+    const int i = idx(dir);
+    trusted_[i] = c.raw;
+    env_ep_[i] = 0.0;
+    env_cum_[i] = 0.0;
+    exp_[i] = 0.0;
+    strikes_ = 0;
     ren_start_us_ = c.now_us;
     ren_ext_ = c.raw;
     ren_ext_prev_ = c.raw;
     any_start_us_ = c.now_us;
     any_min_ = any_max_ = any_min_prev_ = any_max_prev_ = c.raw;
-    i_verified_ = c.i_pm;
+    cert_pending_ = true;
+    cert_start_us_ = c.now_us;
+    cert_raw_ = c.raw;
+  }
+  // P0: 露出の速さ [count/s]（向き dir）。前の tick の出力がその向きなら出力の包絡線、下向きには逆回りの速さを足す
+  double exposure_rate(int dir) const {
+    double r = 0.0;
+    if (last_out_ != 0 && (last_out_ > 0) == (dir > 0)) {
+      const double mag = last_out_ < 0 ? -static_cast<double>(last_out_) : static_cast<double>(last_out_);
+      r += t.deadline_proportional ? static_cast<double>(t.env_count_s) * mag / static_cast<double>(V1_SUP_ENV_PROP_REF_PERMILLE)
+                                   : static_cast<double>(t.env_count_s);
+    }
+    if (dir < 0) r += static_cast<double>(t.backdrive_count_s);
+    return r;
   }
   // 出力 out のうち包絡線に積む分（符号は out と同じ）。目標の近くで静止中は、学んだ保持出力の向きに |i_verified| + trim、
   // 逆向きに trim までを引く

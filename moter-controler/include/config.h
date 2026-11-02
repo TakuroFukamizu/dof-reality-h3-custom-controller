@@ -425,6 +425,26 @@ constexpr int V1_HOLD_I_RATE_PERMILLE_PER_S = 60;
 // 小さければ動ける速さも小さい。仕様の一律の包絡線からの逸脱で、目標の近くで静止中だけ）。残る穴: 保持中にエンコーダが死に、荷重が変わる（乗員が降りる）と、保持出力（I の上限 = duty_max の 90 %
 // まで）で見えないまま動きうる（電流検出が無いと区別できない。PR #50 のリスクに記載）
 constexpr int V1_HOLD_ALLOW_TRIM_PERMILLE = 40;
+// PR #50 の Codex 事前レビュー（b6a93fb）P1a: 保持の偏り（bias、荷重・乗員の補償）と追従の I を分ける。
+//  - bias: 軌道が止まっている間（保持の中を含む）だけ、上の V1_HOLD_KI / V1_HOLD_I_RATE で学ぶ。上限は duty_max × 90 %。走行中は凍結
+//  - 追従の I: 走行中だけ従来の Ki 0.2・10 permille/s で積み、上限は従来の 3 %（V1_I_MAX_PERMILLE）。戻す向き（|I| を減らす）は
+//    V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S で速く戻す。軌道速度の向きが反転したら 0（古い向きの誤差を持ち越さない）。止まったら同じ速さで 0 へ
+constexpr int V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S = 100;
+// P1c: bias を「保持出力」として認める（見えない走行の予算に積まない分の基準にする）のは、確かな動きの後、位置が ±1 の中に
+// V1_HOLD_CERTIFY_MS 留まったとき（沈み・戻りが止まって保てている）だけ。動いただけでは認めない
+constexpr uint32_t V1_HOLD_CERTIFY_MS = 300;
+// P0: 確かな動きが無いまま位置制御（ブレーキ解除）を続けられる期限。積分しない保持出力・PWM 0 の逆回り（荷重で沈む）でも、見えないまま
+// 動ける距離を上下別に積み（露出）、端までの余裕（位置の上限 = 信用できた位置から機械端まで − 400）を超える前に PWM 0 ＋ ブレーキの停止
+//（FEEDBACK_UNCERTAIN）。目標・状態の変化や ±1 のちらつきでは戻さず、確かな動き（その向き）と基準の取り直しだけが戻す。
+//  - 露出の速さ: 出力の向きに、出力の包絡線（既定は Duty に比例: 20 % で 2500 count/s。-DV1_SUP_DEADLINE_PROPORTIONAL=0 で一律 2500）。
+//    下向き（カウント減 = FF の向きの決め方で「下」）には、出力に関係なく V1_SUP_BACKDRIVE_COUNT_S（荷重で逆に回る速さ、仮値）を足す
+//  - 1 回目の停止は余裕の半分で、DISARM → 再 ARM で残りの半分を使える（露出は再 ARM でも戻さない）。2 回目の停止では基準を消す
+//   （POSITION_REFERENCED を落とし、ARM_PREPARE は NOT_REFERENCED。SET_REFERENCE か校正が要る）。見えない走行は合わせて余裕以内
+//  - 生きたエンコーダでも、完全に静止した保持（2 count の動きが無い）はこの期限で停止する（ブレーキが座席を保つ）
+#ifndef V1_SUP_DEADLINE_PROPORTIONAL
+#define V1_SUP_DEADLINE_PROPORTIONAL 1
+#endif
+constexpr int32_t V1_SUP_BACKDRIVE_COUNT_S = 200;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
