@@ -7,6 +7,7 @@ pub mod compat;
 pub mod config;
 pub mod limits;
 pub mod planner;
+pub mod prehistory;
 pub mod protocol;
 pub mod server;
 pub mod session;

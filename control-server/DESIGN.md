@@ -32,6 +32,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `planner` | 純粋 | 100Hz の 3 軸目標生成。速度制限は 3 軸一様スケール、加速度制限、停止（減速）モード |
 | `session` | 純粋 | 駆動クライアントのセッション（単一所有）、Pose 受理判定と鮮度 |
 | `supervisor` | 純粋 | リグ状態機械（計画 §10）。軸イベント・管理命令・tick を受けて軸ごとの送信メッセージを出す。Planner と校正を所有 |
+| `prehistory` | 純粋 | FAULT 直前の経過（Issue #34）: 軸ごとの STATUS の固定容量リングと、ラッチ時の 2 s / 20 Hz の切り出し（§7.2 `fault_history[].prehistory`） |
 | `axis_link` | 非同期 | 1 ポート 1 タスク。HELLO 照合、受信デコード、管理命令（優先・有界キュー）と SET_POSITION（最新 1 件）の送信、STATUS 途絶検出 |
 | `telemetry` | 純粋＋非同期 | 遅延統計（p50/p95/p99/max）、カウンター、有界リングのイベントログ（落とした件数を記録）、非同期 JSONL 記録 |
 | `api` | 非同期 | axum: Game API（WS /v1/motion、POST /v1/session）、GET /v1/status、管理 API。Origin 検査、トークン、本文長制限、rate limit |
@@ -242,7 +243,21 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `session.source_session_prefix`: 現行セッション id の先頭 8 桁（なければ null）。完全な id は `POST /v1/session` の応答でだけ返す（id が Pose 入力の唯一の鍵なので、認証なしの status に載せない）。自分のセッションか確かめるときは先頭 8 桁を比べる。
 - `active_source`: `"game"` / `"center"` / null（ACTIVE 以外）。
 - `fault`: null または `kind` で分かれるオブジェクト: `{"kind":"axis_fault","axis":1,"code":"FOLLOWING_ERROR"}` / `{"kind":"axis_disconnected","axis":2}` / `{"kind":"axis_rebooted","axis":3}` / `{"kind":"axis_changed","axis":1}`（駆動中に担当個体の系統が変わった、§10）/ `{"kind":"axis_state_mismatch","axis":1,"expected":"ACTIVE","actual":"DISARMED"}` / `{"kind":"arm_timeout"}` / `{"kind":"start_timeout","axis":2}`（START が確認できない。detail が `ack_timeout: …` なら ACK が来なかった、そうでなければ ACTIVE にならなかった軸の状態）/ `{"kind":"stop_timeout"}` / `{"kind":"frame_skew","max_skew_frames":6}` / `{"kind":"operator","note":"..."}`。リンク送信失敗は `operator` で note が `link_send_failed: …`。
-- `fault_history[]`: `{"at_ms": 14510.7, "fault": {…上と同じ形…}, "detail": null|"..."}`。`at_ms` は supervisor 起動からの ms（壁時計ではない）。最大 32 件、古いものから捨てる。ラッチ中に重なった原因も入る。
+- `fault_history[]`: `{"at_ms": 14510.7, "fault": {…上と同じ形…}, "detail": null|"...", "fault_event": null|{…}, "prehistory": null|{…}}`。`at_ms` は supervisor 起動からの ms（壁時計ではない）。最大 32 件、古いものから捨てる。ラッチ中に重なった原因も入る。`fault_event` / `prehistory` は Issue #34 で追加（既存の項目は変えていない）:
+  - `fault_event`: 軸の異常をその軸の FAULT_EVENT が知らせたときの中身 `{"axis":1,"boot_id":…,"mcu_time_us":…,"fault_code":"FOLLOWING_ERROR","mcu_state_before":"ACTIVE","mcu_state_before_raw":4,"actual_count":180}`（`mcu_state_before` は未知の値なら null）。STATUS が先にラッチした記録にも、後から届いた FAULT_EVENT が付く（記録は増やさない）。それ以外の原因は null。
+  - `prehistory`: ラッチ直前 2 s の全軸の STATUS を 50 ms 枠（20 Hz）ごとに 1 件（枠の中で最も新しいもの）へ間引いたもの。**新しいエピソードを始めた記録（最初の原因）だけ**が持ち、ラッチ中に重なった原因は null、次のエピソードがラッチすると古い記録からは外す（status を小さく保つため。最新の 1 件で約 6 KB）。サーバー側の原因（`start_timeout`・`stop_timeout`・`operator`・`axis_disconnected` など）にも付く。切断・再接続ではリングを消さないので、`axis_disconnected` でも途絶える前の STATUS が残る。軸ごとのリングは PC の受信時刻つきで 256 件（固定確保、STATUS ごとの確保なし）。
+    ```json
+    {"window_ms": 2000, "interval_ms": 50, "rig_state_before": "ACTIVE",
+     "requested_pose": {"pitch": 1.0, "roll": 1.0, "yaw": 0.0}, "effective_gain": 0.5,
+     "axes": [{"axis": 1,
+               "t_ms": [-1950, -1910, …, -50, -10],
+               "mcu_state": ["ACTIVE", …], "fault_code": ["NONE", …], "flags": [31, …],
+               "actual_count": [180, …, 180, 180], "target_count": [180, …, 861, 970],
+               "server_target_count": [180, …, 1095, 1215], "requested_count": [180, …, 2000, 2000],
+               "following_error_count": [0, …, -681, -790], "velocity_count_s": [0, …], "pwm_permille": [0, …, 1000, 1000]},
+              {"axis": 2, …}, {"axis": 3, …}]}
+    ```
+    列指向（項目ごとの配列。同じ添字が同じ STATUS で、古い順）。`t_ms` はラッチ時刻からの ms（負、PC の受信時刻）。`target_count` は MCU のセットポイント（STATUS）、`server_target_count` はサーバーが送った SET_POSITION の目標（armed 中以外は null）、`requested_count` は姿勢から求めた planner 前の目標（ACTIVE（game）中以外は null）。`flags` は STATUS.flags の生の値（bit0 POWER_ON_CMD、bit1 BRAKE_RELEASE_CMD、bit2 POSITION_REFERENCED、bit3 CONFIGURED、bit4 POWER_CONTROLLER、bit5 CURRENT_VALID、bit6 CLOCK_SYNCED）、`mcu_state` は未知の値なら null。STATUS が 1 件も無い軸は配列が空。`rig_state_before` はラッチ直前のリグ状態、`requested_pose` / `effective_gain` はラッチ時点の指令（無ければ null）。
 - `blockers`: ARM の前提条件だけ（`"<code>: <detail>"`）。armed 中は []。FAULT_LATCHED でも [] のことがある（ARM 拒否の理由は `fault`）ので、クライアントは `fault` も見る。
 - `axes[].device_id` は接続中の個体（無ければ設定値）、`expected_device_id` は設定の照合値（0 = 照合なし）、`assignment` は `"selected"`（MCU の `selected_axis`）/ `"config"`（`device_id` の後方互換経路）/ null（未接続）、`claimants` はこの軸を名乗るポート（通常は primary 1 つ、競合中は 2 つ以上）、`reference_stale` は同じ boot のまま系統を変えた個体で SET_REFERENCE のやり直し待ち。最上位の `axis_conflict` は競合中の軸番号（空なら無し）。§10。
 - `axes[].power_controller`: STATUS の `POWER_CONTROLLER` フラグ（MCU が自分を主電源担当と思っているか）。STATUS が無ければ null。
@@ -259,10 +274,11 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
             {"id": 12, "t_ms": 341.7, "kind": "rig_state", "detail": {"from": "ACTIVE", "to": "FAULT_LATCHED"}}]}
 ```
 
-- supervisor のイベント（`identified`・`disconnected`・`axis_rebooted`・`admin`・`ack_rejected`・`rig_state`・`stopping`・`center_reached`・`session_changed`・`ack_timeout`・`fault`・`fault_reset_timeout`・`calibrate`・`calibrate_cancelled`・`cal_result` など）を制御ループが有界リング（512 件、古いものから上書き）に積む。古い順。`id` は 1 からの通番で、抜けは上書きされた分。`t_ms` はサーバー起動からの ms（壁時計ではない）。
+- supervisor のイベント（`identified`・`disconnected`・`axis_rebooted`・`admin`・`ack_rejected`・`rig_state`・`stopping`・`center_reached`・`session_changed`・`ack_timeout`・`fault`・`fault_event`・`fault_prehistory`・`fault_reset_timeout`・`calibrate`・`calibrate_cancelled`・`cal_result` など）を制御ループが有界リング（512 件、古いものから上書き）に積む。古い順。`id` は 1 からの通番で、抜けは上書きされた分。`t_ms` はサーバー起動からの ms（壁時計ではない）。
 - `n`（既定 100、最大はリングの大きさ）: 新しい方から n 件。`after`: `id > after` のものだけ（ポーリングでは前回の最後の `id` を渡す）。`n` / `after` が数でなければ 400 `bad_request`。
 - 制御ループが落ちた後（`GET /v1/status` が 503）も読める（落ちる前の経過を見るため）。
-- 同じイベントは標準エラーにも出る（`fault` は error、`rig_state` は "rig state" の行、他は info。`RUST_LOG` 既定 `info`）。ファイルへの JSONL 記録（`telemetry.rs` の `Recorder`）は未配線。サーバーを再起動するとリングは空になる。
+- Issue #34: `fault_event` は FAULT_EVENT が届くたび（HOST_FAULT の折り返しを含む。記録に残らないものも）に §7.2 の `fault_event` と同じ形。`fault` の detail にも、FAULT_EVENT が知らせた原因なら `fault_event` が付く。`fault_prehistory` はエピソードの最初のラッチで 1 回だけ、`{"at_ms":…,"fault":{…},"fault_event":null|{…},"prehistory":{…§7.2 と同じ形…}}`（約 6 KB）。
+- 同じイベントは標準エラーにも出る（`fault` は error、`fault_prehistory` は warn の "fault pre-history" の行（JSON 1 行）、`rig_state` は "rig state" の行、他は info。`RUST_LOG` 既定 `info`）。ファイルへの JSONL 記録（`telemetry.rs` の `Recorder`）は未配線。サーバーを再起動するとリングは空になる。
 
 ### 7.4 試験ページ `GET /`
 
