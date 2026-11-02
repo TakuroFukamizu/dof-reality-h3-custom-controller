@@ -225,6 +225,7 @@ inline void test_r10_dead_encoder_near_end_budgets() {
         Harness h;
         const int32_t ref = dir > 0 ? 2700 + 50 - k.d : -2700 - 50 + k.d;
         r10_active(h, ref);
+        h.ax.tuning.soft_reserve_count = 0;  // 参照の端の手前の減速（Issue #45 / #46）を外し、監視の予算だけを見る（参照は既定では監視の帯の外で止まる）
         int expect = ticks_for_budget(k.budget);
         double bound = k.budget;
         if (mode == Projection5) {
@@ -254,6 +255,7 @@ inline void test_r10_irregular_ticks_stay_within_budget() {
   for (int32_t ref : {0, 2100}) {
     Harness h;
     r10_active(h, ref);
+    h.ax.tuning.soft_reserve_count = 0;  // 参照の端の手前の減速を外し、監視の予算だけを見る
     h.enc_connected = false;
     const double phys0 = h.phys;
     for (int i = 0; i < 300; ++i) {
@@ -747,6 +749,7 @@ inline void test_r10_escalation_lifts_axis_needing_15_percent() {
 inline void test_r10_escalation_to_duty_max_then_braked_inhibit() {
   Harness h;
   const EscResult r = escalation_run(h, 249, 26, 3000);
+  if (std::getenv("R10_PRINT")) std::printf("esc 25%%: max_out %d moved %d\n", r.max_out, r.moved ? 1 : 0);
   CHECK(r.max_out == 200 && !r.moved);
   CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && no_fault_events(h));
   Harness g;
@@ -793,6 +796,51 @@ inline void test_r10_residual_pulses_limited_then_zero_output() {
   h.pwm_deadband_permille = 0;
   drive_count_nonzero(h, 800, start - 300);
   CHECK(!h.ax.residual_accepted() && std::abs(h.ax.actual_count() - (start - 300)) <= V1_RESIDUAL_BAND_COUNT);
+}
+
+
+// r10 統合（PR #48 × #49）: 端の余裕の一元化。再生バッファの参照が端へ向かうと、参照はソフトリミットから V1_SOFT_RESERVE_COUNT（= 400 − 50 + 250
+// = 600）の手前で止まり、そこは監視の「端へ出せない帯」（機械端から 400）の外に 250 count の予算を残す所。PWM で動くプラント（エンコーダは
+// 生きている）で ±600 count/s のランプを端の先まで送っても、停止も FAULT も無く参照の止まる所に着く。#49 の元の余裕（100）なら帯の中まで
+// 進もうとして停止（ブレーキ）になり、余裕 100（450）でも寄せの終わりで止まる
+inline void test_r10_integrated_playout_stops_outside_no_drive_zone() {
+  CHECK(V1_SOFT_RESERVE_COUNT == V1_SUP_END_RESERVE_COUNT - V1_MECH_DECEL_ZONE_COUNT + V1_SUP_END_MARGIN_COUNT);
+  CHECK(V1_SOFT_RESERVE_COUNT == 600 && V1_SOFT_BRAKE_ACC_COUNT_S2 == static_cast<double>(V1_BRAKE_GUARD_ACC_COUNT_S2));
+  for (int dir : {1, -1}) {
+    for (int32_t reserve : {V1_SOFT_RESERVE_COUNT, int32_t{100}, int32_t{450}}) {
+      Harness h;
+      r10_active(h, 0, 400);
+      h.ax.tuning.soft_reserve_count = reserve;
+      h.ax.tuning.playout_delay_ms = 40;  // 再生バッファの参照（-DV1_PLAYOUT=0 の構成でも明示的に使う。端の手前の減速はこの経路だけ）
+      h.pos_max_vel = 600;
+      double tgt = 0.0;
+      bool guard_seen = false;
+      for (int i = 0; i < 700; ++i) {  // 7 s: 600 count/s で ±3000 まで（ソフトリミット ±2700 の先）、その後は止めて保持
+        if (std::fabs(tgt) < 3000.0) tgt += dir * 6.0;
+        h.set_position(static_cast<int32_t>(tgt));
+        h.idle(10);
+        if (h.ax.supervisor().end_braking()) guard_seen = true;
+        if (h.ax.supervisor_inhibited() || h.ax.state() == st::FAULT) break;
+      }
+      const v1::Config c = base_config();
+      const int32_t stop_at = dir > 0 ? c.soft_max_count - reserve : c.soft_min_count + reserve;
+      if (std::getenv("R10_PRINT")) {
+        std::printf("integrated dir %+d reserve %d: actual %d target %d inhibited %d fault %u guard %d budget %d/%d\n", dir, reserve,
+                    h.ax.actual_count(), h.ax.target_count(), h.ax.supervisor_inhibited() ? 1 : 0, h.ax.fault_code(),
+                    guard_seen ? 1 : 0, h.ax.supervisor_info().budget_up, h.ax.supervisor_info().budget_down);
+      }
+      if (reserve == V1_SOFT_RESERVE_COUNT) {
+        CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited() && !guard_seen);
+        const V1SupInfo info = h.ax.supervisor_info();
+        CHECK((dir > 0 ? info.budget_up : info.budget_down) >= 100);  // 着いた後も端の向きに 100 count 以上の予算が残る
+        CHECK(std::abs(h.ax.target_count() - stop_at) <= 1 && std::abs(h.ax.actual_count() - stop_at) <= V1_RESIDUAL_BAND_COUNT);
+      } else {
+        // 100（#49 の元の値）: 帯の中へ進もうとして止まる。450（余裕 100）: 帯の外で止まるが、参照の寄せの終わり（減速の尾で軸が
+        // 確かに動かない間も FF が端の向きに出る）で余裕を使い切って止まる。余裕は 250 にした（下の config.h の説明）
+        CHECK(h.ax.supervisor_inhibited() && h.ax.supervisor().feedback_uncertain());
+      }
+    }
+  }
 }
 
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
@@ -842,6 +890,7 @@ inline void run_all() {
   test_r10_escalation_to_duty_max_then_braked_inhibit();
   test_r10_escalation_cut_by_budget_when_encoder_dead();
   test_r10_residual_pulses_limited_then_zero_output();
+  test_r10_integrated_playout_stops_outside_no_drive_zone();
   test_r10_status_flags_bits();
 }
 

@@ -73,7 +73,10 @@ struct V1Snapshot {
   uint32_t tx_deferred = 0;      // TX リングに空きが無く次の poll に回した回数（Issue #15 M7）
   uint32_t tx_stale_dropped = 0; // 古い／入らない STATUS と期限切れの保留を捨てた数
   uint32_t tick_count = 0;
-  uint32_t max_tick_gap_us = 0;  // 起動からの tick 間隔の最大
+  uint32_t max_tick_gap_us = 0;  // 起動から（またはリセットから）の tick 間隔の最大
+  uint32_t active_max_tick_gap_us = 0;  // ACTIVE 中の tick 間隔の最大（PR #49 レビュー P2c。画面のタップで 0 に戻す）
+  uint32_t exec_max_us = 0;      // 制御 tick の処理時間の最大 [us]（入口の now から出力・送信キューまで）
+  uint32_t exec_recent_us = 0;   // 同、直近 1 s の最大
   uint64_t device_id = 0;
   uint32_t boot_id = 0;
   // 校正（CALIBRATING / CAL_RESULT）
@@ -95,5 +98,6 @@ void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis);  /
 void control_v1_select_axis(uint8_t axis);   // DISARMED のときだけ V1Axis が受け付ける
 void control_v1_set_estop(bool latched);     // 画面の非常停止（ラッチ / 解除）
 void control_v1_clear_profile_dirty();       // loop() が NVS に保存した後に呼ぶ
+void control_v1_reset_tick_stats();          // tick の計器（間隔の最大・処理時間・ACTIVE 中の間隔）を 0 に戻す
 V1Snapshot control_v1_snapshot();
 #endif

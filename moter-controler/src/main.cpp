@@ -1042,7 +1042,7 @@ char notice[32];
 uint32_t notice_until_ms = 0;
 char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
 
-enum class V1Action : uint8_t { Motor, Estop };
+enum class V1Action : uint8_t { Motor, Estop, ResetTick };
 
 struct V1Button {
   int x;
@@ -1053,7 +1053,7 @@ struct V1Button {
 };
 
 constexpr int kMargin = 6;
-V1Button v1_buttons[2];
+V1Button v1_buttons[3];
 
 void showNotice(const char* text) {
   snprintf(notice, sizeof(notice), "%s", text);
@@ -1064,6 +1064,7 @@ void showNotice(const char* text) {
 void layoutV1(int width, int height) {
   v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
   v1_buttons[1] = {kMargin, height - 42, width - kMargin * 2, 36, V1Action::Estop};  // 上に USB 診断行と制御項の行を置く
+  v1_buttons[2] = {kMargin, 166, width - kMargin * 2, 14, V1Action::ResetTick};       // tick 行（タップで計器を 0 に）
 }
 
 const V1Button* hitV1(int x, int y) {
@@ -1150,6 +1151,10 @@ void onV1Button(const V1Button& b) {
     case V1Action::Estop:
       control_v1_set_estop(!vsnap.estop_latched);
       showNotice(vsnap.estop_latched ? "非常停止を解除" : "非常停止");
+      break;
+    case V1Action::ResetTick:
+      control_v1_reset_tick_stats();
+      showNotice("tick 計器を 0 に");
       break;
   }
 }
@@ -1323,12 +1328,17 @@ void renderV1() {
   }
   canvas.drawString(cal_text, 8, 155);
 
-  // tick 行（周期の守りの確認用）
-  char tick_text[64];
-  snprintf(tick_text, sizeof(tick_text), "tick %lu  最大間隔 %lu us%s%s", static_cast<unsigned long>(vsnap.tick_count),
-           static_cast<unsigned long>(vsnap.max_tick_gap_us), boot_error[0] ? "  ERR " : "", boot_error);
+  // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す）。
+  // gap = tick 間隔の最大、act = ACTIVE 中の間隔の最大、exe = 処理時間の最大 / 直近 1 s の最大 [us]
+  char tick_text[96];
+  snprintf(tick_text, sizeof(tick_text), "tick %lu gap %lu act %lu exe %lu/%lu us%s%s",
+           static_cast<unsigned long>(vsnap.tick_count), static_cast<unsigned long>(vsnap.max_tick_gap_us),
+           static_cast<unsigned long>(vsnap.active_max_tick_gap_us), static_cast<unsigned long>(vsnap.exec_max_us),
+           static_cast<unsigned long>(vsnap.exec_recent_us), boot_error[0] ? " ERR " : "", boot_error);
+  canvas.setFont(&fonts::Font0);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
 
   // USB 診断行（Issue #11）。6x8 の ASCII フォント。意味は usb_diag_format() のコメント。
   canvas.setFont(&fonts::Font0);

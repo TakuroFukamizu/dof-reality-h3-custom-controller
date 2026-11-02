@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <esp_mac.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #include <atomic>
 #include <string.h>
@@ -90,6 +91,7 @@ void v1_link_poll() {
     usb_diag_note_rx(1);
     if (g_split.push(static_cast<uint8_t>(c))) {
       V1RxFrame f;
+      f.rx_us = static_cast<uint64_t>(esp_timer_get_time());  // Issue #45: 制御タスクが取り出すまでの待ちを再生の時刻に入れない
       f.len = static_cast<uint16_t>(g_split.len);
       memcpy(f.data, g_split.buf, g_split.len);
       if (xQueueSend(g_rx, &f, 0) != pdTRUE) {

@@ -13,3 +13,7 @@ c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -I../include test_host.cpp -o
 # r10（Issue #44・#46）: 監視を切った焼き方（-DV1_SUPERVISOR=0 = r9 と同じ判定）でも全テストが通ること（r10 の試験は監視を明示的に ON にしている）
 c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_SUPERVISOR=0 -I../include test_host.cpp -o /tmp/moter_controler_host_nosup
 /tmp/moter_controler_host_nosup
+# Issue #45: 再生バッファ（config.h V1_PLAYOUT=1）は上の 2 つで既定のまま回る（焼く既定）。従来の軌道 profile_step（-DV1_PLAYOUT=0）
+# でも通ること（test_playout_* は playout_delay_ms を明示しているので、こちらでも再生バッファを検証する）
+c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_PLAYOUT=0 -I../include test_host.cpp -o /tmp/moter_controler_host_noplayout
+/tmp/moter_controler_host_noplayout

@@ -277,6 +277,15 @@ constexpr int V1_SUP_ENV_REF_PERMILLE = V1_SUP_ENV_PROPORTIONAL ? V1_SUP_ENV_PRO
 constexpr int32_t V1_SUP_BUDGET_MAX_COUNT = 1000;
 constexpr int32_t V1_SUP_END_RESERVE_COUNT = 400;
 constexpr int32_t V1_MECH_DECEL_ZONE_COUNT = 50;
+// 再生バッファ（Issue #45）の参照が端の手前で止まる位置に残す、見えない走行の予算の余裕 [count]。参照の止まる位置 =
+// ソフトリミットから V1_SUP_END_RESERVE_COUNT − V1_MECH_DECEL_ZONE_COUNT + これ（V1_SOFT_RESERVE_COUNT、下の再生バッファの節）。
+// 最悪の tick の先読み（2500 count/s × V1_OVERRUN_MS 15 ms = 37.5）以上が要る（static_assert）。さらに、参照の寄せの終わり（減速の尾。
+// 参照速度が数十 count/s の間は FF の切片が端の向きに出るのに、軸は 2 count 確かに動くまで時間が掛かる）の包絡線もここから払う。
+// ホストの PWM プラント（test_r10_integrated_playout_stops_outside_no_drive_zone）では余裕 100 だと寄せの終わりで尽き、150 で残り 86、
+// 250 で残り 125 以上だったので 250 にした（仮値。実機の慣性・遅れで要確認）。代償: 参照はソフトリミットから 600（機械端から 650）の
+// 手前で止まる（ストローク 5551 なら使えるのは約 4250）。一律の包絡線と予算 D − 400 のまま範囲を広げるには、比例の包絡線
+//（V1_SUP_ENV_PROPORTIONAL）か最小予算（V1_SUP_MIN_BUDGET）の検証が要る
+constexpr int32_t V1_SUP_END_MARGIN_COUNT = 250;
 // 確認のための最小の予算（仕様からの逸脱。既定 0 = 仕様どおり）: -DV1_SUP_MIN_BUDGET=1 で min(50, max(0, D − V1_END_HARD_MARGIN_COUNT))
 // を下限にする（端から 400 以内でも 20 ms 分は端へ出せる）
 #ifndef V1_SUP_MIN_BUDGET
@@ -337,9 +346,10 @@ constexpr int V1_FE_HARD_RATIO_PERCENT = 150;       // |誤差| が上限の 1.5
 //    ENCODER_FAULT になった）。進んだ窓では上げずに保つ（下げると止まってまた上げ直す鋸歯になる）。誤差の向きの反転・保持・
 //    |誤差| ≤ 帯・軌道が動く・停止で 0 に戻す。duty_max でも進まなければ LOAD_LIMITED（飽和 1 s）か、カウントが全く動かなければ
 //    その前に見えない走行の予算（中央付近 400 ms）で停止（どちらも PWM 0 ＋ ブレーキ）。ENCODER_FAULT にはしない。
-//    刻みは 50 ms ごとに 2 %: 一律の包絡線の予算（1000 count = 400 ms）の中で duty_max 20 % に届く（約 200 ms）ように選んだ
-//   （100 ms ごとに 1 % だと 20 % まで 1 s 掛かり、予算が先に尽きる）
-constexpr int V1_ESCALATE_STEP_PERMILLE = 20;
+//    刻みは 50 ms ごとに 3 %: 一律の包絡線の予算（1000 count = 400 ms）の中で、再生バッファ（Issue #45）の参照が目標に寄り切るまでの
+//    出力の分を引いても duty_max 20 % に届く（止まってから約 150〜200 ms）ように選んだ（100 ms ごとに 1 % だと 20 % まで 1 s 掛かり、
+//    予算が先に尽きる。r10 統合の前は 2 % だったが、参照の寄せの分で 19 % 止まりになった）
+constexpr int V1_ESCALATE_STEP_PERMILLE = 30;
 constexpr uint32_t V1_ESCALATE_WINDOW_MS = 50;
 // B. 小さな残り誤差: 軌道が止まっていて保持でなく |誤差| ≤ V1_RESIDUAL_BAND_COUNT のときは、出力は動き出しパルスだけ（その間の P + I は
 //    0。数 permille の P + I は静止摩擦に届かず、熱と見えない走行の予算を使うだけ）。進まないパルスが V1_RESIDUAL_MAX_PULSES 回に
@@ -349,12 +359,48 @@ constexpr uint32_t V1_ESCALATE_WINDOW_MS = 50;
 constexpr int32_t V1_RESIDUAL_BAND_COUNT = 6;
 constexpr int32_t V1_RESIDUAL_EXIT_COUNT = 12;
 constexpr int V1_RESIDUAL_MAX_PULSES = 3;
+// Issue #45: 再生バッファ（playout）で SET_POSITION の列から参照（位置・速度）を作る。既定 1、-DV1_PLAYOUT=0 で従来の
+// 「目標ごとに行って止まる」軌道（profile_step）に戻る（V1Tuning::playout_delay_ms = 0 と同じ）。
+// 従来の欠陥: 100 Hz の整数の目標を毎回の移動先として扱い、追いつくと速度を加速度制限を迂回して 0 にしていた → ゆっくり
+//（≲ 70 count/s）では FF（切片 4.6 % を |v| < 30 でテーパ）と r9 の減衰が 1 tick で約 50 permille 抜ける。
+// 新しい経路: 受信時刻つきでフレームをリングに積み、playout 時刻 = いま − DELAY で、その前後 WINDOW の最小二乗直線から
+// 位置・速度を出し、速度・加速度の制限（フレームの max_vel / max_acc。CONFIG で頭打ち）の中で参照を追従させる。
+// 新しいフレームが途切れたら EXTRAP_MS までは直線で外挿、それを越えたら max_acc で減速する（期限 valid_for の扱いは従来どおり）。
+#ifndef V1_PLAYOUT
+#define V1_PLAYOUT 1
+#endif
+#ifndef V1_PLAYOUT_DELAY_MS
+#define V1_PLAYOUT_DELAY_MS 40                            // 再生の遅れ（20 / 40 / 60 を実機で比べる。Issue #45）
+#endif
+constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを推定する窓（playout 時刻を中心に ±窓/2）
+constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
+constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）。目標が動いている間
+constexpr double V1_PLAYOUT_KP_FLAT_PER_S = 40.0;         // 同、目標が止まっている（窓の目標がすべて同じ）とき
+// PR #49 レビュー P1a: フレームが途切れても参照が「受けた最新の目標」をこれ以上越えないよう、最新の目標 + これまでに止まれる速さに抑える
+constexpr int32_t V1_PLAYOUT_LOSS_MARGIN_COUNT = 5;
+// PR #49 レビュー P1b: 減速（再生バッファの制動・途切れ・STOPPING）に使う加速度の下限 [count/s²]。フレームの max_acc が 0・ごく小さくても止まる
+constexpr uint32_t V1_MIN_DECEL_COUNT_S2 = 500;
+constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
+// Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
+// ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。
+// !!! A_BRAKE・RESERVE は仮値。実機が実際に止まれる減速度と、全速（600 count/s）から止めたときの行き過ぎを計測して決めること。
+// r10 統合（PR #48 × #49）: どちらも保護の監視の値から作る（一元化。上の V1_SUP_END_RESERVE_COUNT / V1_MECH_DECEL_ZONE_COUNT /
+// V1_SUP_END_MARGIN_COUNT / V1_BRAKE_GUARD_ACC_COUNT_S2 を変えれば両方が動く）。
+//  - A_BRAKE = 端の手前の制動（END_BRAKING）の減速度。参照の減速度 ≤ 制動の減速度なので、参照どおりに追従している限り制動は掛からない
+//  - RESERVE = 監視の「端へ出せない帯」（機械端から V1_SUP_END_RESERVE_COUNT = ソフトリミットから 400 − 50 = 350）の外に、
+//    V1_SUP_END_MARGIN_COUNT（250）だけ見えない走行の予算を残す所 = ソフトリミットから 600。最後の寄せ（ゆっくり近づく間は確かな動き
+//    2 count までの包絡線を積む）と最悪の tick（15 ms = 37.5 count）の先読みを、その予算で賄う
+constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = static_cast<double>(V1_BRAKE_GUARD_ACC_COUNT_S2);
+constexpr int32_t V1_SOFT_RESERVE_COUNT = V1_SUP_END_RESERVE_COUNT - V1_MECH_DECEL_ZONE_COUNT + V1_SUP_END_MARGIN_COUNT;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
 constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
-constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
+constexpr uint32_t V1_OVERRUN_MS = 15;
+// r10 統合: 参照の止まる位置の余裕は、最悪の tick の先読みの包絡線より大きくなければならない
+static_assert(static_cast<int64_t>(V1_SUP_END_MARGIN_COUNT) * 1000 >= static_cast<int64_t>(V1_SUP_ENV_COUNT_S) * V1_OVERRUN_MS,
+              "V1_SUP_END_MARGIN_COUNT must cover one worst-case tick of the blind-drive envelope");          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
