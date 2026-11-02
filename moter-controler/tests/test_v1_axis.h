@@ -4005,6 +4005,23 @@ inline void test_r8_band_stuck_assist_short_pulses_with_cooldown() {
   CHECK(!any_brk && d.ax.state() == st::ACTIVE);
 }
 
+// 2026-11-02 16:10 の #3: 保持（出力 0）に入った後に 1〜2 count ずれて |誤差| 3〜4 のまま静止しても、静止の監視で ENCODER_FAULT にしない
+inline void test_hold_drift_within_band_is_not_encoder_fault() {
+  Harness h;
+  h.ax.tuning = r6_tuning(30);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.drive(600, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+  h.stall = true;
+  h.raw -= 3;  // 保持の中で 3 count ずれた（保持から出るのは > 4）
+  h.drive(3000, h.ax.target_count());
+  CHECK(h.ax.state() == st::HOLDING && h.ax.fault_code() == 0);
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+}
+
 // SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
 inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
   V1Tuning a = r6_tuning(6, 20);
@@ -5049,6 +5066,7 @@ inline void run_all() {
   test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall();
   test_r6_stall_watchdog_ignores_motion_away_from_target();
   test_r7_stationary_error_3_gets_breakaway_and_watchdog();
+  test_hold_drift_within_band_is_not_encoder_fault();
   test_r8_band_stuck_assist_short_pulses_with_cooldown();
   test_r9_tuning_defaults_and_switch();
   test_r9_damping_term_sign_and_clamp();

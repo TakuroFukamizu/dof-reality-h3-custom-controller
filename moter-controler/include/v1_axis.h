@@ -1986,7 +1986,10 @@ class V1Axis {
     const int64_t err_abs = err < 0 ? -err : err;
     // r6 は hold_exit（4）、r7 は hold_enter（2）: 保持に入れない静止誤差は動き出しパルスとこの監視の対象（出力が流れ続ける帯を残さない）
     const int64_t gate = tuning.ff_directional ? tuning.hold_enter : tuning.band_exit();
-    const bool eligible = setpoint_vel_ == 0.0 && err_abs > gate && brake_release_cmd_;
+    // 2026-11-02 16:10: 保持（HOLD、出力 0）の中では見ない。保持に入った後に 1 count ずれて |誤差| 3（保持から出るのは > 4）のまま
+    // 出力 0 で静止していた #3 が、何も押していないのに「押しても動かない」と判定されて ENCODER_FAULT になった
+    const bool in_hold = tuning.ff_directional && duty_state_.in_band;
+    const bool eligible = setpoint_vel_ == 0.0 && err_abs > gate && brake_release_cmd_ && !in_hold;
     if (!eligible) { reset_stall_boost(); return; }
     const int8_t err_sign = err > 0 ? 1 : -1;
     if (!boost_eligible_ || err_sign != boost_err_sign_) {
