@@ -71,6 +71,7 @@ struct Harness {
   double pwm_count_s_per_permille = 12.0;  // 20 % で 2400 count/s（比例の包絡線 12.5 の下）
   double plant_max_vel = 1e9;
   int pwm_deadband_permille = 0;
+  bool pwm_deadband_subtract = false;  // true なら速度 = (|pwm| − deadband) × 係数（静止摩擦を越えた分だけで動く。荷重で 15 % 要る軸など）
   double ext_vel = 0.0;
   uint32_t brake_delay_ms = 0;
   bool brake_fails = false;
@@ -224,6 +225,7 @@ struct Harness {
       const bool engaged = !released && !brake_fails && now - brake_cmd_off_at >= brake_delay_ms * MS;
       if (released && !held && (u > pwm_deadband_permille || u < -pwm_deadband_permille)) {
         v = static_cast<double>(u) * pwm_count_s_per_permille;
+        if (pwm_deadband_subtract) v = static_cast<double>(u > 0 ? u - pwm_deadband_permille : u + pwm_deadband_permille) * pwm_count_s_per_permille;
         if (v > plant_max_vel) v = plant_max_vel;
         if (v < -plant_max_vel) v = -plant_max_vel;
       }
@@ -3665,6 +3667,8 @@ inline void test_r6_breakaway_pulse_output() {
 inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  // r10: 監視 ON では静止目標の小さな誤差（≤ 6）はパルスの間だけ出力し、それより大きい誤差は引き上げになる（test_r10_*）。ここは r6 の P + I・パルスの仕組みを見る試験なので監視を切る
+  h.ax.tuning.supervisor = false;
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3731,6 +3735,8 @@ inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
 inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  // r10: 監視 ON では静止目標の小さな誤差（≤ 6）はパルスの間だけ出力し、それより大きい誤差は引き上げになる（test_r10_*）。ここは r6 の P + I・パルスの仕組みを見る試験なので監視を切る
+  h.ax.tuning.supervisor = false;
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
@@ -3748,6 +3754,8 @@ inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   // 自重で逆へ動くのは「進み」ではない: 上の要求（誤差 +10）でカウントが下がっても窓は取り直されずパルスが出る
   Harness g;
   g.ax.tuning = r6_tuning(2);
+  // r10: 監視 ON では静止目標の小さな誤差（≤ 6）はパルスの間だけ出力し、それより大きい誤差は引き上げになる（test_r10_*）。ここは r6 の P + I・パルスの仕組みを見る試験なので監視を切る
+  g.ax.tuning.supervisor = false;
   Harness::accepted(g.config_with(c));
   g.reach_holding_from_configured();
   g.stall = true;

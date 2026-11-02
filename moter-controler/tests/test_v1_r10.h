@@ -345,11 +345,11 @@ inline void test_r10_gravity_drift_with_brake_vs_without() {
     h.ext_vel = -300.0;  // 自重（ブレーキ解除中は制御が打ち消している）
     drive_count_nonzero(h, 300, 0);
     CHECK(!h.ax.supervisor_inhibited());
-    h.enc_connected = false;  // エンコーダが死ぬ → 予算で停止
-    for (int i = 0; i < 200 && !h.ax.supervisor_inhibited(); ++i) drive_count_nonzero(h, 5, 0);
+    h.enc_connected = false;  // エンコーダが死んだまま上へ動かそうとする → 予算で停止
+    for (int i = 0; i < 200 && !h.ax.supervisor_inhibited(); ++i) drive_count_nonzero(h, 5, 300);
     CHECK(braked_inhibit(h));
     const double at_inhibit = h.phys;
-    drive_count_nonzero(h, 1000, 0);
+    drive_count_nonzero(h, 1000, 300);
     const double drift = fabs(h.phys - at_inhibit);
     if (std::getenv("R10_PRINT")) std::printf("gravity: delay %u fails %d drift %.1f\n", k.delay_ms, k.fails ? 1 : 0, drift);
     if (k.fails) {
@@ -683,6 +683,118 @@ inline void test_r10_known_hole_noisy_pm2_feedback_renews_budget() {
   }
 }
 
+
+// --- 静止目標での引き上げ（A）と小さな残り誤差の受け入れ（B）。Issue #44 の 14:22 の実測 -------------------------------
+
+// 静止で |誤差| 26（#1 が最下端で行き過ぎた量）の軸を、指定の Duty（静止摩擦）を越えないと動かないプラントで戻す。最大の出力・動いたか・結果を返す
+struct EscResult {
+  int max_out = 0;
+  int32_t final_err = 0;
+  bool moved = false;
+  double blind = 0.0;
+};
+inline EscResult escalation_run(Harness& h, int deadband_pm, int32_t err0, uint32_t ms, bool disconnect = false,
+                                double creep = 0.0) {
+  r10_active(h, 0, 200);
+  h.pwm_deadband_permille = deadband_pm;
+  h.pwm_deadband_subtract = true;
+  const int32_t start = h.ax.actual_count();
+  const int32_t target = start + err0;
+  drive_count_nonzero(h, 60, target);  // 軌道が目標に着く（プラントは静止摩擦で動かない）
+  if (disconnect) h.enc_connected = false;
+  h.ext_vel = creep;
+  const double phys0 = h.phys;
+  EscResult r;
+  for (uint32_t t = 0; t < ms && !h.ax.supervisor_inhibited(); t += 5) {
+    if ((t % 10) == 0) h.set_position(target);
+    h.step(5);
+    const int u = std::abs(h.ax.pwm_permille());
+    if (u > r.max_out) r.max_out = u;
+  }
+  r.final_err = target - h.ax.actual_count();
+  r.moved = std::abs(h.ax.actual_count() - start) >= 10;
+  r.blind = fabs(h.phys - phys0);
+  return r;
+}
+
+// A: 15 % 要る軸。合成（P 78 + I）では動かないが、引き上げが 15 % を越えて動き、目標の近く（残り誤差の帯）に着く。停止も FAULT も無い
+inline void test_r10_escalation_lifts_axis_needing_15_percent() {
+  Harness h;
+  const EscResult r = escalation_run(h, 149, 26, 2000);
+  if (std::getenv("R10_PRINT")) std::printf("esc 15%%: max_out %d final_err %d moved %d\n", r.max_out, r.final_err, r.moved ? 1 : 0);
+  CHECK(r.max_out >= 150 && r.moved && std::abs(r.final_err) <= V1_RESIDUAL_BAND_COUNT + 3);
+  CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
+  CHECK(h.ax.escalation_permille() == 0);  // 着いたら戻る
+  // 監視 OFF（r9 と同じ）では引き上げが無く、動けないまま静止 2 s の監視で ENCODER_FAULT（14:22 の #1 の再現）
+  Harness k;
+  r10_active(k, 0, 200);
+  k.ax.tuning.supervisor = false;
+  k.pwm_deadband_permille = 149;
+  k.pwm_deadband_subtract = true;
+  const int32_t t0 = k.ax.actual_count() + 26;
+  int max_out = 0;
+  for (int i = 0; i < 500 && k.ax.state() != st::FAULT; ++i) {
+    if ((i % 2) == 0) k.set_position(t0);
+    k.step();
+    if (std::abs(k.ax.pwm_permille()) > max_out) max_out = std::abs(k.ax.pwm_permille());
+  }
+  if (std::getenv("R10_PRINT")) std::printf("esc off: fault %u max_out %d\n", k.ax.fault_code(), max_out);
+  CHECK(k.ax.fault_code() == fc::ENCODER_FAULT);
+}
+
+// A: 25 % 要る軸（duty_max 20 % では動かない）。duty_max まで引き上げ、カウントが全く動かないので見えない走行の予算で PWM 0 ＋ ブレーキ。
+// 少しずつ動く（15 count/s のにじみ）なら予算は戻り、duty_max の飽和 1 s で LOAD_LIMITED（ブレーキ）。どちらも ENCODER_FAULT にしない
+inline void test_r10_escalation_to_duty_max_then_braked_inhibit() {
+  Harness h;
+  const EscResult r = escalation_run(h, 249, 26, 3000);
+  CHECK(r.max_out == 200 && !r.moved);
+  CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && no_fault_events(h));
+  Harness g;
+  const EscResult q = escalation_run(g, 249, 40, 3000, false, 15.0);
+  if (std::getenv("R10_PRINT")) std::printf("esc 25%% creep: max_out %d final_err %d\n", q.max_out, q.final_err);
+  CHECK(q.max_out == 200);
+  CHECK(braked_inhibit(g) && g.ax.supervisor().load_limited() && !g.ax.supervisor().feedback_uncertain() && no_fault_events(g));
+}
+
+// A: 引き上げの途中でエンコーダが死ぬ（物理は 15 % を越えて動く）→ 引き上げは duty_max まで続くが、見えない走行の予算で止まる（物理の移動 ≤ 1000）
+inline void test_r10_escalation_cut_by_budget_when_encoder_dead() {
+  Harness h;
+  const EscResult r = escalation_run(h, 149, 26, 3000, true);
+  if (std::getenv("R10_PRINT")) std::printf("esc dead: max_out %d blind %.1f\n", r.max_out, r.blind);
+  CHECK(r.max_out == 200 && r.blind > 0.0 && r.blind <= 1000.0);
+  CHECK(braked_inhibit(h) && h.ax.supervisor().feedback_uncertain() && no_fault_events(h));
+}
+
+// B: 保持の近くで残り誤差 4（下向き）、プラントは 6 %（下向きのパルス 60）では動かない（#2 の 14:22）: パルスは 3 回まで、その後は出力 0 の
+// まま（パルスの合間も 0。「4 で止まったまま P + I が流れる」r6 の振る舞いにならない）。|誤差| が 12 を超える（目標が動く）と解除して動く
+inline void test_r10_residual_pulses_limited_then_zero_output() {
+  Harness h;
+  r10_active(h, 0, 200);
+  h.pwm_deadband_permille = 60;
+  const int32_t start = h.ax.actual_count();
+  int onsets = 0;
+  bool prev_brk = false;
+  int nonzero_after_accept = 0;
+  int nonzero_non_pulse = 0;
+  for (int i = 0; i < 600; ++i) {  // 3 s
+    if ((i % 2) == 0) h.set_position(start - 4);
+    h.step();
+    const bool brk = h.ax.breakaway_active();
+    if (brk && !prev_brk) ++onsets;
+    prev_brk = brk;
+    if (h.ax.residual_accepted() && h.ax.pwm_permille() != 0) ++nonzero_after_accept;
+    if (!brk && h.ax.pwm_permille() != 0 && h.ax.duty_terms().vel_count_s == 0) ++nonzero_non_pulse;
+  }
+  if (std::getenv("R10_PRINT")) std::printf("residual: onsets %d accepted %d\n", onsets, h.ax.residual_accepted() ? 1 : 0);
+  CHECK(onsets >= 1 && onsets <= V1_RESIDUAL_MAX_PULSES);
+  CHECK(h.ax.residual_accepted() && nonzero_after_accept == 0 && nonzero_non_pulse == 0 && h.ax.pwm_permille() == 0);
+  CHECK(h.ax.following_error_count() == 4 && h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
+  // 目標が動けば解除（遠くへ）: 動き出す
+  h.pwm_deadband_permille = 0;
+  drive_count_nonzero(h, 800, start - 300);
+  CHECK(!h.ax.residual_accepted() && std::abs(h.ax.actual_count() - (start - 300)) <= V1_RESIDUAL_BAND_COUNT);
+}
+
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
 inline void test_r10_status_flags_bits() {
   CHECK(fl::LOAD_LIMITED == 0x80 && fl::FEEDBACK_UNCERTAIN == 0x100 && fl::END_BRAKING == 0x200 && fl::LIMIT_RECOVERY == 0x400);
@@ -726,6 +838,10 @@ inline void run_all() {
   test_r10_soft_limit_default_latch_and_grace_variant();
   test_r10_following_error_default_and_grace_variant();
   test_r10_known_hole_noisy_pm2_feedback_renews_budget();
+  test_r10_escalation_lifts_axis_needing_15_percent();
+  test_r10_escalation_to_duty_max_then_braked_inhibit();
+  test_r10_escalation_cut_by_budget_when_encoder_dead();
+  test_r10_residual_pulses_limited_then_zero_output();
   test_r10_status_flags_bits();
 }
 

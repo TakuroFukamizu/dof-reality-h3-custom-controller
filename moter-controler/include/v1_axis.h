@@ -95,6 +95,12 @@ struct V1Tuning {
   //（FEEDBACK_UNCERTAIN）・過負荷（LOAD_LIMITED）・端の手前の制動・SOFT_LIMIT / FOLLOWING_ERROR の猶予に置き換わる
   bool supervisor = false;  // コンストラクタで既定を入れる
   V1SupTuning sup;
+  // r10（supervisor のときだけ）: 静止目標での力の段階的な引き上げ（step 0 で無効）と小さな残り誤差の受け入れ（band 0 で無効）。config.h
+  int escalate_step_permille = V1_ESCALATE_STEP_PERMILLE;
+  uint32_t escalate_window_ms = V1_ESCALATE_WINDOW_MS;
+  int32_t residual_band = V1_RESIDUAL_BAND_COUNT;
+  int32_t residual_exit = V1_RESIDUAL_EXIT_COUNT;
+  int residual_max_pulses = V1_RESIDUAL_MAX_PULSES;
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
@@ -611,6 +617,9 @@ class V1Axis {
   int stall_boost_permille() const { return stall_boost_; }
   // 積分項（Issue #25 手順 9「F」）の現在値 [permille]（四捨五入前の値を丸めたもの）。画面の計器行 `I`。STATUS には載せない
   int integral_permille() const { return static_cast<int>(lround(duty_state_.i_pm)); }
+  // r10: 静止目標での引き上げ [permille]（0 = なし）と、小さな残り誤差を受け入れて出力 0 にしているか（画面・テスト用）
+  int escalation_permille() const { return esc_level_; }
+  bool residual_accepted() const { return residual_accepted_; }
   // 動き出しパルス（Issue #25 r6）: 進まないまま打った数と、いま出しているか（画面・テスト用）
   int breakaway_pulses() const { return brk_pulses_; }
   bool breakaway_active() const { return brk_active_; }
@@ -758,6 +767,14 @@ class V1Axis {
 
   // r10（Issue #44・#46）: 保護の監視
   V1Supervisor sup_{};
+  // r10: 静止目標での引き上げ（update_escalation）と小さな残り誤差の受け入れ
+  bool esc_running_ = false;
+  int esc_dir_ = 0;
+  int esc_level_ = 0;  // [permille]
+  uint64_t esc_win_start_us_ = 0;
+  int64_t esc_anchor_raw_ = 0;
+  int last_combined_pm_ = 0;  // 直近の v1_duty_command の結果（引き上げの起点）
+  bool residual_accepted_ = false;
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
@@ -1674,10 +1691,17 @@ class V1Axis {
       reset_track_assist();
       reset_breakaway();
       reset_stall_boost();
+      reset_escalation();
+      residual_accepted_ = false;
       terms_ = V1DutyTerms{};
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
+    const int64_t err_abs = err < 0 ? -err : err;
+    // r10: 小さな残り誤差の受け入れの解除（|誤差| が出口を超えた・軌道が動いた・ブレーキ作動・監視 OFF）
+    if (residual_accepted_ && (!supervisor_on() || err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || !brake_release_cmd_)) {
+      residual_accepted_ = false;
+    }
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
     stall_boost_gate(err, now);
@@ -1685,8 +1709,30 @@ class V1Axis {
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
     const bool settle_ok = update_settle_dwell(err, dt_us);
     const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
+    update_escalation(err, now);  // r10: 静止目標での引き上げ（esc_level_）
     int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
                               assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
+    last_combined_pm_ = cmd;
+    // r10（supervisor_on）: 静止目標（軌道速度 0・保持でない）での出力の形
+    //  - |誤差| ≤ residual_band か残り誤差の受け入れ中: 動き出しパルスの間だけ出す。それ以外は 0（I も 0）。受け入れ中はパルスも無い
+    //  - |誤差| > residual_band で進まない: 誤差の向きに max(合成, 引き上げ) を出す（duty_max まで）
+    if (supervisor_on() && setpoint_vel_ == 0.0 && !duty_state_.in_band) {
+      if (residual_accepted_ || (tuning.residual_band > 0 && err_abs <= tuning.residual_band && !brk_active_)) {
+        cmd = 0;
+        duty_state_.i_pm = 0.0;
+        terms_.cmd_permille = 0;
+        if (residual_accepted_) terms_.mode = V1DutyMode::HOLD;
+      } else if (esc_level_ > 0) {
+        const int dir = err > 0 ? 1 : -1;
+        long mag = (cmd != 0 && (cmd > 0) == (dir > 0)) ? (cmd < 0 ? -cmd : cmd) : 0;
+        if (mag < esc_level_) mag = esc_level_;
+        const long cap = v1_permille(tuning.duty_max);
+        if (mag > cap) mag = cap;
+        cmd = static_cast<int>(dir * mag);
+        terms_.cmd_permille = static_cast<int16_t>(cmd);
+        terms_.mode = V1DutyMode::BRK;
+      }
+    }
     // r10（Issue #44・#46）: 保護の監視が出力を決める（見えない走行の予算・過負荷・端の手前の制動・ソフトリミットの外の外向き 0）
     if (supervisor_on() && has_config_) {
       sup_.t = tuning.sup;
@@ -1821,6 +1867,13 @@ class V1Axis {
   bool update_breakaway(int64_t err, uint64_t now) {
     if (!tuning.ff_directional || tuning.breakaway_window_ms == 0) { reset_breakaway(); return false; }
     const int64_t err_abs = err < 0 ? -err : err;
+    // r10（supervisor_on）: 静止目標では、小さな残り誤差（≤ residual_band）だけパルスで詰める。それより大きい誤差は引き上げ
+    //（update_escalation）が受け持ち、受け入れ中は打たない
+    if (supervisor_on() && setpoint_vel_ == 0.0 &&
+        (residual_accepted_ || (tuning.escalate_step_permille > 0 && err_abs > escalation_floor()))) {
+      reset_breakaway();
+      return false;
+    }
     int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
     const bool traj_moving = setpoint_vel_ != 0.0;
     const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
@@ -1884,6 +1937,13 @@ class V1Axis {
         brk_active_ = false;  // 進まずに終わった
         ++brk_pulses_;
         if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
+        // r10: 静止目標の小さな残り誤差で進まないパルスが residual_max_pulses 回 → 受け入れて出力 0（パルスを打ち続けない）
+        if (supervisor_on() && mode == 0 && tuning.residual_band > 0 && tuning.residual_max_pulses > 0 &&
+            err_abs <= tuning.residual_band && brk_pulses_ >= tuning.residual_max_pulses) {
+          residual_accepted_ = true;
+          reset_breakaway();
+          return false;
+        }
         if (band) brk_cooldown_until_us_ = now + ms_to_us(tuning.breakaway_band_cooldown_ms);
         brk_phase_start_us_ = now;
         brk_anchor_raw_ = raw_;
@@ -1908,6 +1968,54 @@ class V1Axis {
       return true;
     }
     return false;
+  }
+
+  void reset_escalation() {
+    esc_running_ = false;
+    esc_dir_ = 0;
+    esc_level_ = 0;
+  }
+  // 引き上げの対象になる |誤差| の下限（これを超えたら）。小さな残り誤差の帯が無効なら保持の出口
+  int64_t escalation_floor() const { return tuning.residual_band > 0 ? tuning.residual_band : tuning.hold_exit; }
+
+  // r10（Issue #44 の 14:22 の実測）: 静止目標での力の段階的な引き上げ。Duty を計算する前に呼び、esc_level_ を決める。
+  // 対象: 監視 ON・軌道速度 0・保持でない・小さな残り誤差の受け入れ中でない・|誤差| > escalation_floor・ブレーキ解除指令中・停止中でない。
+  // 窓（escalate_window_ms）の間に誤差の向きへ breakaway_min_move 進まなければ、0 なら max(動き出し Duty, |合成|) + step、以後は窓ごとに
+  // + step（duty_max まで）。進んだ窓では保つ。向きの反転・対象外で 0。出力は V1Supervisor::filter を通る（予算・過負荷・停止）。
+  void update_escalation(int64_t err, uint64_t now) {
+    if (!supervisor_on() || tuning.escalate_step_permille <= 0) { reset_escalation(); return; }
+    const int64_t err_abs = err < 0 ? -err : err;
+    const int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
+    const bool eligible = setpoint_vel_ == 0.0 && !duty_state_.in_band && !residual_accepted_ && err_abs > escalation_floor() &&
+                          brake_release_cmd_ && !sup_.inhibited() && dir != 0;
+    if (!eligible) { reset_escalation(); return; }
+    if (!esc_running_ || dir != esc_dir_) {
+      reset_escalation();
+      esc_running_ = true;
+      esc_dir_ = dir;
+      esc_win_start_us_ = now;
+      esc_anchor_raw_ = raw_;
+      return;
+    }
+    if (now - esc_win_start_us_ < ms_to_us(tuning.escalate_window_ms)) return;
+    const bool progress = static_cast<int64_t>(dir) * (raw_ - esc_anchor_raw_) >= tuning.breakaway_min_move;
+    if (!progress) {
+      const long cap = v1_permille(tuning.duty_max);
+      long level = esc_level_;
+      if (level == 0) {
+        long brk = dir > 0 ? tuning.breakaway_up_permille : tuning.breakaway_down_permille;
+        if (brk < 0) brk = -brk;
+        const long comb = (last_combined_pm_ != 0 && (last_combined_pm_ > 0) == (dir > 0))
+                              ? (last_combined_pm_ < 0 ? -last_combined_pm_ : last_combined_pm_)
+                              : 0;
+        level = brk > comb ? brk : comb;
+      }
+      level += tuning.escalate_step_permille;
+      if (level > cap) level = cap;
+      esc_level_ = static_cast<int>(level);
+    }
+    esc_win_start_us_ = now;
+    esc_anchor_raw_ = raw_;
   }
 
   void reset_stall_boost() {

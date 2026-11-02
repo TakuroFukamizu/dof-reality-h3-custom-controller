@@ -329,6 +329,26 @@ constexpr uint32_t V1_FE_GRACE_MAX_MS = V1_FE_GRACE ? 2000 : 0;  // 0 = 猶予�
 constexpr uint32_t V1_FE_GRACE_VARIANT_MS = 2000;
 constexpr uint32_t V1_FE_TURN_MS = 200;             // 超えた直後に減り始めるのを待つ時間（超えた瞬間の |誤差| は必ず増えている）
 constexpr int V1_FE_HARD_RATIO_PERCENT = 150;       // |誤差| が上限の 1.5 倍以上なら猶予なしでラッチ（猶予中の行き過ぎの上限）
+// r10（Issue #44 の 14:22 の実測、PR #48）: 静止目標での力の段階的な引き上げと、小さな残り誤差の受け入れ。監視（V1_SUPERVISOR）が ON の
+// 方向別の経路だけ。どちらの出力も見えない走行の予算に積む。
+// A. 引き上げ: 軌道が止まっていて保持でなく |誤差| > V1_RESIDUAL_BAND_COUNT のまま、V1_ESCALATE_WINDOW_MS の窓の間に誤差の向きへ
+//    breakaway_min_move（3）進まなければ、誤差の向きの |出力| を max(動き出し Duty, 合成) + V1_ESCALATE_STEP_PERMILLE から窓ごとに
+//    V1_ESCALATE_STEP_PERMILLE ずつ duty_max まで上げる（#1 は最下端で 26 count 行き過ぎ、P 78 + I 30 = 10.8 % のまま 2 s 動けず
+//    ENCODER_FAULT になった）。進んだ窓では上げずに保つ（下げると止まってまた上げ直す鋸歯になる）。誤差の向きの反転・保持・
+//    |誤差| ≤ 帯・軌道が動く・停止で 0 に戻す。duty_max でも進まなければ LOAD_LIMITED（飽和 1 s）か、カウントが全く動かなければ
+//    その前に見えない走行の予算（中央付近 400 ms）で停止（どちらも PWM 0 ＋ ブレーキ）。ENCODER_FAULT にはしない。
+//    刻みは 50 ms ごとに 2 %: 一律の包絡線の予算（1000 count = 400 ms）の中で duty_max 20 % に届く（約 200 ms）ように選んだ
+//   （100 ms ごとに 1 % だと 20 % まで 1 s 掛かり、予算が先に尽きる）
+constexpr int V1_ESCALATE_STEP_PERMILLE = 20;
+constexpr uint32_t V1_ESCALATE_WINDOW_MS = 50;
+// B. 小さな残り誤差: 軌道が止まっていて保持でなく |誤差| ≤ V1_RESIDUAL_BAND_COUNT のときは、出力は動き出しパルスだけ（その間の P + I は
+//    0。数 permille の P + I は静止摩擦に届かず、熱と見えない走行の予算を使うだけ）。進まないパルスが V1_RESIDUAL_MAX_PULSES 回に
+//    なったら残り誤差を受け入れて出力 0（パルスも打たない）。|誤差| > V1_RESIDUAL_EXIT_COUNT か軌道が動くまで続ける。
+//    トレードオフ: 静止の精度は ±6 count まで落ちうる（#2 は 6 % で下がらず、0.2〜0.3 s ごとのパルスが体感のガクガクだった）。
+//    r6 の「4 で止まったまま P + I が流れ続ける」は起きない（受け入れ中・パルスの合間は出力 0）
+constexpr int32_t V1_RESIDUAL_BAND_COUNT = 6;
+constexpr int32_t V1_RESIDUAL_EXIT_COUNT = 12;
+constexpr int V1_RESIDUAL_MAX_PULSES = 3;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
