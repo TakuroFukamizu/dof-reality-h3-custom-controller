@@ -5,9 +5,12 @@
 // MD13S への PWM/DIR 出力。書くのは制御タスクだけ。
 // 内部分解能は permille（0.1 %、Issue #25 手順 8 b）。±1000 が PWM のフルスケール。
 void motor_output_begin();                     // LEDC を設定し PWM 0
-void motor_output_write_permille(int permille); // -1000..1000。反転時は PWM 0 → DIR_COAST_MS → DIR 切替
+void motor_output_write_permille(int permille); // -1000..1000。反転時は PWM 0 → DIR_COAST_MS → DIR 切替（この中で待つ。従来 env）
+// v1 の制御タスク用（毎 tick 呼ぶ）。反転時は PWM 0 を書いて戻り、DIR_COAST_MS 経った後の呼び出しで DIR と PWM を出す（待たない。
+// motor_dir_coast.h）。now_us は esp_timer の時刻（tick の入口の now）
+void motor_output_write_permille_at(int permille, uint64_t now_us);
 void motor_output_write(int percent);           // -100..100（従来 env の手動速度・自動移動）。×10 して permille の経路へ
-int motor_output_applied_permille();            // 直近に書いた値 [permille]
+int motor_output_applied_permille();            // いま出している値 [permille]（反転待ちの間は 0）
 int motor_output_applied();                     // 直近に書いた値 [%]（0 に向けて切り捨て。従来 env の表示用）
 
 // 純粋関数（ホストテスト用）。|permille| → LEDC のカウント。1000 でフルスケール（full_scale）、0 で 0、切り捨て。
