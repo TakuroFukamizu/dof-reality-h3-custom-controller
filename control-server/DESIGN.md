@@ -33,11 +33,12 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 | `session` | 純粋 | 駆動クライアントのセッション（単一所有）、Pose 受理判定と鮮度 |
 | `supervisor` | 純粋 | リグ状態機械（計画 §10）。軸イベント・管理命令・tick を受けて軸ごとの送信メッセージを出す。Planner と校正を所有 |
 | `prehistory` | 純粋 | FAULT 直前の経過（Issue #34）: 軸ごとの STATUS の固定容量リングと、ラッチ時の 2 s / 20 Hz の切り出し（§7.2 `fault_history[].prehistory`） |
+| `port_discovery` | 純粋 | `ports = "auto"` のポート探し。OS のポート一覧（開かない）から、USB VID:PID 303A:1001 で、シリアル番号（eFuse MAC）が設定の `device_id` と一致するポートを選ぶ（§10.4） |
 | `axis_link` | 非同期 | 1 ポート 1 タスク。HELLO 照合、受信デコード、管理命令（優先・有界キュー）と SET_POSITION（最新 1 件）の送信、STATUS 途絶検出 |
 | `telemetry` | 純粋＋非同期 | 遅延統計（p50/p95/p99/max）、カウンター、有界リングのイベントログ（落とした件数を記録）、非同期 JSONL 記録 |
 | `api` | 非同期 | axum: Game API（WS /v1/motion、POST /v1/session）、GET /v1/status、管理 API。Origin 検査、トークン、本文長制限、rate limit |
 | `server` | 非同期 | 配線。バックエンド（sim/serial）生成、リンク起動、制御ループ（`MissedTickBehavior::Skip` の interval）、API 起動。テスト用ハーネス |
-| `main.rs` | | CLI: `--config <path>`、`check-config` |
+| `main.rs` | | CLI: `--config <path>`、`check-config`、`list-ports`（USB の VID:PID・SER と、CoreS3 ならそれに対応する device_id。開かない） |
 
 ## 2. スレッド・データの流れ
 
@@ -358,6 +359,19 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - serial backend の `[backend] sim_axes`: 列挙した軸は実機の代わりに模擬軸（`sim:<軸>`）で埋める（実機が足りない bring-up 用。模擬軸を先に識別するので、同じ系統を名乗る実機は競合になる）。
 - 模擬軸のポートも実ポートと同じく「閉じたら開け直す」（Issue #15。2026-11-02 00:58 の Mac のスリープ復帰で 3 軸が `status_timeout` になり、実機 2 台は 3 s 後に再識別されたのに `sim:3` だけ OFFLINE のままだった）。server.rs の `sim_port_task` がリンクの終了を見て `SERIAL_RETRY` 後に `SimHandle::attach` で同じ `SimMcu` に新しいストリームを付け直す（boot_id・基準・位置・時計はそのまま。`sim_detached` で作った模型に、ランナーだけ付け替える）。`RunningServer.sims` は模型の `view()`（検査・異常注入用。落としてもランナーは止まらない）。`UnknownDevice` になった模擬軸は開け直さない（個体の識別は変わらないので）。
 - server.rs の「primary でないポートの Status / Ack / FaultEvent を捨てる」判定は `Supervisor::axis_port` のままでよい（競合中は `None` なので全部落ちる）。`Disconnected` が primary 以外から来たら `PortClosed` に変換する既存処理で claimants から外す。
+
+### 10.4 ポートの自動検出（`[backend] ports = "auto"`）
+
+ポート名（`/dev/cu.usbmodemXXXX`、`COMn`）はハブの差し込み口で変わる（2026-11-02 17:00、差し直しで 11101/11301/11501 → 14101/14301/14501 になり、名前を書いた設定のサーバーは 3 軸とも未接続のままになった）。USB のシリアル番号は変わらない。CoreS3 の USB JTAG/serial（VID:PID 303A:1001）はシリアル番号に eFuse MAC（`1C:DB:D4:BA:8D:58`）を出し、v1 ファームの `device_id` は `5131` + 同じ 6 byte（`51311cdbd4ba8d58`）なので、ポートを開かずに個体のポートが分かる。
+
+- `ports` は `"auto"` か、ポート名の配列。配列は従来どおり（書いた名前を、何がつながっていても開く）。
+- `"auto"` では `sim_axes` に無い全軸に `device_id` が要る（0 は設定エラー）。探すのはその `device_id` だけ。
+- server.rs の発見タスクが `DISCOVERY_PERIOD`（1 s）ごとにポート一覧を取り（`spawn_blocking`。開かない）、一致したポートごとに従来の port task を起動する。macOS の `/dev/tty.*`（同じ装置の別名。開くと DCD を待つ）は使わない。
+- 自動で起動した port task は、開く前（開き直す前も）に「この名前に、まだこの個体がつながっているか」を一覧で確かめ、違えば終わる。差し直して名前が変わると、古い名前のタスクは終わり、次の走査が新しい名前でタスクを起動する。古い名前に別の装置が現れても開かない。
+- 開いたあとは従来どおり HELLO で照合する（系統と `device_id` が合わなければ `axis_device_mismatch`）。
+- port task は発見タスクの `JoinSet` に属し、発見タスクを止めると一緒に止まる。
+- supervisor は変えていない。新しい名前で HELLO が来るのは、通常の再接続（boot_id が同じなら再起動ではない）。FAULT_LATCHED の解除や基準の取り直しは操作者が行う（自動で FAULT_RESET はしない）。
+- ログ（変化したときに 1 回）: `ports = auto: axisN unit found`（ポート名つき）、`ports = auto: axisN unit not in the USB port list`、`ports = auto: ESP32-S3 USB port not opened (its serial matches no [[axis]] device_id)`（入れ替えた個体や別プロジェクトの ESP32-S3）。
 
 ## 11. 校正（protocol.md §1.2）
 

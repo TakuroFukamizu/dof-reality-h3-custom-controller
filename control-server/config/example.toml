@@ -79,6 +79,8 @@ overspeed_count_s = 9000         # ≥ 1.5 × max_vel_count_s（検査される�
 kind = "serial"
 # 軸は各 CoreS3 で選択した系統（HELLO / STATUS の selected_axis、protocol.md §1.1）で
 # 決まる。ポート番号の順番には依存しない。下の device_id は照合用。
+# ports = "auto" にすると、USB のシリアル番号（= eFuse MAC）が [[axis]].device_id と一致するポートだけを
+# 開き、差し直してポート名が変わっても見つけ直す（その場合は全軸に device_id が必要。config/bringup.toml）。
 ports = ["/dev/cu.usbmodem1101", "/dev/cu.usbmodem1201", "/dev/cu.usbmodem1301"]
 
 [[axis]]

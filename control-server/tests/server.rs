@@ -943,7 +943,7 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     // in-process simulators (no serial port is opened for them).
     let mut cfg = fast_cfg();
     cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
-        ports: vec![],
+        ports: vec![].into(),
         baud: 115_200,
         sim_axes: vec![AxisId::new(1).unwrap(), AxisId::new(2).unwrap(), AxisId::new(3).unwrap()],
         sim: h3cs::config::SimBackendConfig::default(),

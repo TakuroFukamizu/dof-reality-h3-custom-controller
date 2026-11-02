@@ -15,7 +15,7 @@
 - **ブレーキは無通電で作動、24V 通電で解除。** 解除しただけで荷重により機構が動くことがある（#1 は 3 % の Duty でも重力で沈むと記録されている。過去の記録）。ブレーキ解除の指令が出る操作（ARM）は、機構が自由に動いてよい状態で行う。
 - **GND を共通にする。** エンコーダとリレーは H3 側と CoreS3 の GND が共通でないと動かない（カウント 0、A/B が High のまま。過去の記録）。
 - **給電。** Base15 の DC ジャックと USB の同時接続は未検証（DIN Base では USB + 12V で約 85 秒後に電源断。Issue #1）。この手順では **USB のみで給電する env**（`-usbpower`）を使い、Base15 の DC は接続しない。DC 給電の env を使うなら、その組み合わせを先に別途確認する。
-- **ポートを開く操作に注意。** macOS のポート名（`/dev/cu.usbmodemXXXX`）は物理ポートで決まり、個体の識別には使えない。同じ名前に別の ESP32-S3（別プロジェクトの StampS3A など）が現れたことがある（過去の記録）。ポートを開くと、そこにつながっている装置がリセットされることがある。サーバー・書き込み・モニターのどれも、対象のポートに何がつながっているかを `ioreg` の USB Serial Number（= eFuse MAC）で確かめてから使う（§1.1）。
+- **ポートを開く操作に注意。** macOS のポート名（`/dev/cu.usbmodemXXXX`）は物理ポートで決まり、個体の識別には使えない。同じ名前に別の ESP32-S3（別プロジェクトの StampS3A など）が現れたことがある（過去の記録）。ポートを開くと、そこにつながっている装置がリセットされることがある。サーバー・書き込み・モニターのどれも、対象のポートに何がつながっているかを `ioreg` の USB Serial Number（= eFuse MAC）で確かめてから使う（§1.1）。サーバーは `ports = "auto"`（bringup.toml の既定）なら、この照合を自分で行い、一致したポートだけを開く（§3）。
 - **従来 env と v1 env を同じ USB ポートで混ぜない。** v1 env は USB CDC をバイナリ専用にする（テキストの `?` や `HOME` は効かない）。従来 env の画面・シリアルで動かすのは §1 と、§5 でやり直すときだけ。
 - 期待と違う動き（向きが逆・止まらない・音が変）が出たら、原因を考える前に 24V を切る。
 
@@ -87,7 +87,7 @@ $PIO run -e m5stack-cores3-v1-usbpower -t upload --upload-port /dev/cu.usbmodemX
 - 系統は MCU 側で選ぶ（protocol.md §1.1）。NVS のキー `motor` は従来 env と同じなので、§1.2 で `M <n>` した個体は v1 でも同じ `#n` を表示するはず（推定。画面で確認する）。
 - 違っていれば、**DISARMED のときだけ** 画面の系統表示をタップして 1 → 2 → 3 → 1 と送る。選ぶと `CONFIGURED` / `POSITION_REFERENCED` が消え、AXIS_SELECT が 1 回出る。
 - v1 ファームは未選択（`selected_axis = 0`）を名乗らない（NVS に `motor` が無ければ `#1`。`control_v1_begin` が 1〜3 以外を 1 に丸める）。新品や初期化した個体を混ぜて起動すると `#1` が 2 台になり、`axis_conflict: axis1 ...`・`not_connected: axis1`・`rig_state = OFFLINE` になる。これは正常で、片方の画面で系統をタップして直す。1 → 2 → 3 の切り替えに USB の挿し直しは要らない（PC は AXIS_SELECT と STATUS の `selected_axis` で追い、同じポートのまま割当を変える。切り替えた個体には `reference_stale` が付くので §5.1 の基準を取り直す）。
-- `unknown_device` になるのは、`[backend] ports` に CoreS3 以外の装置（別の ESP32-S3 など）のポートを書いたときだけ。PC はそのポートを閉じ、装置が消えるまで開き直さない。その場合は bringup.toml の `ports` を直してサーバーを起動し直す（挿し直しでは直らない）。
+- `unknown_device` になるのは、`[backend] ports` に名前を直接書き、そこに CoreS3 以外の装置（別の ESP32-S3 など）がつながっていたときだけ（`"auto"` はそういうポートを開かない）。PC はそのポートを閉じ、装置が消えるまで開き直さない。その場合は bringup.toml の `ports` を直してサーバーを起動し直す（挿し直しでは直らない）。
 - 3 台が 1・2・3 を 1 つずつ。同じ系統を 2 台が選ぶと `axis_conflict` で ARM できない（§4.3 でわざと起こして見る）。
 
 ## 3. サーバー起動
@@ -98,10 +98,14 @@ cargo build                                               # target/debug/h3-cont
 ./target/debug/h3-control-server list-ports               # ポート一覧。開かない
 ```
 
-`list-ports` は Bluetooth や他の ESP32-S3 のポートも出す。**bringup.toml の `backend.ports` には CoreS3 3 台のポートだけ書く。** サーバーは書かれたポートを全部開いて HELLO_REQ を送るので（HELLO で軸が決まるまでそれ以外は送らない）、他人の装置のポートを書くと、その装置を開いて（場合によってはリセットして）しまう。
+`list-ports` は Bluetooth や他の ESP32-S3 のポートも出す。CoreS3 の行には USB の `SER=`（eFuse MAC）と、それに対応する `device_id` が付く（例 `/dev/cu.usbmodem14501  USB 303A:1001 SER=1C:DB:D4:BA:8D:58  device_id 51311cdbd4ba8d58`）。
+
+bringup.toml は `backend.ports = "auto"`。サーバーは USB のシリアル番号が `[[axis]].device_id` と一致するポートだけを開く。Bluetooth や他人の ESP32-S3 は開かない。ポート一覧は 1 秒ごとに見直すので、ハブの差し込み口が変わってポート名が変わっても、設定の書き換えもサーバーの再起動も要らない。確かめるのは、`list-ports` の `device_id` が bringup.toml の 3 軸の `device_id` と一致していることだけ。個体を入れ替えたら、その軸の `device_id` を書き直す（`"auto"` では 0 にできない）。
+
+名前を直接書くこともできる（`ports = ["/dev/cu.usbmodem14501", ...]`）。その場合は CoreS3 3 台のポートだけを書く。サーバーは書かれたポートを全部開いて HELLO_REQ を送るので（HELLO で軸が決まるまでそれ以外は送らない）、他人の装置のポートを書くと、その装置を開いて（場合によってはリセットして）しまう。差し込み口が変わったら書き直してサーバーを再起動する。
 
 ```sh
-$EDITOR config/bringup.toml                               # backend.ports を §1.1 の対応に合わせる
+$EDITOR config/bringup.toml                               # device_id を §1.1 の対応に合わせる（ports を名前で書くならそれも）
 ./target/debug/h3-control-server check-config config/bringup.toml
 ```
 
@@ -309,7 +313,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 
 ### 6.5 実機が 3 台そろわないとき（模擬軸で代替）
 
-サーバーは 3 軸そろわないと ARM しない。1 台を別件で外しているときは `[backend]` に `sim_axes = [<軸>]` を足し、その軸のポートを `ports` から外す（`control-server/config/bringup.toml` のコメント）。その軸は模擬軸（`sim:<軸>`）として接続・基準済みで現れ、目標に完全に追従する。その軸の `calibration_valid = true` は模擬軸用（実機の宣言ではない）。残りの実機だけを Pose の選び方（§7）で動かして確認する。実機を戻したら `sim_axes` を消す。
+サーバーは 3 軸そろわないと ARM しない。1 台を別件で外しているときは `[backend]` に `sim_axes = [<軸>]` を足し、その軸のポートを `ports` から外す（`"auto"` なら外す必要はない。模擬軸の `device_id` は探さない。`control-server/config/bringup.toml` のコメント）。その軸は模擬軸（`sim:<軸>`）として接続・基準済みで現れ、目標に完全に追従する。その軸の `calibration_valid = true` は模擬軸用（実機の宣言ではない）。残りの実機だけを Pose の選び方（§7）で動かして確認する。実機を戻したら `sim_axes` を消す。
 
 ## 7. 1 軸ずつ電源 ON で低ゲイン
 
@@ -381,7 +385,9 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 
 | 症状 | 意味 | 見るところ・対処 |
 | --- | --- | --- |
-| `not_connected: axisN` | その系統を名乗る個体が無い（未接続、HELLO 失敗、競合中）。**USB には見えるがシリアルに応答しない個体**が 2026-10-31 に 3 回（1C:DB 1 回、30:ED 2 回）あり、どれもボードのリセットで復帰（ポートを閉じたことが原因ではない） | `backend.ports` にその個体のポートがあるか（§3）。画面の `#n` がその系統か。競合なら `axis_conflict` も出る。ポートを開いて 2 s（`timing.hello_timeout_ms`）以内に HELLO が無ければいったん閉じ、3 s 後に開き直して HELLO_REQ をやり直す（`unknown_device` のときだけ開き直さない）。開くたびにリセットされて 2 s 以内に起動しない個体なら、この繰り返しから抜けないので `timing.hello_timeout_ms` を延ばす（`server.log` の `port opened` が 3 s ごとに続くのが目印。USB の挿し直しでは直らない）。従来 env のままの個体はテキストを返すので HELLO にならない（`rx_error` 扱い）→ §1.3 |
+| `not_connected: axisN` | その系統を名乗る個体が無い（未接続、HELLO 失敗、競合中）。**USB には見えるがシリアルに応答しない個体**が 2026-10-31 に 3 回（1C:DB 1 回、30:ED 2 回）あり、どれもボードのリセットで復帰（ポートを閉じたことが原因ではない） | `"auto"` なら `server.log` に `ports = auto: axisN unit found` があるか、`list-ports` のその個体の `device_id` が設定と一致するか（名前で書いているなら `backend.ports` にその個体のポートがあるか。§3）。画面の `#n` がその系統か。競合なら `axis_conflict` も出る。ポートを開いて 2 s（`timing.hello_timeout_ms`）以内に HELLO が無ければいったん閉じ、3 s 後に開き直して HELLO_REQ をやり直す（`unknown_device` のときだけ開き直さない）。開くたびにリセットされて 2 s 以内に起動しない個体なら、この繰り返しから抜けないので `timing.hello_timeout_ms` を延ばす（`server.log` の `port opened` が 3 s ごとに続くのが目印。USB の挿し直しでは直らない）。従来 env のままの個体はテキストを返すので HELLO にならない（`rx_error` 扱い）→ §1.3 |
+| USB を差し直したらポート名が変わり、3 軸とも `not_connected` のまま | `backend.ports` に名前を書いている（ポート名はハブの差し込み口で変わる。2026-11-02 17:00 に 11101/11301/11501 → 14101/14301/14501） | `ports = "auto"` にしてサーバーを再起動する（以後は名前が変わっても自動でつながり直す）。差し直し前に FAULT_LATCHED になっていれば FAULT_RESET、ボードが再起動していれば基準の取り直し（§5.1）は従来どおり |
+| `server.log` に `ports = auto: ESP32-S3 USB port not opened` | そのポートの個体の MAC が、どの `[[axis]].device_id` とも一致しない（入れ替えた個体、別プロジェクトの ESP32-S3） | 意図した個体なら、その軸の `device_id` を `list-ports` の値に書き直してサーバー再起動 |
 | `unknown_device: device <id> on port <port>` | `selected_axis = 0`（未選択）で、設定の `device_id` にも無い個体。サーバーはそのポートを閉じ、装置が消えるまで開き直さない | v1 ファームは 0 を名乗らない（未設定なら `#1`。§2）ので、CoreS3 以外の装置（別の ESP32-S3）のポートを `ports` に書いていないかを疑う。`ports` を直してサーバー再起動 |
 | `axis_conflict: axisN claimed by ...`、`axis_conflict: [N]`、arm が 409 `axis_conflict` | 同じ系統を 2 台が選んでいる。その軸は primary 無し（OFFLINE）、CONFIG も送らない | どちらかの画面で別の系統をタップ（DISARMED のときだけ）。解消後、系統を変えた個体に `reference_stale` |
 | `axis_device_mismatch: axisN device <id>, config expects <expected>` | 設定の `device_id` と違う個体がその系統を選んだ（または、その個体は別の軸として設定されている） | 個体を入れ替えたのか、系統の選択を間違えたのかを画面と `ioreg` で確認。意図した入れ替えなら bringup.toml の `device_id` を直してサーバー再起動 |

@@ -1,6 +1,6 @@
 //! config: loading and structural validation.
 
-use h3cs::config::{BackendConfig, Config, ConfigError, LimitsConfig};
+use h3cs::config::{BackendConfig, Config, ConfigError, LimitsConfig, PortList};
 use h3cs::types::{AxisId, DeviceId};
 use std::path::Path;
 
@@ -335,9 +335,52 @@ fn server_and_backend_zero_values_rejected() {
 
     let mut ex = Config::load(Path::new(EXAMPLE)).unwrap();
     if let BackendConfig::Serial(b) = &mut ex.backend {
-        b.ports.clear();
+        b.ports = PortList::Named(vec![]);
     }
     assert_invalid(&ex, "backend.ports");
+}
+
+const BRINGUP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml");
+
+fn serial_ports(cfg: &Config) -> &PortList {
+    match &cfg.backend {
+        BackendConfig::Serial(b) => &b.ports,
+        _ => panic!("not a serial backend"),
+    }
+}
+
+#[test]
+fn ports_auto_or_list() {
+    // bringup.toml finds its units by USB serial number.
+    let bringup = Config::load(Path::new(BRINGUP)).unwrap();
+    assert_eq!(serial_ports(&bringup), &PortList::Auto);
+    // A list still works, and round-trips through TOML either way.
+    let ex = Config::load(Path::new(EXAMPLE)).unwrap();
+    assert!(matches!(serial_ports(&ex), PortList::Named(v) if v.len() == 3));
+    for cfg in [&bringup, &ex] {
+        let text = toml::to_string(cfg).unwrap();
+        assert_eq!(&Config::from_toml_str(&text).unwrap(), cfg);
+    }
+    // Any other word is a parse error naming the choices.
+    let text = std::fs::read_to_string(BRINGUP).unwrap();
+    let bad = text.replacen("\nports = \"auto\"\n", "\nports = \"/dev/cu.usbmodem14101\"\n", 1);
+    assert_ne!(bad, text);
+    match Config::from_toml_str(&bad) {
+        Err(ConfigError::Parse(e)) => assert!(e.to_string().contains("\"auto\" or a list"), "{e}"),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn ports_auto_needs_a_device_id_on_every_real_axis() {
+    let mut cfg = Config::load(Path::new(BRINGUP)).unwrap();
+    cfg.axes.iter_mut().find(|a| a.axis_id == AxisId::new(2).unwrap()).unwrap().device_id = DeviceId(0);
+    assert_invalid(&cfg, "needs a device_id on [[axis]] axis_id = 2");
+    // A simulated axis is not looked for, so it needs none.
+    if let BackendConfig::Serial(b) = &mut cfg.backend {
+        b.sim_axes = vec![AxisId::new(2).unwrap()];
+    }
+    cfg.validate().unwrap();
 }
 
 #[test]
@@ -499,7 +542,8 @@ fn serial_sim_axes_validation() {
     let bad = h3cs::config::Config::from_toml_str(&with("sim_axes = [4]"));
     assert!(bad.is_err(), "axis 4 does not exist");
     // No ports at all is fine only when every axis is simulated.
-    let no_ports = base.replacen("ports = [", "ports = [] # [", 1);
+    let no_ports = base.replacen("\nports = \"auto\"\n", "\nports = []\n", 1);
+    assert_ne!(no_ports, base);
     assert!(h3cs::config::Config::from_toml_str(&no_ports).is_err());
     assert!(h3cs::config::Config::from_toml_str(&no_ports.replacen("baud = 115200", "baud = 115200\nsim_axes = [1, 2, 3]", 1)).is_ok());
 }

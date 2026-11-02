@@ -89,12 +89,16 @@ overspeed_count_s = 2000         # ≥ 1.5 × max_vel_count_s（検査される�
 
 [backend]
 kind = "serial"
-# 3 台の CoreS3 のポートだけを書く。`h3-control-server list-ports` の一覧をそのまま貼らない
-# （Bluetooth や別の ESP32-S3 のポートが混ざる。サーバーは書かれたポートを全部開いて HELLO_REQ を送るので、
-#   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
-# （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
-# 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
-ports = ["/dev/cu.usbmodem11501", "/dev/cu.usbmodem11101", "/dev/cu.usbmodem11301"]  # 2026-11-01 のハブ: 1C:DB / 68:EE / 30:ED（差し込み口で変わる。list-ports と SER= で確認）
+# ports = "auto": USB のシリアル番号（= CoreS3 の eFuse MAC）が下の [[axis]].device_id と一致するポートだけを開く。
+# ポート名（/dev/cu.usbmodemXXXX）はハブの差し込み口で変わるが、シリアル番号は変わらない。ポート一覧は 1 秒ごとに
+# 見直すので、差し直して名前が変わってもサーバーの再起動は要らない（フォルト解除・基準の取り直しは従来どおり操作者が行う）。
+# 一致しないポート（Bluetooth、別プロジェクトの ESP32-S3、device_id を書いていない個体）は開かない。
+# 個体を入れ替えたら、その軸の device_id を書き直す（auto では 0 にできない）。`h3-control-server list-ports` で
+# 各ポートの SER= と、それに対応する device_id を開かずに確認できる。軸の割当は各 CoreS3 で選んだ系統
+# （HELLO / STATUS の selected_axis）で決まり、device_id は照合に使われる。
+# 名前を直接書くこともできる（例: ports = ["/dev/cu.usbmodem14501", "/dev/cu.usbmodem14101"]。書いたポートは
+# 何がつながっていても開くので、ioreg の USB Serial Number で確かめてから書く）。
+ports = "auto"
 baud = 115200
 # 実機が足りないときは、その軸を模擬軸で代替できる（例: sim_axes = [3]。その軸の ports は書かない）。
 # 模擬軸は目標に完全に追従するので、その軸の pose を中立に保てば動かない扱いになる。その軸の校正値は
@@ -108,7 +112,7 @@ baud = 115200
 axis_id = 1
 # 照合用の個体 ID（16 桁 hex、0 = 照合しない）。§4 で status の axes[].device_id を見てから転記する。
 # 書くと、別の個体が系統 1 を選んだとき ARM しない（axis_device_mismatch）。
-device_id = "51311cdbd4ba8d58"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+device_id = "51311cdbd4ba8d58"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直す。ports = "auto" はこの値でポートを探す）
 name = "右手前リフト (motor #1)"
 # !!! true にする前に確認すること（hardware-bringup.md §5 の終わり）。true は「この軸でこの値を測った」という
 # !!! 操作者の宣言で、有人運転の可否ではない。bring-up 中は無人・物理非常停止あり・[limits] を低い値にしてあることが前提。
@@ -132,7 +136,7 @@ decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 # ---------------------------------------------------------------------------
 [[axis]]
 axis_id = 2
-device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直す。ports = "auto" はこの値でポートを探す）
 name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
@@ -152,7 +156,7 @@ decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 # ---------------------------------------------------------------------------
 [[axis]]
 axis_id = 3
-device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直す。ports = "auto" はこの値でポートを探す）
 name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
