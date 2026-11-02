@@ -10,3 +10,7 @@ c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_VEL_DAMPING=0 -I../inclu
 # 焼く既定（V1_VEL_DAMPING=1）でも同じテストが通ること（減衰を前提にしない試験は Kd を明示的に 0 にしている）
 c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -I../include test_host.cpp -o /tmp/moter_controler_host_damping
 /tmp/moter_controler_host_damping
+# Issue #45: 再生バッファ（config.h V1_PLAYOUT=1）は上の 2 つで既定のまま回る（焼く既定）。従来の軌道 profile_step（-DV1_PLAYOUT=0）
+# でも通ること（test_playout_* は playout_delay_ms を明示しているので、こちらでも再生バッファを検証する）
+c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_PLAYOUT=0 -I../include test_host.cpp -o /tmp/moter_controler_host_noplayout
+/tmp/moter_controler_host_noplayout

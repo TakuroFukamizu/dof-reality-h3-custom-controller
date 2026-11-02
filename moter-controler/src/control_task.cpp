@@ -311,9 +311,11 @@ void v1_task_main(void*) {
     for (uint32_t d = v1_link_take_rx_dropped(); d > 0; --d) {
       g_axis.record_rx_error();
     }
+    // Issue #45: 溜まったフレームも 1 つずつ受信時刻つきで再生バッファへ（途中の目標を捨てない）。期限・lease・応答は従来どおり now。
+    // now を取った後に積まれたフレームは受信時刻が now より新しいことがあるので now で頭打ち（V1Axis::handle も同じく頭打ちする）
     V1RxFrame frame;
     while (v1_link_rx_pop(&frame)) {
-      g_axis.handle_frame(frame.data, frame.len, now);
+      g_axis.handle_frame(frame.data, frame.len, now, frame.rx_us < now ? frame.rx_us : now);
     }
     if (in.select_pulse) {
       if (g_axis.select_axis(in.select_axis, now)) {

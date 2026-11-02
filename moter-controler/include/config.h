@@ -264,7 +264,8 @@ constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定�
 #endif
 constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを推定する窓（playout 時刻を中心に ±窓/2）
 constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
-constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）
+constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）。目標が動いている間
+constexpr double V1_PLAYOUT_KP_FLAT_PER_S = 40.0;         // 同、目標が止まっている（窓の目標がすべて同じ）とき
 constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
 // Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
 // ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。
