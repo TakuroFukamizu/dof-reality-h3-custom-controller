@@ -3161,6 +3161,17 @@ inline void test_flash_write_gap_while_stopped_is_counted_not_faulted() {
     h.step(40);
     CHECK(h.ax.state() == st::ARMING && h.ax.flash_gap_count() == 1 && h.fault_events().empty());
   }
+  {  // 校正の電源待ち（CAL_POWER_SETTLE、ブレーキ作動・PWM 0）は止まっている: 数える
+    Harness h(1, 1, 0, false);
+    Harness::accepted(h.calibrate(1));
+    h.idle(100);
+    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+    h.flash_next = true;
+    h.step(30);
+    CHECK(h.ax.state() == st::CALIBRATING && h.ax.flash_gap_count() == 1);
+    h.ax.reset_flash_gap_stats();
+    CHECK(h.ax.flash_gap_count() == 0 && h.ax.flash_gap_max_us() == 0);
+  }
 }
 
 inline void test_flash_write_gap_while_driving_still_faults() {
@@ -3180,15 +3191,6 @@ inline void test_flash_write_gap_while_driving_still_faults() {
     h.flash_next = true;
     h.step(16);
     CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::CONTROL_OVERRUN && h.ax.flash_gap_count() == 0);
-  }
-  {  // 校正の電源待ち（CAL_POWER_SETTLE、ブレーキ作動・PWM 0）は止まっている: 数える
-    Harness h(1, 1, 0, false);
-    Harness::accepted(h.calibrate(1));
-    h.idle(100);
-    CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
-    h.flash_next = true;
-    h.step(30);
-    CHECK(h.ax.state() == st::CALIBRATING && h.ax.flash_gap_count() == 1);
   }
 }
 

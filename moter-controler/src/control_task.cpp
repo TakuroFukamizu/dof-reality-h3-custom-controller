@@ -319,6 +319,7 @@ void v1_task_main(void*) {
       exec_recent_us = 0;
       exec_win_ticks = 0;
       active_max_gap_us = 0;
+      g_axis.reset_flash_gap_stats();
     }
 
     if (in.clear_dirty_pulse) {

@@ -1329,19 +1329,22 @@ void renderV1() {
   }
   canvas.drawString(cal_text, 8, 155);
 
-  // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す）。
+  // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す。nvs は 0 に戻す）。
   // gap = tick 間隔の最大、act = ACTIVE 中の間隔の最大、exe = 処理時間の最大 / 直近 1 s の最大 [us]
-  char tick_text[128];
-  // nvs = NVS の書き込みと重なった長い間隔を、止まっていたので異常にしなかった回数 / 最大 [ms]（0 回なら出さない）
-  char nvs_text[24] = "";
+  char tick_text[96];
+  // nvs = NVS の書き込みと重なった長い間隔を、止まっていたので異常にしなかった回数 / 最大 [ms]。1 回でもあれば tick 数の代わりに出す
+  //（行は 6 px × 52 文字で切れる。tick 数を残すと入らない）。タップで 0 に戻すと tick 数の表示に戻る
+  char head_text[32];
   if (vsnap.flash_gap_count > 0) {
-    snprintf(nvs_text, sizeof(nvs_text), " nvs %lu/%lums", static_cast<unsigned long>(vsnap.flash_gap_count),
+    snprintf(head_text, sizeof(head_text), "nvs %lu/%lums", static_cast<unsigned long>(vsnap.flash_gap_count),
              static_cast<unsigned long>(vsnap.flash_gap_max_us / 1000));
+  } else {
+    snprintf(head_text, sizeof(head_text), "tick %lu", static_cast<unsigned long>(vsnap.tick_count));
   }
-  snprintf(tick_text, sizeof(tick_text), "tick %lu gap %lu act %lu exe %lu/%lu us%s%s%s",
-           static_cast<unsigned long>(vsnap.tick_count), static_cast<unsigned long>(vsnap.max_tick_gap_us),
-           static_cast<unsigned long>(vsnap.active_max_tick_gap_us), static_cast<unsigned long>(vsnap.exec_max_us),
-           static_cast<unsigned long>(vsnap.exec_recent_us), nvs_text, boot_error[0] ? " ERR " : "", boot_error);
+  snprintf(tick_text, sizeof(tick_text), "%s gap %lu act %lu exe %lu/%lu us%s%s", head_text,
+           static_cast<unsigned long>(vsnap.max_tick_gap_us), static_cast<unsigned long>(vsnap.active_max_tick_gap_us),
+           static_cast<unsigned long>(vsnap.exec_max_us), static_cast<unsigned long>(vsnap.exec_recent_us),
+           boot_error[0] ? " ERR " : "", boot_error);
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);

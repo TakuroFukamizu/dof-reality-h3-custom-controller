@@ -686,6 +686,10 @@ class V1Axis {
   // 止まっている間（PWM 0・ブレーキ作動）の NVS 書き込みで、CONTROL_OVERRUN にせず見逃した長い tick 間隔の回数と最大 [us]
   uint32_t flash_gap_count() const { return flash_gap_count_; }
   uint32_t flash_gap_max_us() const { return flash_gap_max_us_; }
+  void reset_flash_gap_stats() {  // 画面の tick 行のタップ（制御タスクの reset_stats）
+    flash_gap_count_ = 0;
+    flash_gap_max_us_ = 0;
+  }
 
   // --- 参照 -----------------------------------------------------------------
 
@@ -835,7 +839,7 @@ class V1Axis {
   uint64_t boot_origin_us_ = 0;
   uint64_t last_tick_us_ = 0;
   uint64_t now_us_ = 0;  // 直近に handle / tick へ渡された時刻（即時 STATUS の mcu_time_us 用）
-  uint32_t flash_gap_count_ = 0;   // NVS 書き込みと重なった長い間隔を、止まっていたので見逃した回数（起動から）
+  uint32_t flash_gap_count_ = 0;   // NVS 書き込みと重なった長い間隔を、止まっていたので見逃した回数（起動から。reset_flash_gap_stats で 0）
   uint32_t flash_gap_max_us_ = 0;  // 同、間隔の最大
 
   // --- 状態 ---
