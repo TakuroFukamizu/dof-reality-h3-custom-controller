@@ -104,6 +104,11 @@ constexpr uint16_t CONFIGURED = 1u << 3;
 constexpr uint16_t POWER_CONTROLLER = 1u << 4;
 constexpr uint16_t CURRENT_VALID = 1u << 5;
 constexpr uint16_t CLOCK_SYNCED = 1u << 6;
+// r10（Issue #44・#46）: 保護の監視（include/v1_supervisor.h）。いずれもラッチしない状態の表示（FAULT ではない）。protocol.md §3.4
+constexpr uint16_t LOAD_LIMITED = 1u << 7;        // 過負荷: 飽和のまま 1 s 進まず出力 0（誤差が無くなる・向きの反転・2 s 休みで解除）
+constexpr uint16_t FEEDBACK_UNCERTAIN = 1u << 8;  // 見えない走行の予算切れ: 位置制御の出力 0。DISARMED に戻す（再 ARM）まで解除しない
+constexpr uint16_t END_BRAKING = 1u << 9;         // 端の手前の制動: 実測速度で止まれないのでソフトリミットと反対向きに duty_max
+constexpr uint16_t LIMIT_RECOVERY = 1u << 10;     // ソフトリミットの少し外から内側へ戻している、または追従誤差の上限超えが戻りつつある（猶予中）
 }  // namespace flags
 
 namespace role_flags {

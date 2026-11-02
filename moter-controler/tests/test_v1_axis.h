@@ -3653,6 +3653,8 @@ inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
 inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  h.ax.tuning.supervisor = false;
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
@@ -3719,6 +3721,8 @@ inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   // パルス無効でも監視は 2 s
   Harness k;
   k.ax.tuning = r6_tuning(2);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  k.ax.tuning.supervisor = false;
   k.ax.tuning.breakaway_window_ms = 0;
   Harness::accepted(k.config_with(c));
   k.reach_holding_from_configured();
@@ -3786,6 +3790,8 @@ inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
   CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);
   Harness g;
   g.ax.tuning = r6_tuning(6);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  g.ax.tuning.supervisor = false;
   v1::Config c2 = base_config();
   c2.following_error_limit_count = 100000;
   Harness::accepted(g.config_with(c2));
@@ -3852,6 +3858,8 @@ inline void test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall() 
 inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  h.ax.tuning.supervisor = false;
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3908,6 +3916,8 @@ inline void test_r7_stationary_error_3_gets_breakaway_and_watchdog() {
   CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
   Harness g;
   g.ax.tuning = r6_tuning(6);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  g.ax.tuning.supervisor = false;
   Harness::accepted(g.config_with(c));
   g.reach_holding_from_configured();
   g.stall = true;
@@ -4250,6 +4260,8 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
   auto stuck_enc = [](double kd, uint64_t* fault_after_ms, uint16_t* code) {
     Harness g;
     g.ax.tuning = r6_tuning(6);
+    // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+    g.ax.tuning.supervisor = false;
     g.ax.tuning.vel_kd_permille_per_count_s = kd;
     v1::Config c = base_config();
     c.following_error_limit_count = 100000;
@@ -4271,6 +4283,8 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
   // 静止 2 s の監視: 静止目標で誤差 10 のまま進まない → 2 s で ENCODER_FAULT（v_fast 0・軌道 0 なので u_d 0）
   Harness k;
   r9_holding(k);
+  // r10: ENCODER_FAULT を出すのは -DV1_SUPERVISOR=0（r9 と同じ判定）のときだけ。その経路を確かめる（ON の振る舞いは test_r10_*）
+  k.ax.tuning.supervisor = false;
   k.ax.tuning.overrun_ms = V1_OVERRUN_MS;
   k.raw -= 10;
   k.step();

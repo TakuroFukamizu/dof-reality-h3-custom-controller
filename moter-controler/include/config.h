@@ -249,6 +249,66 @@ constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
 constexpr double V1_VEL_KD_PERMILLE_PER_COUNT_S = 0.05;  // Kd: 速度誤差 1 count/s あたり 0.05 permille（200 count/s で上限 10）
 constexpr int V1_VEL_D_MAX_PERMILLE = 10;                // |u_d| の上限 1 %
 constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定の窓
+// r10（Issue #44・#46）: 保護の監視 V1Supervisor（include/v1_supervisor.h）。方向別の経路（V1_FF_DIRECTIONAL）だけで効く。
+// 「進まない → ENCODER_FAULT」の 2 つの判定（走行中の無パルス・静止 2 s の監視）を置き換える。電流検出が無いので「エンコーダは
+// 生きているが完全に止まっている（乗員の荷重）」と「エンコーダ断」はファームでは区別できない。そこで ENCODER_FAULT はラッチせず、
+// 「見えないまま動けた距離（見えない走行）」を実際に出した PWM から積算して上限で出力を止める（FEEDBACK_UNCERTAIN）。
+// 過負荷（生きているのに進まない）は LOAD_LIMITED（ラッチしない）。いずれも仮値で、実機で詰める。-DV1_SUPERVISOR=0 で切れる（r9 と同じ判定）。
+#ifndef V1_SUPERVISOR
+#define V1_SUPERVISOR 1
+#endif
+// 見えない走行の包絡線速度: |Duty| = V1_SUP_ENV_REF_PERMILLE で V1_SUP_ENV_COUNT_S、それ未満は Duty に比例（上限なし。Duty 60 % なら
+// 7500 count/s で外挿 6000〜7800 を覆う）。V1Tuning の sup_env_ref_permille = 0 にすると Issue #44 の仕様どおり |Duty| > 0 なら一律 2500。
+// 比例にした理由: 一律だと保持に入る前の整定（200 ms、P + I が数 permille で動かない）だけで 500 count を使い、端の近くでは毎回
+// FEEDBACK_UNCERTAIN になる。実測（11-02 の回帰）は 20 % で上 1555 / 下 1800 count/s、2 % で下 118 count/s。比例の包絡線はどれも 1.3 倍以上上にある
+constexpr int32_t V1_SUP_ENV_COUNT_S = 2500;
+constexpr int V1_SUP_ENV_REF_PERMILLE = 200;
+// 予算（count）= min(V1_SUP_BUDGET_MAX_COUNT, max(0, D − V1_SUP_END_RESERVE_COUNT))。D = 最後に信用できた位置から駆動の向きの機械端
+// までの距離。機械端は CONFIG のソフトリミットから V1_MECH_DECEL_ZONE_COUNT だけ外（PC の calibration.rs が soft ≥ mechanical +
+// decel_zone を検証している。bringup.toml の decel_zone は 50。PC がこれより小さい decel_zone を使うとここは楽観側になる）。
+// 2500 count/s なら中央付近 400 ms、D = 650 で 100 ms、D ≤ 400 で 0。
+constexpr int32_t V1_SUP_BUDGET_MAX_COUNT = 1000;
+constexpr int32_t V1_SUP_END_RESERVE_COUNT = 400;
+constexpr int32_t V1_MECH_DECEL_ZONE_COUNT = 50;
+// 確認のための最小の予算（仕様からの逸脱。V1Tuning の sup_min_budget_count = 0 で仕様どおり）: D ≤ 400 で予算 0 だと、端から 400 以内では
+// 端へ向かう出力が 1 tick も出せない（PC の目標は soft_min + 150〜350 = 機械端から 200〜400 なので、下端の目標へ着けない）。
+// min(この値, max(0, D − V1_END_HARD_MARGIN_COUNT)) を下限にする: 50 count = 2500 count/s で 20 ms（100 count/s 以上で動いていれば 2 count 進んで確かめられる）
+constexpr int32_t V1_SUP_MIN_BUDGET_COUNT = 50;
+// 「エンコーダが確かに動いた」（予算を戻す唯一の根拠）: 出している Duty の向きへ、窓の中の最も戻った所から V1_SUP_RENEW_MOVE_COUNT 以上の
+// 正味の移動。±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならないので戻さない。Duty 0・向きの反転で窓を取り直す
+constexpr int32_t V1_SUP_RENEW_MOVE_COUNT = 2;
+constexpr uint32_t V1_SUP_RENEW_WINDOW_MS = 200;
+// 過負荷（LOAD_LIMITED）: |出力| ≥ duty_max × 99 % で誤差の向きに出している（飽和）のに、100 ms の窓ごとに向きへ 5 count 進む・
+// |誤差| が 3 減る、のどちらも無いまま 1 s → 出力 0（ラッチしない）。安全に保てる通電の保持 Duty が分からないので 0 に退避する
+//（人が乗った状態の保持 Duty と発熱を測ってから見直す）。|誤差| が保持の出口以下・誤差の向きの反転・2 s 休んだら解除（再び 1 s まで許す）
+constexpr int V1_LOAD_SAT_RATIO_PERMILLE = 990;
+constexpr uint32_t V1_LOAD_SAT_MAX_MS = 1000;
+constexpr uint32_t V1_LOAD_WINDOW_MS = 100;
+constexpr int32_t V1_LOAD_PROGRESS_COUNT = 5;
+constexpr int32_t V1_LOAD_ERR_DROP_COUNT = 3;
+constexpr uint32_t V1_LOAD_REST_MS = 2000;
+// Issue #46: 実測速度を見た端の手前の制動（END_BRAKING、ラッチしない）。実測速度（40 ms 窓の v_fast、無ければ 100 ms 窓）の向きの
+// ソフトリミットまでの残り d に対し、停止距離 v² / (2 × V1_BRAKE_GUARD_ACC_COUNT_S2) > d なら反対向きに duty_max を出す。
+// 減速度 1000 count/s² は実機が確実に止まれる値の仮置き（要計測）。|v| < V1_BRAKE_GUARD_MIN_VEL_COUNT_S は見ない。
+// 解除: |v| < 最小速度 / 2、または停止距離 ≤ d − V1_BRAKE_GUARD_HYST_COUNT
+constexpr int32_t V1_BRAKE_GUARD_ACC_COUNT_S2 = 1000;
+constexpr int32_t V1_BRAKE_GUARD_MIN_VEL_COUNT_S = 50;
+constexpr int32_t V1_BRAKE_GUARD_HYST_COUNT = 20;
+// Issue #46: SOFT_LIMIT はソフトリミットを少し越えただけではラッチしない（SOFT_RECOVERY、内側へ戻す。外向きの出力は 0 にする）。
+// ラッチするのは: 機械端（上の推定）から V1_END_HARD_MARGIN_COUNT 以内、外向きに V1_SOFT_OUT_VEL_COUNT_S を超える速度で
+// V1_SOFT_OUTWARD_GRACE_MS 動き続けた、外に V1_SOFT_RECOVER_MAX_MS 居続けた、目標が外、のどれか
+constexpr int32_t V1_END_HARD_MARGIN_COUNT = 20;
+constexpr int32_t V1_SOFT_OUT_VEL_COUNT_S = 20;
+constexpr uint32_t V1_SOFT_OUTWARD_GRACE_MS = 200;
+constexpr uint32_t V1_SOFT_RECOVER_MAX_MS = 2000;
+// Issue #46: FOLLOWING_ERROR は上限そのものは変えず、超えていても「エンコーダが生きている（直近 V1_FE_ACTIVITY_MS にカウント変化）」かつ
+// 「|誤差| が減っている（V1_FE_WINDOW_MS ごとに V1_FE_MIN_DROP_COUNT 以上減った）」間は最長 V1_FE_GRACE_MAX_MS ラッチしない（LIMIT_RECOVERY）
+constexpr uint32_t V1_FE_ACTIVITY_MS = 100;
+constexpr uint32_t V1_FE_WINDOW_MS = 100;
+constexpr int32_t V1_FE_MIN_DROP_COUNT = 2;
+constexpr uint32_t V1_FE_GRACE_MAX_MS = 2000;
+constexpr uint32_t V1_FE_TURN_MS = 200;             // 超えた直後に減り始めるのを待つ時間（超えた瞬間の |誤差| は必ず増えている）
+constexpr int V1_FE_HARD_RATIO_PERCENT = 150;       // |誤差| が上限の 1.5 倍以上なら猶予なしでラッチ（猶予中の行き過ぎの上限）
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

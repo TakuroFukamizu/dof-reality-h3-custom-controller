@@ -25,6 +25,7 @@
 #include "config.h"
 #include "motor_profile.h"
 #include "v1_codec.h"
+#include "v1_supervisor.h"
 
 // 調整値。既定は config.h（実機で詰めるまでの仮値）。テストで差し替えられるよう構造体にしている。
 struct V1Tuning {
@@ -89,12 +90,18 @@ struct V1Tuning {
   double vel_kd_permille_per_count_s = 0.0;           // Kd [permille / (count/s)]。コンストラクタで既定を入れる
   int vel_d_max_permille = V1_VEL_D_MAX_PERMILLE;     // |u_d| の上限
   uint32_t v_fast_window_ms = V1_V_FAST_WINDOW_MS;    // 速い速度推定の窓
+  // r10（Issue #44・#46。config.h V1_SUPERVISOR）: 保護の監視 V1Supervisor。方向別の経路だけで効く（従来の経路では常に false 扱い）。
+  // true のとき「進まない → ENCODER_FAULT」の 2 つの判定（走行中の無パルス・静止 2 s の監視）は出さず、見えない走行の予算
+  //（FEEDBACK_UNCERTAIN）・過負荷（LOAD_LIMITED）・端の手前の制動・SOFT_LIMIT / FOLLOWING_ERROR の猶予に置き換わる
+  bool supervisor = false;  // コンストラクタで既定を入れる
+  V1SupTuning sup;
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
     if (directional) {
       ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
       vel_kd_permille_per_count_s = V1_VEL_DAMPING ? V1_VEL_KD_PERMILLE_PER_COUNT_S : 0.0;
+      supervisor = V1_SUPERVISOR != 0;
     }
   }
   // 静止の帯の入口／出口（r6 は hold_enter / hold_exit、従来は deadband / deadband_out）。v1_duty_command・整定判定・静止監視で共用
@@ -415,6 +422,7 @@ class V1Axis {
     vel_anchor_raw_ = raw;
     vel_anchor_us_ = now_us;
     reset_v_fast();
+    sup_.reset_trust(raw, now_us);
     state_ = v1::state::DISARMED;
     cal_phase_ = CalPhase::Idle;
     cal_.cfg = cal_config;
@@ -504,6 +512,7 @@ class V1Axis {
     selected_axis_ = axis;
     has_config_ = false;
     referenced_ = false;
+    sup_.reset_trust(raw_, now_us);  // r10: 別の系統の位置は信用の起点にならない
     v1::McuMsg m;
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::AXIS_SELECT;
@@ -607,6 +616,10 @@ class V1Axis {
   bool breakaway_active() const { return brk_active_; }
   // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
   const V1DutyTerms& duty_terms() const { return terms_; }
+  // r10（Issue #44・#46）: 保護の監視が効いているか（方向別の経路かつ tuning.supervisor）と、その計器（画面・テスト用）
+  bool supervisor_on() const { return tuning.ff_directional && tuning.supervisor; }
+  V1SupInfo supervisor_info() const { return sup_.info(now_us_, supervisor_on()); }
+  const V1Supervisor& supervisor() const { return sup_; }
   // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
   // 整数 % で切り捨ててから permille にするので効き目は整数 % のときと同じ: duty_max 20 → 150、14 → 10 % → 100（下限）
   int encoder_fault_duty_threshold_permille() const {
@@ -615,6 +628,7 @@ class V1Axis {
   }
   // duty_max がしきい値より低く、無パルスの ENCODER_FAULT が決して出ない（SET_LIMITS は受理するが画面で警告する）
   bool encoder_fault_check_disabled() const {
+    if (supervisor_on()) return false;  // r10: 無パルスの ENCODER_FAULT 自体が無い（見えない走行の予算が代わりに守る）
     return encoder_fault_duty_threshold_permille() > v1_permille(tuning.duty_max);
   }
 
@@ -627,6 +641,12 @@ class V1Axis {
     if (brake_release_cmd_) f |= v1::flags::BRAKE_RELEASE_CMD;
     if (referenced_) f |= v1::flags::POSITION_REFERENCED;
     if (has_config_) f |= v1::flags::CONFIGURED;
+    if (supervisor_on()) {  // r10（Issue #44・#46）
+      if (sup_.load_limited()) f |= v1::flags::LOAD_LIMITED;
+      if (sup_.feedback_uncertain()) f |= v1::flags::FEEDBACK_UNCERTAIN;
+      if (sup_.end_braking()) f |= v1::flags::END_BRAKING;
+      if (sup_.soft_recovery() || sup_.fe_recovery()) f |= v1::flags::LIMIT_RECOVERY;
+    }
     return f;
   }
 
@@ -733,6 +753,9 @@ class V1Axis {
   size_t vf_count_ = 0;
   bool v_fast_valid_ = false;
   double v_fast_ = 0.0;  // [count/s]
+
+  // r10（Issue #44・#46）: 保護の監視
+  V1Supervisor sup_{};
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
@@ -1119,6 +1142,7 @@ class V1Axis {
     if (state_ != v1::state::FAULT) return v1::ack_reason::BAD_STATE;
     if (fault_cause_present()) return v1::ack_reason::FAULT_CAUSE_PRESENT;
     if (fault_code_ == v1::fault::ENCODER_FAULT) referenced_ = false;
+    sup_.clear_episode();  // r10: FAULT_RESET は FEEDBACK_UNCERTAIN の明示的な解除のひとつ（位置の上限は戻さない）
     state_ = v1::state::DISARMED;
     fault_code_ = v1::fault::NONE;
     stop_kind_ = StopKind::Hold;
@@ -1141,6 +1165,7 @@ class V1Axis {
     reference_offset_ = raw_ - static_cast<int64_t>(reference_count);
     hold_here();
     referenced_ = true;
+    sup_.reset_trust(raw_, now_us_);  // r10: 基準の取り直しは信用の取り直し（見えない走行の包絡線をすべて 0 に）
     return v1::ack_reason::NONE;
   }
 
@@ -1405,15 +1430,55 @@ class V1Axis {
     }
   }
 
+  // r10: 保護の監視への 1 tick の入力（座標は actual_count、速度は v_fast が使えればそれ、無ければ 100 ms 窓）
+  V1Supervisor::Ctx sup_ctx(uint64_t now) const {
+    V1Supervisor::Ctx c;
+    c.now_us = now;
+    c.raw = raw_;
+    c.ref_offset = reference_offset_;
+    c.err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
+    c.soft_min = config_.soft_min_count;
+    c.soft_max = config_.soft_max_count;
+    c.vel = v_fast_valid_ ? v_fast_ : static_cast<double>(velocity_);
+    c.duty_max_pm = v1_permille(tuning.duty_max);
+    c.hold_exit = tuning.hold_exit;
+    return c;
+  }
+
+  // FOLLOWING_ERROR → OVERSPEED → SOFT_LIMIT の順。r10（Issue #46、supervisor_on のときだけ）:
+  //  - FOLLOWING_ERROR: 上限そのものは変えない。超えていても、エンコーダが生きていて（直近 100 ms にカウント変化）|誤差| が減っている
+  //    （100 ms ごとに 2 以上）間は最長 2 s ラッチしない（LIMIT_RECOVERY）。超えた直後の 200 ms は減り始めるのを待つ（超えた瞬間は
+  //    必ず増えている）。減らなくなった・2 s 経った・|誤差| ≥ 上限 × 1.5・カウントが 100 ms 動かない・FEEDBACK_UNCERTAIN ならラッチ。
+  //  - SOFT_LIMIT: 少し越えただけで目標が内側なら内側へ戻す（外向きの出力は V1Supervisor::filter が 0 にする。LIMIT_RECOVERY）。
+  //    機械端（ソフトリミット ∓ 50）から 20 以内・外向きに 200 ms 動き続けた・2 s 外に居続けた・目標が外ならラッチ。
+  //  - OVERSPEED は変えない。
   void check_motion_faults(uint64_t now) {
     if (!has_config_) return;
+    const bool sup = supervisor_on();
+    V1Supervisor::Ctx c;
+    if (sup) {
+      c = sup_ctx(now);
+      sup_.observe(c);  // 前の tick の出力の包絡線を積み、確かな動きなら予算を戻す（異常判定より前）
+    }
     const int64_t fe = static_cast<int64_t>(actual_count()) - static_cast<int64_t>(target_count());
     const int64_t fe_abs = fe < 0 ? -fe : fe;
     const int64_t vel_abs = velocity_ < 0 ? -static_cast<int64_t>(velocity_) : velocity_;
-    if (fe_abs > static_cast<int64_t>(config_.following_error_limit_count)) {
+    bool fe_over = fe_abs > static_cast<int64_t>(config_.following_error_limit_count);
+    if (sup) {
+      if (fe_over && sup_.fe_may_wait(c, fe_abs, config_.following_error_limit_count)) {
+        fe_over = false;
+      } else if (!fe_over) {
+        sup_.fe_within();
+      }
+    }
+    if (fe_over) {
       latch_fault(v1::fault::FOLLOWING_ERROR, now);
     } else if (vel_abs > static_cast<int64_t>(config_.overspeed_count_s)) {
       latch_fault(v1::fault::OVERSPEED, now);
+    } else if (sup) {
+      if (sup_.decide_soft_limit(c, actual_count(), target_count()) == V1SoftDecision::Latch) {
+        latch_fault(v1::fault::SOFT_LIMIT, now);
+      }
     } else if (!inside_soft_window()) {
       latch_fault(v1::fault::SOFT_LIMIT, now);
     }
@@ -1509,6 +1574,7 @@ class V1Axis {
       const MotorProfile& p = cal_.profile;
       reference_offset_ = cal_.origin_raw;  // P 端 = 0
       referenced_ = true;
+      sup_.reset_trust(raw_, now);  // r10: 端当てで基準を取り直した
       sign_ = p.sign < 0 ? -1 : 1;
       dirty_profile_ = p;
       dirty_profile_.motor = selected_axis_;
@@ -1594,6 +1660,8 @@ class V1Axis {
   void update_duty(uint64_t now, uint64_t dt_us = 0) {
     if (!position_control_on()) {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
+      sup_.end_session(raw_, now);  // r10: その回だけの状態（飽和・過負荷・制動・猶予）を捨てる
+      if (state_ == v1::state::DISARMED) sup_.clear_episode();  // DISARM の完了: FEEDBACK_UNCERTAIN の明示的な解除（再 ARM が要る）
       stall_running_ = false;
       duty_state_ = V1DutyState{};
       reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
@@ -1612,8 +1680,10 @@ class V1Axis {
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
     const bool settle_ok = update_settle_dwell(err, dt_us);
     const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
-    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
-                                    assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
+    int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
+                              assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
+    // r10（Issue #44・#46）: 保護の監視が出力を決める（見えない走行の予算・過負荷・端の手前の制動・ソフトリミットの外の外向き 0）
+    if (supervisor_on() && has_config_) cmd = sup_.filter(sup_ctx(now), cmd);
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
@@ -1629,7 +1699,9 @@ class V1Axis {
     //    止まっている間は検出できず、目標が動けば STALL_MS で出る）。
     //  - しきい値を duty_max の 75 % 以上にするのは、kp を上げたとき数百 count の誤差だけで 10 % に届き、荷重で動けない軸が
     //    FOLLOWING_ERROR の前に ENCODER_FAULT になって基準を失うのを避けるため。上限近くまで出しても止まっているときだけ異常。
-    if (mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
+    // r10（supervisor_on）: この判定は出さない（荷重で動けない軸を「エンコーダ断」と取り違える。Issue #44）。見えない走行は
+    // V1Supervisor の予算が止める
+    if (!supervisor_on() && mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
       if (!stall_running_) {
         stall_running_ = true;
         stall_start_us_ = now;
@@ -1879,8 +1951,9 @@ class V1Axis {
     if (tuning.ff_directional) {
       // Issue #25 r6: 床が無いので上乗せもしない。静止 2 s の監視（対象のまま stall_boost_min_move 未満しか進まない →
       // ENCODER_FAULT）だけを残す。時計を戻すのは上の「動いた」だけで、動き出しパルス（update_breakaway）は戻さない。
+      // r10（supervisor_on）: ラッチしない（押さえられた軸を ENCODER_FAULT にしない。Issue #44）。V1Supervisor が代わりに守る
       stall_boost_ = 0;
-      if (timed_out && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
+      if (timed_out && !supervisor_on() && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
       return;
     }
     if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;
