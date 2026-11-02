@@ -170,6 +170,17 @@ struct Rig {
     return r;
   }
   bool done() const { return !results().empty(); }
+  // 最後の DIAG_RESULT。無ければテストの失敗として数え（空の vector の back() で落ちない）、0 埋めの結果を返す
+  v1::DiagResult last_result() const {
+    const std::vector<v1::DiagResult> r = results();
+    CHECK(!r.empty());
+    if (r.empty()) {
+      v1::DiagResult z;
+      memset(&z, 0, sizeof(z));
+      return z;
+    }
+    return r.back();
+  }
 
   // DIAG_READ で記録を全部読む
   std::vector<v1::DiagSample> read_all(uint16_t* total_out = nullptr) {
@@ -393,7 +404,7 @@ inline void test_diag_sag_t_max_full_sequence() {
   CHECK(g.h.ax.duty_permille() == 0);  // SAG は PWM 0 のまま
   CHECK(g.h.ax.diag_fast());
   CHECK(g.run_until([&] { return g.done(); }, 1000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::OK);
   CHECK(r.stop_reason == v1::diag_stop::T_MAX);
   CHECK(r.t_drive_us == v1::DIAG_TIME_NONE);
@@ -458,7 +469,7 @@ inline void test_diag_sag_d_max_stops_early() {
   g.sag_count_s = 1000.0;
   Harness::accepted(g.sag(500, 60));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::D_MAX);
   CHECK(r.disp_at_engage >= 60 && r.disp_at_engage <= 61);
   CHECK(r.t_engage_us >= 59 * MS && r.t_engage_us <= 61 * MS);
@@ -473,7 +484,7 @@ inline void test_diag_sag_end_margin_uses_lookahead() {
   g.sag_count_s = 1500.0;
   Harness::accepted(g.sag(500, 60));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::END_MARGIN);
   CHECK(r.t_engage_us <= 3 * MS);
   CHECK(r.disp_at_engage <= 5);  // d_max（60）よりずっと手前
@@ -488,10 +499,38 @@ inline void test_diag_end_margin_projection_includes_gravity() {
   g.grip_ms = 5;
   Harness::accepted(g.sag(500, 100));  // 2270 + 100 + 225 = 2595 ≤ 2600
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   // 新: 2270 + d + 0.3 × 200 + 225 > 2600 → d > 45 で END_MARGIN。旧（200 ms 一定速度、+40）なら d_max（100）まで走っていた
   CHECK(r.stop_reason == v1::diag_stop::END_MARGIN);
   CHECK(r.disp_at_engage >= 40 && r.disp_at_engage <= 47);
+  CHECK(r.result == v1::diag_result::OK);
+}
+
+// 下側の鏡像（near_end の a + drift − grav < lo）。lo = −2700 + 100 = −2600。開始 −2315、下向き 1500 count/s →
+// 解除直後の短い履歴の速度でも下側を見てすぐ止める。下側の見積もりを外すと d_max（60）まで走り D_MAX になる
+inline void test_diag_sag_end_margin_lower_uses_lookahead() {
+  Rig g(-2315);
+  g.sag_count_s = -1500.0;
+  Harness::accepted(g.sag(500, 60));  // −2315 − 60 − 225 = −2600 ≥ −2600
+  CHECK(g.run_until([&] { return g.done(); }, 8000));
+  const v1::DiagResult r = g.last_result();
+  CHECK(r.stop_reason == v1::diag_stop::END_MARGIN);
+  CHECK(r.t_engage_us <= 3 * MS);
+  CHECK(r.disp_at_engage >= -5 && r.disp_at_engage <= 0);  // d_max（60）よりずっと手前
+  CHECK(g.h.ax.state() == st::DIAG);  // 作動後の滑り（45 count）は端の余裕の内側: 待機に残る
+}
+
+// test_diag_end_margin_projection_includes_gravity の下側: −2270 − d − 0.3 × 200 − 225 < −2600 → d > 45 で END_MARGIN。
+// 下側の見積もりが無ければ d_max（100）まで走る
+inline void test_diag_end_margin_lower_projection_includes_gravity() {
+  Rig g(-2270);
+  g.sag_count_s = -200.0;
+  g.grip_ms = 5;
+  Harness::accepted(g.sag(500, 100));  // −2270 − 100 − 225 = −2595 ≥ −2600
+  CHECK(g.run_until([&] { return g.done(); }, 8000));
+  const v1::DiagResult r = g.last_result();
+  CHECK(r.stop_reason == v1::diag_stop::END_MARGIN);
+  CHECK(r.disp_at_engage <= -40 && r.disp_at_engage >= -47);
   CHECK(r.result == v1::diag_result::OK);
 }
 
@@ -505,7 +544,7 @@ inline void test_diag_engage_v_target() {
   CHECK(g.h.ax.duty_permille() == 200);       // −sign × (+200)
   CHECK(g.h.ax.pwm_permille() == 200);        // カウント増の向き
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::OK);
   CHECK(r.stop_reason == v1::diag_stop::V_TARGET);
   CHECK(r.t_drive_us >= 50 * MS && r.t_drive_us <= 51 * MS);
@@ -537,7 +576,7 @@ inline void test_diag_engage_d_run_and_direction() {
   CHECK(g.h.ax.duty_permille() == 200);   // −(+1) × (−200)
   CHECK(g.h.ax.pwm_permille() == -200);
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::D_RUN);
   CHECK(r.t_drive_us == 0);  // 待ち 0 は解除と同時
   CHECK(r.disp_at_engage <= -400 && r.disp_at_engage >= -402);
@@ -548,7 +587,7 @@ inline void test_diag_engage_run_timeout_fits_buffer() {
   g.count_s_per_percent = 5.0;  // 20 % で 100 count/s（遅い）: 300 ms 走っても 30 count
   Harness::accepted(g.engage(1, 200, 600, 3000, 200));  // 待ち 200 + 走行 300 + 後 500 = 最長の記録
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::RUN_TIMEOUT);
   CHECK(r.t_engage_us - r.t_drive_us >= 300 * MS && r.t_engage_us - r.t_drive_us <= 301 * MS);
   CHECK((r.flags & v1::diag_flags::TRUNCATED) == 0);
@@ -569,7 +608,7 @@ inline void test_diag_engage_no_pulse_latches_encoder_fault() {
   CHECK(!g.h.ax.power_on_cmd());
   CHECK(!g.done());  // 作動後の記録を続けている
   CHECK(g.run_until([&] { return g.done(); }, 1000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::FAULT);
   CHECK(r.stop_reason == v1::diag_stop::NO_PULSE);
   CHECK(r.fault_code == fc::ENCODER_FAULT);
@@ -600,7 +639,7 @@ inline void test_diag_engage_encoder_freezes_after_moving() {
   CHECK(!g.h.ax.brake_release_cmd() && g.h.ax.duty_permille() == 0);
   CHECK(!g.h.ax.referenced());
   CHECK(g.run_until([&] { return g.done(); }, 1000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::FAULT);
   CHECK(r.stop_reason == v1::diag_stop::NO_PULSE);
   CHECK(r.referenced_after == 0);
@@ -613,15 +652,15 @@ inline void test_diag_engage_slow_motion_is_not_no_pulse() {
   g.count_s_per_percent = 0.5;  // 20 % で 10 count/s（100 ms に 1 count）
   Harness::accepted(g.engage(1, 200, 600, 3000, 0));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   // 走り始めから 150 ms で 3 count に届かない → 無パルス（±1 のちらつきを除く判定は従来どおり）
   CHECK(r.stop_reason == v1::diag_stop::NO_PULSE);
   Rig k;
   k.count_s_per_percent = 2.0;  // 20 % で 40 count/s（25 ms に 1 count、150 ms で 6 count）
   Harness::accepted(k.engage(1, 200, 600, 3000, 0));
   CHECK(k.run_until([&] { return k.done(); }, 8000));
-  CHECK(k.results().back().stop_reason == v1::diag_stop::RUN_TIMEOUT);
-  CHECK(k.results().back().result == v1::diag_result::OK);
+  CHECK(k.last_result().stop_reason == v1::diag_stop::RUN_TIMEOUT);
+  CHECK(k.last_result().result == v1::diag_result::OK);
   CHECK(k.h.ax.referenced());
 }
 
@@ -631,7 +670,7 @@ inline void test_diag_engage_reverse_stops() {
   g.sag_count_s = -500.0;       // 荷重に負けて −400 count/s
   Harness::accepted(g.engage(1, 200, 400, 800, 0));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::REVERSE);
   CHECK(r.disp_at_engage <= -20 && r.disp_at_engage >= -22);
   CHECK(r.result == v1::diag_result::OK);
@@ -643,7 +682,7 @@ inline void test_diag_engage_sag_guard_before_drive() {
   g.sag_count_s = -1000.0;  // 待ち 200 ms の間に 100 count 沈む
   Harness::accepted(g.engage(1, 200, 400, 800, 200));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::SAG_GUARD);
   CHECK(r.t_drive_us == v1::DIAG_TIME_NONE);
   CHECK(r.disp_at_engage <= -100 && r.disp_at_engage >= -101);
@@ -668,7 +707,7 @@ inline void test_diag_estop_mid_sag_brakes_same_cycle() {
   g.run(10);
   CHECK(!g.h.ax.brake_release_cmd() && g.h.ax.duty_permille() == 0);
   CHECK(g.run_until([&] { return g.done(); }, 1000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::FAULT);
   CHECK(r.stop_reason == v1::diag_stop::FAULT);
   CHECK(r.fault_code == fc::LOCAL_ESTOP);
@@ -692,7 +731,7 @@ inline void test_diag_host_fault_and_overrun_abort() {
     g.h.host_fault();
     CHECK(g.h.ax.state() == st::FAULT && !g.h.ax.brake_release_cmd());
     CHECK(g.run_until([&] { return g.done(); }, 1000));
-    CHECK(g.results().back().fault_code == fc::HOST_FAULT);
+    CHECK(g.last_result().fault_code == fc::HOST_FAULT);
   }
   {  // 制御周期の逸脱（DIAG は止まっている状態ではないので見る）
     Rig g;
@@ -712,7 +751,7 @@ inline void test_diag_host_fault_and_overrun_abort() {
     g.h.drain();
     CHECK(g.h.ax.state() == st::FAULT && !g.h.ax.power_on_cmd());
     CHECK(g.run_until([&] { return g.done(); }, 10));  // 次の tick で DIAG_RESULT（FAULT_EVENT の後）
-    CHECK(g.done() && g.results().back().result == v1::diag_result::FAULT && g.results().back().sample_count == 0);
+    CHECK(g.done() && g.last_result().result == v1::diag_result::FAULT && g.last_result().sample_count == 0);
   }
 }
 
@@ -730,7 +769,7 @@ inline void test_diag_cancel_and_disarm() {
       if (g.h.out[i].type == v1::msg::DIAG_RESULT && !res_at) res_at = i;
     }
     CHECK(ack_at && res_at && ack_at < res_at);
-    CHECK(g.results().back().result == v1::diag_result::CANCELLED && g.results().back().sample_count == 0);
+    CHECK(g.last_result().result == v1::diag_result::CANCELLED && g.last_result().sample_count == 0);
   }
   {  // 記録中の中止: その周期でブレーキ作動、後の記録を経て CANCELLED
     Rig g;
@@ -742,7 +781,7 @@ inline void test_diag_cancel_and_disarm() {
     CHECK(!g.h.ax.brake_release_cmd());
     CHECK(g.h.ax.state() == st::DIAG);  // 後の記録中
     CHECK(g.run_until([&] { return g.done(); }, 1000));
-    const v1::DiagResult r = g.results().back();
+    const v1::DiagResult r = g.last_result();
     CHECK(r.result == v1::diag_result::CANCELLED && r.stop_reason == v1::diag_stop::CANCEL);
     CHECK(r.sample_count > 400);
     CHECK(g.h.ax.state() == st::DISARMED);
@@ -754,7 +793,7 @@ inline void test_diag_cancel_and_disarm() {
     Harness::accepted(g.h.disarm());
     CHECK(!g.h.ax.brake_release_cmd() && g.h.ax.duty_permille() == 0);
     CHECK(g.run_until([&] { return g.done(); }, 1000));
-    CHECK(g.results().back().result == v1::diag_result::CANCELLED);
+    CHECK(g.last_result().result == v1::diag_result::CANCELLED);
   }
 }
 
@@ -785,7 +824,7 @@ inline void test_diag_power_hold() {
     CHECK(g.h.ax.power_on_cmd());
     CHECK(!g.h.ax.brake_release_cmd() && g.h.ax.duty_permille() == 0);  // ブレーキ作動・PWM 0 のまま
     CHECK(g.run_until([&] { return g.done(); }, 1000));
-    CHECK(g.results().back().result == v1::diag_result::OK);
+    CHECK(g.last_result().result == v1::diag_result::OK);
     CHECK(g.h.ax.state() == st::DISARMED && !g.h.ax.power_on_cmd());
   }
   {  // 受信が途絶えたら主電源を切る
@@ -793,7 +832,7 @@ inline void test_diag_power_hold() {
     g.keepalive = false;
     Harness::accepted(g.power_hold(60000));
     CHECK(g.run_until([&] { return g.done(); }, 8000));
-    CHECK(g.results().back().result == v1::diag_result::CANCELLED);
+    CHECK(g.last_result().result == v1::diag_result::CANCELLED);
     CHECK(g.h.now >= 2000 * MS);
     CHECK(g.h.ax.state() == st::DISARMED && !g.h.ax.power_on_cmd());
   }
@@ -848,7 +887,7 @@ inline void test_diag_power_hold_reports_settled_and_refreshes() {
   CHECK(read_session(g).session_ms >= 10000);
   CHECK(g.results().empty());
   CHECK(g.run_until([&] { return g.done(); }, 6000));
-  CHECK(g.results().back().mode == v1::diag_mode::POWER_HOLD && g.results().back().result == v1::diag_result::OK);
+  CHECK(g.last_result().mode == v1::diag_mode::POWER_HOLD && g.last_result().result == v1::diag_result::OK);
   CHECK(g.h.ax.state() == st::DISARMED && !g.h.ax.power_on_cmd());
   CHECK(read_session(g).session_flags == 0);
 }
@@ -865,7 +904,7 @@ inline void test_diag_settle_is_at_least_5s() {
   CHECK(g.h.now - t_start >= 5000 * MS);
   CHECK(g.h.now - t_start <= 5010 * MS);
   CHECK(g.run_until([&] { return g.done(); }, 1000));
-  CHECK(g.results().back().session_ms_at_release >= 5000);
+  CHECK(g.last_result().session_ms_at_release >= 5000);
 }
 
 // 指摘 2: 同じ区間の計測は主電源を入れたまま続く（2 回目以降は電源待ちなし）。受信が 2 s 途絶えたら待機から区間を閉じる
@@ -887,7 +926,7 @@ inline void test_diag_session_keeps_power_between_runs() {
     }
     CHECK(t_release != 0 && t_release - t_start <= 10 * MS);  // 電源待ちなしで解除
     CHECK(g.done());
-    const v1::DiagResult r = g.results().back();
+    const v1::DiagResult r = g.last_result();
     CHECK(r.result == v1::diag_result::OK && (r.flags & v1::diag_flags::SESSION_KEPT) != 0);
     CHECK(r.session_ms_at_release > 5000);
   }
@@ -896,7 +935,7 @@ inline void test_diag_session_keeps_power_between_runs() {
   // ENGAGE も同じ区間で受ける
   Harness::accepted(g.engage(1, 150, 200, 600, 0));
   CHECK(g.run_until([&] { return g.h.ax.duty_permille() != 0; }, 10));
-  CHECK(g.run_until([&] { return g.results().back().mode == v1::diag_mode::ENGAGE; }, 2000));
+  CHECK(g.run_until([&] { return g.done() && g.results().back().mode == v1::diag_mode::ENGAGE; }, 2000));
   // 道具が落ちた: 待機で 2 s 受信が無ければ区間を閉じる（主電源 OFF）。POWER_HOLD の結果ではないので DIAG_RESULT は出ない
   g.keepalive = false;
   const size_t results_before = g.results().size();
@@ -931,7 +970,7 @@ inline void test_diag_rx_silence_during_settle_and_recording() {
     g.keepalive = false;
     Harness::accepted(g.sag(150, 60));
     CHECK(g.run_until([&] { return g.done(); }, SETTLE_WAIT_MS));
-    const v1::DiagResult r = g.results().back();
+    const v1::DiagResult r = g.last_result();
     CHECK(r.result == v1::diag_result::CANCELLED && r.stop_reason == v1::diag_stop::CANCEL && r.sample_count == 0);
     CHECK(g.h.now <= 2010 * MS);
     CHECK(g.h.ax.state() == st::DISARMED && !g.h.ax.power_on_cmd());
@@ -943,7 +982,7 @@ inline void test_diag_rx_silence_during_settle_and_recording() {
     CHECK(g.run_until([&] { return g.h.ax.brake_release_cmd(); }, SETTLE_WAIT_MS));
     g.keepalive = false;  // 解除の直後に道具が落ちた
     CHECK(g.run_until([&] { return g.done(); }, 2000));
-    const v1::DiagResult r = g.results().back();
+    const v1::DiagResult r = g.last_result();
     CHECK(r.result == v1::diag_result::OK && r.stop_reason == v1::diag_stop::T_MAX);  // 記録は最後まで
     CHECK(r.sample_count >= 899);
     CHECK(g.run_until([&] { return g.h.ax.state() == st::DISARMED; }, 2500));  // その後の待機で閉じる
@@ -965,7 +1004,7 @@ inline void test_diag_room_rechecked_before_release() {
   }
   CHECK(!released);
   CHECK(g.done());
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.result == v1::diag_result::ABORTED);
   CHECK(r.stop_reason == v1::diag_stop::ROOM_LOST);
   CHECK(r.sample_count == 0);
@@ -985,7 +1024,7 @@ inline void test_diag_post_brake_margin_closes_session() {
   g.grip_ms = 2000;  // 作動しても 2 s 滑る
   Harness::accepted(g.sag(500, 60));
   CHECK(g.run_until([&] { return g.done(); }, 8000));
-  const v1::DiagResult r = g.results().back();
+  const v1::DiagResult r = g.last_result();
   CHECK(r.stop_reason == v1::diag_stop::END_MARGIN);  // 見積もりで早めに作動は指令した
   CHECK((r.flags & v1::diag_flags::POST_MARGIN) != 0);
   CHECK((r.flags & v1::diag_flags::SESSION_KEPT) == 0);
@@ -1098,6 +1137,8 @@ inline void run_all() {
   test_diag_sag_d_max_stops_early();
   test_diag_sag_end_margin_uses_lookahead();
   test_diag_end_margin_projection_includes_gravity();
+  test_diag_sag_end_margin_lower_uses_lookahead();
+  test_diag_end_margin_lower_projection_includes_gravity();
   test_diag_engage_v_target();
   test_diag_engage_d_run_and_direction();
   test_diag_engage_run_timeout_fits_buffer();
