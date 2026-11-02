@@ -25,6 +25,7 @@
 #include "config.h"
 #include "motor_profile.h"
 #include "v1_codec.h"
+#include "v1_diag_brake.h"  // 計測専用（V1_DIAG_BRAKE_TEST=1 のときだけ中身がある）
 #include "v1_playout.h"
 
 // 調整値。既定は config.h（実機で詰めるまでの仮値）。テストで差し替えられるよう構造体にしている。
@@ -475,6 +476,9 @@ class V1Axis {
   void handle(const v1::HostMsg& m, uint64_t now_us, uint64_t rx_us) {
     now_us_ = now_us;
     dispatch(m, now_us, rx_us > now_us ? now_us : rx_us);
+#if V1_DIAG_BRAKE_TEST
+    diag_finish_if_done();  // 主電源待ちの間の中止は即終わる（ACK の後に DIAG_RESULT）
+#endif
     emit_status_if_changed();
   }
 
@@ -503,6 +507,9 @@ class V1Axis {
     }
     update_duty(now_us, dt_us);
     tick_calibration(now_us);  // CALIBRATING のときだけ Duty を書く（update_duty の後）
+#if V1_DIAG_BRAKE_TEST
+    diag_finish_if_done();  // 異常（非常停止など）で記録なしに終わった計測の DIAG_RESULT（FAULT_EVENT の後）
+#endif
     emit_status_if_changed();
     emit_periodic_status(now_us);
   }
@@ -550,6 +557,37 @@ class V1Axis {
   void record_rx_error() {
     if (rx_error_count_ < 0xFFFF) rx_error_count_ += 1;
   }
+
+#if V1_DIAG_BRAKE_TEST
+  // --- 計測（DIAG、計測専用の組み立てだけ） --------------------------------------
+  // 制御タスクが呼ぶ: diag_busy() の間は毎周期 tick の後に、diag_fast()（記録中）の間は 1 ms ごとに。
+  // 出力（brake_release_cmd / duty_permille）は state が DIAG の間だけ書く（FAULT の後の記録は出力に触らない）。
+  void diag_step(uint64_t now_us, int64_t raw, uint16_t adc) {
+    if (!diag_.busy()) {
+      diag_finish_if_done();
+      return;
+    }
+    now_us_ = now_us;
+    const int32_t a = clamp_count(raw - reference_offset_);
+    // POWER_HOLD は PC からの受信が途絶えたら主電源を切る（道具が落ちたときに 24 V を入れたままにしない）
+    if (state_ == v1::state::DIAG && diag_.phase() == V1DiagBrake::Phase::PowerHold &&
+        now_us - last_rx_us_ > ms_to_us(V1_DIAG_POWER_HOLD_RX_TIMEOUT_MS)) {
+      diag_.cancel(now_us);
+    }
+    diag_.step(now_us, a, adc, power_on_cmd());
+    uint16_t code = v1::fault::NONE;
+    if (diag_.take_fault_request(&code)) latch_fault(code, now_us);  // 走行中の無パルス（ブレーキ作動・PWM 0 はこの周期に出る）
+    if (state_ == v1::state::DIAG) {
+      brake_release_cmd_ = diag_.brake_release();
+      duty_permille_ = -static_cast<int>(sign_) * diag_.pwm_permille();  // カウントを増やしたいなら −sign × duty（update_duty と同じ）
+    }
+    diag_finish_if_done();
+    emit_status_if_changed();
+  }
+  bool diag_busy() const { return diag_.busy(); }
+  bool diag_fast() const { return diag_.fast(); }
+  const V1DiagBrake& diag() const { return diag_; }
+#endif
 
   // --- 出力（送信メッセージ） -------------------------------------------------
 
@@ -806,6 +844,11 @@ class V1Axis {
   MotorProfile profile_hint_{};
   bool profile_dirty_ = false;
 
+#if V1_DIAG_BRAKE_TEST
+  // --- 計測（DIAG） ---
+  V1DiagBrake diag_{};  // 記録 1024 点（16 KB）を含む。V1Axis は静的領域に置く（control_task.cpp）
+#endif
+
   // --- DUPLICATE 判定（受理した命令、古い順） ---
   Accepted accepted_[kDedupeDepth]{};
   size_t accepted_count_ = 0;
@@ -841,7 +884,11 @@ class V1Axis {
   }
   bool powered_state() const {
     return state_ == v1::state::ARMING || state_ == v1::state::HOLDING || state_ == v1::state::ACTIVE ||
-           state_ == v1::state::STOPPING || state_ == v1::state::DISARMING || state_ == v1::state::CALIBRATING;
+           state_ == v1::state::STOPPING || state_ == v1::state::DISARMING || state_ == v1::state::CALIBRATING
+#if V1_DIAG_BRAKE_TEST
+           || state_ == v1::state::DIAG  // ARMING と同じく主電源 ON 指令（電源担当軸のみ）。待ちは tuning.power_settle_ms
+#endif
+        ;
   }
   // pwm_permille の向きに使う符号。校正で P 端に当たって向きが分かった後はその値（NVS の sign は未校正だと既定値のまま）。
   int8_t effective_sign() const {
@@ -908,6 +955,10 @@ class V1Axis {
       case v1::msg::SET_REFERENCE: command(m, m.set_reference.request_id, now); break;
       case v1::msg::CALIBRATE: command(m, m.calibrate.request_id, now); break;
       case v1::msg::SET_LIMITS: command(m, m.set_limits.request_id, now); break;
+#if V1_DIAG_BRAKE_TEST
+      case v1::msg::DIAG_START: command(m, m.diag_start.request_id, now); break;
+      case v1::msg::DIAG_READ: on_diag_read(m.diag_read); break;  // 読むだけ。FAULT 中も答える（ACK なし）
+#endif
       default: break;  // decode 済みなので来ない
     }
   }
@@ -924,6 +975,9 @@ class V1Axis {
       case v1::msg::SET_REFERENCE: return on_set_reference(m.set_reference.reference_count);
       case v1::msg::CALIBRATE: return on_calibrate(m.calibrate.mode, m.calibrate.flags, now);
       case v1::msg::SET_LIMITS: return on_set_limits(m.set_limits);
+#if V1_DIAG_BRAKE_TEST
+      case v1::msg::DIAG_START: return on_diag_start(m.diag_start, now);
+#endif
       default: return v1::ack_reason::BAD_STATE;
     }
   }
@@ -1002,6 +1056,9 @@ class V1Axis {
     m.hello.fw_minor = id_.fw_minor;
     m.hello.fw_patch = id_.fw_patch;
     m.hello.capabilities = v1::capabilities::POSITION_MODE | v1::capabilities::LIMITS;
+#if V1_DIAG_BRAKE_TEST
+    m.hello.capabilities |= v1::capabilities::DIAG_BRAKE;
+#endif
     m.hello.calibration_hash = calibration_hash();
     push(m);
   }
@@ -1093,6 +1150,9 @@ class V1Axis {
   // 校正中は捨てる（数えない。protocol.md §1.2）。
   void on_set_position(const v1::SetPosition& m, uint64_t now, uint64_t rx_us) {
     if (state_ == v1::state::CALIBRATING) return;
+#if V1_DIAG_BRAKE_TEST
+    if (state_ == v1::state::DIAG) return;  // 計測中は目標を受けない（数えない）
+#endif
     if (!has_config_ || m.session_epoch != config_.session_epoch || m.seq <= last_rx_seq_) {
       if (stale_drop_count_ < 0xFFFF) stale_drop_count_ += 1;
       return;
@@ -1139,6 +1199,9 @@ class V1Axis {
       case v1::state::ACTIVE: begin_stop(StopKind::Disarm, now); break;
       case v1::state::STOPPING: stop_kind_ = StopKind::Disarm; break;
       case v1::state::CALIBRATING: cal_cancel(now); break;  // 校正の中止（終了手順を経て DISARMED）
+#if V1_DIAG_BRAKE_TEST
+      case v1::state::DIAG: diag_cancel(now); break;   // 計測の中止（記録中ならブレーキ作動 → 後の記録 → DISARMED）
+#endif
       case v1::state::FAULT: return v1::ack_reason::FAULT_ACTIVE;  // 異常ゲートで先に弾かれる
       default: break;
     }
@@ -1207,6 +1270,89 @@ class V1Axis {
     return v1::ack_reason::NONE;
   }
 
+#if V1_DIAG_BRAKE_TEST
+  // DIAG_START（計測専用）。CANCEL は DIAG 中なら中止、それ以外は何もせず受理。
+  // 開始の条件: DISARMED（ブレーキ作動・PWM 0）・記録の後始末が済んでいる・ローカル非常停止なし・CONFIG 済み（端の余裕は
+  // ソフトリミットから取る）。SAG / ENGAGE はさらに POSITION_REFERENCED・ソフトリミット内・開始位置に余裕。POWER_HOLD は電源担当軸だけ。
+  // 中止（DIAG_START(CANCEL) / DISARM）。ブレーキ作動・PWM 0 は次の diag_step を待たずにこの場で出力に反映する
+  void diag_cancel(uint64_t now) {
+    diag_.cancel(now);
+    brake_release_cmd_ = diag_.brake_release();
+    duty_permille_ = -static_cast<int>(sign_) * diag_.pwm_permille();
+  }
+
+  uint16_t on_diag_start(const v1::DiagStart& d, uint64_t now) {
+    if (d.mode == v1::diag_mode::CANCEL) {
+      if (state_ == v1::state::DIAG) diag_cancel(now);
+      return v1::ack_reason::NONE;
+    }
+    const uint16_t pr = v1_diag_check_params(d);
+    if (pr != v1::ack_reason::NONE) return pr;
+    if (state_ != v1::state::DISARMED || diag_.busy()) return v1::ack_reason::BAD_STATE;
+    if (estop_latched_) return v1::ack_reason::BAD_STATE;
+    if (!has_config_) return v1::ack_reason::NOT_CONFIGURED;
+    int32_t lo = 0;
+    int32_t hi = 0;
+    if (d.mode == v1::diag_mode::POWER_HOLD) {
+      if (!power_controller()) return v1::ack_reason::INVALID_PARAM;  // 主電源リレーを持たない軸では意味がない
+    } else {
+      if (!referenced_) return v1::ack_reason::NOT_REFERENCED;
+      if (!inside_soft_window()) return v1::ack_reason::BAD_STATE;
+      lo = config_.soft_min_count + V1_DIAG_END_MARGIN_COUNT;
+      hi = config_.soft_max_count - V1_DIAG_END_MARGIN_COUNT;
+      if (!v1_diag_room_ok(d, actual_count(), lo, hi)) return v1::ack_reason::INVALID_PARAM;
+    }
+    state_ = v1::state::DIAG;
+    brake_release_cmd_ = false;
+    duty_permille_ = 0;
+    hold_here();
+    diag_.start(d, now, lo, hi, tuning.power_settle_ms, config_.overspeed_count_s);
+    return v1::ack_reason::NONE;
+  }
+
+  // DIAG_READ: 記録の offset 点目から最大 16 点。範囲外なら n = 0（total で点数が分かる）。
+  void on_diag_read(const v1::DiagRead& r) {
+    v1::McuMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::DIAG_DATA;
+    m.diag_data.request_id = r.request_id;
+    m.diag_data.test_id = diag_.test_id();
+    m.diag_data.offset = r.offset;
+    const size_t total = diag_.sample_count();
+    m.diag_data.total = static_cast<uint16_t>(total);
+    size_t n = 0;
+    while (n < v1::DIAG_SAMPLES_PER_CHUNK && static_cast<size_t>(r.offset) + n < total) {
+      m.diag_data.samples[n] = diag_.sample(r.offset + n);
+      n += 1;
+    }
+    m.diag_data.n = static_cast<uint8_t>(n);
+    push(m);
+  }
+
+  // 終わった計測: DIAG なら DISARMED（主電源 OFF 指令。ブレーキは作動済み・PWM 0）に戻し、DIAG_RESULT を 1 回。
+  // 基準: エンコーダは計測の間も数え続けるので、計測そのものでは基準を消さない（DISARMED の受動的な動きと同じ扱い）。
+  // 走行中の無パルスは ENCODER_FAULT をラッチ済みで、既存の意味どおり FAULT_RESET で消える（referenced_after = 0 で知らせる）。
+  void diag_finish_if_done() {
+    v1::DiagResult r;
+    if (!diag_.take_result(&r)) return;
+    if (state_ == v1::state::DIAG) {
+      state_ = v1::state::DISARMED;
+      brake_release_cmd_ = false;
+      duty_permille_ = 0;
+      hold_here();
+    }
+    r.boot_id = id_.boot_id;
+    r.referenced_after =
+        (referenced_ && !(state_ == v1::state::FAULT && fault_code_ == v1::fault::ENCODER_FAULT)) ? 1 : 0;
+    r.sign = sign_;
+    v1::McuMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = v1::msg::DIAG_RESULT;
+    m.diag_result = r;
+    push(m);
+  }
+#endif
+
   // ------------------------------------------------------------------------
   // 遷移
   // ------------------------------------------------------------------------
@@ -1257,6 +1403,9 @@ class V1Axis {
     if (state_ == v1::state::CALIBRATING) {
       cal_abort_for_fault(code == v1::fault::LOCAL_ESTOP ? "estop" : "fault", now);
     }
+#if V1_DIAG_BRAKE_TEST
+    if (diag_.busy()) diag_.fault(code, now);  // 出力はこの下で落とす。記録中なら作動後の記録は続け、終わりに DIAG_RESULT(FAULT)
+#endif
     state_ = v1::state::FAULT;
     fault_code_ = code;
     stop_kind_ = StopKind::Hold;

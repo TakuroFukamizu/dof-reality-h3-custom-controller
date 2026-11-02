@@ -14,3 +14,7 @@ c++ -std=c++17 -Wall -Wextra -DV1_ARM_POWER_SETTLE_MS=300 -DV1_FF_DIRECTIONAL=0 
 # でも通ること（test_playout_* は playout_delay_ms を明示しているので、こちらでも再生バッファを検証する）
 c++ -std=c++17 -Wall -Wextra -DV1_ARM_POWER_SETTLE_MS=300 -DV1_FF_DIRECTIONAL=0 -DV1_PLAYOUT=0 -I../include test_host.cpp -o /tmp/moter_controler_host_noplayout
 /tmp/moter_controler_host_noplayout
+# 計測専用（ブレーキ・沈み、docs/brake_sag_measurement.md）: -DV1_DIAG_BRAKE_TEST=1 でも同じテストと DIAG のテスト（test_v1_diag.h）が
+# 通ること。上の 3 本（既定 0）は「DIAG がコンパイルされておらず、受けても rx_error になるだけ」を確かめている
+c++ -std=c++17 -Wall -Wextra -DV1_ARM_POWER_SETTLE_MS=300 -DV1_FF_DIRECTIONAL=0 -DV1_DIAG_BRAKE_TEST=1 -I../include test_host.cpp -o /tmp/moter_controler_host_diag
+/tmp/moter_controler_host_diag

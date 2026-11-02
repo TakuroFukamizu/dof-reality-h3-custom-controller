@@ -1085,6 +1085,9 @@ const char* stateName(uint8_t s) {
     case v1::state::DISARMING: return "DISARMING";
     case v1::state::FAULT: return "FAULT";
     case v1::state::CALIBRATING: return "CALIBRATING";
+#if V1_DIAG_BRAKE_TEST
+    case v1::state::DIAG: return "DIAG";
+#endif
   }
   return "?";
 }
@@ -1133,7 +1136,11 @@ uint16_t stateColor(uint8_t s) {
     case v1::state::ARMING:
     case v1::state::STOPPING:
     case v1::state::DISARMING:
-    case v1::state::CALIBRATING: return kAmber;
+    case v1::state::CALIBRATING:
+#if V1_DIAG_BRAKE_TEST
+    case v1::state::DIAG:
+#endif
+      return kAmber;
     case v1::state::FAULT: return kRed;
     default: return kGray;
   }
@@ -1439,6 +1446,9 @@ void setup() {
     if (invalid) profile_invalid_mask |= static_cast<uint8_t>(1u << m);
   }
   if (profile_invalid_mask) noteBootError("prof");  // 壊れた系統は校正行に出す。校正して保存し直せば消える
+#if V1_DIAG_BRAKE_TEST
+  noteBootError("DIAG");  // 計測専用の組み立てであることを画面に出し続ける（計測が終わったら通常の v1 env を焼き戻す）
+#endif
   control_v1_begin(profiles, saved_motor);
   vsnap.selected_axis = saved_motor;
 

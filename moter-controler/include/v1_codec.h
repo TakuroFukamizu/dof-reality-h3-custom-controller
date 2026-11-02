@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include <string.h>
 
+// 計測専用（ブレーキ・沈みの計測。moter-controler/docs/brake_sag_measurement.md）。既定 0 = 量産の組み立てでは
+// DIAG_* の種別・状態・構造体が一切コンパイルされない（受けても未知の種別として rx_error になる）。
+#ifndef V1_DIAG_BRAKE_TEST
+#define V1_DIAG_BRAKE_TEST 0
+#endif
+
 namespace v1 {
 
 constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -47,6 +53,13 @@ constexpr uint8_t CLOCK_SYNC_REPLY = 0x85;
 constexpr uint8_t AXIS_SELECT = 0x86;
 constexpr uint8_t CAL_RESULT = 0x87;
 constexpr uint8_t LIMITS = 0x88;  // SET_LIMITS 受理直後の有効値と絶対上限（motion-limits 設計 §4.3）
+#if V1_DIAG_BRAKE_TEST
+// 計測専用（V1_DIAG_BRAKE_TEST=1 の組み立てだけ）。0x40 / 0xC0 台は本番の種別と重ならない
+constexpr uint8_t DIAG_START = 0x40;   // 計測の開始・中止（ACK あり）
+constexpr uint8_t DIAG_READ = 0x41;    // 記録の読み出し（ACK なし、DIAG_DATA で答える。FAULT 中も答える）
+constexpr uint8_t DIAG_RESULT = 0xC0;  // 計測の終わりに 1 回（要約）
+constexpr uint8_t DIAG_DATA = 0xC1;    // DIAG_READ への応答（記録の一部）
+#endif
 }  // namespace msg
 
 // --- 共通の値（protocol.md §3） ---
@@ -60,6 +73,9 @@ constexpr uint8_t STOPPING = 5;
 constexpr uint8_t DISARMING = 6;
 constexpr uint8_t FAULT = 7;
 constexpr uint8_t CALIBRATING = 8;  // CALIBRATE 受理後、端当て校正の間（protocol.md §1.2）。終了で DISARMED
+#if V1_DIAG_BRAKE_TEST
+constexpr uint8_t DIAG = 9;  // 計測専用: DIAG_START 受理から終わりまで（終われば DISARMED）
+#endif
 }  // namespace state
 
 namespace fault {
@@ -115,6 +131,9 @@ constexpr uint32_t POSITION_MODE = 1u << 0;
 constexpr uint32_t APPLY_AT = 1u << 1;
 constexpr uint32_t CURRENT_SENSE = 1u << 2;
 constexpr uint32_t LIMITS = 1u << 3;  // SET_LIMITS / LIMITS に対応（motion-limits 設計 §4.1）
+#if V1_DIAG_BRAKE_TEST
+constexpr uint32_t DIAG_BRAKE = 1u << 8;  // 計測専用の組み立て（DIAG_START / DIAG_READ に答える）
+#endif
 }  // namespace capabilities
 
 // CALIBRATE の mode（protocol.md §4）
@@ -144,6 +163,47 @@ constexpr uint8_t KEEP_POWER = 0x01;
 
 constexpr size_t CAL_REASON_LEN = 8;  // CAL_RESULT の reason（ASCII、NUL 埋め。8 文字ちょうどなら終端なし）
 
+#if V1_DIAG_BRAKE_TEST
+// DIAG_START の mode
+namespace diag_mode {
+constexpr uint8_t CANCEL = 0;      // 実行中の計測を止める（ブレーキ作動。記録中なら後の記録を続けてから終わる）
+constexpr uint8_t SAG = 1;         // PWM 0 のままブレーキ解除 → 沈みを記録 → ブレーキ作動 → 後の記録
+constexpr uint8_t ENGAGE = 2;      // ブレーキ解除 → 一定 Duty で走らせる → PWM 0 と同時にブレーキ作動 → 後の記録
+constexpr uint8_t POWER_HOLD = 3;  // 主電源だけ入れておく（電源担当軸。ブレーキ作動・PWM 0）。他の軸の計測用
+}  // namespace diag_mode
+// DIAG_RESULT の result
+namespace diag_result {
+constexpr uint8_t OK = 0;
+constexpr uint8_t FAULT = 1;       // 異常（非常停止・無パルスなど）で打ち切った。fault_code に理由
+constexpr uint8_t CANCELLED = 2;   // DIAG_START(CANCEL) / DISARM / POWER_HOLD の受信途絶
+}  // namespace diag_result
+// DIAG_RESULT の stop_reason（ブレーキ作動を指令した理由）
+namespace diag_stop {
+constexpr uint8_t NONE = 0;
+constexpr uint8_t T_MAX = 1;        // SAG: 経過時間が t_max_ms
+constexpr uint8_t D_MAX = 2;        // SAG: |変位| が d_max_count
+constexpr uint8_t END_MARGIN = 3;   // 予測位置がソフトリミットの内側の余裕に入る
+constexpr uint8_t V_TARGET = 4;     // ENGAGE: 走行の向きの速度が v_target
+constexpr uint8_t D_RUN = 5;        // ENGAGE: 走行距離が d_max_count（= D_run）
+constexpr uint8_t RUN_TIMEOUT = 6;  // ENGAGE: 走行時間の上限
+constexpr uint8_t REVERSE = 7;      // ENGAGE: 指令と逆向きに動いた（荷重に負けた・符号違い）
+constexpr uint8_t NO_PULSE = 8;     // ENGAGE: 走らせてもカウントが変わらない（ENCODER_FAULT をラッチ）
+constexpr uint8_t CANCEL = 9;
+constexpr uint8_t FAULT = 10;       // 異常のラッチ（非常停止など）
+constexpr uint8_t SAG_GUARD = 11;   // ENGAGE: 走らせる前の待ちの間に沈みすぎた
+constexpr uint8_t OVERSPEED = 12;   // ENGAGE: CONFIG の overspeed を超えた
+}  // namespace diag_stop
+namespace diag_flags {  // DIAG_RESULT の flags / 記録 1 点の flags
+constexpr uint8_t TRUNCATED = 1u << 0;      // 記録が満杯になり後半を捨てた（DIAG_RESULT）
+constexpr uint8_t NOT_SETTLED = 1u << 1;    // 記録の終わりまでに静止しなかった（DIAG_RESULT）
+constexpr uint8_t BRAKE_RELEASE = 1u << 0;  // 記録 1 点: ブレーキ解除指令中
+constexpr uint8_t POWER_ON = 1u << 1;       // 記録 1 点: 主電源 ON 指令中
+}  // namespace diag_flags
+constexpr size_t DIAG_SAMPLES_PER_CHUNK = 16;
+constexpr size_t DIAG_SAMPLE_BYTES = 13;
+constexpr uint32_t DIAG_TIME_NONE = 0xFFFFFFFFu;
+#endif
+
 // --- 種別ごとの payload 長。未知の種別は -1 ---
 inline int host_payload_len(uint8_t type) {
   switch (type) {
@@ -160,6 +220,10 @@ inline int host_payload_len(uint8_t type) {
     case msg::SET_REFERENCE: return 8;
     case msg::CALIBRATE: return 8;
     case msg::SET_LIMITS: return 16;
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_START: return 20;
+    case msg::DIAG_READ: return 8;
+#endif
     default: return -1;
   }
 }
@@ -174,6 +238,10 @@ inline int mcu_payload_len(uint8_t type) {
     case msg::AXIS_SELECT: return 8;
     case msg::CAL_RESULT: return 28;
     case msg::LIMITS: return 24;
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_RESULT: return 64;
+    case msg::DIAG_DATA: return 16 + static_cast<int>(DIAG_SAMPLES_PER_CHUNK * DIAG_SAMPLE_BYTES);  // 224
+#endif
     default: return -1;
   }
 }
@@ -378,6 +446,23 @@ struct SetLimits {
   uint16_t deadband_count;
   uint16_t deadband_out_count;     // ≥ deadband_count
 };
+#if V1_DIAG_BRAKE_TEST
+struct DiagStart {
+  uint32_t request_id;
+  uint8_t mode;               // diag_mode::*
+  int8_t dir;                 // ENGAGE: +1 = カウント増の向き、−1 = 減る向き
+  uint16_t duty_permille;     // ENGAGE: 走らせる |Duty|（100〜250）
+  uint16_t t_max_ms;          // SAG: ブレーキ解除の最長（1〜500）
+  uint16_t d_max_count;       // SAG: |変位| の上限（1〜200）。ENGAGE: 走行距離の上限 D_run（1〜600）
+  uint16_t v_target_count_s;  // ENGAGE: この速さに達したら止める（1〜3000）
+  uint16_t delay_ms;          // ENGAGE: ブレーキ解除指令から走り始めるまで（0〜200、PWM 0）
+  uint32_t hold_ms;           // POWER_HOLD: 主電源を保つ最長（1〜120000）
+};
+struct DiagRead {
+  uint32_t request_id;
+  uint16_t offset;            // 記録の何点目から（0 始まり）
+};
+#endif
 
 struct Hello {
   uint32_t request_id;
@@ -457,6 +542,48 @@ struct Limits {
   uint32_t abs_max_vel_count_s;    // 絶対上限（V1_ABS_MAX_VEL_COUNT_S）
   uint32_t abs_max_acc_count_s2;   // 絶対上限（V1_ABS_MAX_ACC_COUNT_S2）
 };
+#if V1_DIAG_BRAKE_TEST
+struct DiagSample {
+  uint32_t t_us;          // ブレーキ解除指令（t = 0）からの時間 [us]
+  int32_t count;          // actual_count（基準からの位置）
+  int16_t pwm_permille;   // 出している Duty（STATUS の pwm_permille と同じ: カウント増の向きが正）
+  uint16_t adc_raw;       // VIOUT（G10、ADC1_CH9）の生値 0〜4095（換算は未実施）
+  uint8_t flags;          // diag_flags::BRAKE_RELEASE / POWER_ON（この点で出していた指令）
+};
+struct DiagData {
+  uint32_t request_id;
+  uint32_t test_id;       // DIAG_START の request_id
+  uint16_t offset;
+  uint16_t total;         // 記録の点数（いまの値）
+  uint8_t n;              // この応答の点数（0〜16）
+  DiagSample samples[DIAG_SAMPLES_PER_CHUNK];
+};
+struct DiagResult {
+  uint32_t test_id;
+  uint32_t boot_id;
+  uint8_t mode;
+  uint8_t result;              // diag_result::*
+  uint8_t stop_reason;         // diag_stop::*
+  uint8_t referenced_after;    // 1 = 終わった後も POSITION_REFERENCED
+  uint16_t fault_code;
+  uint16_t sample_count;
+  uint16_t sample_period_us;   // 公称の記録周期（1000）
+  uint16_t max_sample_gap_us;  // 記録の間隔の最大（実測）
+  int32_t start_count;         // t = 0 の actual_count
+  uint32_t t_drive_us;         // ENGAGE: 走り始めた時刻（無ければ DIAG_TIME_NONE）
+  uint32_t t_engage_us;        // ブレーキ作動を指令した時刻（無ければ DIAG_TIME_NONE）
+  int32_t disp_at_engage;      // ブレーキ作動指令の時点の変位（start_count から）
+  int32_t final_disp;          // 記録の最後の変位
+  int32_t peak_disp;           // |変位| が最大の点の変位（符号付き）
+  int32_t v_at_engage_count_s; // ブレーキ作動指令の時点の速度（20 ms 窓）
+  uint32_t t_settle_us;        // ブレーキ作動指令から、20 ms の間 ±1 count に収まり始めた点まで（無ければ DIAG_TIME_NONE）
+  int32_t disp_engage_to_settle;  // ブレーキ作動指令から静止点までの移動
+  int8_t sign;                 // 系統の符号（MD13S の向き = −sign × pwm_permille）
+  uint8_t flags;               // diag_flags::TRUNCATED / NOT_SETTLED
+  uint16_t adc_first;          // t = 0 の VIOUT 生値
+  int16_t drive_pwm_permille;  // ENGAGE の走行 Duty（カウント増が正）
+};
+#endif
 
 // PC → MCU の 1 メッセージ。type で union の有効な要素が決まる。
 struct HostMsg {
@@ -475,6 +602,10 @@ struct HostMsg {
     SetReference set_reference;
     Calibrate calibrate;
     SetLimits set_limits;
+#if V1_DIAG_BRAKE_TEST
+    DiagStart diag_start;
+    DiagRead diag_read;
+#endif
   };
 };
 
@@ -490,6 +621,10 @@ struct McuMsg {
     AxisSelect axis_select;
     CalResult cal_result;
     Limits limits;
+#if V1_DIAG_BRAKE_TEST
+    DiagResult diag_result;
+    DiagData diag_data;
+#endif
   };
 };
 
@@ -579,6 +714,25 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
       // 14: u16 reserved = 0
       break;
     }
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_START: {
+      const DiagStart& d = m.diag_start;
+      put_u32(out + 0, d.request_id);
+      put_u8(out + 4, d.mode);
+      put_u8(out + 5, static_cast<uint8_t>(d.dir));
+      put_u16(out + 6, d.duty_permille);
+      put_u16(out + 8, d.t_max_ms);
+      put_u16(out + 10, d.d_max_count);
+      put_u16(out + 12, d.v_target_count_s);
+      put_u16(out + 14, d.delay_ms);
+      put_u32(out + 16, d.hold_ms);
+      break;
+    }
+    case msg::DIAG_READ:
+      put_u32(out + 0, m.diag_read.request_id);
+      put_u16(out + 4, m.diag_read.offset);
+      break;
+#endif
     default:
       return 0;
   }
@@ -681,6 +835,53 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       put_u32(out + 20, l.abs_max_acc_count_s2);
       break;
     }
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_RESULT: {
+      const DiagResult& r = m.diag_result;
+      put_u32(out + 0, r.test_id);
+      put_u32(out + 4, r.boot_id);
+      put_u8(out + 8, r.mode);
+      put_u8(out + 9, r.result);
+      put_u8(out + 10, r.stop_reason);
+      put_u8(out + 11, r.referenced_after);
+      put_u16(out + 12, r.fault_code);
+      put_u16(out + 14, r.sample_count);
+      put_u16(out + 16, r.sample_period_us);
+      put_u16(out + 18, r.max_sample_gap_us);
+      put_i32(out + 20, r.start_count);
+      put_u32(out + 24, r.t_drive_us);
+      put_u32(out + 28, r.t_engage_us);
+      put_i32(out + 32, r.disp_at_engage);
+      put_i32(out + 36, r.final_disp);
+      put_i32(out + 40, r.peak_disp);
+      put_i32(out + 44, r.v_at_engage_count_s);
+      put_u32(out + 48, r.t_settle_us);
+      put_i32(out + 52, r.disp_engage_to_settle);
+      put_u8(out + 56, static_cast<uint8_t>(r.sign));
+      put_u8(out + 57, r.flags);
+      put_u16(out + 58, r.adc_first);
+      put_i16(out + 60, r.drive_pwm_permille);
+      break;
+    }
+    case msg::DIAG_DATA: {
+      const DiagData& d = m.diag_data;
+      put_u32(out + 0, d.request_id);
+      put_u32(out + 4, d.test_id);
+      put_u16(out + 8, d.offset);
+      put_u16(out + 10, d.total);
+      put_u8(out + 12, d.n);
+      for (size_t i = 0; i < d.n && i < DIAG_SAMPLES_PER_CHUNK; ++i) {
+        uint8_t* q = out + 16 + i * DIAG_SAMPLE_BYTES;
+        const DiagSample& s = d.samples[i];
+        put_u32(q + 0, s.t_us);
+        put_i32(q + 4, s.count);
+        put_i16(q + 8, s.pwm_permille);
+        put_u16(q + 10, s.adc_raw);
+        put_u8(q + 12, s.flags);
+      }
+      break;
+    }
+#endif
     default:
       return 0;
   }
@@ -772,6 +973,25 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
       l.deadband_out_count = get_u16(p + 12);
       break;  // 7・14 の予約は読まない
     }
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_START: {
+      DiagStart& d = out->diag_start;
+      d.request_id = get_u32(p + 0);
+      d.mode = get_u8(p + 4);
+      d.dir = static_cast<int8_t>(get_u8(p + 5));
+      d.duty_permille = get_u16(p + 6);
+      d.t_max_ms = get_u16(p + 8);
+      d.d_max_count = get_u16(p + 10);
+      d.v_target_count_s = get_u16(p + 12);
+      d.delay_ms = get_u16(p + 14);
+      d.hold_ms = get_u32(p + 16);
+      break;
+    }
+    case msg::DIAG_READ:
+      out->diag_read.request_id = get_u32(p + 0);
+      out->diag_read.offset = get_u16(p + 4);
+      break;
+#endif
     default:
       return false;
   }
@@ -874,6 +1094,54 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       l.abs_max_acc_count_s2 = get_u32(p + 20);
       break;  // 14 の予約は読まない
     }
+#if V1_DIAG_BRAKE_TEST
+    case msg::DIAG_RESULT: {
+      DiagResult& r = out->diag_result;
+      r.test_id = get_u32(p + 0);
+      r.boot_id = get_u32(p + 4);
+      r.mode = get_u8(p + 8);
+      r.result = get_u8(p + 9);
+      r.stop_reason = get_u8(p + 10);
+      r.referenced_after = get_u8(p + 11);
+      r.fault_code = get_u16(p + 12);
+      r.sample_count = get_u16(p + 14);
+      r.sample_period_us = get_u16(p + 16);
+      r.max_sample_gap_us = get_u16(p + 18);
+      r.start_count = get_i32(p + 20);
+      r.t_drive_us = get_u32(p + 24);
+      r.t_engage_us = get_u32(p + 28);
+      r.disp_at_engage = get_i32(p + 32);
+      r.final_disp = get_i32(p + 36);
+      r.peak_disp = get_i32(p + 40);
+      r.v_at_engage_count_s = get_i32(p + 44);
+      r.t_settle_us = get_u32(p + 48);
+      r.disp_engage_to_settle = get_i32(p + 52);
+      r.sign = static_cast<int8_t>(get_u8(p + 56));
+      r.flags = get_u8(p + 57);
+      r.adc_first = get_u16(p + 58);
+      r.drive_pwm_permille = get_i16(p + 60);
+      break;
+    }
+    case msg::DIAG_DATA: {
+      DiagData& d = out->diag_data;
+      d.request_id = get_u32(p + 0);
+      d.test_id = get_u32(p + 4);
+      d.offset = get_u16(p + 8);
+      d.total = get_u16(p + 10);
+      d.n = get_u8(p + 12);
+      if (d.n > DIAG_SAMPLES_PER_CHUNK) return false;
+      for (size_t i = 0; i < d.n; ++i) {
+        const uint8_t* q = p + 16 + i * DIAG_SAMPLE_BYTES;
+        DiagSample& s = d.samples[i];
+        s.t_us = get_u32(q + 0);
+        s.count = get_i32(q + 4);
+        s.pwm_permille = get_i16(q + 8);
+        s.adc_raw = get_u16(q + 10);
+        s.flags = get_u8(q + 12);
+      }
+      break;
+    }
+#endif
     default:
       return false;
   }
