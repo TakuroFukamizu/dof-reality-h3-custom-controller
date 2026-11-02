@@ -1724,6 +1724,13 @@ class V1Axis {
     const int64_t ea = c.err < 0 ? -c.err : c.err;
     c.stationary_near = tuning.hold_learn && setpoint_vel_ == 0.0 && ea <= escalation_floor();
     c.park_ok = park_conditions(ea);
+    // 駐車から戻りかけ（ブレーキ解除待ち、参照は駐車した位置で止めている）: 動かないのが正しい。出力（駐車に入ったときの保持出力）は
+    // 学んだ保持出力として扱い（|誤差| が帯を超えていても）、期限の露出は積まない（実機 27eaf6b: 駐車中に 9 count ずれた軸が、
+    // 戻りかけの −1 permille を一律の包絡線で積まれて 0.3 s で FEEDBACK_UNCERTAIN → 参照だけ進んで FOLLOWING_ERROR）
+    if (park_ == ParkPhase::Releasing) {
+      c.stationary_near = tuning.hold_learn;
+      c.deadline_hold = true;
+    }
     return c;
   }
 
@@ -2422,6 +2429,7 @@ class V1Axis {
           park_ = ParkPhase::None;
           park_cooldown_until_us_ = now + ms_to_us(tuning.park_still_ms);
           still_running_ = false;
+          sup_.begin_fresh_window();  // 期限は通常の制御に入ってから新しい窓で（残りの予算までに抑える）
           return ParkAct::None;  // この tick から通常の制御（参照は次の tick から追いつく）
         }
         *out = park_hold_out_;

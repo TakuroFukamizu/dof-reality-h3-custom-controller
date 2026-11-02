@@ -987,6 +987,35 @@ fn happy_path_arm_start_track_stale_stop_hold_disarm() {
     assert_eq!(r.sup.state(), RigState::BrakedDisarmed);
 }
 
+/// r10 firmware braked inhibit (FEEDBACK_UNCERTAIN / LOAD_LIMITED) on one
+/// axis while ACTIVE → the server stops the whole seat (CONTROLLED_STOP to all
+/// three axes), logs `axis_inhibited`, and does not keep driving.
+#[test]
+fn axis_inhibit_flag_stops_the_whole_seat() {
+    for flag in [status_flags::FEEDBACK_UNCERTAIN, status_flags::LOAD_LIMITED] {
+        let cfg = sim_cfg();
+        let mut r = Rig::new(cfg.clone());
+        r.ready();
+        r.admin(AdminCmd::Arm).unwrap();
+        r.wait_state(RigState::Holding, 2000);
+        r.set_game(Some((POSE_A, 0.3)));
+        r.run_ms(30);
+        r.admin(AdminCmd::Start).unwrap();
+        r.wait_state(RigState::Active, 500);
+        r.run_ms(500);
+        let mark = r.sent.len();
+        let t_flag = r.now;
+        r.flip_flags[1] = flag;
+        r.wait_state(RigState::Stopping, 100);
+        assert!(r.now - t_flag <= Duration::from_millis(40), "{:?}", r.now - t_flag);
+        assert_eq!(r.count(mark, msg_type::CONTROLLED_STOP), [1, 1, 1]);
+        let snap = r.sup.snapshot(r.now);
+        assert!(snap.fault.is_none(), "a coordinated stop, not a rig fault");
+        // Holding or stopping is left alone (the flag only matters while driving).
+        r.flip_flags[1] = 0;
+    }
+}
+
 #[test]
 fn late_pose_after_stop_does_not_restart() {
     let cfg = sim_cfg();

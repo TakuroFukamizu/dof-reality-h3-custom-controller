@@ -1539,28 +1539,27 @@ inline void test_r10_park_transitions_accounted() {
   CHECK(e1 - e0 >= 200.0 * 0.09 && fabs(e3 - e2) < 1e-9);
 }
 
-// 戻りかけの間に期限（露出が余裕の全部）に届いたら、駐車をやめて即ブレーキの停止・基準を消す。下の端の近く（下の余裕 120）で、
-// 期限の露出（逆回り 200 count/s）の半分で駐車し、戻りかけ（ブレーキ解除中）に残りを使い切る
-inline void test_r10_deadline_trip_during_release_brakes_immediately() {
+// 戻りかけ（ブレーキ解除待ち、参照を止めている）の間は期限を見ない（動かないのが正しい。実機 27eaf6b）。戻った後は新しい窓で数え、
+// 確かな動きが出るまでは残りの予算までに抑える。下の端の近く（下の余裕 120）で、期限の露出の半分で駐車してから戻っても止まらず目標に着く
+inline void test_r10_release_wait_not_tripped_by_deadline() {
   Harness h;
   r10_active(h, -2230, 100000, 30, 20, true, true, true);  // 下の余裕 = −2230 − (−2750) − 400 = 120
   h.ax.tuning.soft_reserve_count = 0;
   for (int i = 0; i < 100 && !h.ax.brake_parked(); ++i) drive_count_nonzero(h, 10, -2230);
   drive_count_nonzero(h, 300, -2230);
   CHECK(h.ax.brake_parked() && !h.ax.unparking() && !h.ax.supervisor_inhibited());
-  bool released = false;
-  int ticks_in_release = 0;
-  for (int i = 0; i < 100 && !h.ax.supervisor_inhibited(); ++i) {
-    if ((i % 2) == 0) h.set_position(-2220);
+  bool released = false, inhib_in_release = false;
+  for (int i = 0; i < 200; ++i) {
+    if ((i % 2) == 0) h.set_position(-2200);
     h.step();
     if (h.ax.unparking()) {
       released = true;
-      ++ticks_in_release;
+      if (h.ax.supervisor_inhibited()) inhib_in_release = true;
     }
   }
-  if (std::getenv("R10_PRINT")) std::printf("trip during release: ticks %d inhibited %d\n", ticks_in_release, h.ax.supervisor_inhibited() ? 1 : 0);
-  CHECK(released && braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && !h.ax.referenced() && !h.ax.unparking());
-  CHECK(ticks_in_release * 5 < 300);  // 解除待ちの途中で止まった
+  if (std::getenv("R10_PRINT")) std::printf("release near end: released %d inhibited %d actual %d\n", released ? 1 : 0, h.ax.supervisor_inhibited() ? 1 : 0, h.ax.actual_count());
+  CHECK(released && !inhib_in_release && !h.ax.supervisor_inhibited() && no_fault_events(h));
+  CHECK(std::abs(h.ax.actual_count() + 2200) <= 4);
 }
 
 // 保持出力の受け渡し: 戻るときは駐車に入ったときの保持出力を出してから（その次の tick で）ブレーキを解除する。荷重で沈む軸で解除の間に沈まない
@@ -1585,6 +1584,57 @@ inline void test_r10_unpark_handoff_no_sag() {
   if (std::getenv("R10_PRINT")) std::printf("handoff: hold at entry %d, output at release %d, min pos %.2f (parked %.2f)\n", hold_at_entry, out_before_release, min_pos, pos0);
   CHECK(hold_at_entry > 30 && out_before_release == hold_at_entry);
   CHECK(min_pos >= pos0 - 1.0);
+}
+
+
+// 実機 27eaf6b の再現（#2）: 駐車中に 9 count ずれた（ブレーキの掴みで off-target）軸に、目標が 700 count の段（max_vel 1200 /
+// max_acc 6000、再生バッファ）で来る。戻りかけ（参照を止めている）の小さな保持出力を一律の包絡線で積まれて 0.3 s で停止し、参照だけ
+// 進んで FOLLOWING_ERROR になった。いまは戻って追従し、停止も FAULT も無い
+inline void test_r10_park_offtarget_then_large_step_reproduction() {
+  for (int dir : {-1, 1}) {
+    Harness h;
+    r10_active(h, dir < 0 ? 1000 : -1000, 400, 30, 20, true, true, true);  // ソフトリミット ±2700 の中で 700 の段
+    const int32_t base = h.ax.actual_count();
+    h.pos_max_vel = 1200;
+    h.pos_max_acc = 6000;
+    // 実機の #2 は保持出力 −1 permille、それまでに予算をいくらか使っていた。ここでは保持出力を −10（上へ押す 1 % の荷重）にし、
+    // 解除待ちを 450 ms に延ばして、修正前の仕組み（|誤差| 9 > 6 で一律 2500 count/s に積まれて 400 ms で予算切れ）が試験で見えるようにする
+    h.load_permille = -10;
+    h.ax.tuning.brake_release_wait_ms = 450;
+    for (int i = 0; i < 200 && !h.ax.brake_parked(); ++i) drive_count_nonzero(h, 10, base);
+    drive_count_nonzero(h, 400, base);
+    CHECK(h.ax.brake_parked());
+    h.phys += 9.0;  // 駐車中に 9 count ずれた
+    h.raw = static_cast<int64_t>(floor(h.phys));
+    drive_count_nonzero(h, 200, base);
+    CHECK(h.ax.brake_parked() && std::abs(h.ax.following_error_count()) >= 8);
+    const int32_t tgt = base + dir * 700;
+    int fe_max = 0;
+    bool inhib = false;
+    for (int i = 0; i < 300; ++i) {
+      h.set_position(tgt);
+      h.idle(10);
+      fe_max = std::max(fe_max, std::abs(h.ax.following_error_count()));
+      if (h.ax.supervisor_inhibited()) inhib = true;
+    }
+    if (std::getenv("R10_PRINT")) std::printf("rig repro dir %+d: inhibited %d fault %u FE max %d final %d (target %d)\n", dir, inhib ? 1 : 0, h.ax.fault_code(), fe_max, h.ax.actual_count(), tgt);
+    CHECK(!inhib && no_fault_events(h) && h.ax.state() == st::ACTIVE);
+    CHECK(std::abs(h.ax.actual_count() - tgt) <= V1_RESIDUAL_BAND_COUNT && fe_max < 400);
+  }
+}
+
+// 駐車に入るのは |誤差| ≤ 4 が窓の間ずっと続いたときだけ（誤差 9 のまま静止した軸は駐車しない）
+inline void test_r10_park_requires_small_error_through_window() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, false, false, true);  // カウントは手で動かす（動かない）、期限なし
+  h.raw += 9;
+  bool parked = false;
+  for (int i = 0; i < 300 && !h.ax.supervisor_inhibited(); ++i) {
+    h.set_position(0);
+    h.step();
+    if (h.ax.brake_parked()) parked = true;
+  }
+  CHECK(!parked);
 }
 
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
@@ -1651,8 +1701,10 @@ inline void run_all() {
   test_r10_hold_certification_requires_stable_window();
   test_r10_park_transitions_with_disarm_stop_fault();
   test_r10_park_transitions_accounted();
-  test_r10_deadline_trip_during_release_brakes_immediately();
+  test_r10_release_wait_not_tripped_by_deadline();
   test_r10_unpark_handoff_no_sag();
+  test_r10_park_offtarget_then_large_step_reproduction();
+  test_r10_park_requires_small_error_through_window();
   test_r10_status_flags_bits();
 }
 

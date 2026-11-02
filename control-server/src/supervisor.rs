@@ -183,6 +183,10 @@ pub mod stop_reason {
     pub const ADMIN: u8 = 1;
     pub const SOURCE_STALE: u8 = 2;
     pub const CENTER_REACHED: u8 = 3;
+    /// An axis reported FEEDBACK_UNCERTAIN or LOAD_LIMITED (r10 firmware
+    /// braked inhibit): the whole seat stops instead of letting the other
+    /// axes keep moving and the inhibited one end in FOLLOWING_ERROR.
+    pub const AXIS_INHIBITED: u8 = 4;
 }
 
 /// `AdminError::error` codes.
@@ -1204,6 +1208,7 @@ impl Supervisor {
         self.reconcile_limits(now);
         self.check_status_age(now);
         self.check_frame_skew(now);
+        self.check_axis_inhibit(now);
 
         let mut drive_limits = Vec::new();
         match self.phase {
@@ -2835,6 +2840,33 @@ impl Supervisor {
                 self.send_config(i, Purpose::Sync, now);
                 self.axes[i].config_retry_at = Some(now + CONFIG_RETRY);
             }
+        }
+    }
+
+    /// r10 firmware: an axis in its braked inhibit (FEEDBACK_UNCERTAIN /
+    /// LOAD_LIMITED) holds PWM 0 with the brake applied while its reference
+    /// would keep following the game. Stop the whole seat (CONTROLLED_STOP to
+    /// every axis) so the reference decelerates instead of running away into a
+    /// FOLLOWING_ERROR on the inhibited axis. Resuming needs the operator
+    /// (DISARM → ARM, as the firmware requires).
+    fn check_axis_inhibit(&mut self, now: Instant) {
+        if !matches!(self.phase, Phase::Active { .. }) {
+            return;
+        }
+        let mask = status_flags::FEEDBACK_UNCERTAIN | status_flags::LOAD_LIMITED;
+        let hit = (0..AXIS_COUNT).find(|&i| self.axes[i].connected && self.axes[i].flag(mask));
+        if let Some(i) = hit {
+            let flags = self.axes[i].status.map_or(0, |s| s.flags);
+            self.event(
+                now,
+                "axis_inhibited",
+                serde_json::json!({
+                    "axis": i + 1,
+                    "feedback_uncertain": flags & status_flags::FEEDBACK_UNCERTAIN != 0,
+                    "load_limited": flags & status_flags::LOAD_LIMITED != 0,
+                }),
+            );
+            self.begin_stop(stop_reason::AXIS_INHIBITED, now);
         }
     }
 

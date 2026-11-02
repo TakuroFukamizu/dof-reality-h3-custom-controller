@@ -50,6 +50,7 @@ struct Harness {
   int64_t raw = 0;
   bool stall = false;             // プラントが動かない
   uint32_t pos_max_vel = 4000;    // set_position の max_vel_count_s（T のテストで遅い軌道にする）
+  uint32_t pos_max_acc = 20000;   // set_position の max_acc_count_s2（r10 の実機再現で 6000）
   double plant_vel = 4000.0;      // count/s
   // 校正（CALIBRATING）の模擬機構: Duty（MD13S の符号付き %）に比例した速度で raw が動き、端 [end_lo, end_hi] で止まる
   // （止まる＝無パルス。AutoMachine の端検出がこれを拾う）。plant_sign = +1 は「Duty + でカウント減」（#1 の実測。
@@ -213,7 +214,7 @@ struct Harness {
     m.set_position.apply_at_us = 0;
     return m;
   }
-  void set_position(int32_t target, uint16_t valid_for_ms = 50) { send(set_position_msg(target, valid_for_ms)); }
+  void set_position(int32_t target, uint16_t valid_for_ms = 50) { send(set_position_msg(target, valid_for_ms, pos_max_acc)); }
 
   // 1 tick（既定 5 ms）。プラントは位置制御中だけ setpoint に追従する。校正中は Duty に応じて端まで動く。
   void step(uint32_t dt_ms = 5) {
