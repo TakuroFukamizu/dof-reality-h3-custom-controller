@@ -85,6 +85,34 @@ while True:
 EOF
 ```
 
+**展示モードなど、FAULT を自動で解除するクライアントがいるとき**は、上の「状態の変化」を見る方式では取りこぼす（2026-11-02、ゲームの展示モードが FAULT を約 90 ms で解除し、0.3 s ごとの status では一度も `FAULT_LATCHED` が見えなかった）。その場合はイベントの `fault_prehistory`（FAULT のたびに 1 回出る。中身は prehistory 付き）を差分で拾う:
+
+```sh
+python3 -u - <<'EOF2'
+import json, time, urllib.request
+OUT = "/path/to/scratch"
+def get(u):
+    try: return json.load(urllib.request.urlopen(u, timeout=2))
+    except Exception: return None
+after = None
+while True:
+    e = get("http://127.0.0.1:8892/v1/events?n=200" + (f"&after={after}" if after is not None else ""))
+    if e is None: after = None; time.sleep(1); continue          # サーバー再起動で id は振り直し
+    evs = e.get("events", [])
+    if after is None: after = max([x["id"] for x in evs], default=0); time.sleep(0.3); continue
+    for x in evs:
+        after = max(after, x["id"])
+        if x["kind"] == "fault_prehistory":
+            fn = f"{OUT}/fault_ev_{time.strftime('%H%M%S')}.json"; json.dump(x, open(fn, "w"), ensure_ascii=False)
+            print(time.strftime("%H:%M:%S"), "FAULT", json.dumps(x["detail"].get("fault")), "saved", fn, flush=True)
+        elif x["kind"] in ("stopping", "axis_inhibited", "disconnected"):
+            print(time.strftime("%H:%M:%S"), x["kind"], json.dumps(x.get("detail"))[:160], flush=True)
+    time.sleep(0.3)
+EOF2
+```
+
+`stopping` の `reason`: 1 = 管理操作（STOP）、2 = ゲーム入力の途絶（`source_freshness_ms`）、3 = 中立到達。ログからも取れる: `fault pre-history`（WARN）の行の `detail=` 以降が同じ JSON。
+
 - 出力は状態の変化だけに絞る（毎回の status を出すと通知が溢れる）
 - 失敗の状態（`FAULT_LATCHED`、`SERVER_DOWN`、軸の切断）を必ず拾う。成功だけを拾う見張りは、止まっていても黙ったままになる
 
@@ -119,6 +147,9 @@ EOF
 | ゆっくり動かすとき（特に反転付近）にときどきガクッとする | ファームが目標を毎回「行って止まる」移動先として扱い、追いつくと速度を 0 にして FF が抜ける | Issue #45、PR #49 |
 | START を押しても何も起きない | `pose_not_near_hold`（指令姿勢が中立から 300 count 以上）。ログの admin の `blockers` に出る | PR #41 で画面にも出る |
 | #2 だけが下向きで止まりかける、遅れる | #2 の機構・エンコーダ（Issue #23）。制御の問題と混ぜない | Issue #23 |
+| HOLDING（出力 0）で \|誤差\| 3〜4 のまま 2 s 静止して ENCODER_FAULT（2026-11-02 16:10 の #3） | r7 で静止の監視の対象を \|誤差\| > 2 に広げたが、保持（出るのは > 4）の中でも監視が回っていた。何も押していないのに「押しても動かない」と判定 | `hw-r10a-test-20261102` acc3a6d で修正 |
+| 校正の直後に CONTROL_OVERRUN（出力 0、CALIBRATING のまま） | 新しいストロークを NVS に保存する間、フラッシュの書き込みで両コアが止まり制御の周期が 15 ms を超えた（見立て。保存済みの値で再校正すると出ない） | 未修正 |
+| FAULT が見張りに映らないのに、気づくと CALIBRATION_REQUIRED | クライアント（ゲームの展示モード）が FAULT を自動で解除した。イベントの `fault_prehistory` で拾う（§3） | — |
 
 ## 7. 計測スクリプト
 
