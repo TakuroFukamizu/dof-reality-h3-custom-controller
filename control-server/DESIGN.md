@@ -367,9 +367,11 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - `ports` は `"auto"` か、ポート名の配列。配列は従来どおり（書いた名前を、何がつながっていても開く）。
 - `"auto"` では `sim_axes` に無い全軸に `device_id` が要る（0 は設定エラー）。探すのはその `device_id` だけ。
 - server.rs の発見タスクが `DISCOVERY_PERIOD`（1 s）ごとにポート一覧を取り（`spawn_blocking`。開かない）、一致したポートごとに従来の port task を起動する。macOS の `/dev/tty.*`（同じ装置の別名。開くと DCD を待つ）は使わない。
-- 自動で起動した port task は、開く前（開き直す前も）に「この名前に、まだこの個体がつながっているか」を一覧で確かめ、違えば終わる。差し直して名前が変わると、古い名前のタスクは終わり、次の走査が新しい名前でタスクを起動する。古い名前に別の装置が現れても開かない。
-- 開いたあとは従来どおり HELLO で照合する（系統と `device_id` が合わなければ `axis_device_mismatch`）。
-- port task は発見タスクの `JoinSet` に属し、発見タスクを止めると一緒に止まる。
+- 自動で起動した port task は、開く前（開き直す前も）に「この名前に、まだこの個体がつながっているか」を一覧で確かめ、違えば終わる。差し直して名前が変わると、古い名前のタスクは終わり、その後の走査が新しい名前でタスクを起動する。古い名前に別の装置が現れても、開き直さない。
+- ただし、確かめることと開くことは別の OS 呼び出しなので、その間（ミリ秒）に同じ名前へ別の装置が現れれば開いてしまう。開く操作を列挙した USB 装置そのものに結び付ける手段は無い（名前を書く方式では、この窓が常に開いている）。
+- タスクは名前ごと・個体ごとに 1 つまで。新しい名前に移った個体は、古い名前のタスクが終わる（切断から `SERIAL_RETRY` 以内）まで待つ。同じ個体が 2 つのポートから同じ軸を名乗って `axis_conflict` になるのを防ぐため。
+- 開いたあとは従来どおり HELLO で照合する（系統と `device_id` が合わなければ `axis_device_mismatch`）。protocol_version 違い・POSITION_MODE 無しの個体は `"auto"` でも `unknown_device` になる。その場合 port task は、名前が消えるまでではなく、その名前からその個体がいなくなるまで待ってから `PortClosed` を送って終わる（別の個体が同じ名前に入れ替わっても取り残されない）。
+- port task は発見タスクの `JoinSet` に属する。shutdown では発見タスクは走査と open をやめるが、制御ループが DISARM するあいだはリンクのイベントを転送し続ける。制御ループが止まった後に `RunningServer::shutdown` が発見タスクを abort し、そのとき残りも止まる。panic で終わったタスクもタスク ID で外すので、その名前と個体は次の走査で拾い直す。
 - supervisor は変えていない。新しい名前で HELLO が来るのは、通常の再接続（boot_id が同じなら再起動ではない）。FAULT_LATCHED の解除や基準の取り直しは操作者が行う（自動で FAULT_RESET はしない）。
 - ログ（変化したときに 1 回）: `ports = auto: axisN unit found`（ポート名つき）、`ports = auto: axisN unit not in the USB port list`、`ports = auto: ESP32-S3 USB port not opened (its serial matches no [[axis]] device_id)`（入れ替えた個体や別プロジェクトの ESP32-S3）。
 

@@ -87,7 +87,7 @@ $PIO run -e m5stack-cores3-v1-usbpower -t upload --upload-port /dev/cu.usbmodemX
 - 系統は MCU 側で選ぶ（protocol.md §1.1）。NVS のキー `motor` は従来 env と同じなので、§1.2 で `M <n>` した個体は v1 でも同じ `#n` を表示するはず（推定。画面で確認する）。
 - 違っていれば、**DISARMED のときだけ** 画面の系統表示をタップして 1 → 2 → 3 → 1 と送る。選ぶと `CONFIGURED` / `POSITION_REFERENCED` が消え、AXIS_SELECT が 1 回出る。
 - v1 ファームは未選択（`selected_axis = 0`）を名乗らない（NVS に `motor` が無ければ `#1`。`control_v1_begin` が 1〜3 以外を 1 に丸める）。新品や初期化した個体を混ぜて起動すると `#1` が 2 台になり、`axis_conflict: axis1 ...`・`not_connected: axis1`・`rig_state = OFFLINE` になる。これは正常で、片方の画面で系統をタップして直す。1 → 2 → 3 の切り替えに USB の挿し直しは要らない（PC は AXIS_SELECT と STATUS の `selected_axis` で追い、同じポートのまま割当を変える。切り替えた個体には `reference_stale` が付くので §5.1 の基準を取り直す）。
-- `unknown_device` になるのは、`[backend] ports` に名前を直接書き、そこに CoreS3 以外の装置（別の ESP32-S3 など）がつながっていたときだけ（`"auto"` はそういうポートを開かない）。PC はそのポートを閉じ、装置が消えるまで開き直さない。その場合は bringup.toml の `ports` を直してサーバーを起動し直す（挿し直しでは直らない）。
+- `unknown_device` になるのは、`[backend] ports` に名前を直接書き、そこに CoreS3 以外の装置（別の ESP32-S3 など）がつながっていたとき（`"auto"` は `device_id` が一致しないポートを開かない）か、protocol_version 違い・POSITION_MODE 無しのファームの個体（`"auto"` でも起きる。ファームを v1 に書き直す）。PC はそのポートを閉じ、装置が消えるまで開き直さない。その場合は bringup.toml の `ports` を直してサーバーを起動し直す（挿し直しでは直らない）。
 - 3 台が 1・2・3 を 1 つずつ。同じ系統を 2 台が選ぶと `axis_conflict` で ARM できない（§4.3 でわざと起こして見る）。
 
 ## 3. サーバー起動

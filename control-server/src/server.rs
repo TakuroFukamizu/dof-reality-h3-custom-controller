@@ -49,11 +49,18 @@
 //!     non-simulated `[[axis]]` (`crate::port_discovery`). Before every
 //!     (re)open such a task checks that its name still carries that unit and
 //!     ends otherwise, so a unit re-plugged under a new name is picked up by
-//!     the next scan and nothing else is ever opened under the old name. The
-//!     port tasks belong to the discovery task (a `JoinSet`): aborting it
-//!     aborts them. Reconnecting under a new name is an ordinary reconnect
-//!     for the supervisor; a latched fault or a lost reference still needs
-//!     the operator.
+//!     a later scan and the old name is not reopened for another device.
+//!     The check and the open are separate OS calls: a device that takes the
+//!     same name in between (milliseconds) would still be opened; the open
+//!     cannot be bound to the enumerated USB device. At most one task per
+//!     name and per unit, so a unit that moved waits until its old task has
+//!     ended. After `UnknownDevice` the task waits until that unit has left
+//!     the name (not just until the name is gone). The port tasks belong to
+//!     the discovery task (a `JoinSet`): on shutdown it stops scanning but
+//!     keeps them forwarding while the control loop DISARMs; aborting it
+//!     (after the control loop) aborts them. Reconnecting under a new name
+//!     is an ordinary reconnect for the supervisor; a latched fault or a lost
+//!     reference still needs the operator.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -750,18 +757,24 @@ async fn serial_discovery_task(
         units = ?wanted.iter().map(|(a, d)| format!("axis{}={d}", a.get())).collect::<Vec<_>>(),
         "ports = auto: looking for these units by USB serial number"
     );
-    // Port name → its task; the task returns its name when it ends.
+    // Port tasks by task id → (port name, unit). Removed when the task ends,
+    // also on a panic, so the name and the unit can be picked up again.
     let mut tasks: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
-    let mut running = std::collections::BTreeSet::<String>::new();
+    let mut running = std::collections::BTreeMap::<tokio::task::Id, (String, DeviceId)>::new();
     // Last logged state, so each change is logged once.
     let mut found_logged = std::collections::BTreeMap::<DeviceId, String>::new();
     let mut missing_logged = std::collections::BTreeSet::<DeviceId>::new();
     let mut unmatched_logged = std::collections::BTreeSet::<(String, String)>::new();
     loop {
-        while let Some(done) = tasks.try_join_next() {
-            if let Ok(name) = done {
-                running.remove(&name);
-            }
+        while let Some(done) = tasks.try_join_next_with_id() {
+            let id = match done {
+                Ok((id, _)) => id,
+                Err(e) => {
+                    tracing::error!("ports = auto: port task ended abnormally: {e}");
+                    e.id()
+                }
+            };
+            running.remove(&id);
         }
         let listed = listed_ports().await;
         let found = port_discovery::find_units(&listed, &wanted_ids);
@@ -793,23 +806,32 @@ async fn serial_discovery_task(
         }
         unmatched_logged = unmatched;
         for (name, id) in found {
-            if running.insert(name.clone()) {
-                tasks.spawn(serial_port_task(
-                    name,
-                    Some(id),
-                    serial.clone(),
-                    cfg.clone(),
-                    events.clone(),
-                    links.clone(),
-                    shutdown.clone(),
-                ));
+            // One task per name and per unit: a unit that moved to a new name
+            // waits until the task of its old name has ended (within
+            // SERIAL_RETRY of losing it), so it never claims its axis twice.
+            if running.values().any(|(n, d)| *n == name || *d == id) {
+                continue;
             }
+            let handle = tasks.spawn(serial_port_task(
+                name.clone(),
+                Some(id),
+                serial.clone(),
+                cfg.clone(),
+                events.clone(),
+                links.clone(),
+                shutdown.clone(),
+            ));
+            running.insert(handle.id(), (name, id));
         }
         if sleep_or_shutdown(DISCOVERY_PERIOD, &shutdown).await {
-            // Dropping the JoinSet aborts the port tasks.
-            return;
+            break;
         }
     }
+    // Shutdown: no more scans or opens, but keep the port tasks forwarding
+    // link events while the control loop DISARMs (they end once their link
+    // is closed). `RunningServer::shutdown` aborts this task after the
+    // control loop has stopped; dropping the JoinSet then aborts the rest.
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Open / reopen one serial port until shutdown. With `expect` (auto
@@ -859,12 +881,18 @@ async fn serial_port_task(
             }
         }
         if unknown {
-            // Do not keep re-probing a device that is not ours.
+            // Do not keep re-probing a device that is not ours. Wait until it
+            // is gone: the name (named ports), or the unit from this name
+            // (auto: another unit may take the name within one period).
             loop {
                 if sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
                     return port;
                 }
-                if !port_present(&port).await {
+                let gone = match expect {
+                    Some(id) => !port_discovery::still_matches(&listed_ports().await, &port, id),
+                    None => !port_present(&port).await,
+                };
+                if gone {
                     break;
                 }
             }
