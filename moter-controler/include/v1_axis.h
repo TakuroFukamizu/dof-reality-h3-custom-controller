@@ -2011,9 +2011,9 @@ class V1Axis {
   void update_stall_boost(uint64_t now) {
     if (!boost_eligible_ || !boost_window_running_) return;
     const int64_t moved = raw_ - boost_anchor_raw_;
-    // r6（PR #33 Codex P2）: 「動いた」は誤差の向きへの進みだけ（自重で目標から離れても時計は戻さない）。従来経路は向きを問わない
-    const int64_t moved_fwd = tuning.ff_directional ? static_cast<int64_t>(boost_err_sign_) * moved
-                                                    : (moved < 0 ? -moved : moved);
+    // つなぎ（Issue #44、2026-11-02）: 「動いた」はどちら向きでも数える（エンコーダが生きている証拠）。r6 の Codex P2 で
+    // 誤差の向きだけに限定したが、乗員に押されて目標から離れる動きを数えず 2 s で ENCODER_FAULT になった。根本対策は #44 の r10
+    const int64_t moved_fwd = moved < 0 ? -moved : moved;
     if (moved_fwd >= tuning.stall_boost_min_move) {
       boost_window_start_us_ = now;  // 動いている: 窓と時間の起点を取り直す
       boost_active_since_us_ = now;
