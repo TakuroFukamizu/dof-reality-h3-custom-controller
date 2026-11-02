@@ -428,6 +428,28 @@ def info(args) -> int:
         link.close()
 
 
+def fault_reset(args) -> int:
+    """FAULT を解除する（サーバーを HOLDING のまま止めて COMMAND_TIMEOUT になったときなど）。画面の非常停止がラッチ中ならファームが拒否する。
+    ENCODER_FAULT の解除は基準を消す（既存の意味）ので、その後はサーバーから校正し直す。"""
+    if serial is None:
+        raise ToolError("pyserial が無い（~/.platformio/penv/bin/python で動かす）")
+    link = Link(f"ax{args.axis}", args.port, args.mac, lambda m: None)
+    try:
+        link.do_hello(args.axis)
+        st = link.wait_status()
+        if st["mcu_state"] != 7:
+            print(f"ax{args.axis} {v1.STATE_NAMES.get(st['mcu_state'])}（FAULT ではない。何もしない）")
+            return 0
+        before = v1.FAULT_NAMES.get(st["fault_code"], st["fault_code"])
+        link.command(lambda rid: v1.fault_reset(rid), v1.FAULT_RESET)
+        st = link.wait_status()
+        print(f"ax{args.axis} FAULT({before}) → {v1.STATE_NAMES.get(st['mcu_state'])} actual={st['actual_count']} "
+              f"R={int(bool(st['flags'] & v1.FLAG_POSITION_REFERENCED))}")
+        return 0
+    finally:
+        link.close()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", required=True, help="計測する軸の /dev/cu.usbmodemXXXX")
@@ -443,6 +465,7 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="mode", required=True)
     sub.add_parser("info", help="動かさずに個体・状態・位置を表示")
+    sub.add_parser("fault-reset", help="FAULT を解除する（動かさない。ENCODER_FAULT の解除は基準を消す）")
     sp = sub.add_parser("sag", help="PWM 0 のままブレーキ解除 → 沈みを記録 → 作動")
     sp.add_argument("--t-max", type=int, required=True, help="解除の最長 [ms]（≤ 500）")
     sp.add_argument("--d-max", type=int, required=True, help="|変位| の上限 [count]（≤ 200）")
@@ -456,6 +479,8 @@ def main(argv=None) -> int:
     try:
         if args.mode == "info":
             return info(args)
+        if args.mode == "fault-reset":
+            return fault_reset(args)
         return run(args)
     except ToolError as e:
         print(f"error: {e}", file=sys.stderr)

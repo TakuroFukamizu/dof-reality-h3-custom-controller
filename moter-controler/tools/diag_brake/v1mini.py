@@ -165,6 +165,10 @@ def config(request_id: int, session_epoch: int, calibration_hash: int, soft_min:
     return wire(CONFIG, p)
 
 
+def fault_reset(request_id: int) -> bytes:
+    return wire(FAULT_RESET, struct.pack("<I", request_id))
+
+
 def diag_start_payload(request_id: int, mode: int, dir_: int = 0, duty_permille: int = 0, t_max_ms: int = 0,
                        d_max_count: int = 0, v_target_count_s: int = 0, delay_ms: int = 0, hold_ms: int = 0) -> bytes:
     return struct.pack("<IBbHHHHHI", request_id, mode, dir_, duty_permille, t_max_ms, d_max_count, v_target_count_s,

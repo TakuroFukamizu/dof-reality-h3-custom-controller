@@ -58,7 +58,9 @@ r10 の保護の監視（PR #50、branch `hw-r10-integrated-test`）は、見え
    サーバーの試験ページで計測する位置（§4）へ動かし、DISARM して **サーバーを止める**。MCU は DISARMED・基準ありのまま残る。
 3. 個体とポートの対応を確かめる: `ioreg -p IOUSB -l -w0 | grep -E "USB Serial Number|USB Product Name"`。
    個体の MAC: #1 = `1C:DB:D4:BA:8D:58`、#2 = `68:EE:8F:D8:42:F0`、#3 = `30:ED:A0:0B:20:40`（設定の `device_id` の下 12 桁）。
-4. 動かさずに読む（道具の動作確認）:
+4. 設定ファイル `h3-bringup-01-live-20261102.toml` は main にあり、このブランチ（hw-r10a-test から分岐）には無い。
+   main のチェックアウトから動かすか、`--config` に main のチェックアウトの絶対パスを渡す。
+5. 動かさずに読む（道具の動作確認）:
 
 ```sh
 PY=~/.platformio/penv/bin/python   # pyserial と tomllib が入っている（PATH の python3 には pyserial が無い）
@@ -70,6 +72,18 @@ $PY $T --port /dev/cu.usbmodem12501 --mac 1C:DB:D4:BA:8D:58 --axis 1 --config $C
 道具は、開く前に USB Serial Number を `--mac` と照合し（違えば開かない）、HELLO で `device_id`・選択中の系統（`--axis`）・計測専用ファームであること、
 STATUS で DISARMED・基準ありを確かめてから、設定の値（ソフトリミット・保護値・電源担当）で CONFIG を送る。
 CONFIG の `calibration_hash` は 0 で送るので、後でサーバーを起動すると CONFIG を送り直す（サーバーの通常の動き。問題はない）。
+
+FAULT から戻す: サーバーを HOLDING のまま止めると COMMAND_TIMEOUT（lease 400 ms）で FAULT になり、道具は DISARMED でないので拒否する。
+サーバーを起動し直さずに `fault-reset` で解除できる（動かさない。画面の非常停止がラッチ中ならファームが拒否する）。
+ENCODER_FAULT の解除は基準を消すので、その後はサーバーから校正し直す。サーバーは **DISARM してから** 止める。
+
+```sh
+$PY $T --port /dev/cu.usbmodem12501 --mac 1C:DB:D4:BA:8D:58 --axis 1 --config $CFG fault-reset
+```
+
+**電源を入れた後（焼いた後・校正の後も）の最初の 1 回は `sag` にする。** ブレーキ解除で実際に動く（`release_to_motion_ms` が出る）ことを見てから
+`engage` に進む。主電源の待ちは ARMING と同じ 2.5 s で、校正（CAL_POWER_SETTLE_MS = 5 s。10/31 に投入 4 s 後は動かなかった記録）より短い。
+24 V が上がる前に `engage` が走ると無パルスで ENCODER_FAULT になり、基準を失う（#1 単独のとき。#2・#3 は #1 の POWER_HOLD が先に入っている）。
 
 ## 4. 計測の計画
 
@@ -132,6 +146,7 @@ $PY $T --port /dev/cu.usbmodem1101 --mac 30:ED:A0:0B:20:40 --axis 3 --config $CF
 
 ## 6. 既知の制約・未確認
 
+- 主電源の待ち 2.5 s（ARMING と同じ）は校正の 5 s より短い。24 V が上がり切る前に `engage` が走ると無パルス → ENCODER_FAULT（§3 の「最初は sag」）。
 - 実機では未実行（2026-11-02 時点。ホストテストと、V1Axis を pty の向こうで動かした模擬で道具の一連を確認しただけ）。
 - 1 ms 記録の間隔は実機で未確認（DIAG_RESULT の `max_sample_gap_us` に出る。1000 から大きく外れるなら制御タスクの負荷を疑う）。
 - VIOUT の分圧と ADC の換算は未確認（生値を残すだけ。11 dB 減衰 = 約 3.1 V まで）。
