@@ -275,7 +275,8 @@ constexpr int32_t V1_MECH_DECEL_ZONE_COUNT = 50;
 // min(この値, max(0, D − V1_END_HARD_MARGIN_COUNT)) を下限にする: 50 count = 2500 count/s で 20 ms（100 count/s 以上で動いていれば 2 count 進んで確かめられる）
 constexpr int32_t V1_SUP_MIN_BUDGET_COUNT = 50;
 // 「エンコーダが確かに動いた」（予算を戻す唯一の根拠）: 出している Duty の向きへ、窓の中の最も戻った所から V1_SUP_RENEW_MOVE_COUNT 以上の
-// 正味の移動。±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならないので戻さない。Duty 0・向きの反転で窓を取り直す
+// 正味の移動。±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならないので戻さない。窓は半分（100 ms）ずつ 2 つを持つ滑り窓の近似
+// （実効 100〜200 ms）。Duty 0・向きの反転で窓を取り直す
 constexpr int32_t V1_SUP_RENEW_MOVE_COUNT = 2;
 constexpr uint32_t V1_SUP_RENEW_WINDOW_MS = 200;
 // 過負荷（LOAD_LIMITED）: |出力| ≥ duty_max × 99 % で誤差の向きに出している（飽和）のに、100 ms の窓ごとに向きへ 5 count 進む・
