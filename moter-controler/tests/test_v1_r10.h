@@ -1464,6 +1464,129 @@ inline void test_r10_hold_certification_requires_stable_window() {
   CHECK(s.verified_hold_permille() == 60.0);
 }
 
+
+// --- Codex 最終レビュー（e32838e）: 駐車の切り替わりの間の DISARM / STOP / FAULT・監視・保持出力の受け渡し ----------------------------
+
+// 荷重 6 % の軸を駐車の入りかけ（engage = true）または戻りかけ（false）の先頭まで進める。入りかけなら target 0 のまま、戻りかけなら +50
+inline void park_to_transition(Harness& h, bool engage) {
+  r10_active(h, 0, 100000, 30, 20, true, true, true);
+  h.pwm_count_s_per_permille = 4.0;
+  h.load_permille = 60;
+  h.pwm_deadband_permille = 15;  // 静止摩擦 1.5 %（保持できる出力の帯 45〜75）
+  h.pwm_deadband_subtract = true;
+  for (int i = 0; i < 300; ++i) {
+    h.ext_vel = ((i / 30) % 2 == 0) ? 40.0 : -40.0;
+    drive_count_nonzero(h, 10, 0);
+  }
+  h.ext_vel = 0.0;
+  for (int i = 0; i < 400 && !h.ax.brake_parked(); ++i) {
+    if ((i % 2) == 0) h.set_position(0);
+    h.step();
+  }
+  CHECK(h.ax.brake_parked());
+  if (engage) return;
+  drive_count_nonzero(h, 400, 0);  // 入りかけを終えて駐車
+  for (int i = 0; i < 20 && !h.ax.unparking(); ++i) {
+    if ((i % 2) == 0) h.set_position(50);
+    h.step();
+  }
+  CHECK(h.ax.unparking());
+}
+
+inline void test_r10_park_transitions_with_disarm_stop_fault() {
+  for (bool engage : {true, false}) {
+    for (uint32_t at_ms : engage ? std::vector<uint32_t>{5, 75, 140} : std::vector<uint32_t>{5, 100, 250}) {
+      for (int cmd = 0; cmd < 3; ++cmd) {  // 0 = DISARM, 1 = STOP, 2 = FAULT
+        Harness h;
+        park_to_transition(h, engage);
+        const int32_t tgt = engage ? 0 : 50;
+        h.drive(at_ms, tgt);
+        if (cmd == 0) Harness::accepted(h.disarm());
+        if (cmd == 1) Harness::accepted(h.stop());
+        if (cmd == 2) h.host_fault();
+        bool brake_released_seen = false;
+        int ticks = 0;
+        for (; ticks < 200; ++ticks) {  // 1 s
+          if ((ticks % 2) == 0) h.set_position(tgt);
+          h.step();
+          if (h.ax.brake_release_cmd()) brake_released_seen = true;
+        }
+        if (std::getenv("R10_PRINT")) {
+          std::printf("park transition %s at %u ms cmd %d: state %u parked %d brake_rel_seen %d pwm %d\n", engage ? "engage" : "release",
+                      at_ms, cmd, h.ax.state(), h.ax.brake_parked() ? 1 : 0, brake_released_seen ? 1 : 0, h.ax.pwm_permille());
+        }
+        CHECK(!brake_released_seen);  // DISARM / STOP / FAULT の後にブレーキを解除し直さない
+        if (cmd == 0) CHECK(h.ax.state() == st::DISARMED && !h.ax.brake_parked() && h.ax.pwm_permille() == 0);
+        if (cmd == 1) CHECK(h.ax.state() == st::HOLDING && h.ax.brake_parked() && h.ax.pwm_permille() == 0);
+        if (cmd == 2) CHECK(h.ax.state() == st::FAULT && !h.ax.brake_parked() && h.ax.pwm_permille() == 0);
+      }
+    }
+  }
+}
+
+// 入りかけ（掴むまで）と戻りかけは監視に通す: 露出（逆回り）を積み、駐車中（PWM 0・作動）は積まない
+inline void test_r10_park_transitions_accounted() {
+  Harness h;
+  park_to_transition(h, true);
+  const double e0 = h.ax.supervisor().exposure(-1);
+  h.drive(100, 0);  // 入りかけ（150 ms の中）
+  const double e1 = h.ax.supervisor().exposure(-1);
+  h.drive(300, 0);  // 駐車
+  const double e2 = h.ax.supervisor().exposure(-1);
+  h.drive(1000, 0);
+  const double e3 = h.ax.supervisor().exposure(-1);
+  if (std::getenv("R10_PRINT")) std::printf("park exposure: engage +%.1f, parked +%.1f\n", e1 - e0, e3 - e2);
+  CHECK(e1 - e0 >= 200.0 * 0.09 && fabs(e3 - e2) < 1e-9);
+}
+
+// 戻りかけの間に期限（露出が余裕の全部）に届いたら、駐車をやめて即ブレーキの停止・基準を消す。下の端の近く（下の余裕 120）で、
+// 期限の露出（逆回り 200 count/s）の半分で駐車し、戻りかけ（ブレーキ解除中）に残りを使い切る
+inline void test_r10_deadline_trip_during_release_brakes_immediately() {
+  Harness h;
+  r10_active(h, -2230, 100000, 30, 20, true, true, true);  // 下の余裕 = −2230 − (−2750) − 400 = 120
+  h.ax.tuning.soft_reserve_count = 0;
+  for (int i = 0; i < 100 && !h.ax.brake_parked(); ++i) drive_count_nonzero(h, 10, -2230);
+  drive_count_nonzero(h, 300, -2230);
+  CHECK(h.ax.brake_parked() && !h.ax.unparking() && !h.ax.supervisor_inhibited());
+  bool released = false;
+  int ticks_in_release = 0;
+  for (int i = 0; i < 100 && !h.ax.supervisor_inhibited(); ++i) {
+    if ((i % 2) == 0) h.set_position(-2220);
+    h.step();
+    if (h.ax.unparking()) {
+      released = true;
+      ++ticks_in_release;
+    }
+  }
+  if (std::getenv("R10_PRINT")) std::printf("trip during release: ticks %d inhibited %d\n", ticks_in_release, h.ax.supervisor_inhibited() ? 1 : 0);
+  CHECK(released && braked_inhibit(h) && h.ax.supervisor().deadline_tripped() && !h.ax.referenced() && !h.ax.unparking());
+  CHECK(ticks_in_release * 5 < 300);  // 解除待ちの途中で止まった
+}
+
+// 保持出力の受け渡し: 戻るときは駐車に入ったときの保持出力を出してから（その次の tick で）ブレーキを解除する。荷重で沈む軸で解除の間に沈まない
+inline void test_r10_unpark_handoff_no_sag() {
+  Harness h;
+  park_to_transition(h, true);
+  const int hold_at_entry = h.ax.pwm_permille();
+  drive_count_nonzero(h, 400, 0);
+  CHECK(h.ax.brake_parked() && h.ax.pwm_permille() == 0);
+  const double pos0 = h.phys;
+  int out_before_release = 0;
+  bool prev_brake = false;
+  double min_pos = pos0;
+  int i = 0;
+  for (; i < 80; ++i) {  // 400 ms
+    if ((i % 2) == 0) h.set_position(50);
+    h.step();
+    if (!prev_brake && h.ax.brake_release_cmd()) out_before_release = h.ax.pwm_permille();
+    prev_brake = h.ax.brake_release_cmd();
+    if (h.ax.unparking()) min_pos = std::min(min_pos, h.phys);
+  }
+  if (std::getenv("R10_PRINT")) std::printf("handoff: hold at entry %d, output at release %d, min pos %.2f (parked %.2f)\n", hold_at_entry, out_before_release, min_pos, pos0);
+  CHECK(hold_at_entry > 30 && out_before_release == hold_at_entry);
+  CHECK(min_pos >= pos0 - 1.0);
+}
+
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
 inline void test_r10_status_flags_bits() {
   CHECK(fl::LOAD_LIMITED == 0x80 && fl::FEEDBACK_UNCERTAIN == 0x100 && fl::END_BRAKING == 0x200 && fl::LIMIT_RECOVERY == 0x400);
@@ -1526,6 +1649,10 @@ inline void run_all() {
   test_r10_bias_and_tracking_i_separate_on_reversal();
   test_r10_integrators_frozen_while_overridden();
   test_r10_hold_certification_requires_stable_window();
+  test_r10_park_transitions_with_disarm_stop_fault();
+  test_r10_park_transitions_accounted();
+  test_r10_deadline_trip_during_release_brakes_immediately();
+  test_r10_unpark_handoff_no_sag();
   test_r10_status_flags_bits();
 }
 

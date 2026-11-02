@@ -899,7 +899,8 @@ class V1Axis {
   enum class ParkPhase : uint8_t { None, Engaging, Parked, Releasing };
   ParkPhase park_ = ParkPhase::None;
   uint64_t park_phase_us_ = 0;
-  int park_hold_out_ = 0;        // 入るときの保持出力 [permille、カウント増が正]
+  int park_hold_out_ = 0;        // 入るときの保持出力 [permille、カウント増が正]。戻るときもこの値を出してからブレーキを解除する
+  bool park_release_armed_ = false;  // 戻りかけ: 保持出力を出した次の tick でブレーキを解除する
   double park_target_ = 0.0;     // 駐車した目標（フレームの目標の幅の中央）
   bool still_running_ = false;   // 静止の窓を数えている
   uint64_t still_start_us_ = 0;
@@ -1718,7 +1719,8 @@ class V1Axis {
     c.hold_exit = tuning.hold_exit;
     // r10（実測 2）: 保持出力の扱い。軌道が止まっていて目標の近くなら、学んだ保持出力（I）の分は包絡線に積まない（V1Supervisor）
     c.i_pm = duty_state_.bias_pm;  // P1a: 保持の偏り（追従の I は含めない）
-    c.brake_released = brake_release_cmd_;
+    // 駐車の入りかけ（ブレーキ作動の指令から V1_BRAKE_ENGAGE_MS）はまだ掴んでいないとみなし、露出を積む（Codex 最終レビュー P1）
+    c.brake_released = brake_release_cmd_ || park_ == ParkPhase::Engaging;
     const int64_t ea = c.err < 0 ? -c.err : c.err;
     c.stationary_near = tuning.hold_learn && setpoint_vel_ == 0.0 && ea <= escalation_floor();
     c.park_ok = park_conditions(ea);
@@ -1961,8 +1963,37 @@ class V1Axis {
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
     const int64_t err_abs = err < 0 ? -err : err;
-    // ブレーキ駐車（2026-11-02 の操作者の決定）: 駐車の各段階はここで出力を決めて戻る
-    if (parking_enabled() && park_step(err_abs, now)) return;
+    // ブレーキ駐車（2026-11-02 の操作者の決定）。駐車中（ブレーキ作動・PWM 0）だけは監視を通さない。入りかけ・戻りかけは保持出力を
+    // 監視（予算・期限・停止・基準を消す）に通し、停止なら駐車をやめて即ブレーキの停止にする（Codex 最終レビュー P1）
+    if (parking_enabled()) {
+      int park_out = 0;
+      const ParkAct pa = park_step(err_abs, now, &park_out);
+      if (pa == ParkAct::Parked) {
+        sup_.note_parked();
+        apply_park_output(0, V1DutyMode::HOLD);
+        return;
+      }
+      if (pa == ParkAct::Transition) {
+        int out = park_out;
+        if (has_config_) {
+          sup_.t = tuning.sup;
+          out = sup_.filter(sup_ctx(now), out);
+          if (sup_.take_reference_lost()) referenced_ = false;
+          if (sup_.inhibited()) {
+            park_ = ParkPhase::None;  // 停止が駐車より先: ブレーキ作動・PWM 0（戻りかけでも即）
+            still_running_ = false;
+            out = 0;
+            brake_release_cmd_ = false;
+            duty_state_ = V1DutyState{};
+            reset_breakaway();
+            reset_track_assist();
+            reset_stall_boost();
+          }
+        }
+        apply_park_output(out, V1DutyMode::HOLD);
+        return;
+      }
+    }
     // r10: 小さな残り誤差の受け入れの解除（|誤差| が出口を超えた・軌道が動いた・ブレーキ作動・監視 OFF）
     if (residual_accepted_ && (!supervisor_on() || err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || !brake_release_cmd_)) {
       residual_accepted_ = false;
@@ -2295,12 +2326,17 @@ class V1Axis {
     terms_.cmd_permille = static_cast<int16_t>(out_count_positive);
     terms_.i_permille = v1_clamp_i16(duty_state_.bias_pm + duty_state_.i_pm);
   }
+  enum class ParkAct : uint8_t { None, Transition, Parked };
   void enter_park(uint64_t now) {
     park_ = ParkPhase::Engaging;
     park_phase_us_ = now;
     park_target_ = 0.5 * (still_min_ + still_max_);
     if (!still_running_) park_target_ = control_target_;
-    park_hold_out_ = pwm_permille();  // いまの保持出力（直前に出していた値）をブレーキが掴むまで保つ
+    // いまの保持出力（直前に実際に出していた値 = bias + I + P）をブレーキが掴むまで保ち、戻るときもこの値を出す（duty_max で頭打ち）
+    park_hold_out_ = pwm_permille();
+    const int cap = v1_permille(tuning.duty_max);
+    if (park_hold_out_ > cap) park_hold_out_ = cap;
+    if (park_hold_out_ < -cap) park_hold_out_ = -cap;
     brake_release_cmd_ = false;
     still_running_ = false;
     ++park_count_;
@@ -2312,8 +2348,22 @@ class V1Axis {
     duty_state_.in_band = false;
     settle_dwell_us_ = 0;
   }
-  // 駐車の状態機械。true を返したらこの tick の出力はここで決めた（update_duty はそのまま戻る）
-  bool park_step(int64_t err_abs, uint64_t now) {
+  // 駐車の状態機械。Parked: 駐車中（PWM 0、監視を通さない）。Transition: 入りかけ・戻りかけ（*out の保持出力を監視に通して出す）。
+  // None: 通常の制御。DISARMING など ACTIVE / HOLDING / STOPPING 以外では駐車をやめて何もしない（Codex 最終レビュー P1: DISARMING を
+  // 上書きしない。DISARMING は従来どおりブレーキ作動のまま位置制御の出力を BRAKE_APPLY_WAIT_MS 出す）。STOPPING で戻りかけなら
+  // ブレーキ解除をやめて入りかけに戻す（保持出力を出したまま掴むまで待つ）
+  ParkAct park_step(int64_t err_abs, uint64_t now, int* out) {
+    if (state_ != v1::state::ACTIVE && state_ != v1::state::HOLDING && state_ != v1::state::STOPPING) {
+      park_ = ParkPhase::None;
+      still_running_ = false;
+      return ParkAct::None;
+    }
+    if (state_ != v1::state::ACTIVE && park_ == ParkPhase::Releasing) {
+      // STOP（STOPPING、止まっていれば同じ tick で HOLDING）: 戻りかけをやめてブレーキを掴み直す（保持出力を出したまま掴むまで待つ）
+      park_ = ParkPhase::Engaging;
+      park_phase_us_ = now;
+      brake_release_cmd_ = false;
+    }
     const double ct_dev = fabs(control_target_ - park_target_);
     switch (park_) {
       case ParkPhase::None: {
@@ -2336,50 +2386,48 @@ class V1Axis {
         }
         const bool timed = ok && still_running_ && now - still_start_us_ >= ms_to_us(tuning.park_still_ms);
         const bool deadline = sup_.take_park_request() && ok;  // 期限の露出が半分に届いた
-        if (!timed && !deadline) return false;
+        if (!timed && !deadline) return ParkAct::None;
         enter_park(now);
-        sup_.note_parked();
-        apply_park_output(park_hold_out_, V1DutyMode::HOLD);
-        return true;
+        *out = park_hold_out_;
+        return ParkAct::Transition;
       }
       case ParkPhase::Engaging:
         brake_release_cmd_ = false;
-        sup_.note_parked();
         if (now - park_phase_us_ >= ms_to_us(tuning.brake_engage_ms)) {
           park_ = ParkPhase::Parked;
           park_phase_us_ = now;
-          apply_park_output(0, V1DutyMode::HOLD);
-          return true;
+          return ParkAct::Parked;
         }
-        apply_park_output(park_hold_out_, V1DutyMode::HOLD);
-        return true;
+        *out = park_hold_out_;
+        return ParkAct::Transition;
       case ParkPhase::Parked:
         brake_release_cmd_ = false;
-        sup_.note_parked();
         if (ct_dev > static_cast<double>(tuning.park_unpark_count) && state_ == v1::state::ACTIVE) {
-          // 戻る: 保持出力（bias）を出してからブレーキを解除し、解除待ちの間は参照を止めておく
+          // 戻る: まず駐車に入ったときの保持出力を出す（ブレーキはこの tick はまだ作動）。次の tick でブレーキを解除する
           park_ = ParkPhase::Releasing;
           park_phase_us_ = now;
-          brake_release_cmd_ = true;
+          park_release_armed_ = false;
           setpoint_vel_ = 0.0;
-          apply_park_output(holding_output_permille(), V1DutyMode::HOLD);
-          return true;
+          *out = park_hold_out_;
+          return ParkAct::Transition;
         }
-        apply_park_output(0, V1DutyMode::HOLD);
-        return true;
+        return ParkAct::Parked;
       case ParkPhase::Releasing:
+        if (!park_release_armed_) {
+          park_release_armed_ = true;  // 保持出力は前の tick から出ている: ここでブレーキを解除し、解除待ちを数え始める
+          park_phase_us_ = now;
+        }
         brake_release_cmd_ = true;
         if (now - park_phase_us_ >= ms_to_us(tuning.brake_release_wait_ms)) {
           park_ = ParkPhase::None;
           park_cooldown_until_us_ = now + ms_to_us(tuning.park_still_ms);
           still_running_ = false;
-          return false;  // この tick から通常の制御（参照は次の tick から追いつく）
+          return ParkAct::None;  // この tick から通常の制御（参照は次の tick から追いつく）
         }
-        sup_.note_parked();
-        apply_park_output(holding_output_permille(), V1DutyMode::HOLD);
-        return true;
+        *out = park_hold_out_;
+        return ParkAct::Transition;
     }
-    return false;
+    return ParkAct::None;
   }
 
   void reset_escalation() {

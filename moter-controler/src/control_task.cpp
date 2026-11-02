@@ -268,10 +268,12 @@ int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
 int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 // 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
+// 書く順: 主電源 → PWM → ブレーキ（r10 の Codex 最終レビュー P2）。ブレーキを解除する tick には、保持出力がもう出ているようにする
+//（駐車から戻るときは、V1Axis が保持出力を出した次の tick でブレーキを解除するので、順序に頼らなくても先に出ている）
 void write_outputs(bool power_on, bool brake_release, int duty_permille) {
   digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
-  digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
   motor_output_write_permille(duty_permille);
+  digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
 }
 
 void v1_task_main(void*) {
