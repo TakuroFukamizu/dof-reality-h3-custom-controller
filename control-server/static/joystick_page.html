@@ -25,7 +25,20 @@
       「姿勢を 0 に固定」のあいだは速度モードの指令姿勢も 0 に戻す（切ったとき中央から始まる）。
       速度モードから位置モードへ切り替えると姿勢はその場の倒し量へ跳ぶ（位置モードは倒し量 = 姿勢なので）。
   - 管理トークンは sessionStorage にだけ置く（タブを閉じると消える）。スティックの選択・軸の割当・入力モードは localStorage。
-  - 読み込んだだけでは何もしない（session 発行・ARM・姿勢送信はすべてボタン）。
+  - 自動開始（2026-11-02）: 読み込み時（「読み込み時に自動で開始する」が入、localStorage、既定は入）と「リセット」で、
+    条件がそろい次第 送信開始 → ARM → START まで 1 回だけ進める。進め方は status のポーリング（200 ms）ごとに判定する:
+      通信（GET /v1/status が通る）→ 管理トークン（要るときだけ）→ スティックを読める → rig_state が READY_TO_ARM /
+      BRAKED_DISARMED / HOLDING（送信中の別 session が無い）→ 送信開始（新 session）→ session.fresh → ARM → HOLDING →
+      スティックが中央（不感帯の内側）→ START（速度モードは指令姿勢を 0 に）→ ACTIVE（game）で完了。
+      START が pose_not_near_hold（保持位置が中立から離れている。STOP 後の再読み込みでよく起きる）なら一度だけ
+      CENTER（POST /v1/center）で機構を中立へ動かしてから START し直す。busy / no_fresh_pose は 1 s 空けて再試行。
+    安全側の規則: 1 回きり（完了・中止のあとは勝手に再開しない。STOP 後に再 ARM しない）。STOP・手動の操作ボタン・
+      stale_session・WS の切断・スティック喪失・途中の STOPPING / FAULT・時間切れで中止して理由を出す。別のクライアントが
+      送信中（armed かつ session.fresh が 2 s 続く）なら横取りしないで中止。FAULT RESET は自動では送らない（「リセット」を
+      押したときだけ）。待つのは前提（トークン・スティック・接続・校正・前の動きの停止）だけで、そこには時間切れが無い。
+  - 「リセット」: 自動開始を止め、送信を止め、指令姿勢と「姿勢を 0 に固定」を戻し、armed なら POST /v1/stop、FAULT_LATCHED なら
+    POST /v1/fault/reset を送ってから自動開始を最初からやり直す（読み込み時の設定が切でも走る）。
+  - 手動の操作ボタン（送信開始 / ARM / START / DISARM / FAULT RESET / CENTER）はトラブルシュート用にそのまま残す。押すと自動開始は止まる。
   - 姿勢は 50 Hz で送る。50 Hz の刻みは Web Worker で回す: 主スレッドの setInterval や requestAnimationFrame は、
     タブが隠れたり別ウィンドウで覆われたりすると 1 Hz 程度に間引かれ、frame_seq が進まずサーバーの鮮度切れ
     （source_freshness_ms）で減速停止してしまう（2026-11-01 の実機で発生）。Worker のタイマーは間引かれないので、
@@ -37,8 +50,8 @@
   - 自動選択はスティックと判定できる機器だけ（軸 2 本以上＋id / mapping）。ペダルやハンドルは静止で ±1 を出すので、
     間違って選ぶと START で端へ飛ぶ。該当が無ければバナーで知らせ、操作者が一覧から選ぶ（Issue #15 M4）。
   - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。再開は「送信開始」で新しい session（Issue #15 L2）。
-  - 操作ボタン（ARM / START / DISARM / FAULT RESET）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
-    （判定はサーバーが正。STOP は常に押せる）。
+  - 操作ボタン（ARM / START / DISARM / FAULT RESET / CENTER）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
+    （判定はサーバーが正。STOP とリセットは常に押せる）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
 -->
 <!--
@@ -145,6 +158,24 @@
   .token-row { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; color: var(--muted); }
   .token-row label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink); }
   .hint { margin-top: 8px; font-size: 11px; line-height: 1.6; color: var(--dim); }
+  /* 自動開始: 判定文、段の列、リセット。JS は #autoState と #autoSteps の li の className を書く */
+  .auto-box { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line2); background: #070b08; }
+  .auto-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+  .auto-head .eyebrow { margin: 0; }
+  #autoState { flex: 1 1 200px; min-width: 0; font: 12px/1.5 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+  #autoState.wait { color: var(--yellow); }
+  #autoState.busy { color: var(--blue); }
+  #autoState.done { color: var(--green); }
+  #autoState.abort { color: var(--red); font-weight: 700; }
+  #bReset { border-color: var(--orange); color: var(--orange); }
+  #bReset:hover { background: var(--orange); color: #050806; }
+  .auto-steps { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 0; padding: 0; list-style: none; }
+  .auto-steps li { padding: 1px 8px; border: 1px solid var(--line); font: 11px/1.6 var(--mono); color: var(--dim); }
+  .auto-steps li.done { border-color: var(--green); color: var(--green); }
+  .auto-steps li.cur { border-color: var(--yellow); background: var(--yellow); color: #171400; font-weight: 700; }
+  .auto-steps li.bad { border-color: var(--red); background: var(--red); color: #0a0202; font-weight: 700; }
+  .auto-opt { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .auto-opt label { display: inline-flex; align-items: center; gap: 6px; }
 
   /* ---- 入力: 直角、暗い面、橙のアクセント */
   input[type=text], input[type=password], input[type=number], select {
@@ -319,13 +350,25 @@
       <button id="bStart">START</button>
       <button id="bDisarm">DISARM</button>
       <button id="bFaultReset">FAULT RESET</button>
+      <button id="bCenterRig" title="POST /v1/center: HOLDING から機構を中立（neutral count）へ動かして HOLDING に戻る。START が pose_not_near_hold で断られたとき">CENTER</button>
       <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
     </div>
     <div class="token-row">
       <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
       <span class="dim small">sessionStorage に保存（このタブだけ）</span>
     </div>
-    <div class="hint">順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</div>
+    <div class="auto-box">
+      <div class="auto-head">
+        <span class="eyebrow">自動開始</span>
+        <span id="autoState">—</span>
+        <button id="bReset" title="自動開始を止め、送信を止め、armed なら STOP、FAULT_LATCHED なら FAULT RESET を送ってから、最初から自動で開始し直す">リセット</button>
+      </div>
+      <ol id="autoSteps" class="auto-steps">
+        <li>通信</li><li>トークン</li><li>スティック</li><li>送信</li><li>ARM</li><li>START</li><li>運転</li>
+      </ol>
+      <div class="auto-opt"><label><input type="checkbox" id="autoOnLoad"> 読み込み時に自動で開始する</label> <span class="dim small">（localStorage。切でも「リセット」で開始できる）</span></div>
+    </div>
+    <div class="hint">自動: 通信 → トークン → スティック → 送信開始 → ARM → START（保持位置が中立から離れていれば CENTER を挟む）。START の前にスティックを中央へ。STOP・手動の操作・異常で自動は止まり、勝手に再開しない（やり直しは「リセット」）。手動の順番: 送信開始 → ARM → START。送信を止めるかスティックが見えなくなると鮮度切れで減速停止（その場で止まる。中央へは戻らない）。タブを隠したり別ウィンドウで覆っても送信は続く</div>
   </div>
 </section>
 
@@ -613,6 +656,13 @@ window.H3Joy = (function () {
     // 速度モードでは cmd を倒し量で積分する。lastTick = 前回スティックを読めた刻みの時刻（dt の実測）。
     input: DEFAULT_INPUT(), cmd: { pitch: 0, roll: 0 }, lastTick: null, mom: { speed: 0, mult: 1 },
   };
+  // 自動開始（読み込み時とリセットで 1 回だけ走る）。run = 何回目か（リセットをまたいだ古い応答を捨てる）、
+  // phase = off / wait / busy / done / abort、step = いまの段（AUTO_STEPS）、key / since = 時間切れの起点。
+  const AUTO_KEY = 'h3cs_joystick_auto';
+  const auto = {
+    run: 0, on: false, phase: 'off', step: 'link', msg: '', key: '', since: 0, busy: false, lastPost: 0,
+    armSent: false, startSent: false, centerSent: false, startTries: 0, otherSince: null,
+  };
 
   $('hostLabel').textContent = location.host;
 
@@ -653,20 +703,26 @@ window.H3Joy = (function () {
   }
 
   // ---------------------------------------------------------------- admin buttons
+  // 手動の操作ボタン（トラブルシュート用に残す）。押したら自動開始は止める（以後は操作者の手順に任せる）。
   function adminButton(id, path, opts) {
     $(id).addEventListener('click', async () => {
       const b = $(id);
+      autoAbort('手動の操作（' + b.textContent + '）に切り替えた');
       b.disabled = true;
       try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
       // 戻すときはリグ状態の判定に任せる（次の status を待たずに、押せない状態を押せるに戻さない）
       if (state.lastStatus) updateButtons(state.lastStatus); else b.disabled = false;
     });
   }
-  $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
+  $('bStop').addEventListener('click', () => {
+    call('POST', '/v1/stop').catch(() => {});
+    autoAbort('STOP が押された');
+  });
   adminButton('bArm', '/v1/arm', { auth: true });
   adminButton('bStart', '/v1/start', { auth: true });
   adminButton('bDisarm', '/v1/disarm', { auth: true });
   adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+  adminButton('bCenterRig', '/v1/center', { auth: true });
 
   // ---------------------------------------------------------------- status
   const fmt = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
@@ -694,6 +750,7 @@ window.H3Joy = (function () {
       bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
       bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
       bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
+      bCenterRig: [st === 'HOLDING', '前提: HOLDING（いま ' + st + '）'],
     };
     for (const id in rules) {
       const el = $(id);
@@ -816,13 +873,16 @@ window.H3Joy = (function () {
         $('pollBanner').className = 'banner bad';
         state.lastPollError = null;
         $('statusAge').textContent = '(' + (performance.now() - t0).toFixed(0) + ' ms)';
-      } else {
-        pollError('GET /v1/status -> ' + r.status + ' ' + r.text);
+        state.pollBusy = false;
+        autoTick(r.json);
+        return;
       }
+      pollError('GET /v1/status -> ' + r.status + ' ' + r.text);
     } catch (e) {
       pollError('GET /v1/status に届かない: ' + e);
     }
     state.pollBusy = false;
+    autoTick(null);
   }
   setInterval(pollStatus, 200);
   pollStatus();
@@ -1173,11 +1233,12 @@ window.H3Joy = (function () {
 
   // ---------------------------------------------------------------- pose streamer
   $('gain').addEventListener('input', () => { $('gainV').textContent = parseFloat($('gain').value).toFixed(2); });
-  $('bZero').addEventListener('click', () => {
-    state.zero = !state.zero;
+  function setZero(on) {
+    state.zero = on;
     $('bZero').textContent = '姿勢を 0 に固定: ' + (state.zero ? '入' : '切');
     $('bZero').className = state.zero ? 'on' : '';
-  });
+  }
+  $('bZero').addEventListener('click', () => setZero(!state.zero));
 
   function setWsState(text, bad) {
     $('wsState').textContent = text;
@@ -1187,6 +1248,7 @@ window.H3Joy = (function () {
   // 送信を止める。50 Hz の刻み（スティックの読み取り）は止めない: sendPose が WS の無いときは何もしない。
   // bad = 操作者の意図しない停止（stale_session など）。理由を赤で残し、再開は「送信開始」を押す。
   function stopStream(reason, bad) {
+    autoAbort('送信が止まった（' + reason + '）');
     state.streaming = false;
     state.padLost = false;
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
@@ -1234,16 +1296,17 @@ window.H3Joy = (function () {
     $('sentPose').className = 'mono' + (state.padLost ? ' bad' : '');
   }
 
+  // 新しい session を発行して WS を開く。session を発行できなければ false（自動開始が中止の理由に使う）。
   async function startStream() {
     const b = $('bStream');
     b.disabled = true;
     try {
       const r = await call('POST', '/v1/session');
-      if (!(r.ok && r.json && typeof r.json.source_session === 'string')) { b.disabled = false; return; }
+      if (!(r.ok && r.json && typeof r.json.source_session === 'string')) { b.disabled = false; return false; }
       state.session = r.json.source_session;
       if (typeof r.json.max_gain === 'number') setMaxGain(r.json.max_gain);
       $('sessionLabel').textContent = state.session.slice(0, 8) + '…';
-    } catch (e) { b.disabled = false; return; }
+    } catch (e) { b.disabled = false; return false; }
     b.disabled = false;
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const ws = new WebSocket(proto + location.host + '/v1/motion?session=' + encodeURIComponent(state.session));
@@ -1271,11 +1334,230 @@ window.H3Joy = (function () {
     };
     ws.onerror = () => { setWsState('error', true); };
     ws.onclose = (ev) => { if (state.ws === ws) stopStream('close ' + ev.code); };
+    return true;
   }
 
   $('bStream').addEventListener('click', () => {
+    autoAbort('手動の操作（' + $('bStream').textContent + '）に切り替えた');
     if (state.streaming || state.ws) stopStream('operator'); else startStream();
   });
+
+  // ---------------------------------------------------------------- 自動開始（読み込み時とリセットで 1 回だけ）
+  // status のポーリング（200 ms）ごとに autoTick が「いまの段」を判定し、条件がそろっていれば次の操作を 1 つだけ送る。
+  // 管理命令は 1 s 以上あける（rate limit と、応答前の古い status で二重に送らないため）。応答待ちのあいだ（busy）は判定しない。
+  // 完了（ACTIVE game）・中止のあとは何もしない: STOP や鮮度切れで止まっても再 ARM しない。やり直しは「リセット」だけ。
+  const AUTO_STEPS = ['link', 'token', 'stick', 'stream', 'arm', 'start', 'run'];
+  const ARMED_STATES = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
+  const AUTO_PHASE_LABEL = { off: '切', wait: '待ち', busy: '実行中', done: '完了', abort: '中止' };
+
+  function renderAuto() {
+    const el = $('autoState');
+    const t = (AUTO_PHASE_LABEL[auto.phase] || '') + ': ' + auto.msg;
+    if (el.textContent !== t) el.textContent = t;
+    if (el.className !== auto.phase) el.className = auto.phase;
+    const cur = AUTO_STEPS.indexOf(auto.step);
+    const lis = $('autoSteps').children;
+    for (let i = 0; i < lis.length; i++) {
+      let c = '';
+      if (auto.phase === 'done') c = 'done';
+      else if (auto.phase !== 'off') c = i < cur ? 'done' : (i === cur ? (auto.phase === 'abort' ? 'bad' : 'cur') : '');
+      if (lis[i].className !== c) lis[i].className = c;
+    }
+  }
+  function autoBegin(why) {
+    auto.run += 1;
+    Object.assign(auto, {
+      on: true, phase: 'wait', step: 'link', msg: 'サーバーの応答を待つ（GET /v1/status）', key: '', since: performance.now(),
+      busy: false, lastPost: 0, armSent: false, startSent: false, centerSent: false, startTries: 0, otherSince: null,
+    });
+    log('自動開始: 開始（' + why + '）');
+    renderAuto();
+  }
+  function autoAbort(reason) {
+    if (!auto.on) return;
+    auto.on = false; auto.busy = false; auto.phase = 'abort'; auto.msg = reason + '。続けるなら手動のボタン、最初からなら「リセット」';
+    log('自動開始: 中止 — ' + reason, true);
+    renderAuto();
+  }
+  function autoFinish() {
+    auto.on = false; auto.phase = 'done'; auto.step = 'run'; auto.msg = 'ACTIVE（game）: スティックで動かせる';
+    log('自動開始: 完了（ACTIVE game）');
+    renderAuto();
+  }
+  // 待つ。timeoutMs があれば、同じ段・同じ時間切れのまま timeoutMs を過ぎたら中止（前提待ちには付けない）。
+  function autoWait(step, msg, timeoutMs) {
+    const key = step + ':' + (timeoutMs || 0);
+    const now = performance.now();
+    if (auto.key !== key) { auto.key = key; auto.since = now; }
+    auto.step = step; auto.msg = msg; auto.phase = 'wait';
+    if (timeoutMs && now - auto.since > timeoutMs) { autoAbort('時間切れ（' + (timeoutMs / 1000) + ' s）: ' + msg); return; }
+    renderAuto();
+  }
+  // 管理命令を送る。リセットをまたいだり中止されたりしたら undefined（呼び手は何もしない）。ネットワークエラーは null。
+  async function autoPost(step, path, what) {
+    const run = auto.run;
+    auto.busy = true; auto.lastPost = performance.now();
+    auto.step = step; auto.msg = what + ' を送った（応答待ち）'; auto.phase = 'busy';
+    renderAuto();
+    let r = null;
+    try { r = await call('POST', path, { auth: true }); } catch (e) { r = null; }
+    if (auto.run !== run || !auto.on) return undefined;
+    auto.busy = false;
+    return r;
+  }
+  const whyText = (r) => r
+    ? (r.status + ' ' + ((r.json && r.json.error) || r.text) + ((r.json && r.json.blockers && r.json.blockers.length) ? ' — ' + r.json.blockers.join(' / ') : ''))
+    : 'ネットワークエラー';
+  const stickReady = () => !!(state.pad && state.pose && !state.lostWhy);
+  const stickCentered = () => stickReady() && state.pose.roll === 0 && state.pose.pitch === 0;
+  function idleReason(st) {
+    switch (st) {
+      case 'OFFLINE': return 'OFFLINE: 3 系統がつながるのを待つ';
+      case 'CONNECTED_DISARMED': return 'CONNECTED_DISARMED: 設定の受理を待つ';
+      case 'CALIBRATION_REQUIRED': return 'CALIBRATION_REQUIRED: 校正が要る（オペレーター用試験ページで）';
+      case 'FAULT_LATCHED': return 'FAULT_LATCHED: 原因を確かめてから「リセット」（FAULT RESET を送ってやり直す）';
+      default: return 'rig_state ' + (st || '—') + ' では進めない';
+    }
+  }
+
+  function autoTick(s) {
+    if (!auto.on) {
+      // 完了のあとに止まったら、そう書き換える（勝手に再開はしない）
+      if (auto.phase === 'done' && s && s.rig_state !== 'ACTIVE') {
+        auto.msg = '一度 ACTIVE（game）になった。いまは ' + s.rig_state + '。もう一度なら「リセット」';
+      }
+      renderAuto();
+      return;
+    }
+    if (auto.busy) return;
+    if (!s) { if (!state.ws) autoWait('link', 'サーバーに届かない（GET /v1/status）。届くまで待つ'); return; }
+    const now = performance.now();
+    const st = s.rig_state || '';
+    const sess = s.session;
+    const fresh = !!(sess && sess.fresh);
+    const blockers = (s.blockers && s.blockers.length) ? '（blockers: ' + s.blockers.join(' / ') + '）' : '';
+
+    // ---- 送信を始める前: 前提がそろうまで待つ（時間切れなし）
+    if (!state.ws) {
+      if (s.admin_token_required !== false && !token()) return autoWait('token', '管理トークンを入力すると進む');
+      if (!stickReady()) {
+        return autoWait('stick', state.sel
+          ? ((state.lostWhy || 'スティックを読めない') + '。ボタンを 1 回押すか大きく倒す')
+          : (state.noAutoPick ? 'スティックと判定できる機器が無い。「使用するスティック」から選ぶ' : 'スティック未検出。ボタンを 1 回押すか大きく倒す'));
+      }
+      if ((s.axis_conflict || []).length) return autoWait('stream', 'axis_conflict: ' + s.axis_conflict.join(', ') + '（解消を待つ）');
+      // 別のクライアントが送信中なら横取りしない（POST /v1/session は走行中の相手を止めてしまう）。
+      // 再読み込み直後は前のタブの session がまだ新鮮なことがあるので 2 s 見てから決める。
+      if (ARMED_STATES.indexOf(st) >= 0 && fresh) {
+        if (auto.otherSince == null) auto.otherSince = now;
+        if (now - auto.otherSince > 2000) {
+          return autoAbort('別のクライアントが送信中（rig_state ' + st + '、session ' + fmt(sess.source_session_prefix) + '）なので横取りしない。使うならそちらを止めてから');
+        }
+        return autoWait('stream', '別の session が送信中か確かめている（rig_state ' + st + '）');
+      }
+      auto.otherSince = null;
+      if (st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED' || st === 'HOLDING') {
+        const run = auto.run;
+        auto.busy = true; auto.step = 'stream'; auto.msg = 'session を発行して送信を始める'; auto.phase = 'busy';
+        renderAuto();
+        startStream().then((ok) => {
+          if (auto.run !== run || !auto.on) return;
+          auto.busy = false;
+          if (!ok) autoAbort('送信を始められない（POST /v1/session。HTTP ログを見る）');
+        });
+        return;
+      }
+      if (st === 'ARMING' || st === 'ACTIVE' || st === 'STOPPING') return autoWait('stream', '前の動きが止まるのを待つ（rig_state ' + st + '）');
+      return autoWait('stream', idleReason(st) + blockers);
+    }
+
+    // ---- 送信中: ARM → HOLDING → START → ACTIVE（game）
+    if (!state.streaming) return autoWait('stream', 'WS を開いている', 5000);
+    if (state.padLost) return autoAbort('スティックを読めなくなった: ' + state.lostWhy);
+    const ours = !!(sess && state.session && typeof sess.source_session_prefix === 'string' && state.session.indexOf(sess.source_session_prefix) === 0);
+    if (!ours || !fresh) return autoWait('stream', 'サーバーが姿勢を受け取るのを待つ（session.fresh）', 5000);
+    if (st === 'FAULT_LATCHED') return autoAbort('FAULT_LATCHED: ' + (s.fault ? JSON.stringify(s.fault) : '—'));
+    if (st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED') {
+      if (auto.armSent) {
+        // ARM の直後は status がまだ前の状態のことがある。3 s 経っても戻ったままなら止まったと見る
+        if (now - auto.lastPost < 3000) return autoWait('arm', 'ARMING になるのを待つ');
+        return autoAbort('ARM のあと ' + st + ' に戻った' + blockers);
+      }
+      if (now - auto.lastPost < 1000) return;
+      autoPost('arm', '/v1/arm', 'ARM').then((r) => {
+        if (r === undefined) return;
+        if (r && r.ok) { auto.armSent = true; autoWait('arm', 'ARMING: 全軸が HOLDING になるのを待つ', 15000); }
+        else autoAbort('ARM が断られた: ' + whyText(r));
+      });
+      return;
+    }
+    if (st === 'ARMING') return autoWait('arm', 'ARMING: 全軸が HOLDING になるのを待つ', 15000);
+    if (st === 'HOLDING') {
+      if (auto.startSent) return autoWait('run', 'START の確認を待つ（全軸の ACK と ACTIVE）', 8000);
+      if (!stickCentered()) return autoWait('start', 'スティックを中央（不感帯の内側）に戻すと START する');
+      if (now - auto.lastPost < (auto.centerSent ? 1500 : 1000)) return autoWait('start', 'START の前に間を置く');
+      // 速度モード: 指令姿勢を中央から始める（HOLDING のあいだは姿勢に追従しないので跳ばない）。保持位置が中立から
+      // 離れていれば START は pose_not_near_hold で断られるので、一度だけ CENTER で機構を中立へ動かしてからやり直す。
+      if (state.input.mode === 'rate') state.cmd = { pitch: 0, roll: 0 };
+      autoPost('start', '/v1/start', 'START').then((r) => {
+        if (r === undefined) return;
+        const code = r && r.json ? r.json.error : null;
+        if (r && r.ok) { auto.startSent = true; autoWait('run', 'START の確認を待つ（全軸の ACK と ACTIVE）', 8000); return; }
+        if (code === 'pose_not_near_hold' && !auto.centerSent) {
+          log('自動開始: 保持位置が中立から離れている（pose_not_near_hold）→ CENTER で機構を中立へ動かしてから START し直す');
+          autoPost('start', '/v1/center', 'CENTER（機構を中立へ）').then((c) => {
+            if (c === undefined) return;
+            if (c && c.ok) { auto.centerSent = true; autoWait('start', 'CENTER: 機構を中立へ動かしている', 30000); }
+            else autoAbort('CENTER が断られた: ' + whyText(c));
+          });
+          return;
+        }
+        const retry = code === 'busy' || code === 'no_fresh_pose' || (code === 'not_holding' && auto.centerSent);
+        if (retry && ++auto.startTries <= 20) { autoWait('start', 'START を再試行する（' + code + '、' + auto.startTries + ' 回目）'); return; }
+        autoAbort('START が断られた: ' + whyText(r));
+      });
+      return;
+    }
+    if (st === 'ACTIVE') {
+      if (s.active_source === 'game') return autoFinish();
+      if (s.active_source === 'center') return autoWait('start', 'CENTER: 機構を中立へ動かしている', 30000);
+      return autoWait('start', 'ACTIVE（' + fmt(s.active_source) + '）', 10000);
+    }
+    if (st === 'STOPPING') return autoAbort('途中で STOPPING になった' + blockers);
+    return autoAbort('進めない rig_state: ' + st + blockers);
+  }
+
+  // リセット: 自動開始を止める → 送信を止める → 指令姿勢・0 固定を戻す → armed なら STOP、FAULT_LATCHED なら FAULT RESET
+  // → 自動開始を最初から（読み込み時の設定が切でも走る）。FAULT RESET を自動で送るのはここ（操作者が押したとき）だけ。
+  $('bReset').addEventListener('click', async () => {
+    const b = $('bReset');
+    b.disabled = true;
+    log('リセット');
+    autoAbort('リセット');
+    auto.run += 1; // 応答待ちの古い操作を捨てる
+    if (state.ws || state.streaming) stopStream('reset');
+    setZero(false);
+    state.cmd = { pitch: 0, roll: 0 };
+    state.mom = { speed: 0, mult: 1 };
+    state.padLost = false;
+    const st = state.lastStatus ? state.lastStatus.rig_state : '';
+    try {
+      if (st === 'ARMING' || st === 'HOLDING' || st === 'ACTIVE') await call('POST', '/v1/stop');
+      else if (st === 'FAULT_LATCHED') await call('POST', '/v1/fault/reset', { auth: true });
+    } catch (e) { /* 既にログ済み。自動開始の判定に任せる */ }
+    b.disabled = false;
+    autoBegin('リセット');
+  });
+
+  // 読み込み時に自動で開始する（localStorage、既定は入）。切にしたら走っている自動開始も止める。
+  const autoOnLoad = $('autoOnLoad');
+  autoOnLoad.checked = (() => { try { return localStorage.getItem(AUTO_KEY) !== '0'; } catch (e) { return true; } })();
+  autoOnLoad.addEventListener('change', () => {
+    try { localStorage.setItem(AUTO_KEY, autoOnLoad.checked ? '1' : '0'); } catch (e) { /* 無視 */ }
+    if (!autoOnLoad.checked) autoAbort('「読み込み時に自動で開始する」を切にした');
+  });
+  if (autoOnLoad.checked) autoBegin('読み込み');
+  else { auto.msg = '読み込み時の自動開始は切（「リセット」で開始できる）'; renderAuto(); }
 
   window.addEventListener('pagehide', () => stopStream('pagehide'));
 })();

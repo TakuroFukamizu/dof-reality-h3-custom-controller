@@ -177,6 +177,11 @@ async fn joystick_page_is_served_and_self_contained() {
     for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
         assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
     }
+    // Auto start (one shot on load / reset) with a reset button; the manual buttons stay for
+    // troubleshooting. START refused with pose_not_near_hold goes through /v1/center once.
+    for needle in ["id=\"bReset\"", "id=\"autoOnLoad\"", "function autoTick", "pose_not_near_hold", "/v1/center", "/v1/fault/reset", "id=\"bArm\"", "id=\"bStart\"", "id=\"bStream\""] {
+        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    }
     // No external resources: the page must work offline.
     for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
         assert!(!api::JOYSTICK_PAGE.contains(needle), "external resource in the page: {needle}");
