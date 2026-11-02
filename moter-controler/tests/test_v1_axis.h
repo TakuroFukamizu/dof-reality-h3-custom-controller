@@ -3653,6 +3653,7 @@ inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
 inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3690,6 +3691,7 @@ inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
 inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));

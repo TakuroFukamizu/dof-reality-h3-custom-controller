@@ -7,3 +7,6 @@ cd "$(dirname "$0")"
 # vel_kd_permille_per_count_s を明示的に入れて検証する（test_r9_*）。
 c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -DV1_VEL_DAMPING=0 -I../include test_host.cpp -o /tmp/moter_controler_host
 /tmp/moter_controler_host
+# 焼く既定（V1_VEL_DAMPING=1）でも同じテストが通ること（減衰を前提にしない試験は Kd を明示的に 0 にしている）
+c++ -std=c++17 -Wall -Wextra -DV1_FF_DIRECTIONAL=0 -I../include test_host.cpp -o /tmp/moter_controler_host_damping
+/tmp/moter_controler_host_damping
