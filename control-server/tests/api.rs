@@ -177,6 +177,26 @@ async fn joystick_page_is_served_and_self_contained() {
     for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
         assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
     }
+    // Issue #36: a refused admin command shows the server's `error` / `blockers` next to the
+    // buttons (`#opResult`, the pure `H3Joy.adminReject`), rate mode hints 「中央へ」 before START
+    // (`#startHint`, `H3Joy.startGateHint`), and a lost session (stale_session ack, WS closed by a
+    // server restart) raises `#sessionBanner` asking for 「送信開始」 again.
+    for needle in [
+        "id=\"opResult\"",
+        "id=\"startHint\"",
+        "id=\"sessionBanner\"",
+        "adminReject",
+        "startGateHint",
+        "j.blockers",
+        "pose_not_near_hold",
+        "stale_session",
+        "速度モードは「中央へ」で姿勢を 0 に戻してから START",
+        "もう一度「送信開始」を押してください",
+    ] {
+        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    }
+    // Server text is drawn with textContent only.
+    assert!(!api::JOYSTICK_PAGE.contains("innerHTML ="), "the page must not assign innerHTML");
     // No external resources: the page must work offline.
     for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
         assert!(!api::JOYSTICK_PAGE.contains(needle), "external resource in the page: {needle}");

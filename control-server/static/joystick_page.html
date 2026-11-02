@@ -37,6 +37,17 @@
   - 自動選択はスティックと判定できる機器だけ（軸 2 本以上＋id / mapping）。ペダルやハンドルは静止で ±1 を出すので、
     間違って選ぶと START で端へ飛ぶ。該当が無ければバナーで知らせ、操作者が一覧から選ぶ（Issue #15 M4）。
   - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。再開は「送信開始」で新しい session（Issue #15 L2）。
+    そのとき（と、送信中に WS が操作者の意図なく閉じたとき = サーバー再起動など、送信中に status の session が
+    2 回続けて自分のものでないとき）は上の赤いバナー（#sessionBanner）で「送信開始」を押し直すよう知らせる。
+    バナーは次に WS が開いたとき（新しい session）か、操作者が「送信停止」したときに消える（Issue #36）。
+  - 管理操作（ARM / START / DISARM / FAULT RESET / STOP）が断られたら、応答の error と blockers（409 の
+    {"ok": false, "error", "blockers"}。401 / 429 / 503 などは error だけ）をボタンの下（#opResult）にそのまま出し、
+    error ごとの和文の説明と次の手を添える（H3Joy.adminReject）。次に成功した操作で消える。
+    「中央へ」はページの中だけの操作なので断られない: 出ている拒否は「START を押し直す」案内に置き換える。
+  - 速度モードで指令姿勢が中央から離れたまま（|pitch| か |roll| が 0.02 超）START の前の状態にいるときは、
+    START の下（#startHint）と START の title に「中央へ」で 0 に戻す案内を出す（H3Joy.startGateHint）。
+    サーバーの関門（保持位置から game.start_max_offset_count 以内）はページでは正確に計算できない
+    （向き・混合・校正はサーバーの中）ので案内だけ。START は押せる（判定はサーバーが正。断られれば理由が出る）。
   - 操作ボタン（ARM / START / DISARM / FAULT RESET）はリグ状態から押せる／押せないを決め、押せない理由を title に出す
     （判定はサーバーが正。STOP は常に押せる）。
   - サーバーのデータは textContent でだけ描く（innerHTML に入れない）。
@@ -82,6 +93,12 @@
   .banner.bad::before { background: repeating-linear-gradient(135deg, var(--red) 0 6px, #2a0a08 6px 12px); }
   .banner.warn { color: #fff3b0; background: #221f06; border: 1px solid var(--yellow); }
   .banner.warn::before { background: repeating-linear-gradient(135deg, var(--yellow) 0 6px, #221f06 6px 12px); }
+  /* 操作の拒否理由（#opResult）と START の案内（#startHint）: バナーをボタンの下に置く。JS は className を書き換えるので id で装飾 */
+  #opResult, #startHint { margin: 10px 0 0; font-size: 12.5px; }
+  #opResult > div, #startHint > div { overflow-wrap: anywhere; }
+  #opResult > .op-head { font: 700 13px/1.5 var(--mono); letter-spacing: .02em; }
+  #opResult > .op-line { font: 12px/1.6 var(--mono); padding-left: 1em; text-indent: -1em; }
+  #opResult > .op-hint, #startHint > div { font-weight: 700; }
 
   /* ---- 1. 指令帯: rig_state / fault / STOP / 操作 */
   .command { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(300px, 400px); gap: 0; margin: 12px 20px 0;
@@ -292,6 +309,7 @@
 <h1>h3-control-server ジョイスティック試験 <span class="dim small" id="hostLabel"></span> <a href="/" class="small" style="margin-left:12px">オペレーター用試験ページ（/）へ</a></h1>
 <div id="pollBanner" class="banner bad"></div>
 <div id="padBanner" class="banner warn"></div>
+<div id="sessionBanner" class="banner bad" role="alert"></div>
 
 <!-- 1. 指令帯: rig_state と fault、STOP、操作 -->
 <section class="command">
@@ -321,6 +339,9 @@
       <button id="bFaultReset">FAULT RESET</button>
       <button id="bCmdCenter" title="指令姿勢を pitch = roll = 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす。START の前に指令姿勢が中央で無ければ押す">中央へ</button>
     </div>
+    <!-- 操作の結果: START の前の案内（速度モードで指令姿勢が中央から離れている）と、断られた操作の理由（error / blockers） -->
+    <div id="startHint" class="banner warn"></div>
+    <div id="opResult" class="banner bad" role="status" aria-live="polite"></div>
     <div class="token-row">
       <label>管理トークン <input type="password" id="token" size="34" autocomplete="off" placeholder="H3CS_ADMIN_TOKEN"></label>
       <span class="dim small">sessionStorage に保存（このタブだけ）</span>
@@ -591,7 +612,75 @@ window.H3Joy = (function () {
       buttons: Array.from(g.buttons, (b) => !!(b && b.pressed)),
     }));
   }
-  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, rateStep, momentum, readPads };
+  // 管理操作の拒否（Issue #36）。サーバーの error 符号 → 和文の説明。409 は supervisor の拒否で blockers が付く
+  // （{"ok": false, "error", "blockers": [文字列]}）。401 / 403 / 429 / 503 などはミドルウェアの {"ok": false, "error"} だけ。
+  const ADMIN_ERR = {
+    unauthorized: '管理トークンが無いか違う（トークン欄を確かめる）',
+    rate_limited: '管理操作が多すぎる（rate limit）。少し待ってからもう一度',
+    control_loop_unavailable: '制御ループが 1 s 以内に答えなかった。ARM / START / FAULT RESET は実行されていない（STOP / DISARM は実行されたかもしれない）。リグ状態を確かめる',
+    loopback_only: 'このマシン（loopback）からしか使えない操作',
+    forbidden_origin: 'このページの Origin が許可されていない',
+    shutting_down: 'サーバーが終了処理中',
+    not_holding: 'その状態では受けない操作（順番: 送信開始 → ARM → START。START は HOLDING でだけ受ける）',
+    no_fresh_pose: '新鮮な姿勢が届いていない。「送信開始」してスティックが読めているか確かめてから START',
+    pose_not_near_hold: '指令姿勢が作る目標が保持位置から離れすぎている（game.start_max_offset_count を超える軸がある）',
+    not_ready: 'ARM の前提が揃っていない（下の blockers を取り除く）',
+    already_armed: '既に ARM 済み',
+    busy: '前の操作の途中',
+    fault_latched: '異常がラッチされている。原因を取り除いて FAULT RESET',
+    not_faulted: '異常はラッチされていない',
+    reset_in_progress: 'FAULT RESET の途中',
+    axis_disconnected: '未接続の軸がある',
+    axis_not_settled: '軸が落ち着いていない',
+    axis_conflict: '2 台が同じ系統を選んでいる（axis_conflict）',
+    calibrating: '校正中は受けない',
+    not_disarmed: 'DISARM してから',
+  };
+  const fmtPose = (v) => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2);
+  const POSE_EPS = 0.02;
+  const nearZero = (c) => !c || (Math.abs(Number(c.pitch) || 0) <= POSE_EPS && Math.abs(Number(c.roll) || 0) <= POSE_EPS);
+  // 応答 r（call() の戻り値 {ok, status, json, text}、または届かなかったとき {netError}）→ 表示する文。
+  // 成功なら null。ctx: {mode: 'rate' | 'pos', cmd: 指令姿勢 {pitch, roll} | null, zero: 0 固定か}。
+  // 戻り値 {head: 1 行目, lines: blockers（サーバーの文をそのまま）, hint: 次の手（無ければ ''）}。
+  function adminReject(action, r, ctx) {
+    const c = ctx || {};
+    if (r && r.ok) return null;
+    if (!r || r.netError !== undefined) {
+      return { head: action + ': サーバーに届かない（' + String(r ? r.netError : '?') + '）', lines: [], hint: 'サーバーが動いているか確かめる（再起動したなら「送信開始」も押し直す）' };
+    }
+    const j = (r.json && typeof r.json === 'object') ? r.json : null;
+    const code = j && typeof j.error === 'string' ? j.error : '';
+    const why = ADMIN_ERR[code] || '';
+    const head = action + ' 拒否: ' + r.status + ' ' + (code || String(r.text || '').slice(0, 200)) + (why ? ' — ' + why : '');
+    const lines = j && Array.isArray(j.blockers) ? j.blockers.map(String) : [];
+    let hint = '';
+    if (code === 'pose_not_near_hold') {
+      const zeroNow = c.zero || nearZero(c.cmd);
+      if (zeroNow) hint = '指令姿勢はもう 0。サーバーの requested_pose が 0 に近づいてから START を押し直す。それでも断られるなら保持位置が中立から離れている（オペレーター用試験ページの CENTER で中立へ寄せてから START）';
+      else if (c.mode === 'rate') hint = '速度モードは「中央へ」で姿勢を 0 に戻してから START';
+      else hint = '位置モードはスティックを中央（不感帯の内側）に戻してから START';
+    } else if (code === 'no_fresh_pose') {
+      hint = '送信が止まっていないか（WS: open、frame_seq が進んでいるか）を見る';
+    } else if (code === 'unauthorized') {
+      hint = '管理トークン（H3CS_ADMIN_TOKEN）を入れ直す';
+    }
+    return { head, lines, hint };
+  }
+  // START の前の案内（Issue #36）: 速度モードで指令姿勢が中央から離れたまま START の前の状態にいるとき、案内文を返す（無ければ null）。
+  // サーバーの関門（保持位置から game.start_max_offset_count 以内）は向き・混合・校正を通した count で決まるので、ページでは
+  // 正確に計算できない。ここは「0 から離れている」だけを見る（案内であって判定ではない。判定はサーバーが正）。
+  // o: {mode, rigState, hasPose: 一度でも姿勢を読めたか, zero: 0 固定か, gain, cmd: {pitch, roll}}。
+  const PRE_START = ['READY_TO_ARM', 'BRAKED_DISARMED', 'CONNECTED_DISARMED', 'ARMING', 'HOLDING'];
+  function startGateHint(o) {
+    const x = o || {};
+    if (x.mode !== 'rate' || !x.hasPose || x.zero) return null;
+    if (PRE_START.indexOf(x.rigState) < 0) return null;
+    if (Number(x.gain) <= 0) return null;   // gain 0 なら姿勢は効かない
+    if (nearZero(x.cmd)) return null;
+    return '指令姿勢が中央から離れている（roll ' + fmtPose(Number(x.cmd.roll) || 0) + ' / pitch ' + fmtPose(Number(x.cmd.pitch) || 0) +
+      '）。速度モードは「中央へ」で姿勢を 0 に戻してから START（保持位置から離れた姿勢の START はサーバーが pose_not_near_hold で断る）';
+  }
+  return { isStick, isPedal, looksLikeStick, pickDefault, findPad, norm, deadzone, poseFrom, mostMoved, rateStep, momentum, readPads, adminReject, startGateHint };
 })();
 </script>
 <script>
@@ -612,6 +701,8 @@ window.H3Joy = (function () {
     // 入力モード。pose = 倒し量（不感帯の後）、cmd = 指令姿勢（pose として送る値）。位置モードでは cmd = pose、
     // 速度モードでは cmd を倒し量で積分する。lastTick = 前回スティックを読めた刻みの時刻（dt の実測）。
     input: DEFAULT_INPUT(), cmd: { pitch: 0, roll: 0 }, lastTick: null, mom: { speed: 0, mult: 1 },
+    // Issue #36: 断られた操作の名前（#opResult に出している間）、status の session が自分のものでなかった回数（続けて）
+    rejected: null, sessionMismatch: 0,
   };
 
   $('hostLabel').textContent = location.host;
@@ -653,20 +744,60 @@ window.H3Joy = (function () {
   }
 
   // ---------------------------------------------------------------- admin buttons
-  function adminButton(id, path, opts) {
+  // 操作の結果（Issue #36）: 断られたらボタンの下（#opResult）に error と blockers を出す。成功したら消す。
+  // サーバーの文は textContent でだけ描く（行ごとに div）。
+  function setOpResult(head, lines, hint, cls) {
+    const el = $('opResult');
+    while (el.firstChild) el.removeChild(el.firstChild);
+    const add = (text, c) => { const d = document.createElement('div'); d.className = c; d.textContent = text; el.appendChild(d); };
+    add(head, 'op-head');
+    for (const l of lines || []) add('・' + l, 'op-line');
+    if (hint) add('→ ' + hint, 'op-hint');
+    el.className = 'banner ' + (cls || 'bad') + ' show';
+  }
+  function clearOpResult() {
+    state.rejected = null;
+    const el = $('opResult');
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.className = 'banner bad';
+  }
+  function showAdminResult(action, r) {
+    const rej = J.adminReject(action, r, { mode: state.input.mode, cmd: state.pose ? state.cmd : null, zero: state.zero });
+    if (!rej) { clearOpResult(); return; }
+    state.rejected = action;
+    setOpResult(rej.head, rej.lines, rej.hint, 'bad');
+  }
+  async function adminCall(action, path, opts) {
+    let r;
+    try { r = await call('POST', path, opts); } catch (e) { r = { netError: String(e) }; /* ログ済み */ }
+    showAdminResult(action, r);
+    return r;
+  }
+  function adminButton(id, action, path, opts) {
     $(id).addEventListener('click', async () => {
       const b = $(id);
       b.disabled = true;
-      try { await call('POST', path, opts); } catch (e) { /* 既にログ済み */ }
+      await adminCall(action, path, opts);
       // 戻すときはリグ状態の判定に任せる（次の status を待たずに、押せない状態を押せるに戻さない）
       if (state.lastStatus) updateButtons(state.lastStatus); else b.disabled = false;
     });
   }
-  $('bStop').addEventListener('click', () => { call('POST', '/v1/stop').catch(() => {}); });
-  adminButton('bArm', '/v1/arm', { auth: true });
-  adminButton('bStart', '/v1/start', { auth: true });
-  adminButton('bDisarm', '/v1/disarm', { auth: true });
-  adminButton('bFaultReset', '/v1/fault/reset', { auth: true });
+  $('bStop').addEventListener('click', () => { adminCall('STOP', '/v1/stop'); });
+  adminButton('bArm', 'ARM', '/v1/arm', { auth: true });
+  adminButton('bStart', 'START', '/v1/start', { auth: true });
+  adminButton('bDisarm', 'DISARM', '/v1/disarm', { auth: true });
+  adminButton('bFaultReset', 'FAULT RESET', '/v1/fault/reset', { auth: true });
+
+  // 送信が操作者の意図なく止まった・session が無効になった（Issue #36）: 上の赤いバナーで「送信開始」の押し直しを知らせる。
+  function showSessionBanner(text) {
+    const b = $('sessionBanner');
+    b.textContent = text + '。もう一度「送信開始」を押してください（新しい session を発行して送り直す）';
+    b.className = 'banner bad show';
+  }
+  function clearSessionBanner() {
+    state.sessionMismatch = 0;
+    $('sessionBanner').className = 'banner bad';
+  }
 
   // ---------------------------------------------------------------- status
   const fmt = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
@@ -689,20 +820,32 @@ window.H3Joy = (function () {
     const st = s.rig_state || '';
     const armedStates = ['ARMING', 'HOLDING', 'ACTIVE', 'STOPPING'];
     const fresh = !!(s.session && s.session.fresh);
+    // START の前の案内（速度モードで指令姿勢が中央から離れている）。START を押せるときは title にも出す
+    const startHint = J.startGateHint({ mode: state.input.mode, rigState: st, hasPose: !!state.pose, zero: state.zero, gain: parseFloat($('gain').value), cmd: state.cmd });
+    renderStartHint(startHint);
     const rules = {
       bArm: [st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED', '前提: READY_TO_ARM か BRAKED_DISARMED（いま ' + st + '）'],
-      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）'],
+      bStart: [st === 'HOLDING' && fresh, st !== 'HOLDING' ? '前提: HOLDING（いま ' + st + '）' : '前提: 新鮮なゲーム入力（姿勢送信を開始してから）', startHint],
       bDisarm: [armedStates.indexOf(st) >= 0, '前提: ARMING / HOLDING / ACTIVE / STOPPING（いま ' + st + '）'],
       bFaultReset: [st === 'FAULT_LATCHED', '前提: FAULT_LATCHED（いま ' + st + '）'],
     };
     for (const id in rules) {
       const el = $(id);
       if (!el) continue;
-      const [ok, why] = rules[id];
+      const [ok, why, okHint] = rules[id];
       if (el.dataset.title0 === undefined) el.dataset.title0 = el.getAttribute('title') || '';
       el.disabled = !ok;
-      el.title = ok ? el.dataset.title0 : why;
+      el.title = ok ? (okHint || el.dataset.title0) : why;
     }
+  }
+  function renderStartHint(text) {
+    const el = $('startHint');
+    if (!text) { if (el.className !== 'banner warn') el.className = 'banner warn'; return; }
+    if (el.textContent !== text) {
+      while (el.firstChild) el.removeChild(el.firstChild);
+      const d = document.createElement('div'); d.textContent = text; el.appendChild(d);
+    }
+    el.className = 'banner warn show';
   }
 
   function renderStatus(s) {
@@ -721,6 +864,14 @@ window.H3Joy = (function () {
     $('armed').textContent = fmt(s.armed);
     $('activeSource').textContent = fmt(s.active_source);
     $('statusSession').textContent = s.session ? (fmt(s.session.source_session_prefix) + ' last_seq=' + fmt(s.session.last_seq) + ' last_frame_seq=' + fmt(s.session.last_frame_seq)) : 'なし';
+    // 送信中なのにサーバーの session が自分のものでない（2 回続けて。session 発行の直後に飛んでいた poll の古い答えは数えない）
+    if (state.streaming && state.session) {
+      const mine = !!(s.session && s.session.source_session_prefix && state.session.indexOf(s.session.source_session_prefix) === 0);
+      state.sessionMismatch = mine ? 0 : state.sessionMismatch + 1;
+      if (state.sessionMismatch >= 2) showSessionBanner('サーバーの session がこのページのものでなくなった（' + (s.session && s.session.source_session_prefix ? '別の session ' + s.session.source_session_prefix : 'session なし: サーバー再起動？') + '）');
+    } else {
+      state.sessionMismatch = 0;
+    }
     const fresh = $('fresh');
     fresh.textContent = s.session ? String(s.session.fresh) : '—';
     fresh.className = s.session && s.session.fresh ? 'ok' : '';
@@ -937,9 +1088,17 @@ window.H3Joy = (function () {
   $('rtcSpeed').addEventListener('input', () => { state.input.rtcSpeed = clampNum(parseFloat($('rtcSpeed').value), 0.1, 3, 0.5); saveInput(); renderInputControls(); });
   $('momentum').addEventListener('change', () => { state.input.momentum = $('momentum').checked; state.mom = { speed: 0, mult: 1 }; saveInput(); renderInputControls(); });
   // 中央へ: 指令姿勢を 0 にする（速度モード）。サーバーが制限内の速さで中央へ動かす（跳ぶのは指令値だけ）。
+  // ページの中だけの操作なので断られない。出ている START の拒否は消さずに「押し直す」案内へ置き換える（理由は HTTP ログに残る）。
   $('bCmdCenter').addEventListener('click', () => {
     state.cmd = { pitch: 0, roll: 0 };
     log('指令姿勢を中央（pitch 0 / roll 0）にした');
+    if (state.rejected === 'START') {
+      state.rejected = null;
+      setOpResult('中央へ: 指令姿勢を 0 にした', [], 'サーバーの requested_pose が 0 に近づいたら START を押し直す（さっきの拒否の理由は HTTP ログにある）', 'warn');
+    } else {
+      clearOpResult();
+    }
+    if (state.lastStatus) updateButtons(state.lastStatus);
   });
 
   // 割当: 4 秒のあいだ、選択中のスティックでいちばん大きく動いた軸を役割に結びつける（input.js の assign と同じ規則）
@@ -1189,6 +1348,8 @@ window.H3Joy = (function () {
   function stopStream(reason, bad) {
     state.streaming = false;
     state.padLost = false;
+    state.sessionMismatch = 0;
+    if (reason === 'operator') clearSessionBanner();
     if (state.ws) { try { state.ws.close(); } catch (e) { /* 無視 */ } state.ws = null; }
     $('bStream').textContent = '送信開始';
     $('padBanner').className = 'banner warn';
@@ -1251,6 +1412,7 @@ window.H3Joy = (function () {
     setWsState('connecting', false);
     ws.onopen = () => {
       setWsState('open', false);
+      clearSessionBanner(); // 新しい session で送り始めた
       state.streaming = true; // 以後は Worker の刻み（tick）が sendPose を呼ぶ
       b.textContent = '送信停止';
     };
@@ -1266,11 +1428,21 @@ window.H3Joy = (function () {
       // 50 Hz で拒否され続けても意味が無いので送信を止める（Python クライアントと同じ）。再開は「送信開始」（新 session）。
       if (m.accepted === false && m.reason === 'stale_session' && state.ws === ws) {
         stopStream('stale_session', true);
+        showSessionBanner('session が無効になった（stale_session: サーバーが再起動したか、別のクライアントが session を発行した）。送信は止めた');
         log('WS: ack stale_session — session が無効になった（別のクライアントが session を発行したか、サーバーが再起動した）。送信を止めた。再開は「送信開始」', true);
       }
     };
     ws.onerror = () => { setWsState('error', true); };
-    ws.onclose = (ev) => { if (state.ws === ws) stopStream('close ' + ev.code); };
+    // 操作者が止めたのでない close（stopStream は先に state.ws を外すので、ここに来るのは意図しない close だけ）:
+    // サーバー再起動・接続断。赤で残してバナーで「送信開始」の押し直しを知らせる。
+    ws.onclose = (ev) => {
+      if (state.ws !== ws) return;
+      const wasOpen = state.streaming;
+      stopStream('close ' + ev.code, true);
+      showSessionBanner(wasOpen ? 'WS が切れた（close ' + ev.code + '。サーバーの再起動か接続断）。送信は止まっている'
+        : 'WS につながらなかった（close ' + ev.code + '）。サーバーが動いているか確かめる');
+      log('WS: close ' + ev.code + (wasOpen ? '（送信中に切れた）' : '（開く前に閉じた）') + '。再開は「送信開始」', true);
+    };
   }
 
   $('bStream').addEventListener('click', () => {
