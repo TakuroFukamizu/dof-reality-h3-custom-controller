@@ -167,7 +167,8 @@ inline void test_r10_renewal_rules_unit() {
     r.tick(0, 0);                                  // 最後の出力の区間を積む
     const double down_env = r.s.envelope_episode(-1);
     for (int i = 1; i <= 3; ++i) r.tick(0, i);     // 上へ 3 count 動いた
-    CHECK(down_env > 400.0 && r.s.envelope_episode(-1) == down_env && r.s.trusted_raw(1) == 2 && r.s.trusted_raw(-1) == 0);
+    // 下の包絡線は残す（P1c）。位置はいま分かったので両向きの距離の基準はいまの位置（実機 12712ac の FAIL 2）
+    CHECK(down_env > 400.0 && r.s.envelope_episode(-1) == down_env && r.s.trusted_raw(1) == 2 && r.s.trusted_raw(-1) == 2);
   }
   up = down = 0;
   CHECK(ticks_until_inhibit([](int) { return int64_t{0}; }, [](int i) { return (i / 10) % 2 == 0 ? 200 : 0; }, &up, &down) == 80);  // 隙間
@@ -1006,14 +1007,13 @@ inline void test_r10_integrated_playout_stops_outside_no_drive_zone() {
                     h.ax.actual_count(), h.ax.target_count(), h.ax.supervisor_inhibited() ? 1 : 0, h.ax.fault_code(),
                     guard_seen ? 1 : 0, h.ax.supervisor_info().budget_up, h.ax.supervisor_info().budget_down);
       }
-      if (reserve == V1_SOFT_RESERVE_COUNT) {
+      if (reserve != 100) {  // 600（既定）と 450: 帯の外で止まり、寄せの終わり（止まりかけ）の小さな出力は積まないので着く
         CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited() && !guard_seen);
         const V1SupInfo info = h.ax.supervisor_info();
-        CHECK((dir > 0 ? info.budget_up : info.budget_down) >= 100);  // 着いた後も端の向きに 100 count 以上の予算が残る
+        if (reserve == V1_SOFT_RESERVE_COUNT) CHECK((dir > 0 ? info.budget_up : info.budget_down) >= 100);  // 着いた後も 100 以上残る
         CHECK(std::abs(h.ax.target_count() - stop_at) <= 1 && std::abs(h.ax.actual_count() - stop_at) <= V1_RESIDUAL_BAND_COUNT);
       } else {
-        // 100（#49 の元の値）: 帯の中へ進もうとして止まる。450（余裕 100）: 帯の外で止まるが、参照の寄せの終わり（減速の尾で軸が
-        // 確かに動かない間も FF が端の向きに出る）で余裕を使い切って止まる。余裕は 250 にした（下の config.h の説明）
+        // 100（#49 の元の値）: 帯の中へ進もうとして止まる
         CHECK(h.ax.supervisor_inhibited() && h.ax.supervisor().feedback_uncertain());
       }
     }
@@ -1050,12 +1050,13 @@ inline void test_r10_deadline_unit() {
     }
     CHECK(s.feedback_uncertain() && s.deadline_tripped() && s.take_reference_lost() && !s.take_park_request());
     CHECK(fabs(ticks * 0.005 - (2350.0 / 200.0 - 0.015)) <= 0.011 && s.exposure(-1) <= 2350.0 + 1e-6 && s.exposure(1) == 0.0);
-    // DISARMED → 再 ARM でも露出は戻らない: すぐまた止まる
+    // DISARMED（明示的な再 ARM）で露出は戻る（実機 12712ac の FAIL 2 を受けて）。期限で止まった場合は基準が消えているので、
+    // SET_REFERENCE か校正までは ARM_PREPARE が通らない（見えない走行は重ならない）
     s.end_session(0, c.now_us);
     s.clear_episode();
     c.now_us += 5 * MS;
     s.observe(c);
-    CHECK(s.feedback_uncertain());
+    CHECK(!s.feedback_uncertain() && s.exposure(-1) <= 1.0);
   }
   {  // 駐車できる: 余裕の半分（5.875 s）で駐車を求める。停止はしない
     V1Supervisor s;
@@ -1637,6 +1638,98 @@ inline void test_r10_park_requires_small_error_through_window() {
   CHECK(!parked);
 }
 
+
+// 実機 12712ac の FAIL 1: 1200 / 6000（再生バッファ、kp 30、duty_max 20）で各端の参照の止まる所（ソフトリミット ∓ 600）へ寄せて、
+// 10 s 保持（駐車あり）。慣性（時定数 60 ms）・静止摩擦 3 %・重力（下向き 2 %）のある PWM プラント。停止も FAULT も無く、止まる所に着く
+inline void test_r10_end_stop_settle_and_hold_both_ends() {
+  for (int dir : {1, -1}) {
+    Harness h;
+    r10_active(h, 0, 400, 30, 20, true, true, true);
+    h.pwm_count_s_per_permille = 12.0;
+    h.plant_tau_s = 0.06;
+    h.pwm_deadband_permille = 30;
+    h.pwm_deadband_subtract = true;
+    h.load_permille = 20;
+    h.pos_max_vel = 1200;
+    h.pos_max_acc = 6000;
+    const v1::Config c = base_config();
+    const int32_t stop_at = dir > 0 ? c.soft_max_count - V1_SOFT_RESERVE_COUNT : c.soft_min_count + V1_SOFT_RESERVE_COUNT;
+    bool inhib = false;
+    int parks = 0;
+    bool was = false;
+    for (int i = 0; i < 1300; ++i) {  // 寄せ 3 s ＋ 保持 10 s
+      h.set_position(dir * 3000);
+      h.idle(10);
+      if (h.ax.supervisor_inhibited()) inhib = true;
+      const bool p = h.ax.brake_parked();
+      if (p && !was) ++parks;
+      was = p;
+    }
+    if (std::getenv("R10_PRINT")) {
+      std::printf("end stop dir %+d: actual %d (stop %d) inhibited %d fault %u parks %d budget %d/%d\n", dir, h.ax.actual_count(), stop_at,
+                  inhib ? 1 : 0, h.ax.fault_code(), parks, h.ax.supervisor_info().budget_up, h.ax.supervisor_info().budget_down);
+    }
+    CHECK(!inhib && no_fault_events(h) && h.ax.state() == st::ACTIVE && h.ax.referenced());
+    CHECK(std::abs(h.ax.actual_count() - stop_at) <= V1_RESIDUAL_BAND_COUNT + 4 && parks >= 1);
+  }
+}
+
+// 実機 12712ac の FAIL 2 の再現: 下の端の近くで端の向き（下）の予算が尽きて停止 → 目標が上へ動いて FOLLOWING_ERROR → FAULT_RESET
+//（基準は残る）→ ARM → START → 上（端から離れる向き）へ動かす。上の予算は独立で、端の向きの小さな補正は 0 にするだけなので、止まらずに動く
+inline void test_r10_after_near_end_inhibit_can_drive_away() {
+  Harness h;
+  r10_active(h, -2100, 400, 30, 20, true, true, false);  // 下の参照の止まる所（下の余裕 250）。期限あり・駐車なし
+  h.ax.tuning.soft_reserve_count = 0;
+  // 動けないまま下へ 6 % ほど押させる（確かな動きなし）→ 下の予算（一律 2500 count/s）が期限（出力に比例 ＋ 逆回り）より先に尽きて
+  // 停止。基準は残る（実機の flags 285 と同じ）
+  h.held = true;
+  for (int i = 0; i < 200 && !h.ax.supervisor_inhibited(); ++i) { h.set_position(-2120); h.idle(10); }
+  CHECK(h.ax.supervisor_inhibited() && h.ax.supervisor().feedback_uncertain() && h.ax.referenced());
+  h.held = false;
+  for (int i = 0; i < 300 && h.ax.state() != st::FAULT; ++i) { h.set_position(-2100 + i * 4); h.idle(10); }  // 目標が上へ → FE
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::FOLLOWING_ERROR);
+  Harness::accepted(h.fault_reset());
+  CHECK(h.ax.state() == st::DISARMED && h.ax.referenced());
+  h.reach_holding_from_configured();
+  const int32_t here = h.ax.actual_count();
+  h.set_position(here);
+  Harness::accepted(h.start());
+  bool inhib = false;
+  for (int i = 0; i < 200; ++i) {
+    h.set_position(here + std::min(i * 4, 400));
+    h.idle(10);
+    if (h.ax.supervisor_inhibited()) inhib = true;
+  }
+  if (std::getenv("R10_PRINT")) {
+    std::printf("drive away after inhibit: inhibited %d fault %u moved %d deadline %d env_cum down %.1f env_ep down %.1f budget %d/%d ref %d\n",
+                inhib ? 1 : 0, h.ax.fault_code(), h.ax.actual_count() - here, h.ax.supervisor().deadline_tripped() ? 1 : 0,
+                h.ax.supervisor().envelope_cumulative(-1), h.ax.supervisor().envelope_episode(-1), h.ax.supervisor_info().budget_up,
+                h.ax.supervisor_info().budget_down, h.ax.referenced() ? 1 : 0);
+  }
+  CHECK(!inhib && h.ax.state() == st::ACTIVE && std::abs(h.ax.actual_count() - (here + 400)) <= 6);
+}
+
+
+// FAIL 1 の仕組み（寄せの終わり）: 下の参照の止まる所（下の余裕 250）へ 10 count/s の遅い参照で寄せ、軸は 100 ms に 1 count ずつ付いていく
+//（確かな動き 2 count まで 200 ms）。参照速度が 0 になる前の小さな出力を一律の包絡線で積むと 200 ms × 2500 = 500 > 250 で停止していた。
+// いまは止まりかけ（参照速度 ≤ 30・|誤差| ≤ 6）の小さな出力は積まないので止まらない
+inline void test_r10_slow_final_approach_near_end_not_charged() {
+  Harness h;
+  r10_active(h, -2100, 100000, 30, 20, false, false, false);  // カウントは手で動かす。期限・駐車なし（予算だけを見る）
+  h.ax.tuning.soft_reserve_count = 0;
+  h.ax.tuning.playout_delay_ms = 0;  // 一定の遅い参照（従来の軌道）
+  h.pos_max_vel = 10;
+  bool inhib = false;
+  for (int i = 0; i < 150; ++i) {
+    h.set_position(-2110);
+    h.idle(10);
+    if ((i % 10) == 9 && h.ax.actual_count() > -2110) h.raw -= 1;  // 100 ms に 1 count 付いていく
+    if (h.ax.supervisor_inhibited()) inhib = true;
+  }
+  if (std::getenv("R10_PRINT")) std::printf("slow approach near end: inhibited %d actual %d\n", inhib ? 1 : 0, h.ax.actual_count());
+  CHECK(!inhib && h.ax.state() == st::ACTIVE);
+}
+
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
 inline void test_r10_status_flags_bits() {
   CHECK(fl::LOAD_LIMITED == 0x80 && fl::FEEDBACK_UNCERTAIN == 0x100 && fl::END_BRAKING == 0x200 && fl::LIMIT_RECOVERY == 0x400);
@@ -1705,6 +1798,9 @@ inline void run_all() {
   test_r10_unpark_handoff_no_sag();
   test_r10_park_offtarget_then_large_step_reproduction();
   test_r10_park_requires_small_error_through_window();
+  test_r10_end_stop_settle_and_hold_both_ends();
+  test_r10_after_near_end_inhibit_can_drive_away();
+  test_r10_slow_final_approach_near_end_not_charged();
   test_r10_status_flags_bits();
 }
 

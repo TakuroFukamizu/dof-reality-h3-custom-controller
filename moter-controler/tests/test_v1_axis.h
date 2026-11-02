@@ -77,6 +77,8 @@ struct Harness {
   // r10（実測 2）: 荷重で逆に回る（back-drive する）軸。プラントが見る Duty = pwm − load_permille（ブレーキ解除中）。load 60 なら
   // 6 % 未満では不足分に比例した速さで沈む（deadband があればその分は静止摩擦）
   int load_permille = 0;
+  double plant_tau_s = 0.0;  // 慣性: 速度が一次遅れで追う時定数（0 なら即時）
+  double plant_v = 0.0;
   bool pwm_deadband_subtract = false;  // true なら速度 = (|pwm| − deadband) × 係数（静止摩擦を越えた分だけで動く。荷重で 15 % 要る軸など）
   double ext_vel = 0.0;
   uint32_t brake_delay_ms = 0;
@@ -240,7 +242,14 @@ struct Harness {
         if (v < -plant_max_vel) v = -plant_max_vel;
       }
       v += ext_vel;
-      if (engaged) v = 0.0;
+      if (plant_tau_s > 0.0) {
+        plant_v += (v - plant_v) * std::min(1.0, static_cast<double>(dt_ms) / 1000.0 / plant_tau_s);
+        v = plant_v;
+      }
+      if (engaged) {
+        v = 0.0;
+        plant_v = 0.0;
+      }
       phys += v * static_cast<double>(dt_ms) / 1000.0;
       if (enc_connected) raw = static_cast<int64_t>(floor(phys));
     } else if (!stall && ax.brake_release_cmd()) {

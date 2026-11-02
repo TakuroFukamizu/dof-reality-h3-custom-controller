@@ -1722,7 +1722,11 @@ class V1Axis {
     // 駐車の入りかけ（ブレーキ作動の指令から V1_BRAKE_ENGAGE_MS）はまだ掴んでいないとみなし、露出を積む（Codex 最終レビュー P1）
     c.brake_released = brake_release_cmd_ || park_ == ParkPhase::Engaging;
     const int64_t ea = c.err < 0 ? -c.err : c.err;
-    c.stationary_near = tuning.hold_learn && setpoint_vel_ == 0.0 && ea <= escalation_floor();
+    // 目標の近くで止まりかけ（参照速度 ≤ 駐車の入口 30 count/s・|誤差| ≤ 6）: 整定・保持の小さな出力（学んだ保持出力 + 4 % まで）は
+    // 積まない（実機 12712ac の FAIL 1: 下の参照の止まる所への寄せの終わりで、参照速度が 0 になる前の小さな出力を一律の包絡線で積み、
+    // 端の余裕 250 を使い切って停止した）
+    const double sv_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+    c.stationary_near = tuning.hold_learn && sv_abs <= static_cast<double>(tuning.park_ref_vel_count_s) && ea <= escalation_floor();
     c.park_ok = park_conditions(ea);
     // 駐車から戻りかけ（ブレーキ解除待ち、参照は駐車した位置で止めている）: 動かないのが正しい。出力（駐車に入ったときの保持出力）は
     // 学んだ保持出力として扱い（|誤差| が帯を超えていても）、期限の露出は積まない（実機 27eaf6b: 駐車中に 9 count ずれた軸が、

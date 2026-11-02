@@ -136,11 +136,17 @@ class V1Supervisor {
     ren_dir_ = 0;
   }
   // DISARMED に戻った（DISARM の完了・FAULT_RESET）: 明示的な解除。FEEDBACK_UNCERTAIN / LOAD_LIMITED と回の上限を戻す（位置の上限は戻さない）
+  // 期限の露出もここで戻す（実機 12712ac の FAIL 2 を受けて）: DISARMED の間はブレーキで動けないので露出は増えない。期限で止まった場合は
+  // 基準が消えていて再 ARM できない（SET_REFERENCE か校正が要る）ので、露出を戻しても期限による見えない走行は重ならない。位置の上限
+  //（env_cum_）は戻さない
   void clear_episode() {
     feedback_uncertain_ = false;
     load_limited_ = false;
     deadline_tripped_ = false;
-    env_ep_[0] = env_ep_[1] = 0.0;  // 露出（exp_）と期限の回数（strikes_）は戻さない（P0）
+    env_ep_[0] = env_ep_[1] = 0.0;
+    exp_[0] = exp_[1] = 0.0;
+    strikes_ = 0;
+    fresh_window_ = false;
   }
   // 位置制御が止まった（DISARMED / FAULT / 校正 / ARMING のブレーキ解除前）: その回だけの状態を捨てる
   void end_session(int64_t raw, uint64_t now_us) {
@@ -379,10 +385,17 @@ class V1Supervisor {
         const double eps = 1e-9;
         if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
             env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
-          feedback_uncertain_ = true;
-          out = 0;
-          braking_ = false;
-          sat_running_ = false;
+          const int mag = out < 0 ? -out : out;
+          if (!guard && mag <= t.hold_allow_trim_permille) {
+            // 実機 12712ac（FAIL 2）: 尽きた向きへの小さな出力（≤ 4 %、整定・保持の補正）は 0 にするだけで停止しない。
+            // 反対向き（端から離れる向き）の予算とは独立に動ける。大きな出力（駆動）なら従来どおり停止
+            out = 0;
+          } else {
+            feedback_uncertain_ = true;
+            out = 0;
+            braking_ = false;
+            sat_running_ = false;
+          }
         }
       }
     }
@@ -536,7 +549,9 @@ class V1Supervisor {
   void renew(const Ctx& c, int dir) {
     const int i = idx(dir);
     fresh_window_ = false;
-    trusted_[i] = c.raw;
+    // 位置はいま分かった: 両向きの端までの距離はここから測る（実機 12712ac の FAIL 2: 下の端の近くで尽きた下の予算が、上へ大きく動いた後も
+    // 古い位置から測られて残り続けた）。反対向きの包絡線・露出（見えないまま動けたかもしれない量）は残す（P1c）
+    trusted_[0] = trusted_[1] = c.raw;
     env_ep_[i] = 0.0;
     env_cum_[i] = 0.0;
     exp_[i] = 0.0;
