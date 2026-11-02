@@ -961,3 +961,32 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     assert!(st.axes.iter().all(|a| a.assignment == Some("selected")));
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn serial_backend_ports_auto_opens_nothing_that_does_not_match() {
+    // `ports = "auto"` with device_ids no real unit has: the discovery task
+    // scans the port list (on any machine) but never starts a port task, so
+    // every axis stays unconnected, and shutdown stops the discovery task.
+    let mut cfg = fast_cfg();
+    for (k, a) in cfg.axes.iter_mut().enumerate() {
+        a.device_id = h3cs::types::DeviceId(0x5131_0000_0000_0a01 + k as u64);
+    }
+    cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
+        ports: h3cs::config::PortList::Auto,
+        baud: 115_200,
+        sim_axes: vec![],
+        sim: h3cs::config::SimBackendConfig::default(),
+    });
+    let srv = h3cs::server::start(
+        cfg,
+        h3cs::server::ServerOptions { admin_token: None, bind_override: Some("127.0.0.1:0".parse().unwrap()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    // Two discovery periods.
+    tokio::time::sleep(h3cs::server::DISCOVERY_PERIOD * 2 + Duration::from_millis(200)).await;
+    let st = srv.status();
+    assert_eq!(st.rig_state, RigState::Offline);
+    assert!(st.axes.iter().all(|a| !a.connected && a.port.is_none()), "{:?}", st.axes);
+    tokio::time::timeout(Duration::from_secs(10), srv.shutdown()).await.expect("shutdown hung");
+}
