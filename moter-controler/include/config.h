@@ -98,6 +98,7 @@ constexpr int32_t SLOW_ZONE = 400;              // 端の手前で HOME_DUTY に
 constexpr int32_t ARRIVAL_MIN_TRAVEL = 400;     // これ未満の移動で止まったら到達ではなく失敗
 constexpr uint32_t DWELL_MS = 200;              // 中立のバンド内に居続ける時間
 constexpr int32_t RETREAT_COUNTS = 600;         // 端当てで開始直後に止まったとき、反対へ退避する距離（約 1.5 回転）。退避後に改めて端へ当てる
+constexpr int32_t RETREAT_END_MIN_TRAVEL = 50;  // 退避がこれ以上動いてから止まったら「反対の端に当たった」とみなし、そこから改めて端へ向かう（端の近くから始めた校正が退避で反対の端に当たって失敗した 2026-11-02、Issue #34）。これ未満で止まれば従来どおり失敗
 
 // --- 手動速度の守り（無パルス／遅すぎで出力 0） ---
 constexpr int MANUAL_GUARD_MIN_DUTY = NEUTRAL_DUTY_MIN;  // これ未満は機構が動かないことがある（7 % で動くことを実測）ので監視しない
