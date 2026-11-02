@@ -1,13 +1,13 @@
 # ===========================================================================
 # 2026-11-02 午後の実機の運用設定（h3-bringup-01）。flight_circus などの繋ぎ込みで同じリグを使うときはこれを使う。
-# - 焼いてあるファーム: #1・#2 とも hw-r10a-test-20261102（r9 ＋ 校正の修正 ＋ 再生バッファ PR #49 ＋ つなぎの監視 ＋ ARM の電源待ち 2.5 s）。
-#   この組み合わせは kp 30 が前提（kp 6 では追従が柔らかすぎる）
-# - #3（ヨー）は 24 V 未接続のため模擬軸（sim_axes = [3]）。サーバー起動後に POST /v1/reference {"axis":3,"count":3069}
+# - 焼いてあるファーム: 3 台とも hw-r10a-test-20261102（r9 ＋ 校正の修正 ＋ 再生バッファ PR #49 ＋ つなぎの監視 ＋ ARM の電源待ち 2.5 s）。
+#   kp 50（乗員の荷重で戻れない件のつなぎ。Issue #44）
+# - #3（ヨー）は 11-02 夕方にエンコーダ（コードホイール）を仮復旧し、本物の軸に戻した（校正 6205/3102、6206/3103。Issue #9）
 # - このリグは [game].swap_pitch_roll = true（PR #21、操作者が実機で確認）
 # - 仮想位置の端はソフトリミットから 350 count 内側（Issue #34 / PR #38）
-# - ポートは 1C:DB = /dev/cu.usbmodem11501（#1、主電源担当）、68:EE = /dev/cu.usbmodem11101（#2）。ハブの差し替えで変わるので
+# - ポートは 1C:DB = /dev/cu.usbmodem11501（#1、主電源担当）、68:EE = /dev/cu.usbmodem11101（#2）、30:ED = /dev/cu.usbmodem11301（#3）。ハブの差し替えで変わるので
 #   ioreg の USB Serial Number で確認すること（hardware-bringup.md §1.1）
-# - 校正後はサーバーの再起動が要る（calibration_stale）。校正値はこのファイルの値と毎回ほぼ一致（#1 5555〜5556 / 2777〜2778、#2 5508〜5509 / 2754）
+# - 校正後はサーバーの再起動が要る（calibration_stale）。校正値はこのファイルの値と毎回ほぼ一致（#1 5555〜5556 / 2777〜2778、#2 5508〜5509 / 2754、#3 6205〜6206 / 3102〜3103）
 # ===========================================================================
 # h3-control-server が校正結果から書き出した設定（POST /v1/calibration/export）。
 # 書き出し: 20261101-132909（UTC）。元の設定: /private/tmp/claude-501/-Users-takuro--superset-worktrees-dof-reality-h3-custom-controller-quilted-pendulum/b547c39a-9972-42f1-a8ff-5d6e28e8b307/scratchpad/bringup-live3.toml
@@ -97,7 +97,7 @@ max_acc_count_s2 = 6000          # 11-02 15:3x 展示用。旧 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
 duty_min_percent = 9             # 11-02: 7〜8 % では #2 が動かず、9 % で動き出した実測から
-kp_percent_per_100 = 50          # 11-02 15:10 つなぎ: 乗員の荷重で戻れない（誤差 29 で 8.7 % 頭打ち）→ 50。旧 30。 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
+kp_percent_per_100 = 50          # 11-02 16:0x hw-r10a-test に戻す（kp 50 のつなぎ）。r10 統合版（保持の学習・段階的な力の上げ・駐車）は kp 30 から（Codex）。15:10 のつなぎは: 乗員の荷重で戻れない（誤差 29 で 8.7 % 頭打ち）→ 50（誤差 29 で 14.5 %）。旧 30。 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
 ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
 deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
 deadband_out_count = 20          # 同（出る側）
@@ -113,12 +113,11 @@ kind = "serial"
 #   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
 # （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
 # 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
-ports = ["/dev/cu.usbmodem11501", "/dev/cu.usbmodem11101"]  # 1C:DB(#1) / 68:EE(#2)。#3 は 24V 未接続のため模擬軸
+ports = ["/dev/cu.usbmodem11501", "/dev/cu.usbmodem11101", "/dev/cu.usbmodem11301"]  # 1C:DB(#1) / 68:EE(#2) / 30:ED(#3)。11-02 夕方: #3 のエンコーダ（コードホイール）を仮復旧  # 1C:DB(#1) / 68:EE(#2)。#3 は 24V 未接続のため模擬軸
 baud = 115200
 # 実機が足りないときは、その軸を模擬軸で代替できる（例: sim_axes = [3]。その軸の ports は書かない）。
 # 模擬軸は目標に完全に追従するので、その軸の pose を中立に保てば動かない扱いになる。その軸の校正値は
 # 模擬軸用に calibration_valid = true にする（実機の宣言ではない）。実機を戻したら sim_axes を消す。
-sim_axes = [3]
 
 # ---------------------------------------------------------------------------
 # 軸 1: 右手前リフト (motor #1)。P 端 = 下限（沈み切り）。過去の記録: stroke 5553（1C:DB、2026-10-31）
@@ -176,10 +175,10 @@ name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 3069     # = stroke / 2（2026-10-31 の校正 6138 / 3069。10-26 は 6159 / 3079）
-count_at_virtual_1023 = 5738    # soft_max − 350
+count_at_virtual_512 = 3103  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
+count_at_virtual_1023 = 5806  # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 6138     # 2026-10-31 の CAL。校正ごとに ±20 程度ぶれる
+mechanical_max_count = 6206  # 11-02 夕方の CAL
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 6088           # mechanical_max − decel_zone
+soft_max_count = 6156  # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
