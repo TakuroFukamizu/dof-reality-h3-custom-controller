@@ -6,8 +6,8 @@
 
 namespace {
 
-constexpr uint32_t kDutyMax = (1u << PWM_BITS) - 1;
-int g_applied = 0;
+constexpr uint32_t kDutyMax = (1u << PWM_BITS) - 1;  // 1000 permille でこの値
+int g_applied = 0;  // permille
 
 int oppositeLevel(int level) { return level ? 0 : 1; }
 
@@ -38,26 +38,29 @@ void motor_output_begin() {
 }
 
 // 反転するときだけ PWM を落としてから DIR を変える。同じ出力なら戻る。
-void motor_output_write(int percent) {
-  if (percent == g_applied) {
+void motor_output_write_permille(int permille) {
+  if (permille == g_applied) {
     return;
   }
-  percent = constrain(percent, SPEED_MIN, SPEED_MAX);
-  const int new_dir = (percent >= 0) ? DIR_POSITIVE_LEVEL : oppositeLevel(DIR_POSITIVE_LEVEL);
-  const int old_dir = (g_applied >= 0) ? DIR_POSITIVE_LEVEL : oppositeLevel(DIR_POSITIVE_LEVEL);
-  const bool reversing = percent != 0 && g_applied != 0 && new_dir != old_dir;
-  if (reversing || percent == 0) {
+  permille = constrain(permille, PERMILLE_MIN, PERMILLE_MAX);
+  const int new_dir = (permille >= 0) ? DIR_POSITIVE_LEVEL : oppositeLevel(DIR_POSITIVE_LEVEL);
+  const bool reversing = motor_output_reverses(g_applied, permille);
+  if (reversing || permille == 0) {
     writePwm(0);
   }
   if (reversing) {
     delay(DIR_COAST_MS);
   }
-  if (percent != 0) {
+  if (permille != 0) {
     digitalWrite(PIN_MD13S_DIR, new_dir);
-    const int magnitude = percent < 0 ? -percent : percent;
-    writePwm(static_cast<uint32_t>(magnitude) * kDutyMax / 100u);
+    writePwm(motor_output_pwm_ticks(permille, kDutyMax));
   }
-  g_applied = percent;
+  g_applied = permille;
 }
 
-int motor_output_applied() { return g_applied; }
+void motor_output_write(int percent) {
+  motor_output_write_permille(constrain(percent, SPEED_MIN, SPEED_MAX) * PERMILLE_PER_PERCENT);
+}
+
+int motor_output_applied_permille() { return g_applied; }
+int motor_output_applied() { return g_applied / PERMILLE_PER_PERCENT; }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 // Bottom は Base15 産業用プロト基板モジュール V1.1（M5Stack K025-B）。DIN Base は使わない。
@@ -68,6 +69,11 @@ constexpr uint32_t DIR_COAST_MS = 5;       // 反転前に PWM を落として�
 
 constexpr int SPEED_MIN = -100;
 constexpr int SPEED_MAX = 100;
+// モーター出力の内部分解能は permille（0.1 %。Issue #25 手順 8 b）。従来 env の手動速度・自動移動は整数 % のままで、
+// motor_output_write(%) が ×10 して同じ経路に入る。±1000 permille が PWM のフルスケール（(1 << PWM_BITS) − 1）
+constexpr int PERMILLE_PER_PERCENT = 10;
+constexpr int PERMILLE_MIN = SPEED_MIN * PERMILLE_PER_PERCENT;  // −1000
+constexpr int PERMILLE_MAX = SPEED_MAX * PERMILLE_PER_PERCENT;  // +1000
 
 // --- フィードバックセンサー（encoder-tester の実測に合わせる） ---
 // XH 8pin #2 = A（センサー白）→ G17、#3 = B（センサー緑）→ G18。Base15 内のレベル変換後の 3.3V。
@@ -114,7 +120,123 @@ constexpr int V1_DUTY_MAX = 20;                 // Duty の上限の初期値（
 constexpr int V1_ABS_DUTY_MAX = 60;                     // Duty の絶対上限 [%]
 constexpr uint32_t V1_ABS_MAX_VEL_COUNT_S = 6000;       // 速度の絶対上限 [count/s]
 constexpr uint32_t V1_ABS_MAX_ACC_COUNT_S2 = 40000;     // 加速度の絶対上限 [count/s²]
-constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty|（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）
+constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始める |Duty| の下限（下限 7 % の押し当てでは #2 の持ち上げ側が動かないことがあるので、下限より上）。ブレーキ解除指令中に目標（軌道）が動いている間だけ、これ以上を STALL_MS 出してカウントが変わらなければ異常（目標が止まっているときの静止やブレーキ作動中は見ない）
+// Issue #15 M2: 実際のしきい値は max(V1_STALL_DUTY, duty_max × この割合)。kp を上げると数百 count の誤差だけで 10 % に届き、
+// 動けない軸（荷重）が FOLLOWING_ERROR ではなく ENCODER_FAULT になって基準を失うので、ループが上限近くまで出しているときだけ
+// 「エンコーダが死んだ」と判定する。それ未満の無パルスは FOLLOWING_ERROR（と下の停止ブースト）に任せる。
+// duty_max < V1_STALL_DUTY の SET_LIMITS は受理するが検出が無効になる（画面に警告。docs/control-server/limits.md）。
+constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
+// permille 換算（Issue #25 手順 8 b）。位置ループは v1_duty_command から PWM まで permille（0.1 %）で運ぶ。SET_LIMITS / LIMITS の
+// 線上は整数 % のまま（V1Tuning の duty_min / duty_max / stall_duty も %）で、しきい値はここの定数と v1_permille() で換算する。
+constexpr int V1_PERMILLE_PER_PERCENT = PERMILLE_PER_PERCENT;
+constexpr int V1_DUTY_MIN_PERMILLE = V1_DUTY_MIN * V1_PERMILLE_PER_PERCENT;      // 70
+constexpr int V1_DUTY_MAX_PERMILLE = V1_DUTY_MAX * V1_PERMILLE_PER_PERCENT;      // 200
+constexpr int V1_ABS_DUTY_MAX_PERMILLE = V1_ABS_DUTY_MAX * V1_PERMILLE_PER_PERCENT;  // 600
+constexpr int V1_STALL_DUTY_PERMILLE = V1_STALL_DUTY * V1_PERMILLE_PER_PERCENT;  // 100。ENCODER_FAULT しきい値の下限
+// Issue #15 H4: 停止ブースト。位置ループに積分が無いので、目標が止まっている（軌道速度 0）のに |誤差| が不感帯の外で、
+// 下限 Duty を出してもカウントが動かない（荷重とのつり合い）状態が続くと静的誤差を詰められない。auto_move.h の neutral_boost と
+// 同じく、この時間カウントが V1_STALL_BOOST_MIN_MOVE 未満しか動かないたびに下限を 1 % ずつ上げる（上限は duty_max。超えない）。
+// 誤差が不感帯に入る・誤差の符号が反転する・軌道が動き出す・ブレーキ作動のどれかで 0 に戻す。実機 11-02: kp 6 / duty_min 9 で
+// 自重のかかった軸の動き出しは約 9 %、7〜8 % では動かない。
+constexpr uint32_t V1_STALL_BOOST_MS = 200;
+constexpr int V1_STALL_BOOST_STEP_PERMILLE = 1 * V1_PERMILLE_PER_PERCENT;  // 窓ごとの上乗せ幅（1 % = 10 permille）
+constexpr int32_t V1_STALL_BOOST_MIN_MOVE = 3;  // 窓の間にこれ未満しか動かなければ「動いていない」（停止中のエンコーダの ±1 のちらつきで窓を取り直さない）
+// 上乗せの上限: 対象になってからこれだけ動かなければ（または上乗せが duty_max で頭打ちのまま次の窓も動かなければ）ENCODER_FAULT を
+// ラッチする（詰まった機構を duty_max で押し続けない。静止目標では無パルス判定が回らないので、ここで閉じる）。0 で時間の上限なし。
+constexpr uint32_t V1_STALL_BOOST_MAX_MS = 2000;
+// Issue #25 手順 8 (c)「E」: Duty 下限（duty_min ＋ 停止ブースト）はヒステリシス付きの「床の適用状態」が ON のときだけ掛ける。
+// ON になる条件: |誤差| > deadband_out（20）かつ P と合成（FF + P）の向きが一致。OFF になる条件: |誤差| ≤ V1_FLOOR_OFF_COUNT（15）
+// または向きの不一致（即時）。15 < |誤差| ≤ 20 は前の状態を保つ。OFF のときは有界の生の FF + P を permille でそのまま出す
+//（0 にはしない。旧 M1 は誤差と逆向きの合成を 0 に置き換えていた。「誤差と逆向きに床を掛けない」という M1 の規則は向きの条件として残る）。
+// 狙い: 追従中の小さい誤差で床（9 % ≈ 900 count/s）が軌道速度を超えて「バースト → 停止」になるのをなくし、FF だけで追従させる。
+// 静止の不感帯（10 / 20）と停止ブースト（H4。床が ON のときだけ上乗せが効く）はそのまま。
+constexpr int32_t V1_FLOOR_OFF_COUNT = 15;
+// Issue #25 手順 9「F」: 有界の積分と保持バイアス。I += Ki × 誤差 × dt [permille] を位置制御中だけ積む。|I| ≤ V1_I_MAX_PERMILLE、
+// 変化率 ≤ V1_I_RATE_PERMILLE_PER_S。アンチワインドアップは実出力で見る: 出力が duty_max で飽和、床（duty_min ＋ ブースト／
+// 動き出し補助）が合成を持ち上げている、床の向き不一致（E の抑制中）のどれかなら、|I| を増やす向きには積まない（戻す向きは
+// 常に許す）。静止の不感帯の中では積まない（凍結）が、学んだ I はそのまま出力に出す（保持バイアス。0 に落とさない。自重で
+// 下がる軸を 0 ↔ 9 % の蹴りなしで保持する狙い）。DISARMED / FAULT / SET_REFERENCE / 系統切替 / 位置制御の終了で 0。
+// 実機 A/B 用に -DV1_INTEGRAL=0 で切れる（V1Tuning の ki が 0 になる。I は常に 0 で不感帯の中は従来どおり 0）。
+#ifndef V1_INTEGRAL
+#define V1_INTEGRAL 1
+#endif
+constexpr double V1_KI_PERMILLE_PER_COUNT_S = 0.1;  // Ki = 0.01 %/(count·s) = 0.1 permille/(count·s)。誤差 20 で 2 permille/s
+constexpr int V1_I_MAX_PERMILLE = 30;               // |I| の上限 3 %
+constexpr int V1_I_RATE_PERMILLE_PER_S = 10;        // |dI/dt| の上限 1 %/s
+// Issue #25 手順 9「T」: 追従中の動き出し補助。|軌道速度| > V1_ASSIST_VEL_COUNT_S なのに |実測速度| < V1_ASSIST_MEAS_VEL_COUNT_S
+// のまま |誤差| が増え続けて V1_ASSIST_MS 経ったら、床の適用状態（|誤差| > 20）に依らず床（duty_min、合成の向き）を掛ける。
+// エンコーダが V1_ASSIST_RELEASE_MOVE 以上動いたら即解除。停止ブースト（H4）は静止目標だけなので、その補完。保護との関係は
+// protocol.md §5（床 9 % は ENCODER_FAULT のしきい値 15 % 未満で、FOLLOWING_ERROR の判定は触らない）。-DV1_TRACK_ASSIST=0 で切れる
+#ifndef V1_TRACK_ASSIST
+#define V1_TRACK_ASSIST 1
+#endif
+constexpr int32_t V1_ASSIST_VEL_COUNT_S = 100;       // これより速い軌道速度が対象
+constexpr int32_t V1_ASSIST_MEAS_VEL_COUNT_S = 20;   // 実測速度がこれ未満なら「動いていない」（100 ms 窓なので 0 か ±10）
+constexpr uint32_t V1_ASSIST_MS = 150;               // この時間続いたら補助 ON
+constexpr int32_t V1_ASSIST_RELEASE_MOVE = 3;        // ON の後、これ以上カウントが動けば解除
+// Issue #25 手順 10「S」: 整定判定。静止の不感帯（Duty = I の保持）に入るのは「軌道速度 0 かつ |誤差| ≤ deadband かつ
+// |実測速度| ≤ V1_SETTLED_MEAS_VEL_COUNT_S」が V1_SETTLED_MS 続いたとき。軌道が動く・|誤差| > deadband_out で即抜ける。
+// -DV1_SETTLED_MEASURED=0 で切れる（従来どおり |誤差| ≤ deadband で即入る）
+#ifndef V1_SETTLED_MEASURED
+#define V1_SETTLED_MEASURED 1
+#endif
+constexpr int32_t V1_SETTLED_MEAS_VEL_COUNT_S = 10;
+constexpr uint32_t V1_SETTLED_MS = 200;
+// Issue #25 r6（2026-11-02、Codex 設計コンサル）: 方向別 FF ＋ PI、走行中の床なし。既定 1。-DV1_FF_DIRECTIONAL=0 で r5 までの
+// 経路（v/ff の FF、床 E、補助 T、不感帯 10/20、Ki 0.1）に戻る（ホストテストはこの 0 で従来の経路を検証し、r6 は明示的に ON にして検証する）。
+// ON のとき SET_LIMITS の ff_count_s_per_percent / duty_min / deadband / deadband_out は受理・LIMITS で返すが位置ループでは使わない。
+#ifndef V1_FF_DIRECTIONAL
+#define V1_FF_DIRECTIONAL 1
+#endif
+// 方向別 FF: d = 軌道速度の向き（「上」= カウント増）、w = min(|v| / V1_FF_TAPER_COUNT_S, 1)、u_ff = w × a_d + b_d × v [permille]、
+// v = 0 なら 0。a は符号付きの切片（下向きは負の値のまま足す）、b は permille / (count/s)。
+// 実測（11-02、#1、r3、一定速度ランプの定常区間の平均 Duty）: 上 99→5.6 %、198→6.2、413→8.9、593→10.5 / 下 −99→−1.8、−198→−2.5、
+// −397→−5.3、−592→−7.1。直線回帰: 上 u ≈ 4.6 % + 0.0099 %·v、下 u ≈ −0.74 % + 0.0107 %·v（重力バイアス ≈ +1.9 %、クーロン ≈ 2.7 %）。
+constexpr int V1_FF_A_UP_PERMILLE = 46;                        // 上向き（カウント増）の切片 4.6 %
+constexpr double V1_FF_B_UP_PERMILLE_PER_COUNT_S = 0.10;       // 上向きの傾き 1.0 % / 100 count/s
+constexpr int V1_FF_A_DOWN_PERMILLE = -7;                      // 下向き（カウント減）の符号付き切片 −0.7 %
+constexpr double V1_FF_B_DOWN_PERMILLE_PER_COUNT_S = 0.107;    // 下向きの傾き 1.07 % / 100 count/s
+constexpr int32_t V1_FF_TAPER_COUNT_S = 30;                    // 反転時に切片を一気に反転させないテーパ幅 [count/s]
+// PI: Kp は SET_LIMITS（bringup 6 %/100 count）。Ki は r6 で 0.02 %/(count·s) = 0.2 permille/(count·s)。|I| ≤ V1_I_MAX_PERMILLE、
+// |dI/dt| ≤ V1_I_RATE_PERMILLE_PER_S（上と同じ 30 / 10）。アンチワインドアップは「duty_max で飽和した向きへ積み増さない」だけ
+//（床・符号不一致の抑制は無い。軌道より先行して逆向きに補正するのは正当）。動き出しパルス中と保持中は凍結、保持に入ったら 0。
+constexpr double V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S = 0.2;
+// 保持: 軌道完了（軌道速度 0）かつ |誤差| ≤ V1_HOLD_ENTER_COUNT かつ |実測速度| ≤ V1_SETTLED_MEAS_VEL_COUNT_S が V1_SETTLED_MS
+// 続いたら入る（I と出力を 0。#1 は中立付近で自己保持する）。|誤差| > V1_HOLD_EXIT_COUNT か軌道が動けば出る。10/20 の不感帯に代わる。
+constexpr int32_t V1_HOLD_ENTER_COUNT = 2;
+constexpr int32_t V1_HOLD_EXIT_COUNT = 4;
+// 動き出しパルス（床の唯一の例外）: |誤差| > V1_HOLD_EXIT_COUNT の要求が続いていて、V1_BREAKAWAY_WINDOW_MS の間に指令の向きへ
+// V1_BREAKAWAY_MIN_MOVE 未満しか進まなければ、指令の向きに V1_BREAKAWAY_UP/DOWN_PERMILLE（実測の動き出し Duty。合成がそれ以上なら合成）を
+// V1_BREAKAWAY_PULSE_MS または 3 count 進むまで出す。進まないままのパルスは V1_BREAKAWAY_MAX_PULSES で打ち切り（連打しない）、
+// あとは静止 2 s の監視（ENCODER_FAULT）に任せる。パルスは監視の時計を戻さない。
+constexpr int V1_BREAKAWAY_UP_PERMILLE = 90;       // 上向き（カウント増）9 %
+constexpr int V1_BREAKAWAY_DOWN_PERMILLE = 60;     // 下向き（カウント減）6 %
+constexpr uint32_t V1_BREAKAWAY_WINDOW_MS = 100;   // 「進まない」を判定する窓
+constexpr uint32_t V1_BREAKAWAY_PULSE_MS = 100;    // パルスの長さの上限
+constexpr int32_t V1_BREAKAWAY_MIN_MOVE = 3;       // 窓／パルスの間にこれ以上進めば「進んだ」
+constexpr int V1_BREAKAWAY_MAX_PULSES = 5;         // 進まないまま打てるパルスの数
+// 軌道が動いているときの動き出しパルス（PR #33 Codex レビュー P1）: 遅い軌道（30 count/s 前後）に普通に遅れているだけでも
+// 100 ms に 3 count が境目になり 9 % を連発しかねない。そこで走行中は「軌道は速い（|v_traj| ≥ MIN_TRAJ）のに軸は止まっている
+//（実測 |v| ≤ MAX_VEL）まま MOVING_WINDOW の間 |誤差| が増え続けた」ときだけ打つ。静止目標（軌道速度 0）は従来どおり 100 ms 窓。
+// r7: 軌道速度の下限は外す（0）。正弦波の反転付近（|v_traj| < 100 が周期の 1/4）で FF がテーパして止まったままになるのが r6 の追従誤差の
+// 主因だったため。遅い追従（25〜30 count/s）は実測 |v| > 10 なので対象外のまま
+constexpr int32_t V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S = 0;
+constexpr int32_t V1_BREAKAWAY_MOVING_MAX_VEL_COUNT_S = 10;
+constexpr uint32_t V1_BREAKAWAY_MOVING_WINDOW_MS = 200;
+// r8（Issue #25、Codex 案 d）: 軌道速度がこの帯の間は「引っかかった時だけ短く押す」。100 ms 向きへ 1 count も進まず |誤差| が
+// 増えていれば上 90 / 下 60 permille を最初の 1 count か 50 ms まで、その後 200 ms は押さない（回数の上限は V1_BREAKAWAY_MAX_PULSES）。
+// 実機 11-02: 50〜150 count/s の速度ムラが r3 の 1.3〜1.9 倍（静止摩擦 ≈ 9 % と動摩擦 ≈ 5 % の差）。HI = 0 で無効。
+constexpr int32_t V1_BREAKAWAY_BAND_LO_COUNT_S = 50;
+constexpr int32_t V1_BREAKAWAY_BAND_HI_COUNT_S = 150;
+constexpr uint32_t V1_BREAKAWAY_BAND_WINDOW_MS = 100;
+constexpr uint32_t V1_BREAKAWAY_BAND_PULSE_MS = 50;
+constexpr uint32_t V1_BREAKAWAY_BAND_COOLDOWN_MS = 200;
+constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
+// Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
+constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
+constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
+constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
+constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
 constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）

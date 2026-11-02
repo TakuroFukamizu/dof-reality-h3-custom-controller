@@ -267,10 +267,10 @@ int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
 int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 // 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
-void write_outputs(bool power_on, bool brake_release, int duty) {
+void write_outputs(bool power_on, bool brake_release, int duty_permille) {
   digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
   digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
-  motor_output_write(duty);
+  motor_output_write_permille(duty_permille);
 }
 
 void v1_task_main(void*) {
@@ -323,7 +323,7 @@ void v1_task_main(void*) {
     }
 
     g_axis.tick(now, encoder_count());
-    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_percent());
+    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille());
 
     // 校正に成功した系統の符号を、次の系統切り替え（set_sign）に反映する。NVS への保存は loop() が行う
     //（Preferences の書き込みは数十 ms 止まることがあり、5 ms の制御タスクでは CONTROL_OVERRUN になる）。
@@ -354,7 +354,11 @@ void v1_task_main(void*) {
     snap.selected_axis = g_axis.selected_axis();
     snap.power_on_cmd = g_axis.power_on_cmd();
     snap.brake_release_cmd = g_axis.brake_release_cmd();
-    snap.duty = g_axis.duty_percent();
+    snap.duty_permille = g_axis.duty_permille();
+    snap.stall_boost_permille = g_axis.stall_boost_permille();
+    snap.terms = g_axis.duty_terms();
+    snap.pwm_permille = g_axis.pwm_permille();
+    snap.encoder_fault_check_disabled = g_axis.encoder_fault_check_disabled();
     snap.actual = g_axis.actual_count();
     snap.target = g_axis.target_count();
     snap.velocity = g_axis.velocity_count_s();
@@ -367,6 +371,8 @@ void v1_task_main(void*) {
     snap.rx_error_count = g_axis.rx_error_count();
     snap.stale_drop_count = g_axis.stale_drop_count();
     snap.tx_dropped = v1_link_tx_dropped();
+    snap.tx_deferred = v1_link_tx_deferred();
+    snap.tx_stale_dropped = v1_link_tx_stale_dropped();
     ticks += 1;
     snap.tick_count = ticks;
     snap.max_tick_gap_us = max_gap_us;

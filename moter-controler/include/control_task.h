@@ -43,6 +43,7 @@ void control_clear_profile_dirty();
 ControlSnapshot control_snapshot();
 
 #if MC_PROTO_V1
+#include "v1_axis.h"  // V1DutyTerms（計器行）
 // --- USB プロトコル v1（MC_PROTO_V1）。制御タスクは V1Axis を回し、G2 / G13 / PWM を直接書く ---
 struct V1Snapshot {
   uint8_t state = 0;             // v1::state::*
@@ -51,7 +52,11 @@ struct V1Snapshot {
   uint8_t selected_axis = 0;
   bool power_on_cmd = false;
   bool brake_release_cmd = false;
-  int duty = 0;                  // 符号付き %
+  int duty_permille = 0;         // 符号付き permille（MD13S の向き。motor_output_write_permille に渡した値）
+  int stall_boost_permille = 0;  // 停止ブースト（Issue #15 H4）で下限に上乗せしている permille（0 = なし）
+  V1DutyTerms terms{};           // 位置ループの各項（Issue #25 手順 8 の計器行。permille、カウント増が正）
+  int16_t pwm_permille = 0;      // STATUS と同じ pwm_permille（カウント増が正）
+  bool encoder_fault_check_disabled = false;  // duty_max がしきい値より低く無パルスの ENCODER_FAULT が出ない（Issue #15 M2）
   int32_t actual = 0;
   int32_t target = 0;
   int32_t velocity = 0;          // count/s（100 ms 窓）
@@ -64,6 +69,8 @@ struct V1Snapshot {
   uint16_t rx_error_count = 0;
   uint16_t stale_drop_count = 0;
   uint32_t tx_dropped = 0;
+  uint32_t tx_deferred = 0;      // TX リングに空きが無く次の poll に回した回数（Issue #15 M7）
+  uint32_t tx_stale_dropped = 0; // 古い／入らない STATUS と期限切れの保留を捨てた数
   uint32_t tick_count = 0;
   uint32_t max_tick_gap_us = 0;  // 起動からの tick 間隔の最大
   uint64_t device_id = 0;
