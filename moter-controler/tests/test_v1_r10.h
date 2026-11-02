@@ -83,7 +83,7 @@ inline void test_r10_conservative_defaults() {
   CHECK(!t.soft_grace && t.fe_grace_max_ms == 0);           // SOFT_LIMIT / FOLLOWING_ERROR の猶予は OFF
   CHECK(V1Tuning(true).supervisor == (V1_SUPERVISOR != 0) && !V1Tuning(false).supervisor);
   CHECK(!t.renew_directional && t.hold_allow_trim_permille == 40);  // どちら向きでも確かな動き、保持出力 + 4 % は積まない（実測 2）
-  CHECK(t.deadline && t.deadline_proportional && t.backdrive_count_s == 200 && t.certify_ms == 300);  // P0 / P1c
+  CHECK(t.deadline && t.deadline_proportional && t.backdrive_count_s == 200 && t.certify_ms == 100);  // P0 / P1c
   CHECK(V1Tuning(true).park == (V1_PARK != 0) && !V1Tuning(false).park && V1Tuning(true).park_still_ms == 500 &&
         V1Tuning(true).brake_engage_ms == 150 && fl::PARKED == 0x800);
   CHECK(V1Tuning(true).hold_learn == (V1_HOLD_LEARN != 0) && !V1Tuning(false).hold_learn);
@@ -761,7 +761,12 @@ inline EscResult escalation_run(Harness& h, int load_pm, int deadband_pm, int32_
 inline void test_r10_escalation_lifts_axis_needing_15_percent() {
   Harness h;
   const EscResult r = escalation_run(h, 120, 30, 26, 3000);
-  if (std::getenv("R10_PRINT")) std::printf("esc 15%%: max_out %d final_err %d moved %d I %d\n", r.max_out, r.final_err, r.moved ? 1 : 0, h.ax.integral_permille());
+  if (std::getenv("R10_PRINT")) {
+    std::printf("esc 15%%: max_out %d final_err %d moved %d I %d inhib %d fu %d ll %d dl %d budget %d/%d verified %.1f\n", r.max_out, r.final_err, r.moved ? 1 : 0,
+                h.ax.integral_permille(), h.ax.supervisor_inhibited() ? 1 : 0, h.ax.supervisor().feedback_uncertain() ? 1 : 0,
+                h.ax.supervisor().load_limited() ? 1 : 0, h.ax.supervisor().deadline_tripped() ? 1 : 0, h.ax.supervisor_info().budget_up,
+                h.ax.supervisor_info().budget_down, h.ax.supervisor().verified_hold_permille());
+  }
   CHECK(r.max_out >= 150 && r.moved && std::abs(r.final_err) <= 2);
   CHECK(h.ax.state() == st::ACTIVE && no_fault_events(h) && !h.ax.supervisor_inhibited());
   CHECK(h.ax.escalation_permille() == 0);  // 着いたら戻る
@@ -1442,7 +1447,8 @@ inline void test_r10_integrators_frozen_while_overridden() {
   }
 }
 
-// P1c: bias を保持出力として認めるのは、確かな動きの後に位置が ±1 の中に 300 ms 留まったときだけ
+// P1c（実機 17d0282 の後）: 保持出力として認めるのは、確かな動きの後に落ち着いて（|誤差| ≤ 6・|実測速度| ≤ 10・位置 ±1）100 ms
+// 保てたときの、実際に出していた出力。落ち着いている間は更新し続ける。動いている・目標から離れている間は認めない
 inline void test_r10_hold_certification_requires_stable_window() {
   V1Supervisor s;
   V1Supervisor::Ctx c;
@@ -1454,22 +1460,27 @@ inline void test_r10_hold_certification_requires_stable_window() {
   s.t.brake_acc_count_s2 = 0;
   s.reset_trust(0, 0);
   s.end_session(0, 0);
-  auto tick = [&](int64_t raw, double bias) {
+  auto tick = [&](int64_t raw, int out, int64_t err) {
     c.now_us += 5 * MS;
     c.raw = raw;
-    c.i_pm = bias;
+    c.err = err;
     s.observe(c);
-    s.filter(c, 0);
+    s.filter(c, out);
   };
-  tick(0, 10.0);
-  tick(2, 20.0);  // 確かな動き: 認定待ち
-  for (int i = 0; i < 50; ++i) tick(2 + (i % 2), 30.0 + i);  // ±1 で 250 ms: まだ
+  tick(0, 10, 0);
+  tick(2, 20, 0);  // 確かな動き: 認定待ち
+  for (int i = 0; i < 40; ++i) tick(2, 30, 9);  // 誤差 9（目標の近くでない）: 認めない
   CHECK(s.verified_hold_permille() == 0.0);
-  for (int i = 0; i < 12; ++i) tick(2, 60.0);  // 300 ms を越えた
+  for (int i = 0; i < 18; ++i) tick(2 + (i % 2), 40, 1);  // 落ち着いて 90 ms: まだ
+  CHECK(s.verified_hold_permille() == 0.0);
+  for (int i = 0; i < 4; ++i) tick(2, 60, 1);  // 100 ms を越えた: 出していた出力（60）
   CHECK(s.verified_hold_permille() == 60.0);
-  tick(4, 90.0);  // また動いた: 認定は前のまま
-  tick(4, 95.0);
-  CHECK(s.verified_hold_permille() == 60.0);
+  tick(2, 65, 1);  // 落ち着いている間は更新
+  tick(2, 65, 1);
+  CHECK(s.verified_hold_permille() == 65.0);
+  tick(5, 90, 1);  // 動いた（±1 を越えた）: 取り直し、認定は前のまま
+  tick(5, 95, 1);
+  CHECK(s.verified_hold_permille() == 65.0);
 }
 
 
@@ -1637,12 +1648,18 @@ inline void test_r10_park_requires_small_error_through_window() {
   r10_active(h, 0, 100000, 30, 20, false, false, true);  // カウントは手で動かす（動かない）、期限なし
   h.raw += 9;
   bool parked = false;
-  for (int i = 0; i < 300 && !h.ax.supervisor_inhibited(); ++i) {
+  int budget_at_park = 1000;
+  for (int i = 0; i < 300 && !h.ax.supervisor_inhibited() && !parked; ++i) {
     h.set_position(0);
+    const V1SupInfo before = h.ax.supervisor_info();
     h.step();
-    if (h.ax.brake_parked()) parked = true;
+    if (h.ax.brake_parked()) {
+      parked = true;
+      budget_at_park = std::min(before.budget_up, before.budget_down);
+    }
   }
-  CHECK(!parked);
+  // 静止の窓（|誤差| ≤ 4 が 500 ms）では入らない。誤差 9 のまま動けず予算が尽きたときだけ、停止ではなく駐車（参照が止まっている）
+  CHECK(!parked || budget_at_park < 40);
 }
 
 
@@ -1776,7 +1793,8 @@ inline void test_r10_frozen_feedback_repeated_short_sessions() {
 }
 
 // PR #50 の Codex 事前レビュー（e6ee0ef）P1b: エンコーダが止まったまま、目標の小さな出入り（+3 / 0）で駐車と戻りを繰り返しても、期限の
-// 露出は戻らない（駐車中は止まるだけ）。いずれ止めて基準を消す
+// 露出は戻らない（駐車中は止まるだけ）。参照が止まっていれば期限は停止ではなく駐車（ブレーキが保つ）になり、参照が動いている間に
+// 尽きれば止めて基準を消す。どちらにしても露出は余裕 + arm_grace 以内
 inline void test_r10_frozen_feedback_park_cycles_do_not_renew() {
   Harness h;
   r10_active(h, 0, 100000, 30, 20, true, true, true);
@@ -1794,8 +1812,138 @@ inline void test_r10_frozen_feedback_park_cycles_do_not_renew() {
     prev = e;
   }
   if (std::getenv("R10_PRINT")) std::printf("frozen park cycles: cycles %d inhibited %d exposure %.1f monotonic %d\n", cycles, h.ax.supervisor_inhibited() ? 1 : 0, h.ax.supervisor().exposure(-1), monotonic ? 1 : 0);
-  CHECK(monotonic && h.ax.supervisor_inhibited() && h.ax.supervisor().deadline_tripped() && !h.ax.referenced());
+  CHECK(monotonic && (h.ax.supervisor_inhibited() || h.ax.brake_parked()));
   CHECK(h.ax.supervisor().exposure(-1) <= 2350.0 + V1_SUP_ARM_GRACE_COUNT + 13.0);
+}
+
+
+// --- 系統的な回帰（実機 17d0282 の FAIL: 上の端から 1350 の位置へ着いて約 0.7 s で FEEDBACK_UNCERTAIN・基準を消す）-------------------
+// PWM で動くプラント（重力 0 / 3 / 6 %、静止摩擦 2.5 %、慣性 60 ms、Duty 1 permille あたり 10 count/s）、kp 30・duty_max 20・
+// 1200 / 6000・再生バッファ・駐車・期限あり（焼く既定）。ストロークの端から端まで 300 count ごとの位置を順に回り、各位置で:
+// 300〜1500 の段（上下交互）→ 落ち着いて駐車 → 10 s 保持 → 小さな段（+5）で戻る → 大きな段（−800 / +800）→ 元の位置へ戻る。
+// どこでも停止（FEEDBACK_UNCERTAIN / LOAD_LIMITED）・基準を消す・FAULT が無いこと（参照は端の手前 600 で止まるので、端の帯には入らない）。
+struct SweepStats {
+  int cases = 0;
+  int inhibits = 0;
+  int faults = 0;
+  bool ref_lost = false;
+  int min_budget = 1000000;
+  double max_exposure = 0.0;
+  int parks = 0;
+  int worst_case = -1;
+  int32_t worst_pos = 0;
+};
+
+inline SweepStats sweep_session(int load_pm, bool print_cases) {
+  Harness h;
+  r10_active(h, 0, 400, 30, 20, true, true, true);
+  h.pwm_count_s_per_permille = 10.0;
+  h.plant_tau_s = 0.06;
+  h.pwm_deadband_permille = 25;
+  h.pwm_deadband_subtract = true;
+  h.load_permille = load_pm;
+  h.pos_max_vel = 1200;
+  h.pos_max_acc = 6000;
+  SweepStats st;
+  bool was_parked = false;
+  int case_min_budget = 1000000;
+  double case_max_exp = 0.0;
+  auto run = [&](int32_t target, uint32_t ms) {
+    for (uint32_t t = 0; t < ms; t += 10) {
+      h.set_position(target);
+      h.idle(10);
+      const V1SupInfo info = h.ax.supervisor_info();
+      const int b = std::min(info.budget_up, info.budget_down);
+      case_min_budget = std::min(case_min_budget, b);
+      const double e = std::max(h.ax.supervisor().exposure(1), h.ax.supervisor().exposure(-1));
+      case_max_exp = std::max(case_max_exp, e);
+      const bool p = h.ax.brake_parked();
+      if (p && !was_parked) ++st.parks;
+      was_parked = p;
+      if (h.ax.supervisor_inhibited() || h.ax.state() == st::FAULT) {
+        if (std::getenv("R10_SWEEP_DEBUG")) {
+          std::printf("    stop: target %d ref %d actual %d sv %.1f err %d dl %d fault %u exp up %.1f down %.1f budget %d/%d pwm %d unparking %d parked %d\n",
+                      target, h.ax.target_count(), h.ax.actual_count(), h.ax.setpoint_vel(), h.ax.following_error_count(),
+                      h.ax.supervisor().deadline_tripped() ? 1 : 0, h.ax.fault_code(), h.ax.supervisor().exposure(1),
+                      h.ax.supervisor().exposure(-1), h.ax.supervisor_info().budget_up, h.ax.supervisor_info().budget_down,
+                      h.ax.pwm_permille(), h.ax.unparking() ? 1 : 0, h.ax.brake_parked() ? 1 : 0);
+        }
+        return false;
+      }
+    }
+    return true;
+  };
+  const int sizes[] = {300, 600, 900, 1200, 1500};
+  int k = 0;
+  for (int32_t pos = -2400; pos <= 2400; pos += 300, ++k) {
+    for (int dir : {1, -1}) {
+      case_min_budget = 1000000;
+      case_max_exp = 0.0;
+      const int size = sizes[(k * 2 + (dir > 0 ? 0 : 1)) % 5];
+      const int32_t step = pos + dir * size;
+      bool ok = run(pos, 2500);                    // 位置へ
+      ok = ok && run(step, 3000);                  // 段 → 落ち着く
+      ok = ok && run(step, 10000);                 // 10 s 保持（駐車）
+      ok = ok && run(step + 5, 2000);              // 小さな段で戻る
+      ok = ok && run(step + 5 - dir * 800, 3000);  // 大きな段
+      ok = ok && run(pos, 3000);                   // 元へ
+      ++st.cases;
+      if (print_cases) {
+        std::printf("  load %2d pos %+5d dir %+d size %4d: min budget %4d max exposure %7.1f %s\n", load_pm, pos, dir, size,
+                    case_min_budget, case_max_exp, ok ? "" : "<-- STOP");
+      }
+      st.min_budget = std::min(st.min_budget, case_min_budget);
+      st.max_exposure = std::max(st.max_exposure, case_max_exp);
+      if (!ok) {
+        if (h.ax.supervisor_inhibited()) ++st.inhibits;
+        if (h.ax.state() == st::FAULT) ++st.faults;
+        if (!h.ax.referenced()) st.ref_lost = true;
+        if (st.worst_case < 0) { st.worst_case = st.cases; st.worst_pos = h.ax.actual_count(); }
+        return st;
+      }
+    }
+  }
+  st.ref_lost = !h.ax.referenced();
+  return st;
+}
+
+inline void test_r10_systematic_sweep_whole_stroke() {
+  const bool print = std::getenv("R10_PRINT") != nullptr;
+  for (int load : {0, 30, 60}) {
+    const SweepStats st = sweep_session(load, print);
+    if (print) {
+      std::printf("sweep load %d: cases %d inhibits %d faults %d ref_lost %d parks %d min budget %d max exposure %.1f first stop case %d at %d\n",
+                  load, st.cases, st.inhibits, st.faults, st.ref_lost ? 1 : 0, st.parks, st.min_budget, st.max_exposure, st.worst_case,
+                  st.worst_pos);
+    }
+    CHECK(st.inhibits == 0 && st.faults == 0 && !st.ref_lost && st.cases == 34);
+  }
+}
+
+// 実機 17d0282 の再現: 中立（0）から上の端の 1350 手前（機械端 2750 − 1350 = 1400）へ 1200 / 6000 で段、重力 3 / 6 %、落ち着いて駐車。停止しない
+inline void test_r10_step_to_upper_mid_settle_and_park() {
+  for (int load : {30, 60}) {
+    Harness h;
+    r10_active(h, 0, 400, 30, 20, true, true, true);
+    h.pwm_count_s_per_permille = 10.0;
+    h.plant_tau_s = 0.06;
+    h.pwm_deadband_permille = 25;
+    h.pwm_deadband_subtract = true;
+    h.load_permille = load;
+    h.pos_max_vel = 1200;
+    h.pos_max_acc = 6000;
+    drive_count_nonzero(h, 3000, 0);
+    bool inhib = false;
+    double max_exp = 0.0;
+    for (int i = 0; i < 600 && !inhib; ++i) {
+      h.set_position(1400);
+      h.idle(10);
+      inhib = h.ax.supervisor_inhibited();
+      max_exp = std::max(max_exp, h.ax.supervisor().exposure(1));
+    }
+    if (std::getenv("R10_PRINT")) std::printf("step to upper mid load %d: inhibited %d ref %d parked %d actual %d max up exposure %.1f\n", load, inhib ? 1 : 0, h.ax.referenced() ? 1 : 0, h.ax.brake_parked() ? 1 : 0, h.ax.actual_count(), max_exp);
+    CHECK(!inhib && h.ax.referenced() && h.ax.brake_parked() && std::abs(h.ax.actual_count() - 1400) <= 6);
+  }
 }
 
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
@@ -1871,6 +2019,8 @@ inline void run_all() {
   test_r10_slow_final_approach_near_end_not_charged();
   test_r10_frozen_feedback_repeated_short_sessions();
   test_r10_frozen_feedback_park_cycles_do_not_renew();
+  test_r10_step_to_upper_mid_settle_and_park();
+  test_r10_systematic_sweep_whole_stroke();
   test_r10_status_flags_bits();
 }
 

@@ -120,6 +120,9 @@ class V1Supervisor {
     bool park_ok = false;         // 目標の近くで静止して落ち着いている（期限の露出が半分に届いたら駐車を求める）
     bool deadline_hold = false;   // 駐車から戻りかけ（ブレーキ解除待ち、参照は止めている）: 動かないのが正しいので露出を積まず期限も見ない
     bool deadline_defer = false;  // ARMING のブレーキ解除待ち・駐車の入りかけ: 露出は積むが、止めるのは余裕 + arm_grace まで待つ
+    bool park_fallback = false;   // 参照が止まっていて駐車できる（ACTIVE / HOLDING・ブレーキ解除中）: 予算・期限が尽きたら停止ではなく駐車
+    bool deadline_engaging = false;  // 駐車の入りかけ（ブレーキ指令済み、まだ掴んでいない）: 露出は積むが期限では止めない
+    bool park_transition = false;    // 駐車の入りかけ・戻りかけ: 出力は駐車に入ったときの保持出力そのもの（それで保てていた）なので予算に積まない
   };
 
   V1SupTuning t;
@@ -152,6 +155,7 @@ class V1Supervisor {
     last_charge_ = 0;
     i_verified_ = 0.0;  // bias も DISARM などで捨てられる
     cert_pending_ = false;
+    cert_active_ = false;
     any_win_ = false;
     have_last_us_ = false;
     ren_dir_ = 0;
@@ -238,15 +242,21 @@ class V1Supervisor {
                                    : (ren_ext_ > ren_ext_prev_ ? ren_ext_ : ren_ext_prev_);
       if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) renew(c, d);
     }
-    // P1c: 保持出力の認定。確かな動きの後、位置が ±1 の中に certify_ms 留まった（保てている）ら、そのときの bias を学んだ保持出力にする
-    if (cert_pending_) {
+    // P1c: 保持出力の認定。確かな動きの後、落ち着いて（|誤差| ≤ 6・|実測速度| ≤ 10・位置 ±1）certify_ms 保てたら、そのとき実際に
+    // 出していた出力を学んだ保持出力にする。落ち着いている間は更新し続ける（ブレーキ解除中だけ。駐車中の 0 は認定しない）
+    if (cert_pending_ || cert_active_) {
       const int64_t dv = c.raw - cert_raw_;
-      if (dv > 1 || dv < -1) {
-        cert_raw_ = c.raw;  // まだ動いている（2 count 未満の動きの途中）: 取り直す
+      const double v_abs = c.vel < 0.0 ? -c.vel : c.vel;
+      const int64_t e_abs = c.err < 0 ? -c.err : c.err;
+      // |誤差| は保持の帯の外（静止摩擦で目標の数 count 手前に止まる）まで許す（目標の近く = 6 以内）。肝心なのは位置が ±1 の中で動かないこと
+      const bool settled = dv <= 1 && dv >= -1 && e_abs <= 6 && v_abs <= 10.0 && c.brake_released && !c.deadline_hold;
+      if (!settled) {
+        cert_raw_ = c.raw;  // まだ動いている・目標から離れている: 取り直す
         cert_start_us_ = c.now_us;
       } else if (c.now_us - cert_start_us_ >= ms(t.certify_ms)) {
-        i_verified_ = c.i_pm;
+        i_verified_ = static_cast<double>(last_out_);
         cert_pending_ = false;
+        cert_active_ = true;
       }
     }
     // P0: 期限（先読みは最悪の tick 間隔ぶん）。目標の近くで静止して落ち着いていれば余裕の半分で駐車を求める（ブレーキが保つ）。
@@ -378,7 +388,17 @@ class V1Supervisor {
           const int mag = out < 0 ? -out : out;
           const bool away = out != 0 && (out > 0) != (dd > 0) && mag > t.hold_allow_trim_permille;
           if (away) continue;
+          // 予算に積まれる駆動（保持出力の扱いの外の出力。制動も）は予算が見る（期限は保持・受け身の分を見る）。実機 17d0282 の系統的な
+          // 回帰: 下の止まる所の近くで長く保持した後、参照が下へ少し動いただけで期限で止めていた
+          const int chg = guard ? out : charge_of(out, c);
+          if (chg != 0 && (chg > 0) == (out > 0)) continue;
+          if (c.deadline_engaging) continue;  // ブレーキはもう指令している
           if (c.deadline_defer && !dl_over_grace_[k]) continue;
+          if (c.park_fallback) {
+            // 参照が止まっている: 停止（基準を消す）ではなくブレーキで駐車（実機 17d0282: 端から 1350 の位置で落ち着く前に期限に届いた）
+            park_fallback_ = true;
+            break;
+          }
           feedback_uncertain_ = true;
           deadline_tripped_ = true;
           ++strikes_;
@@ -402,8 +422,12 @@ class V1Supervisor {
         if (env_ep_[idx(d)] + proj > static_cast<double>(t.budget_max_count) + eps ||
             env_cum_[idx(d)] + proj > static_cast<double>(position_limit(d, c)) + eps) {
           const int mag = out < 0 ? -out : out;
-          if (!guard && mag <= t.hold_allow_trim_permille) {
-            // 実機 12712ac（FAIL 2）: 尽きた向きへの小さな出力（≤ 4 %、整定・保持の補正）は 0 にするだけで停止しない。
+          if (!guard && c.park_fallback) {
+            // 参照が止まっている: 停止ではなくブレーキで駐車（V1Axis が入りかけに入る。直前の出力を掴むまで保つので、重力に対する
+            // 保持出力を落として沈むことは無い。実機 17d0282・系統的な回帰）
+            park_fallback_ = true;
+          } else if (!guard && mag <= t.hold_allow_trim_permille) {
+            // 実機 12712ac（FAIL 2）: 参照が動いている間、尽きた向きへの小さな出力（≤ 4 %）は 0 にするだけで停止しない。
             // 反対向き（端から離れる向き）の予算とは独立に動ける。大きな出力（駆動）なら従来どおり停止
             out = 0;
           } else {
@@ -454,6 +478,12 @@ class V1Supervisor {
     sat_running_ = false;
     braking_ = false;
   }
+  // 予算・期限が尽きたが参照が止まっているので、停止ではなく駐車を求める（V1Axis が入りかけに入る）。読んだら消える
+  bool take_park_fallback() {
+    const bool r = park_fallback_;
+    park_fallback_ = false;
+    return r;
+  }
   bool take_reference_lost() {
     const bool r = reference_lost_;
     reference_lost_ = false;
@@ -503,10 +533,12 @@ class V1Supervisor {
   bool deadline_tripped_ = false;
   bool reference_lost_ = false;
   bool park_request_ = false;
+  bool park_fallback_ = false;
   bool fresh_window_ = false;      // 駐車から戻った後、確かな動きが出るまで（期限の上限を残りの予算に抑える）
   bool dl_over_[2] = {false, false};        // 期限: 露出が余裕の全部に届いた（[0] = 上、[1] = 下）
   bool dl_over_grace_[2] = {false, false};  // 同、余裕 + arm_grace も超えた
   bool cert_pending_ = false;      // P1c: 保持出力の認定待ち
+  bool cert_active_ = false;       // 認定した後、落ち着いている間は更新し続ける
   uint64_t cert_start_us_ = 0;
   int64_t cert_raw_ = 0;
   double env_ep_[2] = {0.0, 0.0};   // [0] = 上（カウント増）、[1] = 下
@@ -596,7 +628,8 @@ class V1Supervisor {
   // 出力 out のうち包絡線に積む分（符号は out と同じ）。目標の近くで静止中は、学んだ保持出力の向きに |i_verified| + trim、
   // 逆向きに trim までを引く
   int charge_of(int out, const Ctx& c) const {
-    if (out == 0 || !c.stationary_near) return out;
+    if (out == 0 || c.park_transition) return 0;  // 駐車の入りかけ・戻りかけの保持出力は積まない（期限の露出は入りかけで積む）
+    if (!c.stationary_near) return out;
     const int od = out > 0 ? 1 : -1;
     const int vd = i_verified_ > 0.0 ? 1 : (i_verified_ < 0.0 ? -1 : 0);
     double allow = static_cast<double>(t.hold_allow_trim_permille);

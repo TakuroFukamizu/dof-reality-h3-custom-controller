@@ -1735,8 +1735,18 @@ class V1Axis {
       c.stationary_near = tuning.hold_learn;
       c.deadline_hold = true;
     }
-    // ARMING のブレーキ解除待ち・駐車の入りかけ: 露出は積むが、止めるのは余裕 + arm_grace まで待つ（落ち着けば駐車に入る）
-    c.deadline_defer = state_ == v1::state::ARMING || park_ == ParkPhase::Engaging;
+    // ARMING のブレーキ解除待ち: 露出は積むが、止めるのは余裕 + arm_grace まで待つ（落ち着けば駐車に入る）。駐車の入りかけはブレーキを
+    // もう指令しているので期限では止めない（掴めば露出は止まる）
+    c.deadline_defer = state_ == v1::state::ARMING;
+    c.deadline_engaging = park_ == ParkPhase::Engaging;
+    // 駐車の入りかけ・戻りかけの出力は、駐車に入ったときに実際に出していた保持出力（それで保てていた）: 予算に積まない（実機 17d0282 の
+    // 系統的な回帰: 上の止まる所で駐車・戻りを繰り返すうちに上の回の予算が尽き、戻りかけの保持出力で停止していた）
+    c.park_transition = park_ == ParkPhase::Engaging || park_ == ParkPhase::Releasing;
+    // 参照が止まっていれば（|参照速度| ≤ 30・ACTIVE / HOLDING・ブレーキ解除中・駐車の処理の外）、予算・期限が尽きても停止ではなく駐車する
+    //（実機 17d0282・系統的な回帰: 端の近くや中ほどで、落ち着く前に期限・予算に届いて基準を消していた。参照が止まっているならブレーキで
+    // 保つのが安全で、目標が動けば自動で戻る。参照が動いている間に尽きたら従来どおり停止）
+    c.park_fallback = parking_enabled() && park_ == ParkPhase::None && brake_release_cmd_ && sv_abs <= static_cast<double>(tuning.park_ref_vel_count_s) &&
+                      (state_ == v1::state::ACTIVE || state_ == v1::state::HOLDING);
     return c;
   }
 
@@ -2057,6 +2067,12 @@ class V1Axis {
       sup_.t = tuning.sup;
       cmd = sup_.filter(sup_ctx(now), cmd);
       if (sup_.take_reference_lost()) referenced_ = false;  // P0: 駐車できないまま期限の露出が余裕の全部に届いた → 基準を消す
+      if (sup_.take_park_fallback() && parking_enabled() && park_ == ParkPhase::None) {
+        // 予算・期限が尽きたが参照が止まっている: 停止ではなく駐車（直前の出力を保ってブレーキが掴むまで待つ）
+        enter_park(now);
+        apply_park_output(park_hold_out_, V1DutyMode::HOLD);
+        return;
+      }
       if (sup_.inhibited()) {
         // 持続する停止（PR #48 の Codex 事前レビュー P0）: PWM 0 ＋ ブレーキ作動（G13 を作動側へ）。主電源は保つ（powered_state のまま）。
         // 制御器の状態（積分・動き出しパルス・補助）も捨てる（再開は DISARMED → ARM_PREPARE の通常の手順で、目標は現在位置から）
