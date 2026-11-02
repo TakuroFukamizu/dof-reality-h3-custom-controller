@@ -223,6 +223,15 @@ constexpr int V1_BREAKAWAY_MAX_PULSES = 5;         // 進まないまま打て�
 constexpr int32_t V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S = 0;
 constexpr int32_t V1_BREAKAWAY_MOVING_MAX_VEL_COUNT_S = 10;
 constexpr uint32_t V1_BREAKAWAY_MOVING_WINDOW_MS = 200;
+// r8（Issue #25、Codex 案 d）: 軌道速度がこの帯の間は「引っかかった時だけ短く押す」。100 ms 向きへ 1 count も進まず |誤差| が
+// 増えていれば上 90 / 下 60 permille を最初の 1 count か 50 ms まで、その後 200 ms は押さない（回数の上限は V1_BREAKAWAY_MAX_PULSES）。
+// 実機 11-02: 50〜150 count/s の速度ムラが r3 の 1.3〜1.9 倍（静止摩擦 ≈ 9 % と動摩擦 ≈ 5 % の差）。HI = 0 で無効。
+constexpr int32_t V1_BREAKAWAY_BAND_LO_COUNT_S = 50;
+constexpr int32_t V1_BREAKAWAY_BAND_HI_COUNT_S = 150;
+constexpr uint32_t V1_BREAKAWAY_BAND_WINDOW_MS = 100;
+constexpr uint32_t V1_BREAKAWAY_BAND_PULSE_MS = 50;
+constexpr uint32_t V1_BREAKAWAY_BAND_COOLDOWN_MS = 200;
+constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）

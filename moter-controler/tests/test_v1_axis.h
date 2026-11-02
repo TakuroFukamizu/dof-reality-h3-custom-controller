@@ -3919,6 +3919,73 @@ inline void test_r7_stationary_error_3_gets_breakaway_and_watchdog() {
   CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - t0 <= 2300 * MS);
 }
 
+// r8: 軌道速度 50〜150 count/s の帯では「引っかかった時だけ短く押す」。
+// (A) 100 count/s で軸が止まったまま → 100 ms の窓の後に 50 ms のパルス、その後 200 ms は押さない（次は ~350 ms 後）。
+// (B) 1 count 進めばパルスは次の tick で終わり、休みに入る。(C) 普通に付いてきている（10 ms に 1 count）なら押さない。
+inline void test_r8_band_stuck_assist_short_pulses_with_cooldown() {
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  auto active = [&](Harness& h) {
+    h.ax.tuning = r6_tuning(30);
+    Harness::accepted(h.config_with(c));
+    h.reach_holding_from_configured();
+    h.set_position(h.ax.actual_count());
+    Harness::accepted(h.start());
+    h.pos_max_vel = 100;
+  };
+  // (A)
+  Harness a;
+  active(a);
+  a.ax.tuning.kp_percent_per_100 = 10;  // kp 30 では止まったまま約 0.5 s で P が 15 % を超え無パルス保護が先に働く（それは正しい）
+  a.stall = true;
+  const int32_t sa = a.ax.actual_count();
+  int onsets = 0, run = 0, max_run = 0;
+  bool prev = false;
+  std::vector<uint64_t> onset_t;
+  const uint64_t t0 = a.now;
+  for (int i = 0; i < 80; ++i) {  // 0.8 s
+    a.drive(10, sa + 2000);
+    const bool brk = a.ax.duty_terms().mode == V1DutyMode::BRK;
+    if (brk && !prev) { ++onsets; onset_t.push_back(a.now - t0); run = 0; }
+    if (brk) { ++run; if (run > max_run) max_run = run; }
+    prev = brk;
+  }
+  CHECK(a.ax.state() == st::ACTIVE);
+  CHECK(onsets >= 2 && onsets <= 4);
+  CHECK(max_run <= 6);  // 50 ms（10 ms 刻みの観測で 5〜6）
+  CHECK(onset_t.size() >= 2 && onset_t[0] >= 100 * MS && onset_t[0] <= 200 * MS);
+  CHECK(onset_t.size() >= 2 && onset_t[1] - onset_t[0] >= 330 * MS && onset_t[1] - onset_t[0] <= 400 * MS);
+  // (B)
+  Harness b;
+  active(b);
+  b.stall = true;
+  const int32_t sb = b.ax.actual_count();
+  for (int i = 0; i < 30 && b.ax.duty_terms().mode != V1DutyMode::BRK; ++i) b.drive(10, sb + 2000);
+  CHECK(b.ax.duty_terms().mode == V1DutyMode::BRK && b.ax.duty_permille() <= -90);
+  b.raw += 1;  // 上へ 1 count
+  b.drive(10, sb + 2000);
+  CHECK(b.ax.duty_terms().mode != V1DutyMode::BRK && b.ax.breakaway_pulses() == 0);
+  bool brk_in_cooldown = false;
+  for (int i = 0; i < 18; ++i) {  // 休み 200 ms の間（止まったままでも）押さない
+    b.drive(10, sb + 2000);
+    if (b.ax.duty_terms().mode == V1DutyMode::BRK) brk_in_cooldown = true;
+  }
+  CHECK(!brk_in_cooldown);
+  // (C)
+  Harness d;
+  active(d);
+  d.stall = true;
+  const int32_t sd = d.ax.actual_count();
+  bool any_brk = false;
+  d.drive(50, sd + 2000);  // 5 count ほど遅れる（> 2）
+  for (int i = 0; i < 100; ++i) {
+    d.raw += 1;  // 10 ms に 1 count = 100 count/s で付いていく
+    d.drive(10, sd + 2000);
+    if (d.ax.duty_terms().mode == V1DutyMode::BRK) any_brk = true;
+  }
+  CHECK(!any_brk && d.ax.state() == st::ACTIVE);
+}
+
 // SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
 inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
   V1Tuning a = r6_tuning(6, 20);
@@ -4035,6 +4102,7 @@ inline void run_all() {
   test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall();
   test_r6_stall_watchdog_ignores_motion_away_from_target();
   test_r7_stationary_error_3_gets_breakaway_and_watchdog();
+  test_r8_band_stuck_assist_short_pulses_with_cooldown();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

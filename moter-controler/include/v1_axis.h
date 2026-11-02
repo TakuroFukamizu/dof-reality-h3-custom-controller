@@ -79,6 +79,12 @@ struct V1Tuning {
   int32_t breakaway_moving_min_traj_count_s = V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S;  // 走行中に打つ条件（Codex P1）
   int32_t breakaway_moving_max_vel_count_s = V1_BREAKAWAY_MOVING_MAX_VEL_COUNT_S;
   uint32_t breakaway_moving_window_ms = V1_BREAKAWAY_MOVING_WINDOW_MS;
+  int32_t breakaway_band_lo_count_s = V1_BREAKAWAY_BAND_LO_COUNT_S;   // r8: 引っかかった時だけ短く押す帯（hi 0 で無効）
+  int32_t breakaway_band_hi_count_s = V1_BREAKAWAY_BAND_HI_COUNT_S;
+  uint32_t breakaway_band_window_ms = V1_BREAKAWAY_BAND_WINDOW_MS;
+  uint32_t breakaway_band_pulse_ms = V1_BREAKAWAY_BAND_PULSE_MS;
+  uint32_t breakaway_band_cooldown_ms = V1_BREAKAWAY_BAND_COOLDOWN_MS;
+  int32_t breakaway_band_min_move = V1_BREAKAWAY_BAND_MIN_MOVE;
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
@@ -702,7 +708,8 @@ class V1Axis {
   int brk_pulses_ = 0;               // 進まないまま打ったパルスの数
   uint64_t brk_phase_start_us_ = 0;  // 窓／パルスの開始
   int64_t brk_anchor_raw_ = 0;       // 窓／パルスの開始時のカウント
-  bool brk_moving_ = false;          // 軌道が動いている要求（窓 breakaway_moving_window_ms、|誤差| の増加を要する）
+  int brk_mode_ = 0;                 // 0 = 静止目標、1 = 走行中（帯の外）、2 = 走行中で軌道速度が帯の中（r8）
+  uint64_t brk_cooldown_until_us_ = 0;  // 帯の中で押した後の休みの終わり（r8）
   int64_t brk_err_anchor_abs_ = 0;   // 窓の開始時の |誤差|（走行中: 増えていなければ打たない）
   uint64_t stall_start_us_ = 0;
   uint64_t stall_last_change_us_ = 0;
@@ -1621,8 +1628,9 @@ class V1Axis {
     brk_exhausted_ = false;
     brk_dir_ = 0;
     brk_pulses_ = 0;
-    brk_moving_ = false;
+    brk_mode_ = 0;
     brk_err_anchor_abs_ = 0;
+    brk_cooldown_until_us_ = 0;
   }
 
   // 動き出しパルス（Issue #25 r6。床の唯一の例外）。Duty を計算する前に呼ぶ。true ならこの tick は v1_duty_command が
@@ -1637,35 +1645,46 @@ class V1Axis {
     const int64_t err_abs = err < 0 ? -err : err;
     int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
     const bool traj_moving = setpoint_vel_ != 0.0;
+    const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+    // r8（Issue #25、Codex 案 d）: 軌道速度が帯 [band_lo, band_hi] の間は「引っかかった時だけ短く押す」モード。
+    // 実機の解析で 50〜150 count/s の速度ムラが r3 の 1.3〜1.9 倍（静止摩擦 ≈ 9 % と動摩擦 ≈ 5 % の差で引っかかっては P が溜まって
+    // 飛び出す）。帯の中では: 100 ms カウントが向きへ 1 も進まず |誤差| が増えていれば、上 90 / 下 60 を最初の 1 count か 50 ms まで。
+    // 押した後 200 ms は押さない。帯の外の走行中は r7 のまま（実測 |v| ≤ 10 が 200 ms・誤差増加）。
+    const bool band = traj_moving && tuning.breakaway_band_hi_count_s > 0 &&
+                      traj_abs >= static_cast<double>(tuning.breakaway_band_lo_count_s) &&
+                      traj_abs <= static_cast<double>(tuning.breakaway_band_hi_count_s);
+    const int mode = band ? 2 : (traj_moving ? 1 : 0);
     if (traj_moving) {
       const int traj_dir = setpoint_vel_ > 0.0 ? 1 : -1;
       if (traj_dir != dir) dir = 0;  // 軌道より先行: 対象外
       // 走行中（PR #33 Codex P1）: 軌道が速い（≥ moving_min_traj）のに軸が止まっている（実測 |v| ≤ moving_max_vel）ときだけ対象。
       // 遅い軌道に普通に遅れている（30 count/s ≈ 3 count/100 ms）だけでは打たない。実測速度は 100 ms 窓（最長 100 ms 古い）。
-      const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
       const int32_t v_abs = velocity_ < 0 ? -velocity_ : velocity_;
-      if (traj_abs < static_cast<double>(tuning.breakaway_moving_min_traj_count_s) ||
-          v_abs > tuning.breakaway_moving_max_vel_count_s) {
+      if (!band && (traj_abs < static_cast<double>(tuning.breakaway_moving_min_traj_count_s) ||
+                    v_abs > tuning.breakaway_moving_max_vel_count_s)) {
         dir = 0;
       }
     }
     // r7: 静止目標で保持に入っていなければ |誤差| > hold_enter から対象（r6 は > hold_exit で、2 < |誤差| ≤ 4 に P ＋ I が
-    // 流れたまま止まる帯があった）。走行中は > hold_exit のまま
-    const int64_t thresh = traj_moving ? tuning.hold_exit : tuning.hold_enter;
+    // 流れたまま止まる帯があった）。帯の走行中も > hold_enter（r8）。帯の外の走行中は > hold_exit のまま
+    const int64_t thresh = mode == 1 ? tuning.hold_exit : tuning.hold_enter;
     const bool demand = dir != 0 && err_abs > thresh && brake_release_cmd_ && !duty_state_.in_band;
     if (!demand) { reset_breakaway(); return false; }
-    if (!brk_running_ || dir != brk_dir_ || traj_moving != brk_moving_) {
+    if (!brk_running_ || dir != brk_dir_ || mode != brk_mode_) {
       reset_breakaway();
       brk_running_ = true;
       brk_dir_ = dir;
-      brk_moving_ = traj_moving;
+      brk_mode_ = mode;
       brk_phase_start_us_ = now;
       brk_anchor_raw_ = raw_;
       brk_err_anchor_abs_ = err_abs;
       return false;
     }
+    const int32_t min_move = band ? tuning.breakaway_band_min_move : tuning.breakaway_min_move;
+    const uint32_t pulse_ms = band ? tuning.breakaway_band_pulse_ms : tuning.breakaway_pulse_ms;
     const int64_t progress = static_cast<int64_t>(dir) * (raw_ - brk_anchor_raw_);
-    if (progress >= tuning.breakaway_min_move) {
+    if (progress >= min_move) {
+      if (band && brk_active_) brk_cooldown_until_us_ = now + ms_to_us(tuning.breakaway_band_cooldown_ms);
       brk_active_ = false;  // 進んだ: 窓を取り直し、数も戻す
       brk_exhausted_ = false;
       brk_pulses_ = 0;
@@ -1675,12 +1694,19 @@ class V1Axis {
       return false;
     }
     if (brk_exhausted_) return false;
+    if (band && !brk_active_ && now < brk_cooldown_until_us_) {
+      brk_phase_start_us_ = now;  // 押した直後の休み: 窓は休みが明けてから数え始める
+      brk_anchor_raw_ = raw_;
+      brk_err_anchor_abs_ = err_abs;
+      return false;
+    }
     const uint64_t elapsed = now - brk_phase_start_us_;
     if (brk_active_) {
-      if (elapsed >= ms_to_us(tuning.breakaway_pulse_ms)) {
+      if (elapsed >= ms_to_us(pulse_ms)) {
         brk_active_ = false;  // 進まずに終わった
         ++brk_pulses_;
         if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
+        if (band) brk_cooldown_until_us_ = now + ms_to_us(tuning.breakaway_band_cooldown_ms);
         brk_phase_start_us_ = now;
         brk_anchor_raw_ = raw_;
         brk_err_anchor_abs_ = err_abs;
@@ -1688,7 +1714,8 @@ class V1Axis {
       }
       return true;
     }
-    const uint32_t window_ms = traj_moving ? tuning.breakaway_moving_window_ms : tuning.breakaway_window_ms;
+    const uint32_t window_ms = mode == 2 ? tuning.breakaway_band_window_ms
+                                         : (mode == 1 ? tuning.breakaway_moving_window_ms : tuning.breakaway_window_ms);
     if (elapsed >= ms_to_us(window_ms)) {
       if (traj_moving && err_abs <= brk_err_anchor_abs_) {
         brk_phase_start_us_ = now;  // 走行中で |誤差| が増えていない: 打たずに窓を取り直す
