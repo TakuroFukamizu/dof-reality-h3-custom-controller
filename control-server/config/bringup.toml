@@ -118,9 +118,9 @@ name = "右手前リフト (motor #1)"
 #   3. 座席に人がいない。物理非常停止（24V の遮断）を押せる人がいる
 #   向き（仮想 0→1023 が上か下か）は §7 で低ゲインで確認する。逆なら count_at_virtual_0 と 1023 の値を入れ替えて再起動
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
-count_at_virtual_0 = 200        # soft_min + 150（位置制御の行き過ぎ。gain 1.0・加速度 39500・Duty 60 % で約 80 count 行き過ぎた 2026-11-01）
+count_at_virtual_0 = 400        # soft_min + 350（2026-11-02: r3・kp 6・600 count/s で下端へ向かい、最下端の目標 200 から 48 まで 152 count 以上行き過ぎて SOFT_LIMIT。Issue #34。11-01 は約 80 count）
 count_at_virtual_512 = 2775     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
-count_at_virtual_1023 = 5351    # soft_max − 150
+count_at_virtual_1023 = 5151    # soft_max − 350
 mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
 mechanical_max_count = 5551     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
 soft_min_count = 50             # mechanical_min + decel_zone
@@ -136,9 +136,9 @@ device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体�
 name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
-count_at_virtual_0 = 200        # soft_min + 150（位置制御の行き過ぎ。gain 1.0・加速度 39500・Duty 60 % で約 80 count 行き過ぎた 2026-11-01）
+count_at_virtual_0 = 400        # soft_min + 350（2026-11-02: r3・kp 6・600 count/s で下端へ向かい、最下端の目標 200 から 48 まで 152 count 以上行き過ぎて SOFT_LIMIT。Issue #34。11-01 は約 80 count）
 count_at_virtual_512 = 2731     # = stroke / 2
-count_at_virtual_1023 = 5262    # soft_max − 150
+count_at_virtual_1023 = 5062    # soft_max − 350
 mechanical_min_count = 0
 mechanical_max_count = 5462
 soft_min_count = 50             # mechanical_min + decel_zone
@@ -156,9 +156,9 @@ device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体�
 name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = false  # true にする前に hardware-bringup.md §5 の確認
-count_at_virtual_0 = 200        # soft_min + 150（位置制御の行き過ぎ。gain 1.0・加速度 39500・Duty 60 % で約 80 count 行き過ぎた 2026-11-01）
+count_at_virtual_0 = 400        # soft_min + 350（2026-11-02: r3・kp 6・600 count/s で下端へ向かい、最下端の目標 200 から 48 まで 152 count 以上行き過ぎて SOFT_LIMIT。Issue #34。11-01 は約 80 count）
 count_at_virtual_512 = 3069     # = stroke / 2（2026-10-31 の校正 6138 / 3069。10-26 は 6159 / 3079）
-count_at_virtual_1023 = 5938    # soft_max − 150
+count_at_virtual_1023 = 5738    # soft_max − 350
 mechanical_min_count = 0
 mechanical_max_count = 6138     # 2026-10-31 の CAL。校正ごとに ±20 程度ぶれる
 soft_min_count = 50             # mechanical_min + decel_zone
