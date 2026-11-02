@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -3652,6 +3653,7 @@ inline void test_r6_axis_hold_requires_dwell_and_holds_to_4() {
 inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -3689,6 +3691,7 @@ inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
 inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   Harness h;
   h.ax.tuning = r6_tuning(2);
+  h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
   Harness::accepted(h.config_with(c));
@@ -4007,6 +4010,377 @@ inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
   CHECK(v1_duty_command(0, 600.0, sa, a, 0, nullptr, 0.0, false) == 106 && v1_duty_command(0, 600.0, sb, b, 0, nullptr, 0.0, false) == 50);
 }
 
+// ---- Issue #35 r9: 速度誤差の減衰項（config.h V1_VEL_DAMPING）。40 ms 窓の速い速度推定 v_fast、u_d = clamp(Kd × (v_traj − v_fast), ±10) ----
+// ホストテストは -DV1_VEL_DAMPING=0 で組む（run_tests.sh。既存の r6〜r8 のテストは r8 と同じ出力で検証する）。r9 は kd を明示的に入れて検証する。
+
+inline V1Tuning r9_tuning(int kp = 30, int duty_max = 20) {
+  V1Tuning t = r6_tuning(kp, duty_max);
+  t.vel_kd_permille_per_count_s = V1_VEL_KD_PERMILLE_PER_COUNT_S;
+  return t;
+}
+
+// 既定値とコンパイルスイッチの配線。従来の経路（V1Tuning(false)）では kd は常に 0。
+inline void test_r9_tuning_defaults_and_switch() {
+  CHECK(fabs(V1_VEL_KD_PERMILLE_PER_COUNT_S - 0.05) < 1e-12 && V1_VEL_D_MAX_PERMILLE == 10 && V1_V_FAST_WINDOW_MS == 40);
+  CHECK(fabs(V1Tuning(true).vel_kd_permille_per_count_s - (V1_VEL_DAMPING ? 0.05 : 0.0)) < 1e-12);  // テストは 0 で組む
+  CHECK(V1Tuning(false).vel_kd_permille_per_count_s == 0.0);
+  CHECK(V1Tuning(true).vel_d_max_permille == 10 && V1Tuning(true).v_fast_window_ms == 40);
+  const V1Tuning t = r9_tuning();
+  CHECK(t.ff_directional && t.kp_percent_per_100 == 30 && fabs(t.vel_kd_permille_per_count_s - 0.05) < 1e-12);
+}
+
+// u_d の符号と上限（直接呼ぶ。誤差 0・I 0 なので出力 = FF + u_d）。上り 100 count/s の FF = 46 + 10 = 56。
+inline void test_r9_damping_term_sign_and_clamp() {
+  const V1Tuning t = r9_tuning();
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, 100.0) == 56 && o.d_permille == 0);  // 速度どおり
+  CHECK(o.v_fast_valid && o.v_fast_count_s == 100 && o.mode == V1DutyMode::MOVE);
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, 50.0) == 59 && o.d_permille == 3);    // 遅い: +2.5 → 58.5 → 59
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, 150.0) == 54 && o.d_permille == -3);  // 速い: −2.5 → 53.5 → 54
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, 75.0) == 57);   // 量子化 25 count/s ぶん = 1.25 permille
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, -200.0) == 66 && o.d_permille == 10);  // +15 → 上限 +10
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, true, 400.0) == 46 && o.d_permille == -10);  // −15 → 下限 −10
+  // 下り: FF = −7 − 10.7 = −17.7。v_fast −50（遅い）→ u_d = 0.05 × (−100 + 50) = −2.5 → −20.2 → −20
+  CHECK(v1_duty_command(0, -100.0, st, t, 0, &o, 0.0, true, false, true, -50.0) == -20 && o.d_permille == -3);
+  CHECK(v1_duty_command(0, -100.0, st, t, 0, &o, 0.0, true, false, true, -150.0) == -15);  // 速すぎ: +2.5 → −15.2 → −15
+  // 静止目標の補正中（保持の外）も効く: 軌道 0 で +100 count/s で動いていれば −5（P の行き過ぎを抑える向き）
+  CHECK(v1_duty_command(0, 0.0, st, t, 0, &o, 0.0, false, false, true, 100.0) == -5 && o.d_permille == -5);
+  CHECK(v1_duty_command(10, 0.0, st, t, 0, &o, 0.0, false, false, true, 100.0) == 25);  // P 30 − 5
+  // 推定なし（has_v_fast = false）・kd 0・従来の経路では u_d は出ない
+  CHECK(v1_duty_command(0, 100.0, st, t, 0, &o, 0.0, true, false, false, -200.0) == 56 && o.d_permille == 0 && !o.v_fast_valid);
+  V1Tuning t0 = t;
+  t0.vel_kd_permille_per_count_s = 0.0;
+  CHECK(v1_duty_command(0, 100.0, st, t0, 0, &o, 0.0, true, false, true, -200.0) == 56 && o.d_permille == 0);
+  V1Tuning legacy(false);
+  legacy.vel_kd_permille_per_count_s = 0.05;
+  V1DutyState sl1, sl2;
+  CHECK(v1_duty_command(25, 300.0, sl1, legacy, 0, &o, 0.0, true, false, true, -500.0) ==
+        v1_duty_command(25, 300.0, sl2, legacy, 0, nullptr, 0.0, true, false, false, 0.0));
+  CHECK(o.d_permille == 0);
+  // 上限は調整値で変えられる
+  V1Tuning t5 = t;
+  t5.vel_d_max_permille = 5;
+  CHECK(v1_duty_command(0, 100.0, st, t5, 0, &o, 0.0, true, false, true, -200.0) == 61 && o.d_permille == 5);
+}
+
+// 保持（HOLD）の中では u_d を足さない: 出力 0 のまま（v_fast がいくら大きくても）。出れば次の tick から効く。
+inline void test_r9_damping_zero_in_hold() {
+  const V1Tuning t = r9_tuning();
+  V1DutyState st;
+  V1DutyTerms o;
+  CHECK(v1_duty_command(2, 0.0, st, t, 0, &o, 0.005, true, false, true, 300.0) == 0 && o.mode == V1DutyMode::HOLD);
+  CHECK(o.d_permille == 0 && o.in_band && st.i_pm == 0.0);
+  CHECK(v1_duty_command(4, 0.0, st, t, 0, &o, 0.005, false, false, true, -300.0) == 0 && o.d_permille == 0 && o.in_band);
+  CHECK(o.v_fast_valid && o.v_fast_count_s == -300);  // 計器として v_fast は見える
+  CHECK(v1_duty_command(5, 0.0, st, t, 0, &o, 0.005, false, false, true, -300.0) == 25 && o.mode == V1DutyMode::MOVE);  // P 15 + 10
+}
+
+// 飽和とアンチワインドアップは u_d 込みの合成で判定する。動き出しパルスの振る舞いは変えない。
+inline void test_r9_damping_saturation_and_breakaway_interplay() {
+  const V1Tuning t = r9_tuning();  // kp 30（誤差 1 = 3 permille）、duty_max 20
+  V1DutyTerms o;
+  // u_d が飽和から引き戻す: 誤差 50・上り 100 → P 150 + FF 56 = 206（u_d なしなら飽和で I を積まない）
+  V1DutyState sa;
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, 100.0, sa, t, 0, &o, 0.005, true, false, true, 100.0);
+  CHECK(o.cmd_permille == 200 && sa.i_pm == 0.0);
+  V1DutyState sb;  // v_fast 300（速すぎ）→ u_d −10 → 196: 飽和しないので I が積まれ、上限 200 で頭打ち
+  for (int i = 0; i < 200; ++i) v1_duty_command(50, 100.0, sb, t, 0, &o, 0.005, true, false, true, 300.0);
+  CHECK(o.d_permille == -10 && sb.i_pm > 0.0 && o.cmd_permille == 200);
+  // u_d が飽和へ押し込む: 誤差 45 → 135 + 56 = 191（飽和しない）→ v_fast −100（遅い）で u_d +10 → 201 → 200 で飽和、I は積まない
+  V1DutyState sc;
+  CHECK(v1_duty_command(45, 100.0, sc, t, 0, &o, 0.005, true, false, true, -100.0) == 200 && o.d_permille == 10);
+  CHECK(sc.i_pm == 0.0);
+  V1DutyState sd;  // u_d なしなら 191 で I が積まれる
+  CHECK(v1_duty_command(45, 100.0, sd, t, 0, &o, 0.005, true, false, true, 100.0) == 191 && sd.i_pm > 0.0);
+  // 下向きも同じ: 誤差 −60 → −180 − 17.7 = −197.7、v_fast 0（遅い）→ u_d −5 → −202.7 → −200
+  V1DutyState se;
+  CHECK(v1_duty_command(-60, -100.0, se, t, 0, &o, 0.005, true, false, true, 0.0) == -200 && se.i_pm == 0.0);
+  // 動き出しパルスは従来どおり: 誤差の向きに max(|合成|, 90 / 60)
+  V1DutyState sf;
+  CHECK(v1_duty_command(5, 0.0, sf, t, 0, &o, 0.005, true, true, true, -100.0) == 90 && o.mode == V1DutyMode::BRK);  // 15 + 5 < 90
+  CHECK(v1_duty_command(-5, 0.0, sf, t, 0, &o, 0.005, true, true, true, 100.0) == -60 && o.mode == V1DutyMode::BRK);
+  CHECK(sf.i_pm == 0.0);  // パルス中は凍結
+  CHECK(v1_duty_command(40, 0.0, sf, t, 0, &o, 0.0, true, true, true, -300.0) == 130);  // 合成 120 + 10 = 130 > 90 → 合成
+}
+
+// 軸を通した v_fast: 位置制御中（HOLDING）に生カウントを手で動かして推定値を見る。
+inline void r9_holding(Harness& h) {
+  h.ax.tuning = r9_tuning(2);
+  h.ax.tuning.overrun_ms = 1000;  // 時間の飛びのテストで CONTROL_OVERRUN にしない
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;  // プラントはテストが手で動かす
+}
+// 1 tick 進める（毎 tick SET_POSITION で lease を保つ。目標は動かさない）
+inline void r9_tick(Harness& h, int64_t draw, uint32_t dt_ms = 5) {
+  h.set_position(h.ax.target_count());
+  h.raw += draw;
+  h.step(dt_ms);
+}
+
+inline void test_r9_v_fast_constant_speed_and_quantization() {
+  // 一定速度: 5 ms に 1 count = 200 count/s → 40 ms 窓で 8 count / 0.040 s = 200 ちょうど
+  Harness h;
+  r9_holding(h);
+  for (int i = 0; i < 20; ++i) r9_tick(h, 1);
+  CHECK(h.ax.v_fast_valid() && fabs(h.ax.v_fast_count_s() - 200.0) < 1e-9);
+  CHECK(h.ax.duty_terms().v_fast_valid && h.ax.duty_terms().v_fast_count_s == 200);
+  // 下向き 5 ms に 2 count = −400
+  for (int i = 0; i < 10; ++i) r9_tick(h, -2);
+  CHECK(fabs(h.ax.v_fast_count_s() + 400.0) < 1e-9);
+  // 速度が変わったら 40 ms で追いつく（100 ms 窓より速い）: 止めて 35 ms ではまだ動きが残り、40 ms で 0
+  for (int i = 0; i < 7; ++i) r9_tick(h, 0);
+  CHECK(h.ax.v_fast_count_s() < 0.0);
+  r9_tick(h, 0);
+  CHECK(h.ax.v_fast_valid() && h.ax.v_fast_count_s() == 0.0);
+  // 量子化: 15 ms に 1 count（66.7 count/s）→ 40 ms 窓には 2 か 3 count → 50 か 75 だけ。平均は 66.7 に近い
+  Harness g;
+  r9_holding(g);
+  double sum = 0.0;
+  int n = 0;
+  bool only_steps = true;
+  for (int i = 0; i < 300; ++i) {  // 1.5 s（目標から離れ続けるので 2 s で静止の監視が ENCODER_FAULT にする。その前まで）
+    r9_tick(g, (i % 3) == 0 ? 1 : 0);
+    if (i >= 30) {
+      const double v = g.ax.v_fast_count_s();
+      if (fabs(v - 50.0) > 1e-9 && fabs(v - 75.0) > 1e-9) only_steps = false;
+      sum += v;
+      ++n;
+    }
+  }
+  CHECK(only_steps && g.ax.v_fast_valid() && g.ax.state() == st::HOLDING);
+  CHECK(fabs(sum / n - 200.0 / 3.0) < 1.0);
+}
+
+inline void test_r9_v_fast_gap_startup_and_reset() {
+  Harness h;
+  r9_holding(h);
+  for (int i = 0; i < 20; ++i) r9_tick(h, 1);
+  // 時間の飛び 60 ms（≤ 2 × 窓）: 実際の経過で割る。60 ms に 12 count → 200 count/s
+  r9_tick(h, 12, 60);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.v_fast_valid() && fabs(h.ax.v_fast_count_s() - 200.0) < 1e-9);
+  // 飛び 100 ms（> 2 × 窓）: 古いサンプルを捨てる → 推定なし（減衰項 0）。20 ms 分たまれば最も古いサンプルで割って戻る
+  r9_tick(h, 20, 100);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.v_fast_valid() && h.ax.v_fast_count_s() == 0.0);
+  CHECK(h.ax.duty_terms().d_permille == 0 && !h.ax.duty_terms().v_fast_valid);
+  for (int i = 0; i < 3; ++i) r9_tick(h, 1);  // 15 ms
+  CHECK(!h.ax.v_fast_valid());
+  r9_tick(h, 1);  // 20 ms: 4 count / 0.020 s
+  CHECK(h.ax.v_fast_valid() && fabs(h.ax.v_fast_count_s() - 200.0) < 1e-9);
+  for (int i = 0; i < 10; ++i) r9_tick(h, 1);
+  CHECK(fabs(h.ax.v_fast_count_s() - 200.0) < 1e-9);
+  // FAULT（積分と同じ契機）で捨てる。FAULT の間も推定なし
+  Harness::accepted(h.host_fault());
+  CHECK(h.ax.state() == st::FAULT && !h.ax.v_fast_valid() && h.ax.duty_terms().d_permille == 0);
+  h.raw += 5;
+  h.step();
+  CHECK(!h.ax.v_fast_valid());
+  // 位置制御の開始（ARMING のブレーキ解除）から: 最初の tick は推定なし、20 ms で戻る
+  Harness g;
+  g.ax.tuning = r9_tuning(2);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(g.config_with(c));
+  Harness::accepted(g.arm());
+  g.stall = true;
+  int ticks_on = 0;
+  bool first_invalid = false;
+  int valid_at = -1;
+  for (int i = 0; i < 200 && valid_at < 0; ++i) {
+    g.set_position(g.ax.target_count());
+    g.raw += 1;
+    g.step();
+    CHECK(g.ax.brake_release_cmd() || !g.ax.v_fast_valid());  // 位置制御の外では推定しない
+    if (g.ax.brake_release_cmd()) {
+      if (ticks_on == 0) first_invalid = !g.ax.v_fast_valid();
+      if (g.ax.v_fast_valid()) valid_at = ticks_on;
+      ++ticks_on;
+    }
+  }
+  CHECK(first_invalid && valid_at == 4);  // 5 サンプル目（20 ms 前のサンプルがある）
+  CHECK(fabs(g.ax.v_fast_count_s() - 200.0) < 1e-9);
+}
+
+// 軸を通して: 保持中は v_fast があっても出力 0。保護（FOLLOWING_ERROR・走行中の無パルス・静止 2 s の監視）は r8 と同じ判定で出る。
+inline void test_r9_axis_hold_zero_and_protections_unchanged() {
+  // 保持中に 1 count のちらつき（v_fast ±25）が来ても出力 0
+  Harness h;
+  r9_holding(h);
+  h.ax.tuning.overrun_ms = V1_OVERRUN_MS;
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD);
+  for (int i = 0; i < 40; ++i) {
+    r9_tick(h, (i % 2) == 0 ? 1 : -1);
+    CHECK(h.ax.duty_permille() == 0 && h.ax.duty_terms().d_permille == 0 && h.ax.duty_terms().mode == V1DutyMode::HOLD);
+  }
+  // 走行中に止まった軸（v_fast 0、軌道 600）: u_d +10 が足される。FOLLOWING_ERROR 400 は r8 と同じ時刻
+  auto stuck_run = [](double kd, uint64_t* fault_after_ms, uint16_t* code, int* d_seen) {
+    Harness g;
+    g.ax.tuning = r6_tuning(2, 40);
+    g.ax.tuning.vel_kd_permille_per_count_s = kd;
+    v1::Config c = base_config();
+    c.following_error_limit_count = 400;
+    Harness::accepted(g.config_with(c));
+    g.reach_holding_from_configured();
+    g.set_position(g.ax.actual_count());
+    Harness::accepted(g.start());
+    g.stall = true;
+    g.pos_max_vel = 600;
+    const int32_t s0 = g.ax.actual_count();
+    const uint64_t t0 = g.now;
+    *d_seen = 0;
+    for (int i = 0; i < 150 && g.ax.state() != st::FAULT; ++i) {
+      g.drive(10, s0 + 5000);
+      if (g.ax.duty_terms().d_permille > *d_seen) *d_seen = g.ax.duty_terms().d_permille;
+    }
+    *fault_after_ms = (g.now - t0) / MS;
+    *code = g.ax.fault_code();
+    CHECK(g.ax.duty_permille() == 0 && !g.ax.v_fast_valid());
+  };
+  uint64_t t_r8 = 0, t_r9 = 0;
+  uint16_t c_r8 = 0, c_r9 = 0;
+  int d_r8 = 0, d_r9 = 0;
+  stuck_run(0.0, &t_r8, &c_r8, &d_r8);
+  stuck_run(V1_VEL_KD_PERMILLE_PER_COUNT_S, &t_r9, &c_r9, &d_r9);
+  CHECK(c_r8 == fc::FOLLOWING_ERROR && c_r9 == fc::FOLLOWING_ERROR && t_r8 == t_r9 && t_r9 <= 1000);
+  CHECK(d_r8 == 0 && d_r9 == 10);
+  // 走行中の無パルス（kp 6 / duty_max 20 → しきい値 15 %）: r9 は u_d +10 のぶん早くしきい値に届くことがあるが、判定の窓 200 ms は同じ
+  auto stuck_enc = [](double kd, uint64_t* fault_after_ms, uint16_t* code) {
+    Harness g;
+    g.ax.tuning = r6_tuning(6);
+    g.ax.tuning.vel_kd_permille_per_count_s = kd;
+    v1::Config c = base_config();
+    c.following_error_limit_count = 100000;
+    Harness::accepted(g.config_with(c));
+    g.reach_holding_from_configured();
+    g.set_position(g.ax.actual_count());
+    Harness::accepted(g.start());
+    g.stall = true;
+    g.pos_max_vel = 600;
+    const int32_t s0 = g.ax.actual_count();
+    const uint64_t t0 = g.now;
+    for (int i = 0; i < 100 && g.ax.state() != st::FAULT; ++i) g.drive(10, s0 + 5000);
+    *fault_after_ms = (g.now - t0) / MS;
+    *code = g.ax.fault_code();
+  };
+  stuck_enc(0.0, &t_r8, &c_r8);
+  stuck_enc(V1_VEL_KD_PERMILLE_PER_COUNT_S, &t_r9, &c_r9);
+  CHECK(c_r8 == fc::ENCODER_FAULT && c_r9 == fc::ENCODER_FAULT && t_r9 <= t_r8 && t_r9 + 100 >= t_r8 && t_r8 <= 600);
+  // 静止 2 s の監視: 静止目標で誤差 10 のまま進まない → 2 s で ENCODER_FAULT（v_fast 0・軌道 0 なので u_d 0）
+  Harness k;
+  r9_holding(k);
+  k.ax.tuning.overrun_ms = V1_OVERRUN_MS;
+  k.raw -= 10;
+  k.step();
+  const uint64_t t0 = k.now;
+  k.drive(1900, k.ax.target_count());
+  CHECK(k.ax.state() == st::HOLDING);
+  k.drive(150, k.ax.target_count());
+  CHECK(k.ax.state() == st::FAULT && k.ax.fault_code() == fc::ENCODER_FAULT && k.now - t0 <= 2100 * MS);
+}
+
+// 遅れ・慣性のあるプラントで、減衰項が遅い区間の速度の波を減らす（決定的なシミュレーション）。
+// プラント: 出力（pwm_permille、カウント増が正）は 3 tick（15 ms）遅れて効き、定常速度は FF の逆（上り v = (u − a(x)) / 0.10、
+// 下り v = (u + 7) / 0.107、その間は 0）。a(x) = 46 + cog × sin(2π x / period) は位置で変わる摩擦（30 count 周期なら 100 count/s で
+// 3.3 Hz の外乱。cog 5 permille ≈ ±50 count/s で、実機の ±60 count/s の波と同じ桁）。速度は時定数 tau の一次遅れ。位置は小数で持ち、
+// ファームには切り捨てた整数カウントを渡す。kp 30、軌道 100 count/s の上り。P ループの共振（kp 30・遅れ 15 ms・tau 50 ms で約 3 Hz）を
+// 外乱が揺らすので、減衰が足りないと速度の波が大きくなる。実機の再現ではなく「減衰項が共振の山を下げる」ことの確認。
+struct R9PlantResult {
+  double vel_err_rms = 0.0;   // プラントの真の速度 − 軌道速度
+  double vfw_err_rms = 0.0;   // ファームの 100 ms 窓の速度 − 軌道速度（実機の指標 v_fw に相当）
+  double fe_rms = 0.0;        // 追従誤差
+  int d_max_abs = 0;          // |u_d| の最大
+  int reversals = 0;          // 真の速度の符号反転（上り一定の軌道なので 0 のはず）
+  bool active = false;
+};
+inline R9PlantResult r9_plant_run(double kd, double cog, double period, double tau_s) {
+  Harness h;
+  h.ax.tuning = r6_tuning(30);
+  h.ax.tuning.vel_kd_permille_per_count_s = kd;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.pos_max_vel = 100;
+  const double pi = 3.14159265358979323846;
+  const double dt = 0.005, tau = tau_s;
+  double pos = static_cast<double>(h.raw);
+  double v = 0.0;
+  int16_t delay[3] = {0, 0, 0};
+  const int32_t s0 = h.ax.actual_count();
+  R9PlantResult r;
+  double se = 0.0, sfw = 0.0, sfe = 0.0;
+  int n = 0;
+  int prev_sign = 0;
+  for (int i = 0; i < 800; ++i) {  // 4 s
+    if ((i % 2) == 0) h.set_position(s0 + 2000);
+    const int16_t u_now = h.ax.pwm_permille();
+    const double u = delay[0];
+    delay[0] = delay[1];
+    delay[1] = delay[2];
+    delay[2] = u_now;
+    const double a_up = 46.0 + cog * sin(2.0 * pi * pos / period);
+    double v_ss = 0.0;
+    if (u > a_up) {
+      v_ss = (u - a_up) / 0.10;
+    } else if (u < -7.0) {
+      v_ss = (u + 7.0) / 0.107;
+    }
+    v += (v_ss - v) * dt / tau;
+    pos += v * dt;
+    h.raw = static_cast<int64_t>(floor(pos));
+    h.step(5);
+    if (i >= 200) {  // 1 s 以降（加速と初期の過渡を除く）
+      const double sv = h.ax.duty_terms().vel_count_s;
+      se += (v - sv) * (v - sv);
+      const double vfw = static_cast<double>(h.ax.velocity_count_s());
+      sfw += (vfw - sv) * (vfw - sv);
+      const double fe = static_cast<double>(h.ax.following_error_count());
+      sfe += fe * fe;
+      ++n;
+      const int d = h.ax.duty_terms().d_permille;
+      if ((d < 0 ? -d : d) > r.d_max_abs) r.d_max_abs = d < 0 ? -d : d;
+      const int sg = v > 1.0 ? 1 : (v < -1.0 ? -1 : 0);
+      if (sg != 0) {
+        if (prev_sign != 0 && sg != prev_sign) ++r.reversals;
+        prev_sign = sg;
+      }
+    }
+  }
+  r.vel_err_rms = sqrt(se / n);
+  r.vfw_err_rms = sqrt(sfw / n);
+  r.fe_rms = sqrt(sfe / n);
+  r.active = h.ax.state() == st::ACTIVE && h.ax.duty_terms().vel_count_s == 100;
+  return r;
+}
+
+inline void test_r9_damping_reduces_velocity_ripple_in_delayed_plant() {
+  // 2 つの条件（摩擦の揺れ ±5 permille・30 count 周期・時定数 50 ms ／ ±8 permille・40 count 周期・時定数 80 ms）で比べる
+  struct Case { double cog, period, tau; };
+  for (const Case& k : {Case{5.0, 30.0, 0.050}, Case{8.0, 40.0, 0.080}}) {
+    const R9PlantResult r8 = r9_plant_run(0.0, k.cog, k.period, k.tau);
+    const R9PlantResult r9 = r9_plant_run(V1_VEL_KD_PERMILLE_PER_COUNT_S, k.cog, k.period, k.tau);
+    if (std::getenv("R9_PLANT_PRINT")) {
+      std::printf("r9 plant (cog %.0f / %.0f count / tau %.0f ms): r8 vel_err %.1f vfw_err %.1f fe %.2f rev %d / "
+                  "r9 vel_err %.1f vfw_err %.1f fe %.2f rev %d d_max %d\n",
+                  k.cog, k.period, k.tau * 1000.0, r8.vel_err_rms, r8.vfw_err_rms, r8.fe_rms, r8.reversals, r9.vel_err_rms,
+                  r9.vfw_err_rms, r9.fe_rms, r9.reversals, r9.d_max_abs);
+    }
+    CHECK(r8.active && r9.active);
+    CHECK(r8.vel_err_rms > 30.0);                       // 減衰なしでは波が立つ（テストの前提）
+    CHECK(r9.vel_err_rms < 0.75 * r8.vel_err_rms);      // 25 % 以上減る（Issue #35 の合格基準と同じ比）
+    CHECK(r9.vfw_err_rms < 0.75 * r8.vfw_err_rms);      // ファームの 100 ms 窓の速度（v_fw）で見ても
+    CHECK(r9.fe_rms <= r8.fe_rms * 1.10);               // 追従誤差は悪くしない
+    CHECK(r8.reversals == 0 && r9.reversals == 0);      // 軌道にない往復を増やさない
+    CHECK(r9.d_max_abs > 0 && r9.d_max_abs <= 10);
+  }
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -4103,6 +4477,14 @@ inline void run_all() {
   test_r6_stall_watchdog_ignores_motion_away_from_target();
   test_r7_stationary_error_3_gets_breakaway_and_watchdog();
   test_r8_band_stuck_assist_short_pulses_with_cooldown();
+  test_r9_tuning_defaults_and_switch();
+  test_r9_damping_term_sign_and_clamp();
+  test_r9_damping_zero_in_hold();
+  test_r9_damping_saturation_and_breakaway_interplay();
+  test_r9_v_fast_constant_speed_and_quantization();
+  test_r9_v_fast_gap_startup_and_reset();
+  test_r9_axis_hold_zero_and_protections_unchanged();
+  test_r9_damping_reduces_velocity_ripple_in_delayed_plant();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();
