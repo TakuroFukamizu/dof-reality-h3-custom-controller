@@ -3880,6 +3880,45 @@ inline void test_r6_stall_watchdog_ignores_motion_away_from_target() {
   CHECK(g.ax.state() == st::HOLDING && g.ax.fault_code() == 0);
 }
 
+// r7: 静止目標で |誤差| = 3（保持に入れず、r6 ではパルスも監視も対象外だった帯）→ 100 ms 後に動き出しパルス、進めば保持へ。
+// 進まなければ 5 回で打ち切り、2 s で ENCODER_FAULT（監視も > 2 から）。
+inline void test_r7_stationary_error_3_gets_breakaway_and_watchdog() {
+  Harness h;
+  h.ax.tuning = r6_tuning(6);
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 10;  // 誤差 +10 で保持から出る（保持中は |誤差| > 4 まで保持のまま: ヒステリシス）
+  h.step();
+  h.raw += 7;   // 誤差 +3 まで戻って止まる（r6 ではここで P ＋ I が流れたまま止まった）
+  h.step();
+  h.drive(90, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::MOVE && !h.ax.breakaway_active());
+  h.drive(20, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::BRK && h.ax.duty_permille() == -90);
+  h.raw += 3;  // 進んだ → 誤差 0
+  h.drive(10, h.ax.target_count());
+  CHECK(!h.ax.breakaway_active() && h.ax.breakaway_pulses() == 0);
+  h.drive(450, h.ax.target_count());
+  CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
+  Harness g;
+  g.ax.tuning = r6_tuning(6);
+  Harness::accepted(g.config_with(c));
+  g.reach_holding_from_configured();
+  g.stall = true;
+  g.raw -= 10;
+  g.step();
+  g.raw += 7;
+  g.step();
+  const uint64_t t0 = g.now;
+  g.drive(1900, g.ax.target_count());
+  CHECK(g.ax.state() == st::HOLDING && g.ax.breakaway_pulses() == 5);
+  g.drive(200, g.ax.target_count());
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - t0 <= 2300 * MS);
+}
+
 // SET_LIMITS は従来どおり受理・LIMITS で返す。r6 で効くのは kp と duty_max。ff / duty_min / deadband は出力に影響しない。
 inline void test_r6_set_limits_ff_and_floor_fields_are_ignored() {
   V1Tuning a = r6_tuning(6, 20);
@@ -3995,6 +4034,7 @@ inline void run_all() {
   test_r6_set_limits_ff_and_floor_fields_are_ignored();
   test_r6_breakaway_not_fired_by_slow_lag_but_fires_on_moving_stall();
   test_r6_stall_watchdog_ignores_motion_away_from_target();
+  test_r7_stationary_error_3_gets_breakaway_and_watchdog();
   test_device_id_packs_mac_in_printed_order();
   test_control_overrun_faults_only_when_not_parked();
   test_host_fault_latches_immediately_from_active();

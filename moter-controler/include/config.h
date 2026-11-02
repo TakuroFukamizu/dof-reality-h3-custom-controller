@@ -218,7 +218,9 @@ constexpr int V1_BREAKAWAY_MAX_PULSES = 5;         // 進まないまま打て�
 // 軌道が動いているときの動き出しパルス（PR #33 Codex レビュー P1）: 遅い軌道（30 count/s 前後）に普通に遅れているだけでも
 // 100 ms に 3 count が境目になり 9 % を連発しかねない。そこで走行中は「軌道は速い（|v_traj| ≥ MIN_TRAJ）のに軸は止まっている
 //（実測 |v| ≤ MAX_VEL）まま MOVING_WINDOW の間 |誤差| が増え続けた」ときだけ打つ。静止目標（軌道速度 0）は従来どおり 100 ms 窓。
-constexpr int32_t V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S = 100;
+// r7: 軌道速度の下限は外す（0）。正弦波の反転付近（|v_traj| < 100 が周期の 1/4）で FF がテーパして止まったままになるのが r6 の追従誤差の
+// 主因だったため。遅い追従（25〜30 count/s）は実測 |v| > 10 なので対象外のまま
+constexpr int32_t V1_BREAKAWAY_MOVING_MIN_TRAJ_COUNT_S = 0;
 constexpr int32_t V1_BREAKAWAY_MOVING_MAX_VEL_COUNT_S = 10;
 constexpr uint32_t V1_BREAKAWAY_MOVING_WINDOW_MS = 200;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。

@@ -1649,7 +1649,10 @@ class V1Axis {
         dir = 0;
       }
     }
-    const bool demand = dir != 0 && err_abs > tuning.hold_exit && brake_release_cmd_ && !duty_state_.in_band;
+    // r7: 静止目標で保持に入っていなければ |誤差| > hold_enter から対象（r6 は > hold_exit で、2 < |誤差| ≤ 4 に P ＋ I が
+    // 流れたまま止まる帯があった）。走行中は > hold_exit のまま
+    const int64_t thresh = traj_moving ? tuning.hold_exit : tuning.hold_enter;
+    const bool demand = dir != 0 && err_abs > thresh && brake_release_cmd_ && !duty_state_.in_band;
     if (!demand) { reset_breakaway(); return false; }
     if (!brk_running_ || dir != brk_dir_ || traj_moving != brk_moving_) {
       reset_breakaway();
@@ -1719,7 +1722,9 @@ class V1Axis {
   void stall_boost_gate(int64_t err, uint64_t now) {
     if (tuning.stall_boost_ms == 0) { reset_stall_boost(); return; }
     const int64_t err_abs = err < 0 ? -err : err;
-    const bool eligible = setpoint_vel_ == 0.0 && err_abs > tuning.band_exit() && brake_release_cmd_;  // r6 は hold_exit（4）
+    // r6 は hold_exit（4）、r7 は hold_enter（2）: 保持に入れない静止誤差は動き出しパルスとこの監視の対象（出力が流れ続ける帯を残さない）
+    const int64_t gate = tuning.ff_directional ? tuning.hold_enter : tuning.band_exit();
+    const bool eligible = setpoint_vel_ == 0.0 && err_abs > gate && brake_release_cmd_;
     if (!eligible) { reset_stall_boost(); return; }
     const int8_t err_sign = err > 0 ? 1 : -1;
     if (!boost_eligible_ || err_sign != boost_err_sign_) {
