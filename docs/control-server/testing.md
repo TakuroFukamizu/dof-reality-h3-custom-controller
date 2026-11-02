@@ -86,6 +86,19 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 - **telemetry の不足**（計画 §8・§11 との差。未実装）: SET_POSITION の送信→MCU 適用の遅延、ゲーム側の source age の分布、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。§8 のベンチ目標（サーバー受信→MCU 適用 p99 20 ms）は今の telemetry では評価できない。ファイルへの JSONL 記録も未配線（イベントはメモリ上のリング `GET /v1/events` と標準エラーだけ）。
 - **CoreS3 側の規則への適合**: ACK と STATUS の順序（protocol.md §1）、ACTIVE 以外での停止命令の扱い、CONFIG の検査範囲などは、PC が依存していることを模擬軸の試験で確かめただけ。実ファームウェアがそうなっているかは CoreS3 側の実装・試験で確かめる。
 
+## 2026-11-02 の結果（Issue #36 と自動開始（PR #47）の統合: main を取り込んだあと）
+
+環境: 下の節と同じ。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 439 passed、0 failed、1 ignored（`api.rs` の `joystick_page_is_served_and_self_contained` は PR #47 の検査と Issue #36 の検査の両方、`autoRefused`・「CENTER ボタン」・自動開始中は案内を出さないことを追加） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| ページの JS | 構文・id の検査と `H3Joy` の 24 項目（`pose_not_near_hold` の案内はこのページの CENTER ボタンを指し、オペレーター用試験ページを指さない） |
+| ジョイスティック試験ページ（ヘッドレス Chromium、sim、空きポート 18936。`start_max_offset_count = 50` の複製設定、`kind = "sim"`） | 手で書いた Playwright スクリプト（リポジトリには入れていない）。**79 項目すべて通過**、ページエラー・console エラー 0。下の節の手動の流れ（自動開始を切にしたページ）52 項目に加えて、自動開始: 手動で ACTIVE にして roll を倒し STOP（axis1 が中立から 250 count 超離れて停止）→ **自動開始のページを開くと 送信 → ARM → START が `pose_not_near_hold` → ボタンの下に黄で「自動開始の START 拒否: 409 pose_not_near_hold」とサーバーの blockers（`axis1 target … counts from hold … (max 50)`）と「自動で CENTER を送り…START し直す」→ CENTER → START → ACTIVE（game）で表示が消える**（赤は一度も出ない）→ トークン違いのページでは自動開始の ARM が 401 → 自動開始は中止、赤で「自動開始の ARM 拒否: 401 unauthorized — 管理トークンが無いか違う」→ スティックを倒したまま開いたページは HOLDING で「スティックを中央に戻すと START」を待ち、そのあいだ「中央へ」の案内は出ない → 別のクライアントの `POST /v1/session` で `stale_session`、自動開始は中止、バナー「…もう一度「送信開始」を押してください（…自動で START まで進め直すなら「リセット」）」、中止後は「中央へ」の案内が出る → 「リセット」でバナーが消え自動開始がやり直される |
+
+変えたこと: `static/joystick_page.html`（自動開始の ARM / START / CENTER の拒否も `#opResult` に出す（`autoRefused`）、START の `pose_not_near_hold` で自動の CENTER に回るときは黄、自動開始の操作が通れば消す（CENTER は START が通るまで残す）、自動開始が走っているあいだは「中央へ」の案内を出さない、CENTER の案内はこのページの CENTER ボタンへ、`bCenterRig` も拒否を表示、「リセット」でもバナーを消す、バナーに「リセット」を併記）、`tests/api.rs`、`DESIGN.md` §7.5、`hardware-bringup.md`。サーバーは変えていない。実機ではまだ使っていない。
+
 ## 2026-11-02 の結果（Issue #36: ジョイスティックページで START などの拒否理由・「中央へ」の案内・session 切れのバナーを出す）
 
 環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、node 26.3、Playwright 1.65 alpha（npx のキャッシュ）＋ chromium_headless_shell 1243 を `executablePath` で指定。

@@ -177,6 +177,11 @@ async fn joystick_page_is_served_and_self_contained() {
     for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
         assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
     }
+    // Auto start (one shot on load / reset) with a reset button; the manual buttons stay for
+    // troubleshooting. START refused with pose_not_near_hold goes through /v1/center once.
+    for needle in ["id=\"bReset\"", "id=\"autoOnLoad\"", "function autoTick", "pose_not_near_hold", "/v1/center", "/v1/fault/reset", "id=\"bArm\"", "id=\"bStart\"", "id=\"bStream\""] {
+        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    }
     // Issue #36: a refused admin command shows the server's `error` / `blockers` next to the
     // buttons (`#opResult`, the pure `H3Joy.adminReject`), rate mode hints 「中央へ」 before START
     // (`#startHint`, `H3Joy.startGateHint`), and a lost session (stale_session ack, WS closed by a
@@ -192,6 +197,10 @@ async fn joystick_page_is_served_and_self_contained() {
         "stale_session",
         "速度モードは「中央へ」で姿勢を 0 に戻してから START",
         "もう一度「送信開始」を押してください",
+        // Refusals during the auto start show up in the same box; the CENTER hint points to the in-page button.
+        "function autoRefused",
+        "CENTER ボタン",
+        "auto.on ? null : J.startGateHint",
     ] {
         assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
     }
