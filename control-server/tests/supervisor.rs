@@ -1016,6 +1016,36 @@ fn axis_inhibit_flag_stops_the_whole_seat() {
     }
 }
 
+/// An inhibit while HOLDING rejects START / CENTER (blocker text), and an
+/// inhibit that appears while a START is pending stops the seat.
+#[test]
+fn axis_inhibit_blocks_start_and_stops_a_pending_start() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.ready();
+    r.admin(AdminCmd::Arm).unwrap();
+    r.wait_state(RigState::Holding, 2000);
+    r.set_game(Some((POSE_A, 0.3)));
+    r.run_ms(30);
+    r.flip_flags[2] = status_flags::FEEDBACK_UNCERTAIN;
+    r.run_ms(30);
+    let e = r.admin(AdminCmd::Start).unwrap_err();
+    assert_eq!(e.error, admin_error::AXIS_INHIBITED);
+    assert!(has(&e.blockers, "axis_inhibited: axis3 reports FEEDBACK_UNCERTAIN"), "{:?}", e.blockers);
+    assert_eq!(r.admin(AdminCmd::Center).unwrap_err().error, admin_error::AXIS_INHIBITED);
+    assert!(has(&r.blockers(), "axis_inhibited: axis3"), "{:?}", r.blockers());
+    r.flip_flags[2] = 0;
+    r.run_ms(30);
+    // Inhibit appears while the START is pending (the ACK of axis 1 is lost, so START stays pending).
+    r.drop_start_ack[0] = true;
+    let mark = r.sent.len();
+    r.admin(AdminCmd::Start).unwrap();
+    r.run_ms(10);
+    r.flip_flags[1] = status_flags::LOAD_LIMITED;
+    r.wait_state(RigState::Stopping, 200);
+    assert!(r.count(mark, msg_type::CONTROLLED_STOP).iter().all(|&c| c == 1));
+}
+
 #[test]
 fn late_pose_after_stop_does_not_restart() {
     let cfg = sim_cfg();

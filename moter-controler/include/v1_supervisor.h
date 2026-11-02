@@ -60,6 +60,7 @@ struct V1SupTuning {
   bool deadline = true;                                           // P0（false で期限なし。試験用）
   bool deadline_proportional = V1_SUP_DEADLINE_PROPORTIONAL != 0; // P0: 露出の速さを Duty に比例（false で一律 env_count_s）
   int32_t backdrive_count_s = V1_SUP_BACKDRIVE_COUNT_S;           // P0: 下向きに足す逆回りの速さ
+  int32_t arm_grace_count = V1_SUP_ARM_GRACE_COUNT;               // ARMING / 駐車の入りかけで止めるのを待つ上限（余裕の全部を超えた分）
   uint32_t renew_window_ms = V1_SUP_RENEW_WINDOW_MS;
   uint32_t projection_ms = V1_OVERRUN_MS;  // 先読みの刻み: 次の tick までの最悪の間隔（これを超えれば CONTROL_OVERRUN）
   int load_sat_ratio_permille = V1_LOAD_SAT_RATIO_PERMILLE;
@@ -118,6 +119,7 @@ class V1Supervisor {
     bool brake_released = true;   // ブレーキ解除指令中（露出を積むのはこの間だけ）
     bool park_ok = false;         // 目標の近くで静止して落ち着いている（期限の露出が半分に届いたら駐車を求める）
     bool deadline_hold = false;   // 駐車から戻りかけ（ブレーキ解除待ち、参照は止めている）: 動かないのが正しいので露出を積まず期限も見ない
+    bool deadline_defer = false;  // ARMING のブレーキ解除待ち・駐車の入りかけ: 露出は積むが、止めるのは余裕 + arm_grace まで待つ
   };
 
   V1SupTuning t;
@@ -136,17 +138,13 @@ class V1Supervisor {
     ren_dir_ = 0;
   }
   // DISARMED に戻った（DISARM の完了・FAULT_RESET）: 明示的な解除。FEEDBACK_UNCERTAIN / LOAD_LIMITED と回の上限を戻す（位置の上限は戻さない）
-  // 期限の露出もここで戻す（実機 12712ac の FAIL 2 を受けて）: DISARMED の間はブレーキで動けないので露出は増えない。期限で止まった場合は
-  // 基準が消えていて再 ARM できない（SET_REFERENCE か校正が要る）ので、露出を戻しても期限による見えない走行は重ならない。位置の上限
-  //（env_cum_）は戻さない
+  // 期限の露出（exp_）と位置の上限（env_cum_）は戻さない（PR #50 の Codex 事前レビュー e6ee0ef P1a: 位置が分かったわけではない）。
+  // 端の向きの露出が尽きていても、離れる向きの駆動は止めない（filter の期限の判定）
   void clear_episode() {
     feedback_uncertain_ = false;
     load_limited_ = false;
     deadline_tripped_ = false;
     env_ep_[0] = env_ep_[1] = 0.0;
-    exp_[0] = exp_[1] = 0.0;
-    strikes_ = 0;
-    fresh_window_ = false;
   }
   // 位置制御が止まった（DISARMED / FAULT / 校正 / ARMING のブレーキ解除前）: その回だけの状態を捨てる
   void end_session(int64_t raw, uint64_t now_us) {
@@ -265,16 +263,13 @@ class V1Supervisor {
           if (rem < lim) lim = rem;
         }
         const double next = exp_[idx(dd)] + exposure_rate(dd) * static_cast<double>(step_us) / 1e6;
-        if (c.park_ok && next > 0.5 * lim + 1e-9) {
-          park_request_ = true;
-        } else if (next > lim + 1e-9) {
-          feedback_uncertain_ = true;
-          deadline_tripped_ = true;
-          ++strikes_;
-          reference_lost_ = true;
-          break;
-        }
+        if (c.park_ok && next > 0.5 * lim + 1e-9) park_request_ = true;
+        dl_over_[k] = next > lim + 1e-9;                                        // 余裕の全部に届いた
+        dl_over_grace_[k] = next > lim + static_cast<double>(t.arm_grace_count) + 1e-9;  // 待てる上限も超えた
       }
+    } else {
+      dl_over_[0] = dl_over_[1] = false;
+      dl_over_grace_[0] = dl_over_grace_[1] = false;
     }
     // FOLLOWING_ERROR の猶予に使う |誤差| の傾向（fe_window ごとに比べる）
     const int64_t fe_abs = c.err < 0 ? -c.err : c.err;
@@ -374,6 +369,27 @@ class V1Supervisor {
         out = update_load(c, out);
       }
       // 見えない走行の予算（先読み）。制動の出力も含めて、出す出力はすべてここを通す（P1a）
+      // 期限（P0）: 露出が余裕の全部に届いた向き d について、出力が d から離れる向き（> 4 %）なら止めない（離れる向きはその向きの
+      // 露出・予算で見る）。それ以外（0・保持・d へ向かう）は止めて基準を消す。ARMING / 駐車の入りかけは余裕 + arm_grace まで待つ
+      if (t.deadline && c.brake_released && !c.deadline_hold) {
+        for (int k = 0; k < 2; ++k) {
+          if (!dl_over_[k]) continue;
+          const int dd = k == 0 ? 1 : -1;
+          const int mag = out < 0 ? -out : out;
+          const bool away = out != 0 && (out > 0) != (dd > 0) && mag > t.hold_allow_trim_permille;
+          if (away) continue;
+          if (c.deadline_defer && !dl_over_grace_[k]) continue;
+          feedback_uncertain_ = true;
+          deadline_tripped_ = true;
+          ++strikes_;
+          reference_lost_ = true;
+          out = 0;
+          braking_ = false;
+          sat_running_ = false;
+          guard = false;
+          break;
+        }
+      }
       // 端の手前の制動の出力は割り引かない（保持出力の分を引かず、一律の包絡線で全部積む。PR #50 の Codex 事前レビュー P2）
       const int chg = guard ? out : charge_of(out, c);
       const bool near = guard ? false : c.stationary_near;
@@ -430,8 +446,7 @@ class V1Supervisor {
   // 駐車から戻って通常の制御に入った（Codex / 実機 27eaf6b）: 期限の露出を新しい窓で数え直す。確かな動きが出るまでは、期限の上限を
   // 残りの予算に抑える（見えない走行の予算は戻さない）。戻りかけの間（参照を止めて動かないのが正しい）に積んだ露出で止めないため
   void begin_fresh_window() {
-    exp_[0] = exp_[1] = 0.0;
-    fresh_window_ = true;
+    fresh_window_ = true;  // 露出は戻さない（駐車の前の分も含めて数え続ける。PR #50 の Codex 事前レビュー e6ee0ef P1b）
   }
   void note_parked() {
     last_out_ = 0;
@@ -489,6 +504,8 @@ class V1Supervisor {
   bool reference_lost_ = false;
   bool park_request_ = false;
   bool fresh_window_ = false;      // 駐車から戻った後、確かな動きが出るまで（期限の上限を残りの予算に抑える）
+  bool dl_over_[2] = {false, false};        // 期限: 露出が余裕の全部に届いた（[0] = 上、[1] = 下）
+  bool dl_over_grace_[2] = {false, false};  // 同、余裕 + arm_grace も超えた
   bool cert_pending_ = false;      // P1c: 保持出力の認定待ち
   uint64_t cert_start_us_ = 0;
   int64_t cert_raw_ = 0;

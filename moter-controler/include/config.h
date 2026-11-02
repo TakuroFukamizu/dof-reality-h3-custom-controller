@@ -446,6 +446,12 @@ constexpr uint32_t V1_HOLD_CERTIFY_MS = 300;
 #define V1_SUP_DEADLINE_PROPORTIONAL 1
 #endif
 constexpr int32_t V1_SUP_BACKDRIVE_COUNT_S = 200;
+// PR #50 の Codex 事前レビュー（e6ee0ef）: 期限の露出は DISARM / FAULT_RESET / 駐車・戻りでも戻さない（位置が分かる = 確かな動き・
+// SET_REFERENCE・校正のときだけ戻す）。露出が余裕の全部に届いた向き d があっても、出力が d から離れる向き（> 4 %）なら止めない
+//（離れる向きはその向きの露出・予算で見る。端の近くで止まった後に離れられないのを防ぐ）。ARMING（ブレーキ解除待ち）と駐車の入りかけ
+// では止めるのを待つ（落ち着けば駐車する）が、余裕の全部 + V1_SUP_ARM_GRACE_COUNT を超えたら止めて基準を消す（短い ARM を繰り返して
+// 見えない走行を延ばせないように）
+constexpr int32_t V1_SUP_ARM_GRACE_COUNT = 100;
 // 2026-11-02 の操作者の決定: 静止した保持はブレーキで駐車する（PARKED。FAULT でも停止でもない。主電源は保つ。自動で戻る）。監視 ON の方向別の経路だけ。
 //  - 入る: 参照が止まっている（|参照速度| ≤ V1_PARK_REF_VEL_COUNT_S）・目標（フレームの目標）の幅が V1_PARK_TARGET_SPAN_COUNT 以内・
 //    |誤差| ≤ 保持の出口（4）・|実測速度| ≤ 10 が V1_PARK_STILL_MS 続いた（ACTIVE でも HOLDING でも）。または期限の露出が余裕の半分に届く

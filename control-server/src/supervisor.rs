@@ -199,6 +199,9 @@ pub mod admin_error {
     /// START (game): the fresh pose would command an axis farther than
     /// `game.start_max_offset_count` from its hold position (Issue #15 M4).
     pub const POSE_NOT_NEAR_HOLD: &str = "pose_not_near_hold";
+    /// START / CENTER while an axis reports the r10 braked inhibit
+    /// (FEEDBACK_UNCERTAIN / LOAD_LIMITED): DISARM and ARM again first.
+    pub const AXIS_INHIBITED: &str = "axis_inhibited";
     pub const FAULT_LATCHED: &str = "fault_latched";
     pub const NOT_FAULTED: &str = "not_faulted";
     pub const RESET_IN_PROGRESS: &str = "reset_in_progress";
@@ -972,7 +975,7 @@ impl Supervisor {
 
     /// Why ARM is (or would be) refused right now. Empty = ready.
     pub fn blockers(&self, now: Instant) -> Vec<String> {
-        let mut b = Vec::new();
+        let mut b = self.inhibited_axes();
         for (i, t) in self.axes.iter().enumerate() {
             let n = i + 1;
             if !t.connected {
@@ -2395,6 +2398,10 @@ impl Supervisor {
             ));
         }
         self.refuse_if_calibrating()?;
+        let inhibited = self.inhibited_axes();
+        if !inhibited.is_empty() {
+            return Err(AdminError::new(admin_error::AXIS_INHIBITED, inhibited));
+        }
         match self.phase {
             Phase::Holding {
                 start: None,
@@ -2849,8 +2856,25 @@ impl Supervisor {
     /// every axis) so the reference decelerates instead of running away into a
     /// FOLLOWING_ERROR on the inhibited axis. Resuming needs the operator
     /// (DISARM → ARM, as the firmware requires).
+    /// Blocker lines for axes in the r10 braked inhibit.
+    fn inhibited_axes(&self) -> Vec<String> {
+        (0..AXIS_COUNT)
+            .filter_map(|i| {
+                let t = &self.axes[i];
+                let f = t.status.map_or(0, |s| s.flags);
+                if !t.connected || f & (status_flags::FEEDBACK_UNCERTAIN | status_flags::LOAD_LIMITED) == 0 {
+                    return None;
+                }
+                let why = if f & status_flags::FEEDBACK_UNCERTAIN != 0 { "FEEDBACK_UNCERTAIN" } else { "LOAD_LIMITED" };
+                Some(format!("{}: axis{} reports {why} (DISARM and ARM again)", admin_error::AXIS_INHIBITED, i + 1))
+            })
+            .collect()
+    }
+
     fn check_axis_inhibit(&mut self, now: Instant) {
-        if !matches!(self.phase, Phase::Active { .. }) {
+        // ACTIVE, and a START still pending (HOLDING → ACTIVE): stop the seat.
+        let driving = matches!(self.phase, Phase::Active { .. } | Phase::Holding { start: Some(_), .. });
+        if !driving {
             return;
         }
         let mask = status_flags::FEEDBACK_UNCERTAIN | status_flags::LOAD_LIMITED;

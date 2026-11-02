@@ -1050,13 +1050,20 @@ inline void test_r10_deadline_unit() {
     }
     CHECK(s.feedback_uncertain() && s.deadline_tripped() && s.take_reference_lost() && !s.take_park_request());
     CHECK(fabs(ticks * 0.005 - (2350.0 / 200.0 - 0.015)) <= 0.011 && s.exposure(-1) <= 2350.0 + 1e-6 && s.exposure(1) == 0.0);
-    // DISARMED（明示的な再 ARM）で露出は戻る（実機 12712ac の FAIL 2 を受けて）。期限で止まった場合は基準が消えているので、
-    // SET_REFERENCE か校正までは ARM_PREPARE が通らない（見えない走行は重ならない）
+    // DISARMED → 再 ARM でも露出は戻らない（PR #50 の Codex 事前レビュー e6ee0ef P1a）: 出力 0（離れる向きでない）ならすぐまた止まる
+    s.end_session(0, c.now_us);
+    s.clear_episode();
+    CHECK(!s.feedback_uncertain() && s.exposure(-1) > 2300.0);
+    c.now_us += 5 * MS;
+    s.observe(c);
+    s.filter(c, 0);
+    CHECK(s.feedback_uncertain());
+    // 離れる向き（上へ 10 %）の出力なら、下の露出が尽きていても止めない
     s.end_session(0, c.now_us);
     s.clear_episode();
     c.now_us += 5 * MS;
     s.observe(c);
-    CHECK(!s.feedback_uncertain() && s.exposure(-1) <= 1.0);
+    CHECK(s.filter(c, 100) == 100 && !s.feedback_uncertain());
   }
   {  // 駐車できる: 余裕の半分（5.875 s）で駐車を求める。停止はしない
     V1Supervisor s;
@@ -1730,6 +1737,67 @@ inline void test_r10_slow_final_approach_near_end_not_charged() {
   CHECK(!inhib && h.ax.state() == st::ACTIVE);
 }
 
+
+// PR #50 の Codex 事前レビュー（e6ee0ef）P1a: エンコーダが止まったまま（断線）、ARM → 短い保持 → DISARM を繰り返しても、期限の露出は
+// 戻らず積み上がる（ARMING の待ちの分も積む）。余裕 + arm_grace を超えたら止めて基準を消し、ARM_PREPARE は NOT_REFERENCED。
+// 荷重で沈む（外力 −150 count/s）物理の移動は余裕 + arm_grace 以下
+inline void test_r10_frozen_feedback_repeated_short_sessions() {
+  Harness h;
+  r10_active(h, -2000, 100000, 30, 20, true, true, true);  // 下の余裕 = −2000 − (−2750) − 400 = 350
+  h.enc_connected = false;
+  h.ext_vel = -150.0;
+  const double phys0 = h.phys;
+  double prev_exp = h.ax.supervisor().exposure(-1);
+  bool monotonic = true;
+  int sessions = 0;
+  bool ref_lost = false;
+  for (int k = 0; k < 40; ++k) {
+    drive_count_nonzero(h, 200, -2000);  // 短い保持
+    Harness::accepted(h.disarm());
+    h.idle(400);
+    const double e = h.ax.supervisor().exposure(-1);
+    if (e + 1e-9 < prev_exp) monotonic = false;
+    prev_exp = e;
+    if (!h.ax.referenced()) { ref_lost = true; break; }
+    const v1::Ack a = h.arm();
+    if (a.result != ar::ACCEPTED) break;
+    ++sessions;
+    h.drive(620, -2000);
+    if (h.ax.state() == st::HOLDING) {
+      h.set_position(h.ax.actual_count());
+      h.start();
+    }
+  }
+  const double sag = fabs(h.phys - phys0);
+  if (std::getenv("R10_PRINT")) std::printf("frozen short sessions: sessions %d ref_lost %d exposure %.1f sag %.1f monotonic %d\n", sessions, ref_lost ? 1 : 0, h.ax.supervisor().exposure(-1), sag, monotonic ? 1 : 0);
+  CHECK(monotonic && ref_lost && sessions < 40);
+  CHECK(sag <= 350.0 + V1_SUP_ARM_GRACE_COUNT + 1.0);
+  Harness::rejected(h.arm(), rs::NOT_REFERENCED);
+}
+
+// PR #50 の Codex 事前レビュー（e6ee0ef）P1b: エンコーダが止まったまま、目標の小さな出入り（+3 / 0）で駐車と戻りを繰り返しても、期限の
+// 露出は戻らない（駐車中は止まるだけ）。いずれ止めて基準を消す
+inline void test_r10_frozen_feedback_park_cycles_do_not_renew() {
+  Harness h;
+  r10_active(h, 0, 100000, 30, 20, true, true, true);
+  drive_count_nonzero(h, 1500, 0);
+  CHECK(h.ax.brake_parked());
+  h.enc_connected = false;
+  double prev = h.ax.supervisor().exposure(-1);
+  bool monotonic = true;
+  int cycles = 0;
+  for (; cycles < 60 && !h.ax.supervisor_inhibited(); ++cycles) {
+    drive_count_nonzero(h, 1000, 3);
+    drive_count_nonzero(h, 1000, 0);
+    const double e = h.ax.supervisor().exposure(-1);
+    if (e + 1e-9 < prev) monotonic = false;
+    prev = e;
+  }
+  if (std::getenv("R10_PRINT")) std::printf("frozen park cycles: cycles %d inhibited %d exposure %.1f monotonic %d\n", cycles, h.ax.supervisor_inhibited() ? 1 : 0, h.ax.supervisor().exposure(-1), monotonic ? 1 : 0);
+  CHECK(monotonic && h.ax.supervisor_inhibited() && h.ax.supervisor().deadline_tripped() && !h.ax.referenced());
+  CHECK(h.ax.supervisor().exposure(-1) <= 2350.0 + V1_SUP_ARM_GRACE_COUNT + 13.0);
+}
+
 // STATUS の flags（bit 7〜10）。監視が OFF（従来の経路）では立たない。flags の変化（停止・ブレーキ作動）で即時 STATUS が出る
 inline void test_r10_status_flags_bits() {
   CHECK(fl::LOAD_LIMITED == 0x80 && fl::FEEDBACK_UNCERTAIN == 0x100 && fl::END_BRAKING == 0x200 && fl::LIMIT_RECOVERY == 0x400);
@@ -1801,6 +1869,8 @@ inline void run_all() {
   test_r10_end_stop_settle_and_hold_both_ends();
   test_r10_after_near_end_inhibit_can_drive_away();
   test_r10_slow_final_approach_near_end_not_charged();
+  test_r10_frozen_feedback_repeated_short_sessions();
+  test_r10_frozen_feedback_park_cycles_do_not_renew();
   test_r10_status_flags_bits();
 }
 

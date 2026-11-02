@@ -1735,6 +1735,8 @@ class V1Axis {
       c.stationary_near = tuning.hold_learn;
       c.deadline_hold = true;
     }
+    // ARMING のブレーキ解除待ち・駐車の入りかけ: 露出は積むが、止めるのは余裕 + arm_grace まで待つ（落ち着けば駐車に入る）
+    c.deadline_defer = state_ == v1::state::ARMING || park_ == ParkPhase::Engaging;
     return c;
   }
 
