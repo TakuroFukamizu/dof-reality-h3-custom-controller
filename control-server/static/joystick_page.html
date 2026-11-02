@@ -38,7 +38,8 @@
     間違って選ぶと START で端へ飛ぶ。該当が無ければバナーで知らせ、操作者が一覧から選ぶ（Issue #15 M4）。
   - ack が stale_session なら送信を止める（50 Hz で拒否され続けない）。再開は「送信開始」で新しい session（Issue #15 L2）。
     そのとき（と、送信中に WS が操作者の意図なく閉じたとき = サーバー再起動など、送信中に status の session が
-    2 回続けて自分のものでないとき）は上の赤いバナー（#sessionBanner）で「送信開始」を押し直すよう知らせる。
+    2 回続けて自分のものでないとき。これは姿勢が無く ack が来ない場合の保険で、送信も止める）は上の赤いバナー
+    （#sessionBanner）で「送信開始」を押し直すよう知らせる（ボタンは「送信開始」に戻っているので 1 回押せば済む）。
     バナーは次に WS が開いたとき（新しい session）か、操作者が「送信停止」したときに消える（Issue #36）。
   - 管理操作（ARM / START / DISARM / FAULT RESET / STOP）が断られたら、応答の error と blockers（409 の
     {"ok": false, "error", "blockers"}。401 / 429 / 503 などは error だけ）をボタンの下（#opResult）にそのまま出し、
@@ -868,7 +869,13 @@ window.H3Joy = (function () {
     if (state.streaming && state.session) {
       const mine = !!(s.session && s.session.source_session_prefix && state.session.indexOf(s.session.source_session_prefix) === 0);
       state.sessionMismatch = mine ? 0 : state.sessionMismatch + 1;
-      if (state.sessionMismatch >= 2) showSessionBanner('サーバーの session がこのページのものでなくなった（' + (s.session && s.session.source_session_prefix ? '別の session ' + s.session.source_session_prefix : 'session なし: サーバー再起動？') + '）');
+      // 送っていない（姿勢が無く ack が来ない）あいだに session が替わったときの保険。送信も止める（ボタンを「送信開始」に戻す）
+      if (state.sessionMismatch >= 2) {
+        const other = s.session && s.session.source_session_prefix;
+        stopStream('stale_session (status)', true);
+        showSessionBanner('サーバーの session がこのページのものでなくなった（' + (other ? '別の session ' + other : 'session なし: サーバー再起動？') + '）。送信は止めた');
+        log('status: session がこのページのものでない（2 回続けて）。送信を止めた。再開は「送信開始」', true);
+      }
     } else {
       state.sessionMismatch = 0;
     }
