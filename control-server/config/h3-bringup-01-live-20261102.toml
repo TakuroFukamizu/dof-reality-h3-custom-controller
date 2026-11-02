@@ -92,8 +92,8 @@ invert_yaw = false
 # !!! 決めた値はここに書く。上限はファームの絶対上限（Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0。
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）
 max_gain = 1.0                  # 11-02: 向きの確認済み。全開でソフトリミット内の端まで（余裕 150 count）
-max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）より遅い
-max_acc_count_s2 = 2000
+max_vel_count_s = 1200           # 11-02 15:3x 展示用（無人のステップ試験で FE ≤ 9、端まで SOFT_LIMIT なし）。旧 600。 1.5 回転/s。従来 env の HOME（10 %）より遅い
+max_acc_count_s2 = 6000          # 11-02 15:3x 展示用。旧 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
 duty_min_percent = 9             # 11-02: 7〜8 % では #2 が動かず、9 % で動き出した実測から
