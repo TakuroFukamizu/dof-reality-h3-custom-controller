@@ -373,6 +373,7 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
 - 開いたあとは従来どおり HELLO で照合する（系統と `device_id` が合わなければ `axis_device_mismatch`）。protocol_version 違い・POSITION_MODE 無しの個体は `"auto"` でも `unknown_device` になる。その場合 port task は、名前が消えるまでではなく、その名前からその個体がいなくなるまで待ってから `PortClosed` を送って終わる（別の個体が同じ名前に入れ替わっても取り残されない）。
 - port task は発見タスクの `JoinSet` に属する。shutdown では発見タスクは走査と open をやめるが、制御ループが DISARM するあいだはリンクのイベントを転送し続ける。制御ループが止まった後に `RunningServer::shutdown` が発見タスクを abort し、そのとき残りも止まる。panic で終わったタスクもタスク ID で外すので、その名前と個体は次の走査で拾い直す。
 - supervisor は変えていない。新しい名前で HELLO が来るのは、通常の再接続（boot_id が同じなら再起動ではない）。FAULT_LATCHED の解除や基準の取り直しは操作者が行う（自動で FAULT_RESET はしない）。
+- ポートの一覧と open は `server::SerialPorts` 経由（既定は OS の `OsSerialPorts`）。試験は `ServerOptions::serial_ports` に模擬軸を USB 個体として見せる偽物を渡し、実機なしで次を確かめる（tests/server.rs の `ports_auto_*`）: 設定の個体だけを開き tty 別名・他の ESP32-S3 は開かない、差し直して名前が変わった個体につながり直し古い名前（別の装置が入った）を開き直さない、ACTIVE 中の shutdown で DISARM が届く、拒否された個体が同じ名前で別の設定個体に入れ替わったら拾い直す、同じ個体が 2 つの名前に見えても 1 回だけ開く。
 - ログ（変化したときに 1 回）: `ports = auto: axisN unit found`（ポート名つき）、`ports = auto: axisN unit not in the USB port list`、`ports = auto: ESP32-S3 USB port not opened (its serial matches no [[axis]] device_id)`（入れ替えた個体や別プロジェクトの ESP32-S3）。
 
 ## 11. 校正（protocol.md §1.2）

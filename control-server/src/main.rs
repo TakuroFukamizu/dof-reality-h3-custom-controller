@@ -154,7 +154,7 @@ fn run(path: &Path, bind: Option<SocketAddr>) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()) };
+        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()), serial_ports: None };
         let srv = match server::start(cfg, opts).await {
             Ok(s) => s,
             Err(e) => {

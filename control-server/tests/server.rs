@@ -99,19 +99,25 @@ impl Streamer {
 /// Server up, all axes READY_TO_ARM, poses streaming, armed and ACTIVE.
 async fn active_rig(cfg: Config) -> (h3cs::server::RunningServer, Streamer) {
     let srv = start_sim(cfg).await;
-    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let streamer = activate(&srv).await;
+    (srv, streamer)
+}
+
+/// READY_TO_ARM → session + 30 Hz poses → ARM → START → ACTIVE.
+async fn activate(srv: &h3cs::server::RunningServer) -> Streamer {
+    wait_state(srv, RigState::ReadyToArm, 3 * S).await;
     let id = new_session(srv.local_addr).await;
     let ws = ws_connect(srv.local_addr, &id).await;
     let streamer = Streamer::start(ws, id, 1);
-    wait_status(&srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
+    wait_status(srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
 
     let r = admin(srv.local_addr, "/v1/arm").await;
     assert_eq!(r.status, 200, "arm: {r:?}");
-    wait_state(&srv, RigState::Holding, 3 * S).await;
+    wait_state(srv, RigState::Holding, 3 * S).await;
     let r = admin(srv.local_addr, "/v1/start").await;
     assert_eq!(r.status, 200, "start: {r:?}");
-    wait_state(&srv, RigState::Active, 2 * S).await;
-    (srv, streamer)
+    wait_state(srv, RigState::Active, 2 * S).await;
+    streamer
 }
 
 async fn wait_converged(srv: &h3cs::server::RunningServer, expected: [Counts; 3]) {
@@ -359,7 +365,7 @@ async fn stop_without_token_brakes_and_late_poses_do_not_restart() {
 async fn non_loopback_bind_is_refused() {
     let r = server::start(
         sim_cfg(),
-        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()), config_path: None },
+        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()), config_path: None, serial_ports: None },
     )
     .await;
     assert!(matches!(r, Err(ServerError::NonLoopback(_))), "{:?}", r.err());
@@ -989,4 +995,230 @@ async fn serial_backend_ports_auto_opens_nothing_that_does_not_match() {
     assert_eq!(st.rig_state, RigState::Offline);
     assert!(st.axes.iter().all(|a| !a.connected && a.port.is_none()), "{:?}", st.axes);
     tokio::time::timeout(Duration::from_secs(10), srv.shutdown()).await.expect("shutdown hung");
+}
+
+// ------------------------------------------------- ports = "auto" (fake USB)
+//
+// `FakeUsb` lists simulated CoreS3 units as USB ports (VID:PID 303A:1001,
+// serial = MAC; each also under its macOS `/dev/tty.*` alias) and opens
+// them onto the simulator. Every open is recorded, so a test can assert what
+// was never opened.
+
+mod fake_usb {
+    use h3cs::port_discovery::{ListedPort, UsbIds};
+    use h3cs::server::{OpenFuture, PortStream, SerialPorts};
+    use h3cs::sim_axis::{sim_detached, SimHandle, SimParams};
+    use h3cs::types::DeviceId;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    pub const ID: [DeviceId; 3] =
+        [DeviceId(0x5131_0000_0000_0a01), DeviceId(0x5131_0000_0000_0a02), DeviceId(0x5131_0000_0000_0a03)];
+    /// Another project's ESP32-S3 (same VID:PID).
+    pub const FOREIGN: DeviceId = DeviceId(0x5131_d0cf_130e_96f8);
+
+    pub fn mac(id: DeviceId) -> String {
+        let b = id.0.to_be_bytes();
+        format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[2], b[3], b[4], b[5], b[6], b[7])
+    }
+
+    /// A unit: USB serial from `usb_id`; its HELLO says `hello_id` / `axis`.
+    pub fn unit(usb_id: DeviceId, hello_id: DeviceId, axis: u8) -> (String, SimHandle) {
+        let params = SimParams::from_backend(&Default::default(), hello_id, rand::random::<u32>().max(1), axis);
+        (mac(usb_id), sim_detached(params))
+    }
+
+    #[derive(Debug, Default)]
+    pub struct FakeUsb {
+        state: Mutex<State>,
+    }
+
+    #[derive(Debug, Default)]
+    struct State {
+        plugged: BTreeMap<String, (String, SimHandle)>,
+        opened: Vec<String>,
+    }
+
+    impl FakeUsb {
+        pub fn plug(&self, name: &str, unit: (String, SimHandle)) {
+            self.state.lock().unwrap().plugged.insert(name.into(), unit);
+        }
+        /// Pull the cable: the open link sees EOF. Returns the unit.
+        pub fn unplug(&self, name: &str) -> (String, SimHandle) {
+            let (ser, mut sim) = self.state.lock().unwrap().plugged.remove(name).expect("plugged");
+            drop(sim.attach()); // stops the runner of the open link
+            (ser, sim)
+        }
+        pub fn view(&self, name: &str) -> SimHandle {
+            self.state.lock().unwrap().plugged[name].1.view()
+        }
+        pub fn opened(&self) -> Vec<String> {
+            self.state.lock().unwrap().opened.clone()
+        }
+        pub fn opens_of(&self, name: &str) -> usize {
+            self.opened().iter().filter(|n| *n == name).count()
+        }
+    }
+
+    impl SerialPorts for FakeUsb {
+        fn list(&self) -> Vec<ListedPort> {
+            let st = self.state.lock().unwrap();
+            let mut v = vec![ListedPort { name: "/dev/cu.Bluetooth-Incoming-Port".into(), usb: None }];
+            for (name, (ser, _)) in &st.plugged {
+                let usb = Some(UsbIds { vid: 0x303A, pid: 0x1001, serial: Some(ser.clone()) });
+                v.push(ListedPort { name: name.clone(), usb: usb.clone() });
+                v.push(ListedPort { name: name.replace("/dev/cu.", "/dev/tty."), usb });
+            }
+            v
+        }
+        fn open<'a>(&'a self, port: &'a str, _baud: u32) -> OpenFuture<'a> {
+            let r = {
+                let mut st = self.state.lock().unwrap();
+                st.opened.push(port.to_string());
+                match st.plugged.get_mut(port) {
+                    Some((_, sim)) => Ok(Box::new(sim.attach()) as PortStream),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such port")),
+                }
+            };
+            Box::pin(async move { r })
+        }
+    }
+}
+
+use fake_usb::{FakeUsb, FOREIGN, ID};
+
+const P1: &str = "/dev/cu.usbmodem11101";
+const P2: &str = "/dev/cu.usbmodem11301";
+const P3: &str = "/dev/cu.usbmodem11501";
+
+fn auto_cfg() -> Config {
+    let mut cfg = fast_cfg();
+    for a in cfg.axes.iter_mut() {
+        a.device_id = ID[a.axis_id.index()];
+    }
+    cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
+        ports: h3cs::config::PortList::Auto,
+        baud: 115_200,
+        sim_axes: vec![],
+        sim: h3cs::config::SimBackendConfig::default(),
+    });
+    cfg
+}
+
+async fn start_auto(usb: &std::sync::Arc<FakeUsb>) -> h3cs::server::RunningServer {
+    let ports: std::sync::Arc<dyn h3cs::server::SerialPorts> = usb.clone();
+    server::start(
+        auto_cfg(),
+        ServerOptions {
+            admin_token: Some(TOKEN.into()),
+            bind_override: Some("127.0.0.1:0".parse().unwrap()),
+            config_path: None,
+            serial_ports: Some(ports),
+        },
+    )
+    .await
+    .expect("server start")
+}
+
+/// The three configured units on P1..P3 plus a foreign ESP32-S3.
+fn rig_usb() -> std::sync::Arc<FakeUsb> {
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], ID[0], 1));
+    usb.plug(P2, fake_usb::unit(ID[1], ID[1], 2));
+    usb.plug(P3, fake_usb::unit(ID[2], ID[2], 3));
+    usb.plug("/dev/cu.usbmodem2101", fake_usb::unit(FOREIGN, FOREIGN, 1));
+    usb
+}
+
+fn axis_port(st: &h3cs::supervisor::StatusSnapshot, axis: u8) -> Option<String> {
+    st.axes[usize::from(axis - 1)].port.clone()
+}
+
+#[tokio::test]
+async fn ports_auto_opens_the_configured_units_and_nothing_else() {
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    assert_eq!([1, 2, 3].map(|a| axis_port(&st, a)), [Some(P1.into()), Some(P2.into()), Some(P3.into())]);
+    let mut opened = usb.opened();
+    opened.sort();
+    assert_eq!(opened, [P1, P2, P3], "only the configured units, each once, never a tty alias or the foreign unit");
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_follows_a_unit_replugged_under_a_new_name() {
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    // Hub socket change: unit 1 comes back as 14101, and the foreign unit
+    // now sits on its old name.
+    let unit1 = usb.unplug(P1);
+    let foreign = usb.unplug("/dev/cu.usbmodem2101");
+    usb.plug("/dev/cu.usbmodem14101", unit1);
+    usb.plug(P1, foreign);
+    let st = wait_status(&srv, 10 * S, "axis 1 on 14101", |s| {
+        s.rig_state == RigState::ReadyToArm && axis_port(s, 1).as_deref() == Some("/dev/cu.usbmodem14101")
+    })
+    .await;
+    assert!(st.blockers.is_empty(), "{:?}", st.blockers);
+    // Give the old name's task time to look again: it must not reopen.
+    tokio::time::sleep(h3cs::server::SERIAL_RETRY + S).await;
+    assert_eq!(usb.opens_of(P1), 1, "old name reopened with the foreign unit on it: {:?}", usb.opened());
+    assert_eq!(usb.opens_of("/dev/cu.usbmodem2101"), 0);
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_shutdown_while_active_still_disarms() {
+    // The port tasks must keep forwarding the DISARM ACK / STATUS while the
+    // control loop disarms (Codex review P1 on PR #59).
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    let streamer = activate(&srv).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let views = [P1, P2, P3].map(|p| usb.view(p));
+    let t0 = tokio::time::Instant::now();
+    srv.shutdown().await;
+    for (i, v) in views.iter().enumerate() {
+        let s = v.snapshot();
+        assert_eq!(s.state, McuState::Disarmed, "axis {} after shutdown: {s:?}", i + 1);
+    }
+    assert!(t0.elapsed() < server::SHUTDOWN_DISARM_WAIT, "DISARM was not confirmed (waited {:?})", t0.elapsed());
+    streamer.stop().await;
+}
+
+#[tokio::test]
+async fn ports_auto_rejected_unit_replaced_on_the_same_name() {
+    // P1 carries unit 1's USB serial, but its HELLO names no axis and an
+    // unknown device: the link is rejected (`unknown_device`). Then that
+    // unit is swapped for unit 2 on the same name: the port task must notice
+    // the unit left (not just wait for the name to vanish), clear the
+    // blocker, and unit 2 must be opened on P1.
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], FOREIGN, 0));
+    usb.plug(P3, fake_usb::unit(ID[2], ID[2], 3));
+    let srv = start_auto(&usb).await;
+    wait_status(&srv, 5 * S, "unknown_device", |s| s.blockers.iter().any(|b| b.starts_with("unknown_device"))).await;
+    let _gone = usb.unplug(P1);
+    usb.plug(P1, fake_usb::unit(ID[1], ID[1], 2));
+    let st = wait_status(&srv, 10 * S, "axis 2 on P1", |s| axis_port(s, 2).as_deref() == Some(P1)).await;
+    wait_status(&srv, 2 * S, "unknown_device cleared", |s| !s.blockers.iter().any(|b| b.starts_with("unknown_device")))
+        .await;
+    assert!(axis_port(&st, 1).is_none());
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_opens_a_unit_seen_under_two_names_once() {
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], ID[0], 1));
+    usb.plug("/dev/cu.usbmodem99", fake_usb::unit(ID[0], ID[0], 1));
+    let srv = start_auto(&usb).await;
+    wait_status(&srv, 5 * S, "axis 1 connected", |s| axis_port(s, 1).is_some()).await;
+    tokio::time::sleep(h3cs::server::DISCOVERY_PERIOD * 3).await;
+    let st = srv.status();
+    assert!(st.axis_conflict.is_empty(), "{:?}", st.axis_conflict);
+    assert_eq!(usb.opened().len(), 1, "{:?}", usb.opened());
+    srv.shutdown().await;
 }

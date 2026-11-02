@@ -41,6 +41,7 @@ pub async fn start_sim_with_path(cfg: Config, config_path: Option<std::path::Pat
             admin_token: Some(TOKEN.into()),
             bind_override: Some("127.0.0.1:0".parse().unwrap()),
             config_path,
+            ..Default::default()
         },
     )
     .await
