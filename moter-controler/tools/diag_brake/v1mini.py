@@ -40,10 +40,12 @@ FLAG_POWER_CONTROLLER = 1 << 4
 
 MODE_CANCEL, MODE_SAG, MODE_ENGAGE, MODE_POWER_HOLD = 0, 1, 2, 3
 MODE_NAMES = {0: "CANCEL", 1: "SAG", 2: "ENGAGE", 3: "POWER_HOLD"}
-RESULT_NAMES = {0: "OK", 1: "FAULT", 2: "CANCELLED"}
+RESULT_NAMES = {0: "OK", 1: "FAULT", 2: "CANCELLED", 3: "ABORTED"}
+RESULT_OK, RESULT_FAULT, RESULT_CANCELLED, RESULT_ABORTED = 0, 1, 2, 3
 STOP_NAMES = {
     0: "NONE", 1: "T_MAX", 2: "D_MAX", 3: "END_MARGIN", 4: "V_TARGET", 5: "D_RUN", 6: "RUN_TIMEOUT",
-    7: "REVERSE", 8: "NO_PULSE", 9: "CANCEL", 10: "FAULT", 11: "SAG_GUARD", 12: "OVERSPEED",
+    7: "REVERSE", 8: "NO_PULSE", 9: "CANCEL", 10: "FAULT", 11: "SAG_GUARD", 12: "OVERSPEED", 13: "ROOM_LOST",
+    14: "BUFFER_FULL",
 }
 STATE_NAMES = {
     0: "BOOT", 1: "DISARMED", 2: "ARMING", 3: "HOLDING", 4: "ACTIVE", 5: "STOPPING", 6: "DISARMING",
@@ -63,6 +65,14 @@ SAMPLE_FLAG_BRAKE_RELEASE = 1 << 0
 SAMPLE_FLAG_POWER_ON = 1 << 1
 RESULT_FLAG_TRUNCATED = 1 << 0
 RESULT_FLAG_NOT_SETTLED = 1 << 1
+RESULT_FLAG_POST_MARGIN = 1 << 2   # ブレーキ作動の後に端の余裕を越えた（区間は閉じた）
+RESULT_FLAG_SESSION_KEPT = 1 << 3  # 結果の後も DIAG の待機（主電源 ON・ブレーキ作動）に残っている
+SESSION_ACTIVE = 1 << 0            # DIAG_DATA の session_flags
+SESSION_POWER_CMD = 1 << 1
+SESSION_SETTLED = 1 << 2
+SESSION_TEST_BUSY = 1 << 3
+DIAG_READ_STATUS_ONLY = 0xFFFF     # 範囲外の offset: 記録は返さず区間の状態だけ読む
+POWER_SETTLE_MS = 5000             # ファームの V1_DIAG_POWER_SETTLE_MS
 TIME_NONE = 0xFFFFFFFF
 SAMPLES_PER_CHUNK = 16
 SAMPLE_BYTES = 13
@@ -222,21 +232,22 @@ def decode(encoded: bytes) -> Msg | None:
         return Msg(t, dict(boot_id=boot, mcu_time_us=mcu_us, fault_code=code, mcu_state_before=before,
                            actual_count=actual))
     if t == DIAG_RESULT:
-        v = struct.unpack("<IIBBBBHHHHiIIiiiiIibBHhxx", p)
+        v = struct.unpack("<IIBBBBHHHHiIIiiiiIibBHhH", p)
         names = ["test_id", "boot_id", "mode", "result", "stop_reason", "referenced_after", "fault_code",
                  "sample_count", "sample_period_us", "max_sample_gap_us", "start_count", "t_drive_us", "t_engage_us",
                  "disp_at_engage", "final_disp", "peak_disp", "v_at_engage_count_s", "t_settle_us",
-                 "disp_engage_to_settle", "sign", "flags", "adc_first", "drive_pwm_permille"]
+                 "disp_engage_to_settle", "sign", "flags", "adc_first", "drive_pwm_permille", "session_ms_at_release"]
         return Msg(t, dict(zip(names, v)))
     if t == DIAG_DATA:
-        rid, test_id, offset, total, n = struct.unpack_from("<IIHHB", p, 0)
+        rid, test_id, offset, total, n, session_flags, session_ms = struct.unpack_from("<IIHHBBH", p, 0)
         if n > SAMPLES_PER_CHUNK:
             return None
         samples = []
         for i in range(n):
             ts, count, pwm, adc, flags = struct.unpack_from("<IihHB", p, 16 + i * SAMPLE_BYTES)
             samples.append(dict(t_us=ts, count=count, pwm_permille=pwm, adc_raw=adc, flags=flags))
-        return Msg(t, dict(request_id=rid, test_id=test_id, offset=offset, total=total, n=n, samples=samples))
+        return Msg(t, dict(request_id=rid, test_id=test_id, offset=offset, total=total, n=n, session_flags=session_flags,
+                           session_ms=session_ms, samples=samples))
     return Msg(t, {})
 
 
