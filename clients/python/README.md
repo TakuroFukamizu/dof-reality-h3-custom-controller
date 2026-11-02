@@ -1,5 +1,7 @@
 # h3_motion_client（Game 側 Python クライアント）
 
+ゲーム（アプリ）側の制御の前提（姿勢 −1..1 と gain、全域の使い方、速度・加速度がどう丸められるか、開始・停止・鮮度、`limits` の使い方）は [docs/control-server/game-tips.md](../../docs/control-server/game-tips.md) を先に読む。
+
 状態: **実装済み・模擬軸（sim）サーバー、パッチ後の h3game bridge と結合試験済み。実機は未実施。**
 
 `h3-control-server` の Game API（[DESIGN.md](../../control-server/DESIGN.md) §7、§8）に Pose を送るクライアント。h3game の `bridge.py` から使う想定。管理 API（ARM / START / DISARM、管理トークン）は含めない。

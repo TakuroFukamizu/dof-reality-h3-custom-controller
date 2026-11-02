@@ -2,7 +2,7 @@
 
 状態: **パッチ作成済み・模擬軸（sim）サーバーと結合試験済み。実機、実際の Chrome（ヘッドあり）での長時間運転は未実施。**
 
-既存ゲーム（`TakuroFukamizu/20261004_shi3z_hackathon` の `h3game/`）を、USB 直結の旧 H3 の代わりに `h3-control-server` へつなぐための小さいパッチと、bridge 用のバックエンド層。計画は [architecture.md](../../docs/control-server/architecture.md) §4、実装設計は [DESIGN.md](../../control-server/DESIGN.md) §8。
+既存ゲーム（`TakuroFukamizu/20261004_shi3z_hackathon` の `h3game/`）を、USB 直結の旧 H3 の代わりに `h3-control-server` へつなぐための小さいパッチと、bridge 用のバックエンド層。計画は [architecture.md](../../docs/control-server/architecture.md) §4、実装設計は [DESIGN.md](../../control-server/DESIGN.md) §8。ゲーム側で知っておくべき制御の前提（gain と全域、速度・加速度の丸め、開始・停止・鮮度）は [game-tips.md](../../docs/control-server/game-tips.md)。
 
 h3game リポジトリへは push していない。パッチはこのディレクトリに置くだけ。
 

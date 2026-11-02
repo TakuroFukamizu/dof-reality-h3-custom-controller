@@ -166,9 +166,9 @@ v1 ファームの端当て校正（protocol.md §1.2、DESIGN.md §11）を使�
 1. 3 軸が接続され、全軸 `DISARMED`（status の `axes[].mcu_state`）であること。`calibration_valid = false` のままでよい（校正に CONFIG も基準も要らない）。
 2. 試験ページの「校正（3 軸）」（確認ダイアログあり）、または `curl -sX POST -H "$AUTH" $URL/v1/calibrate`。電源担当軸（系統 1）を含めないと 409 `power_axis_required`（他の軸は 24V が無く端当てに失敗する）。
 3. status: 各軸が `CALIBRATING`（blockers に `calibrating: axisN`。この間 ARM / START / CENTER / REFERENCE は 409 `calibrating`）。止めるなら「校正を中止」/ `POST /v1/calibrate/cancel` / STOP。
-4. 終わると各軸の `calibration` に `result`（`OK` / `FAILED` / `CANCELLED`）・`reason`・`n_end_count`（N 端の count。P 端 = 0）・`neutral_count`・`sign`。`OK` の軸は `referenced = true`（MCU が P 端 = 0 の基準を自分で作る。/v1/reference は不要）で中立に止まっている。`FAILED`（`stall` / `slow` / `travel` / `timeout` …）なら従来 env の §1.2 と同じ切り分け。
+4. 終わると各軸の `calibration` に `result`（`OK` / `FAILED` / `CANCELLED`）・`reason`・`n_end_count`（N 端の count。P 端 = 0）・`neutral_count`・`sign`。`OK` の軸は `referenced = true`（MCU が P 端 = 0 の基準を自分で作る。/v1/reference は不要）で中立に止まっている。同時にその軸は `calibration_stale = true` になり、blockers に `calibration_stale: axisN recalibrated (stroke S, neutral N); export and reload config before ARM` が出る（MCU の原点・行程・向きが測り直されたので、いま動いているサーバーの設定の幾何は承認済みとみなさない。Issue #15 H3）。**この印は 5.→6. で export したファイルでサーバーを起動し直すまで消えない**（CoreS3 の再接続・再起動でも消えない。旧設定のまま再起動しても消えるので、起動する `--config` が export したファイルであることは操作者が確かめる）。`FAILED`（`stall` / `slow` / `travel` / `timeout` …）なら従来 env の §1.2 と同じ切り分け。
 5. 「校正結果を設定に書き出す」/ `POST /v1/calibration/export`。`bringup.toml` と同じディレクトリに `h3-bringup-01.calibration-<YYYYmmdd-HHMMSS>.toml`（UTC）が書かれる: OK の軸の `mechanical_* / soft_* / count_at_virtual_* / device_id` が結果から置き換わり、コメントと他の軸はそのまま、`calibration_valid = false` のまま、先頭に生の結果と置き換え前の値。
-6. そのファイルを見て、`n_end_count` が過去の記録（§5.3、±30）と合うこと・`sign` が §5.2 の前提と合うことを確かめ、§5.5 の手順で `calibration_valid = true` にして `--config` にそのファイルを指定して起動し直す。基準は boot ごとに消える（§5.1 の末尾）ので、再起動後は校正をやり直すか、中立で止まっていれば §5.1 の /v1/reference で `count_at_virtual_512` を入れる。
+6. そのファイルを見て、`n_end_count` が過去の記録（§5.3、±30）と合うこと・`sign` が §5.2 の前提と合うことを確かめ、§5.5 の手順で `calibration_valid = true` にして `--config` にそのファイルを指定して起動し直す（この再起動で 4. の `calibration_stale` が消える。再起動せずに ARM はできない）。基準は boot ごとに消える（§5.1 の末尾）ので、再起動後は校正をやり直すか、中立で止まっていれば §5.1 の /v1/reference で `count_at_virtual_512` を入れる。
 
 以下 §5.1〜§5.4 は、校正に対応していないファーム・校正が失敗するときの手動の手順（そのまま使える）。
 
@@ -287,7 +287,7 @@ curl -s $URL/v1/status | python3 -m json.tool
 curl -sX POST -H "$AUTH" $URL/v1/start
 ```
 
-- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。
+- START の受理には、期限内の SET_POSITION（ARM 中からサーバーが送り続けている保持目標）と、新鮮な Pose（スクリプトが送っている）が要る。`409 no_fresh_pose` ならスクリプトが止まっている。その Pose が作る目標は保持位置から `[game].start_max_offset_count`（300 count）以内でなければならない（`409 pose_not_near_hold`。上の `0 0 0 0.05` なら中立で問題ない。§10 の表）。
 - 受理後 `rig_state = ACTIVE`、`active_source = "game"`、3 軸 `mcu_state = ACTIVE`。目標は `count_at_virtual_512` へ `[limits].max_vel_count_s` 以内で動く（limits.md §4 の低い値 600 count/s で始める）。
 - **ここで 3 通りに分かれる**（ファームの無パルス判定は「ブレーキ解除指令中に目標（軌道）が動いている間」だけ働く。設計 §3）:
   - `|actual_count − count_at_virtual_512| ≤ 5`（基準がぴったり）: 目標 = 実位置で Duty 0 のまま。ACTIVE が続く。送信停止 → `BRAKED_DISARMED` まで進むことを見る。
@@ -332,7 +332,7 @@ HOLDING のまま `curl -sX POST -H "$AUTH" $URL/v1/disarm` → 3 軸 `DISARMING
 3. 送信開始（`0 0 1 0.05`） → `/v1/arm` → `/v1/start`。#3 の目標が `count_at_virtual_512 + 0.05 × 511 × (5560/1023) ≈ +139 count` へ動く。**向きを記録する**（右か左か）。#1 / #2 は動かない。
 4. 送信停止。`0 0 -1 0.05` で反対へ。
 5. 同様に `1 1 0 0.05`（#1 だけ、roll + pitch = 2 なので約 +250 count）、`-1 1 0 0.05`（#2 だけ）。それぞれ **上がったか下がったか** を記録。
-6. ゲームの意図（`pitch +` で前が上がるのか、`roll +` で右が上がるのか、`yaw +` で右へ向くのか）と比べ、逆な軸は §5.3 の方法で `count_at_virtual_0 / 1023` を入れ替える → サーバー再起動 → §5.1 → この節をやり直す。
+6. ゲームの意図（`pitch +` で前が上がるのか、`roll +` で右が上がるのか、`yaw +` で右へ向くのか）と比べる。混合式は h3game のまま（`roll` = #1・#2 同方向、`pitch` = #1・#2 逆方向）なので、**前後と左右が入れ替わっていれば `[game].swap_pitch_roll = true`**、向きだけ逆なら `invert_pitch` / `invert_roll` / `invert_yaw`（いずれもゲーム側の軸の意味で指定。ゲームは変えない）。1 軸だけ逆（そのモーターの配線・符号）なら §5.3 の方法で `count_at_virtual_0 / 1023` を入れ替える。どれもサーバー再起動 → §5.1 → この節をやり直す。組み直した H3 は 2026-11-02 に `swap_pitch_roll = true` と判明（ジョイスティックの前後で左右に傾いた）。
 7. 1 軸ずつ通ったら gain 0.10、0.15 で同じ Pose。`max_gain`（0.15 にしてある）を超える値は `effective_gain` が 0.15 に制限される（`limits` に `gain_limited`）。
 8. 各回、status の `following_error_count`（`following_error_limit_count` に近づくと FAULT）、`velocity_count_s`（`max_vel_count_s` 以下）、`telemetry.tick_dt_ms.p99`（10 ms 前後）を控える。
 9. 向きが 3 軸とも合ったら、limits.md §4 の手順で `duty_min` → 速度・加速度 → Duty 上限の順に上げる（試験ページの「動きの制限」か `POST /v1/limits`。サーバーを再起動せずに変えられる）。
@@ -396,11 +396,13 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 | `fault_code = LOCAL_ESTOP`（12） | CoreS3 画面の非常停止ボタン（protocol.md §3.2）。ラッチ中に `fault/reset` を送ると HTTP は 200 だが MCU が `FAULT_CAUSE_PRESENT` で拒否し、`rig_state` は `FAULT_LATCHED` のまま、`blockers` に `fault_reset_rejected: axisN FaultCausePresent` | 画面のボタンで「解除」→ `/v1/fault/reset`。`UNKNOWN` と表示されるなら PC 側が 12 を知らない古いバイナリ（`cargo build` し直す） |
 | `fault_code = HOST_FAULT` | 他の軸の FAULT を受けて PC が止めた | `fault` の `axis` / `code` が原因の軸。`events` で最初の `fault` を見る |
 | `fault.kind = "axis_disconnected"` / `"axis_rebooted"` / `"axis_changed"` | 駆動中に軸が切れた / `boot_id` が変わった / 担当個体の系統が変わった | USB・給電。`axis_changed` は駆動中に画面をタップした（DISARMED 以外では MCU が無視するはずなので、起きたらファームの不具合）。再基準化から |
+| `fault.kind = "start_timeout"`（`axis` 付き） | START が確認できなかった。detail が `ack_timeout: START on axisN not ACKed … (MCU reports ACTIVE)` なら、MCU は START を適用したのに ACK が PC に届かなかった（USB の取りこぼし。2026-11-02 03:48 の形）。detail がその軸の状態（`not ACTIVE within 5000 ms (reports HOLDING)`）なら ACK は来たが ACTIVE にならなかった | `GET /v1/events` の `ack_timeout` と、その軸の `rx_error_count` / `decode_errors`。再現するなら USB ハブ・ケーブル（Issue #11 と同じ経路）。FAULT_RESET → ARM → START でやり直す |
 | `fault.kind = "axis_state_mismatch"` | ACK の後の STATUS が遷移前の状態だった（例: ARM_PREPARE の ACK の後に DISARMED） | ファームの ACK → STATUS の順序の不具合（protocol.md §1）。PC 側では直せない。`events` を保存して報告 |
 | `fault.kind = "frame_skew"` | 3 軸の `last_applied_frame` の差が 5 を超えた | 1 軸だけ SET_POSITION を取りこぼしている。その軸の `stale_drop_count` / `rx_error_count`、USB ハブ |
 | HTTP 401 / 403 | トークン無し・不一致（`require_admin_token = true` のときだけ） / Origin 違反 | `H3CS_ADMIN_TOKEN` が起動時と同じか。curl は Origin を付けないので 403 はブラウザー側 |
 | 3 台とも USB に見えるのに HELLO にも書き込み（esptool）にも答えない | USB-JTAG が固まっている。Base15 の DC を切っても USB ハブの VBUS で CoreS3 は動き続け、再起動しない（`ioreg -p IOUSB -l -w0 \| grep sessionID` が変わらない） | **ハブの上流 USB ケーブルを抜き差し**（または各 USB を抜き差し）して再列挙させる。2026-11-01 に 2 台同時に起きた（[runs/hw_20261101.md](runs/hw_20261101.md)） |
 | HTTP 409 `no_fresh_pose` | START に新鮮な Pose が無い | `bringup_pose.py` が動いているか、`session.fresh`。`frame_seq` の無い Pose は拒否（`allow_missing_frame_seq = false`） |
+| HTTP 409 `pose_not_near_hold` | START 時の Pose が作る目標が、保持位置から `[game].start_max_offset_count`（既定 300 count）を超えて離れた軸がある | `blockers` に軸ごとの距離。送っている Pose を中立（0, 0, 0）か gain 0 に戻してから START（忘れたタブが極端な姿勢を流していないか） |
 | HTTP 409 `not_holding` / `not_disarmed`（`blockers` に `rig_state: <状態>`） | その状態では受けない命令（例: READY_TO_ARM で start、ACTIVE で center、HOLDING 中に reference） | 順序: arm → start。center は HOLDING で、reference は全軸 DISARMED で |
 | HTTP 429 | 管理 API の rate limit（20 回/秒） | status のポーリングは `GET /v1/status`（認証なし・対象外）で |
 | HTTP 503 `control_loop_unavailable` | 制御ループが 1 s 以内に答えない | arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は **実行されたかもしれない**。status で確かめる。`GET /v1/status` 自体が 503 なら制御ループが落ちている → `GET /v1/events` は読めるので保存し、**24V を切ってから** サーバーを再起動（MCU は lease 切れで既に止まっているはず） |

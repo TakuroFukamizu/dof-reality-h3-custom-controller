@@ -47,7 +47,7 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 | スイート | 件数 | 内容 | 段階 |
 | --- | ---: | --- | --- |
 | `clients/python/tests/test_motion_client.py` | 28 | 偽サーバー相手: 送信規則（新しい submit だけ送る、seq 単調、source_age をキュー待ちで作り直さない）、再接続とバックオフ、stale_session 後に取り返さない、送信がブロックしない、float にできない巨大な整数・2⁶⁴−1 を超える frame_seq は例外ではなく `False`、`axis_conflict` の拒否では再接続せず送り続けてログは 1 回（他の拒否理由では `axis_conflict` を立てない）、`_summary` に各軸の割当（port / device_id / claimants / `reference_stale`）と競合を出し古い形の status でも落ちない、`submit_limits`（合成・Pose より先に送る・省略項目は送らない・ack が `last_limits_ack`・拒否も入る） | 1 |
-| `clients/python/tests/test_against_server.py` | 8 | 実サーバー（sim）: ARM しない、gain 上限（0.5）、`submit_limits` で gain の上限が変わり速度は 6000 で切られ status / `GET /v1/limits` に出て新 session で戻る、frame_seq なしの拒否、同じ frame_seq で鮮度が切れる、トークンなしの stop、走行中の再接続で停止、クライアントが許す最大の frame_seq（2⁶⁴−1）をサーバーが受理 | 2 |
+| `clients/python/tests/test_against_server.py` | 8 | 実サーバー（sim）: ARM しない、gain 上限（0.5）、`submit_limits` でゲームが上げた gain 0.8 / 速度 7000 は操作者の 0.5 / 3000 で切られ（`operator_limited`）、下げた gain 0.3 は効き、status（`operator_max` / `game_fields`）/ `GET /v1/limits` に出て新 session で戻る、frame_seq なしの拒否、同じ frame_seq で鮮度が切れる、トークンなしの stop、走行中の再接続で停止、クライアントが許す最大の frame_seq（2⁶⁴−1）をサーバーが受理 | 2 |
 | `clients/h3game/tests/test_server_backend.py` | 32 | bridge 用バックエンド層（偽クライアント）: frame_seq の扱い、owner 変更、無効値（float にできない巨大な整数、2⁶⁴−1 を超える frame_seq は `invalid` で、以後のフレームを塞がない）、`/state` のキー（session を取られたら `connected` は false、status の `axis_conflict` と blockers・ack の拒否理由から `hud_note`「系統の競合(軸1、入力拒否)」「個体の不一致」「再基準化が必要」を作る、他の blocker は載せず届いていなければ `null`、壊れた入力でも落ちない）、並行 POST、POST の `limits` オブジェクトの転送（姿勢と独立・未知キーは無視・数値でなければ `invalid`） | 2 |
 | `clients/h3game/tests/test_patch.py` | 11 | パッチの適用（blob SHA・変更ファイル・正本との一致）、index.html の隠れたときの規則（0 ＋表示中に最後に送った frame_seq）と server 用の HUD 表示（`hud_note` を `srvNote()` に足す）、legacy は元の bridge と同じ応答、server・dry は serial / h3_direct を import しない、サーバー不在でも POST が待たされない、壊れた数値の POST にも応答して `invalid` に数える、ポート使用中の 2 つ目の bridge はサーバーへ 1 回も要求せずに終わる、LAN のアドレスからの `GET /reconnect`・`/claim` は無視（LAN の IPv4 アドレスが無ければこの 1 件は skip） | 2 |
 | `clients/h3game/tests/test_integration.py` | 7 | 実サーバー（sim）＋パッチ後の bridge: 追従、ゲーム停止で STOPPING → BRAKED_DISARMED（中央へ戻さない）、POST が続いても frame_seq が止まれば停止、ACTIVE 中に画面を隠しても目標が動かずその位置で停止（ページの規則を模擬ブラウザーで再現したもの。ページ自体の確認は test_browser.py）、再読み込みで新 session・自動再開なし、走行中に bridge を二重起動しても session は変わらず走行が続く・別のクライアントに session を取られると bridge の `/state` が `connected: false`・`session_lost: true`、frame_seq なしは START 不可、dry は何も送らない | 2 |
@@ -84,7 +84,21 @@ cd moter-controler && /Users/takuro/.platformio/penv/bin/pio run && cd ..  # 6 e
 - **telemetry の不足**（計画 §8・§11 との差。未実装）: SET_POSITION の送信→MCU 適用の遅延、ゲーム側の source age の分布、管理・イベントのキュー深さ、STATUS の欠落数、USB 書き込み遅延、clock_sync の品質。§8 のベンチ目標（サーバー受信→MCU 適用 p99 20 ms）は今の telemetry では評価できない。ファイルへの JSONL 記録も未配線（イベントはメモリ上のリング `GET /v1/events` と標準エラーだけ）。
 - **CoreS3 側の規則への適合**: ACK と STATUS の順序（protocol.md §1）、ACTIVE 以外での停止命令の扱い、CONFIG の検査範囲などは、PC が依存していることを模擬軸の試験で確かめただけ。実ファームウェアがそうなっているかは CoreS3 側の実装・試験で確かめる。
 
-## 最新の結果（2026-11-01 夕方、トークン既定・`sim_axes`・USB 方式の戻し・ファームの KEEP_POWER の後）
+## 2026-11-02 の結果（Issue #15: ゲーム経路の制限値の上限・模擬軸の開け直し・StartTimeout）
+
+環境: macOS 26.5（arm64）、rustc / cargo 1.96.0、clippy 0.1.96、Python 3.14.4 ＋ websockets 17（`clients/python/.venv`）。サーバーだけの変更（ファームは触っていない）。
+
+| 試験 | 結果 |
+| --- | --- |
+| `cargo test` | 438 passed、0 failed、1 ignored（この PR で 5 本追加: `limits.rs` 2・`supervisor.rs` 2・`server.rs` 1。WS の limits 試験は操作者の上限で書き直し） |
+| `cargo clippy --all-targets -- -D warnings` | 警告 0 |
+| `clients/python/tests` | Ran 36、OK（`test_against_server.py` の limits 試験を `operator_limited` に書き直し） |
+| `clients/h3game/tests` | Ran 51、OK（`H3GAME_SRC` に既存のクローン。パッチの `h3_motion_client.py` の複製は docstring だけ更新） |
+| `e2e_sim.sh` | PASS、チェック 120 / 120（`--out` を作業用ディレクトリにしたので `runs/` には置いていない。e2e は limits を送らないので操作者の上限は通らない） |
+
+変えたこと: WS `limits` で書いた項目は `[limits]` の初期値を超えない（`operator_limited`、status / `GET/POST /v1/limits` に `operator_max` / `game_fields`、limits.md §1）、模擬軸のポートもリンクが閉じたら `SERIAL_RETRY` 後に同じ `SimMcu` へ開け直す（`sim_port_task`、DESIGN.md §10.3）、START が確認できないときの FAULT を `StartTimeout { axis }` にして detail に `ack_timeout: …` か未到達の状態を書く（DESIGN.md §5 / §7.2）。
+
+## 2026-11-01 夕方の結果（トークン既定・`sim_axes`・USB 方式の戻し・ファームの KEEP_POWER の後）
 
 実機の記録は [runs/hw_20261101.md](runs/hw_20261101.md)。
 
@@ -211,7 +225,7 @@ e2e の主な値（模擬軸、1 回分。推定値の目安で、保証値で�
 | 制御 tick の周期（目標 10 ms） | p50 10.0 ms、p99 11.1 ms、max 16.4 ms（overrun 1 回 / 2240 tick） |
 | 3 軸の frame skew | p99 1 フレーム、max 1 フレーム |
 | ゲーム停止（最後に frame_seq が進んだ POST）→ STOPPING | 264 ms（`source_freshness_ms` 250。status の poll 10 ms 分の誤差を含む） |
-| STOPPING → BRAKED_DISARMED | 1057 ms（`stop_hold_ms` 1000 を含む） |
+| STOPPING → BRAKED_DISARMED | 1057 ms（`stop_hold_ms` 1000 を含む）。実測の静止判定（`rest_dwell_ms` 200、Issue #15 H1）を入れた後は、鮮度切れからの停止で 1051 ms（止まっていた軸は dwell が済んでいる）、走行中の `POST /v1/stop` で 1252 ms（減速の末尾に dwell が足される）。[runs/e2e_sim_20261102-013725](runs/e2e_sim_20261102-013725/summary.md) |
 | 管理者 FAULT → 全軸 FAULT | 21 ms |
 
 値は [runs/e2e_sim_20261030-120325/summary.md](runs/e2e_sim_20261030-120325/summary.md)（Python 3.14）のもの。

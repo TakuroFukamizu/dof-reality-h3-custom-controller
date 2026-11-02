@@ -44,6 +44,9 @@ stop_settle_timeout_ms = 3000
 stop_hold_ms = 1000
 max_frame_skew = 25                # USB の遅延揺らぎ（status_age 2〜80 ms）と模擬軸の混在で 7 フレームずれて FAULT になった（2026-11-01）。bring-up 用。実機 3 台で詰め直す
 center_reach_timeout_ms = 5000     # /v1/center で目標が中立に着いてから実位置が game.center_tolerance_count に入るまでの猶予。過ぎたら FAULT（StopTimeout）
+rest_velocity_count_s = 50         # 「実測で静止」= |velocity_count_s| ≤ これ かつ |following_error_count| ≤ rest_error_count が rest_dwell_ms 続くこと。
+rest_error_count = 50              # STOPPING（減速→保持→ブレーキ）と center 後の整定は、軌道の速度 0 だけでなくこの実測条件も要る（Issue #15 H1）。deadband_out_count 以上
+rest_dwell_ms = 200                # 静止と判定するまでの継続時間。stop_settle_timeout_ms 未満
 hello_retry_ms = 200
 hello_timeout_ms = 2000
 
@@ -54,6 +57,13 @@ virtual_min = 0.0
 virtual_max = 1023.0
 center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
 center_tolerance_count = 50      # 中立到達は全軸の「実位置」がこの範囲に入って初めて成立（deadband_out 20 以上）。11-01 に #2 が 280 count 手前で「到達」になったため
+# 機構の向き（hardware-bringup.md §7 の向きの確認で決める。ゲーム側は pitch / roll をゲームの意味のまま送る）。
+# 混合式は h3game のまま: roll = #1・#2 同方向、pitch = #1・#2 逆方向。組み直した H3 では同方向が前後の傾きだったので入れ替える（2026-11-02 実機）。
+swap_pitch_roll = true
+invert_pitch = false             # 前に倒して前が下がらなければ true
+invert_roll = false              # 右に倒して右が下がらなければ true
+invert_yaw = false
+start_max_offset_count = 300     # START 時の姿勢が保持位置からこの count を超えて離れる軸があれば 409 pose_not_near_hold（忘れたタブの極端な姿勢で START 直後に飛ばないため）。ゲームを中立にしてから START
 
 [limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
 # !!! bring-up 用に低い値（旧 PR と同じ動き: gain 0.15、600 count/s、2000 count/s²、Duty 7〜20 %）。
@@ -62,7 +72,7 @@ center_tolerance_count = 50      # 中立到達は全軸の「実位置」がこ
 # !!! gain は 0.5 まで（example.toml / sim.toml の値が上げ切った先の目標）。実行時は試験ページか POST /v1/limits、
 # !!! 決めた値はここに書く。上限はファームの絶対上限（Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0。
 # 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）
-max_gain = 0.5                  # 0.15 → 0.5（向きの確認が済んだので。gain 1.0 でソフトリミットいっぱい）
+max_gain = 1.0                  # 11-02: 向き（swap_pitch_roll）確認済み。gain 1.0 = 全開でソフトリミット内の端まで（count_at_virtual_0/1023 の余裕 150 count で行き過ぎを吸収）。試験ページ側の gain 既定も 1.0
 max_vel_count_s = 600            # 1.5 回転/s。従来 env の HOME（10 %）より遅い
 max_acc_count_s2 = 2000
 duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）

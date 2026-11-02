@@ -114,6 +114,17 @@ pub struct TimingConfig {
     /// be within `game.center_tolerance_count` of neutral within this, or the rig
     /// faults (StopTimeout) instead of reporting `center_reached` on a lagging axis.
     pub center_reach_timeout_ms: u64,
+    /// Measured rest (Issue #15 H1): an axis is "at rest" when STATUS reports
+    /// |velocity_count_s| <= `rest_velocity_count_s` AND
+    /// |following_error_count| <= `rest_error_count`, continuously for
+    /// `rest_dwell_ms`. STOPPING (Decel -> Hold, Hold -> DISARM) and the
+    /// post-center settle require every axis at rest, not just a trajectory
+    /// at velocity 0: the MCU declares HOLDING when its SETPOINT stops, while a
+    /// gravity-loaded axis can still be moving / hundreds of counts off.
+    pub rest_velocity_count_s: u32,
+    /// Must cover the firmware deadband (`limits.deadband_out_count`).
+    pub rest_error_count: u32,
+    pub rest_dwell_ms: u64,
     /// Handshake: HELLO_REQ retry period and overall timeout per port.
     pub hello_retry_ms: u64,
     pub hello_timeout_ms: u64,
@@ -133,6 +144,9 @@ impl Default for TimingConfig {
             stop_hold_ms: 1000,
             max_frame_skew: 5,
             center_reach_timeout_ms: 5000,
+            rest_velocity_count_s: 50,
+            rest_error_count: 50,
+            rest_dwell_ms: 200,
             hello_retry_ms: 200,
             hello_timeout_ms: 2000,
         }
@@ -157,6 +171,32 @@ pub struct GameConfig {
     /// (`limits.deadband_out_count`) with margin; 2026-11-01 a lagging axis was
     /// declared centered 280 counts short because only the setpoint was checked.
     pub center_tolerance_count: u32,
+    /// Rig orientation (compat::Orientation): the game sends pitch / roll / yaw
+    /// in its own sense; these map them onto this rig's mixer inputs. The
+    /// operator sets them after the orientation check (hardware-bringup.md §7);
+    /// the game never needs to know. Rebuilt H3 2026-11-02: swap_pitch_roll = true.
+    pub swap_pitch_roll: bool,
+    pub invert_pitch: bool,
+    pub invert_roll: bool,
+    pub invert_yaw: bool,
+    /// START (game) is refused (`pose_not_near_hold`) when the fresh pose
+    /// would command any axis farther than this from where it is held: a
+    /// forgotten tab streaming an extreme pose must not launch the seat at
+    /// START (Issue #15 M4). The game should be at neutral when START is
+    /// pressed. Measured in counts along the same path as tracking
+    /// (mix → saturate → calibration → soft limits).
+    pub start_max_offset_count: u32,
+}
+
+impl GameConfig {
+    pub fn orientation(&self) -> crate::compat::Orientation {
+        crate::compat::Orientation {
+            swap_pitch_roll: self.swap_pitch_roll,
+            invert_pitch: self.invert_pitch,
+            invert_roll: self.invert_roll,
+            invert_yaw: self.invert_yaw,
+        }
+    }
 }
 
 impl Default for GameConfig {
@@ -168,6 +208,11 @@ impl Default for GameConfig {
             virtual_max: 1023.0,
             center_speed_fraction: 0.25,
             center_tolerance_count: 50,
+            swap_pitch_roll: false,
+            invert_pitch: false,
+            invert_roll: false,
+            invert_yaw: false,
+            start_max_offset_count: 300,
         }
     }
 }
@@ -435,6 +480,9 @@ impl Config {
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.max_frame_skew", u64::from(t.max_frame_skew)),
             ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_velocity_count_s", u64::from(t.rest_velocity_count_s)),
+            ("timing.rest_error_count", u64::from(t.rest_error_count)),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
         ] {
@@ -453,6 +501,7 @@ impl Config {
             ("timing.stop_settle_timeout_ms", t.stop_settle_timeout_ms),
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
+            ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
             ("timing.hello_timeout_ms", t.hello_timeout_ms),
             ("server.status_period_ms", s.status_period_ms),
@@ -473,6 +522,22 @@ impl Config {
             errs.push(format!(
                 "timing.mcu_command_timeout_ms ({}) must be > timing.planner_period_ms ({})",
                 t.mcu_command_timeout_ms, t.planner_period_ms
+            ));
+        }
+        // The rest dwell is part of every stop: it must fit in the settle window.
+        if t.stop_settle_timeout_ms > 0 && t.rest_dwell_ms >= t.stop_settle_timeout_ms {
+            errs.push(format!(
+                "timing.rest_dwell_ms ({}) must be < timing.stop_settle_timeout_ms ({})",
+                t.rest_dwell_ms, t.stop_settle_timeout_ms
+            ));
+        }
+        if t.rest_error_count > 0 && u32::from(self.limits.deadband_out_count) > t.rest_error_count {
+            // The firmware stops correcting inside deadband_out, so a rest
+            // tolerance tighter than that could never be met: every STOP would
+            // time out.
+            errs.push(format!(
+                "timing.rest_error_count ({}) must be >= limits.deadband_out_count ({})",
+                t.rest_error_count, self.limits.deadband_out_count
             ));
         }
 
@@ -503,6 +568,9 @@ impl Config {
         }
         if !(g.center_speed_fraction > 0.0 && g.center_speed_fraction <= 1.0) {
             errs.push(format!("game.center_speed_fraction must be within (0, 1], got {}", g.center_speed_fraction));
+        }
+        if g.start_max_offset_count == 0 {
+            errs.push("game.start_max_offset_count must be > 0".into());
         }
 
         // Limits (design 2026-11-01 §2).
@@ -566,6 +634,44 @@ impl Config {
                 crate::limits::OVERSPEED_MARGIN,
                 l.max_vel_count_s
             ));
+        }
+        // Stop-time rule (Issue #15 H2): a STOP decelerates at max_acc; if that
+        // takes longer than the stop timeouts the rig faults and brakes at speed.
+        // Checked on the initial set and on the firmware ceilings (a runtime
+        // request may raise max_vel to the ceiling; the clamp then needs an
+        // acceleration bound it can actually reach).
+        {
+            use crate::limits::{min_acc_for_stop, stop_deadline, stop_time_s, Ceilings, STOP_TIME_FRACTION};
+            let deadline = stop_deadline(t);
+            let deadline_s = deadline.as_secs_f64();
+            let budget = format!(
+                "{deadline_s:.3} s ({STOP_TIME_FRACTION} x min(timing.mcu_stop_timeout_ms {}, timing.stop_settle_timeout_ms {}))",
+                t.mcu_stop_timeout_ms, t.stop_settle_timeout_ms
+            );
+            if l.max_acc_count_s2 > 0 {
+                let stop_s = stop_time_s(l.max_vel_count_s, l.max_acc_count_s2);
+                if stop_s > deadline_s {
+                    errs.push(format!(
+                        "limits.max_vel_count_s ({}) / limits.max_acc_count_s2 ({}) = {stop_s:.3} s worst-case stop time \
+                         must be <= {budget}: a STOP would run into the timeout and brake at speed \
+                         (max_acc_count_s2 must be >= {})",
+                        l.max_vel_count_s,
+                        l.max_acc_count_s2,
+                        min_acc_for_stop(l.max_vel_count_s, deadline)
+                    ));
+                }
+            }
+            let c = Ceilings::fallback(l.overspeed_count_s);
+            let stop_s = stop_time_s(c.max_vel_count_s, c.max_acc_count_s2);
+            if stop_s > deadline_s {
+                errs.push(format!(
+                    "firmware ceilings: max_vel {} / max_acc {} = {stop_s:.3} s worst-case stop time must be <= {budget} \
+                     (protocol::fw_absolute and limits.overspeed_count_s / {})",
+                    c.max_vel_count_s,
+                    c.max_acc_count_s2,
+                    crate::limits::OVERSPEED_MARGIN
+                ));
+            }
         }
 
         // Backend.

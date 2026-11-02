@@ -1,6 +1,6 @@
 //! compat: pose checks, mixer, saturation, and the legacy `h3_direct.H3` model.
 
-use h3cs::compat::{check_pose, mix, saturate, LegacyH3Model, PoseError};
+use h3cs::compat::{check_pose, mix, orient, saturate, LegacyH3Model, Orientation, PoseError};
 use h3cs::types::{LimitReason, Pose, VirtualPos};
 
 fn pose(pitch: f64, roll: f64, yaw: f64) -> Pose {
@@ -840,3 +840,39 @@ Scenario { name: "sine_sweep_gain_06", gain: 0.6, max_step: 40.0, ops: &[
     ]),
 ]},
 ];
+
+// ---------------------------------------------------------------- orientation
+
+#[test]
+fn orient_identity_by_default() {
+    let p = pose(0.3, -0.2, 0.1);
+    assert_eq!(orient(p, Orientation::default()), p);
+    assert_eq!(mix(orient(p, Orientation::default()), 0.35), mix(p, 0.35));
+}
+
+/// 2026-11-02 on the rebuilt H3: the mixer's common mode (roll slot) tilts the
+/// seat forward/back, so the game's pitch must feed the roll slot and vice
+/// versa. With the swap, a pure game pitch moves #1 and #2 the same way.
+#[test]
+fn orient_swap_sends_game_pitch_to_common_mode() {
+    let o = Orientation { swap_pitch_roll: true, ..Orientation::default() };
+    let game_pitch = pose(1.0, 0.0, 0.0);
+    let v = mix(orient(game_pitch, o), 0.35);
+    assert_eq!(v[0], v[1], "swapped pitch must be common mode: {v:?}");
+    assert!(v[0].0 > 512.0);
+    let game_roll = pose(0.0, 1.0, 0.0);
+    let v = mix(orient(game_roll, o), 0.35);
+    assert_eq!(v[0].0 - 512.0, -(v[1].0 - 512.0), "swapped roll must be differential: {v:?}");
+    // yaw untouched by the swap
+    assert_eq!(orient(pose(0.0, 0.0, 0.7), o), pose(0.0, 0.0, 0.7));
+}
+
+/// Inversions apply to the GAME's axes (before the swap), so `invert_pitch`
+/// always means "the game's forward is this rig's backward".
+#[test]
+fn orient_inversions_refer_to_game_axes() {
+    let o = Orientation { swap_pitch_roll: true, invert_pitch: true, ..Orientation::default() };
+    assert_eq!(orient(pose(0.5, 0.25, 0.0), o), pose(0.25, -0.5, 0.0));
+    let o = Orientation { invert_roll: true, invert_yaw: true, ..Orientation::default() };
+    assert_eq!(orient(pose(0.5, 0.25, -0.1), o), pose(0.5, -0.25, 0.1));
+}

@@ -53,6 +53,11 @@
 //!   CONFIG outside ARMING → not a fault (blocker `not_configured`, retried);
 //!   FAULT_RESET → stays latched, blocker `fault_reset_rejected`;
 //!   SET_REFERENCE → event only. `DUPLICATE` is treated as `ACCEPTED`.
+//! - START not confirmed → `StartTimeout { axis }` (Issue #15): at
+//!   [`ACK_TIMEOUT`] when the axis's START ACK never came (detail
+//!   `ack_timeout: … (MCU reports ACTIVE)` — the MCU usually did start), or
+//!   at `arm_timeout_ms` when an axis is still not ACTIVE (detail names its
+//!   state). Never an `AxisStateMismatch { expected: ACTIVE, actual: ACTIVE }`.
 //! - FaultReset is refused synchronously when an axis is disconnected, has no
 //!   STATUS, has no STATUS processed after its HOST_FAULT ACK (event order, not
 //!   time), is still powered / decelerating with a fault, or a reset is in
@@ -72,6 +77,16 @@
 //! - `stop_settle_timeout_ms` bounds the deceleration, the post-center settle
 //!   and the wait for DISARMED; `arm_timeout_ms` bounds ARMING and START
 //!   confirmation.
+//! - "Stopped" is judged on MEASURED values as well as on the trajectory
+//!   (Issue #15 H1): an axis is at rest when its STATUS has shown
+//!   |velocity_count_s| <= `timing.rest_velocity_count_s` and
+//!   |following_error_count| <= `timing.rest_error_count` for
+//!   `timing.rest_dwell_ms`. STOPPING Decel → Hold needs the planner settled,
+//!   every MCU HOLDING and every axis at rest; Hold → DISARM (the brake) needs
+//!   `stop_hold_ms` elapsed and every axis at rest (an axis drifting during the
+//!   hold gets `stop_settle_timeout_ms` more); the post-center settle needs
+//!   HOLDING and at rest. The `StopTimeout` detail lists the axes not at rest
+//!   with their measured velocity and following error.
 //! - Center is complete when the planner is at neutral with zero velocity,
 //!   every axis's STATUS.target_count (MCU setpoint) is within
 //!   [`CENTER_TOLERANCE_COUNT`] of neutral, AND every axis's measured
@@ -109,6 +124,14 @@
 //!   takes the axis) and logged as the event `cal_result`. A successful unit
 //!   re-references itself (P end = 0, POSITION_REFERENCED): the supervisor
 //!   accepts that and also clears any `reference_stale` mark of the unit.
+//! - A CAL_RESULT OK also marks the axis `calibration_stale` (Issue #15 H3):
+//!   the geometry this server was started with (`calibration_valid`, soft
+//!   window, neutral, sign) was approved for the previous origin, so ARM is
+//!   refused (`calibration_stale: axisN recalibrated (stroke S, neutral N); …`,
+//!   `axes[].calibration_stale`, event `calibration_stale`) until the server
+//!   is restarted with the exported config. The mark is in memory only: it
+//!   survives reconnects and reboots of the unit and is cleared by nothing
+//!   but a restart. `/v1/calibration/export` keeps working meanwhile.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -120,7 +143,8 @@ use crate::calibration::{self, AxisCalibration};
 use crate::compat;
 use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
 use crate::limits::{
-    self as motion_limits, Ceilings, FwAbsolute, FwTuning, LimitedField, MotionLimits, MotionLimitsSnapshot,
+    self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest, MotionLimits,
+    MotionLimitsSnapshot, OperatorCap,
 };
 use crate::planner::{AxisLimits, Planner};
 use crate::protocol::{
@@ -168,6 +192,9 @@ pub mod admin_error {
     pub const NOT_HOLDING: &str = "not_holding";
     pub const BUSY: &str = "busy";
     pub const NO_FRESH_POSE: &str = "no_fresh_pose";
+    /// START (game): the fresh pose would command an axis farther than
+    /// `game.start_max_offset_count` from its hold position (Issue #15 M4).
+    pub const POSE_NOT_NEAR_HOLD: &str = "pose_not_near_hold";
     pub const FAULT_LATCHED: &str = "fault_latched";
     pub const NOT_FAULTED: &str = "not_faulted";
     pub const RESET_IN_PROGRESS: &str = "reset_in_progress";
@@ -372,6 +399,11 @@ pub struct AxisSnapshot {
     pub configured: bool,
     pub referenced: bool,
     pub calibration_valid: bool,
+    /// Recalibrated (CAL_RESULT OK) in this server run: the configured
+    /// geometry is no longer approved for this axis (blocker
+    /// `calibration_stale`) until the server restarts with the exported
+    /// config (Issue #15 H3).
+    pub calibration_stale: bool,
     pub actual_count: Option<Counts>,
     pub target_count: Option<Counts>,
     pub velocity_count_s: Option<i32>,
@@ -559,6 +591,10 @@ struct AxisTrack {
     limits_inflight: Option<FwTuning>,
     limits_rejected: Option<AckReason>,
     limits_retry_at: Option<Instant>,
+    /// Since when every STATUS has shown the axis at rest (|velocity| and
+    /// |following_error| inside `timing.rest_*`); `None` once one did not.
+    /// `axis_at_rest` needs this to be `rest_dwell_ms` old.
+    rest_since: Option<Instant>,
 }
 
 impl AxisTrack {
@@ -646,15 +682,33 @@ pub struct Supervisor {
     limits_cfg: LimitsConfig,
     /// What the API asked for (shared set, before the ceilings).
     requested_limits: MotionLimits,
-    /// `requested_limits` clamped to the current ceilings.
+    /// Fields of `requested_limits` the game channel wrote last: held to the
+    /// operator's `[limits]` values by the clamp (Issue #15).
+    game_fields: FieldSet,
+    /// `requested_limits` clamped (ceilings + stop-time rule): what we want
+    /// in force and what SET_LIMITS carries.
+    target_limits: MotionLimits,
+    /// What the planner / SET_POSITION use. Equals `target_limits` once the
+    /// SET_LIMITS carrying the target's duty tuning is ACKed by every
+    /// connected axis; until then it keeps the confirmed tuning and takes
+    /// only the lowered components of the target (Issue #15 M3).
     effective_limits: MotionLimits,
     limited: Vec<LimitedField>,
+    limit_reasons: Vec<LimitReason>,
+    /// `target_limits` is waiting for SET_LIMITS ACKs (status `pending`).
+    limits_pending: bool,
     names: [String; AXIS_COUNT],
     device_ids: [DeviceId; AXIS_COUNT],
     operator_valid: [bool; AXIS_COUNT],
     cal: [AxisCalibration; AXIS_COUNT],
     cal_error: [Option<String>; AXIS_COUNT],
     hashes: [u32; AXIS_COUNT],
+    /// Issue #15 H3: the axis was recalibrated (CAL_RESULT OK: `(stroke,
+    /// neutral)`) in this server run, so the configured geometry (`cal`,
+    /// `operator_valid`, `hashes`) may no longer describe the MCU's origin /
+    /// sign. ARM blocker `calibration_stale` until the server is restarted
+    /// with the exported config; survives reboots and reconnects on purpose.
+    calibration_stale: [Option<(Counts, Counts)>; AXIS_COUNT],
     power_axis: AxisId,
 
     axes: [AxisTrack; AXIS_COUNT],
@@ -729,21 +783,30 @@ impl Supervisor {
         let hashes = std::array::from_fn(|i| calibration::calibration_hash(&cfg.rig_id, &cal[i]));
         let neutral: [Counts; AXIS_COUNT] = std::array::from_fn(|i| cal[i].neutral_count());
         let requested_limits = MotionLimits::from_config(&cfg.limits);
-        let (effective_limits, limited) =
-            motion_limits::clamp(&requested_limits, &Ceilings::fallback(cfg.limits.overspeed_count_s));
+        let clamped = motion_limits::clamp(
+            &requested_limits,
+            &Ceilings::fallback(cfg.limits.overspeed_count_s),
+            &OperatorCap::none(requested_limits),
+            motion_limits::stop_deadline(&cfg.timing),
+        );
         Self {
             timing: cfg.timing.clone(),
             game: cfg.game.clone(),
             limits_cfg: cfg.limits.clone(),
             requested_limits,
-            effective_limits,
-            limited,
+            game_fields: FieldSet::NONE,
+            target_limits: clamped.effective,
+            effective_limits: clamped.effective,
+            limited: clamped.limited,
+            limit_reasons: clamped.reasons,
+            limits_pending: false,
             names,
             device_ids,
             operator_valid,
             cal,
             cal_error,
             hashes,
+            calibration_stale: [None; AXIS_COUNT],
             power_axis: cfg.power_controller_axis,
             axes: Default::default(),
             unknown_ports: BTreeMap::new(),
@@ -941,6 +1004,11 @@ impl Supervisor {
             }
             if let Some(e) = &self.cal_error[i] {
                 b.push(format!("calibration_invalid: {e}"));
+            }
+            if let Some((stroke, neutral)) = self.calibration_stale[i] {
+                b.push(format!(
+                    "calibration_stale: axis{n} recalibrated (stroke {stroke}, neutral {neutral}); export and reload config before ARM"
+                ));
             }
             if let Some(r) = t.reset_rejected {
                 b.push(format!("fault_reset_rejected: axis{n} {r:?}"));
@@ -1277,6 +1345,7 @@ impl Supervisor {
                         })
                         .collect(),
                     reference_stale: self.reference_stale(i),
+                    calibration_stale: self.calibration_stale[i].is_some(),
                     boot_id: t.boot_id,
                     mcu_state: t.mcu_state(),
                     fault_code: s.map(|s| s.fault_code),
@@ -1336,15 +1405,47 @@ impl Supervisor {
 
     // ------------------------------------------------------------ motion limits
 
-    /// Replace the requested shared set (the control loop forwards the
-    /// API's value every tick). Takes effect at the next `tick`.
+    /// Replace the requested shared set as the operator / config would
+    /// (no field under the game-channel cap). Takes effect at the next `tick`.
     pub fn set_requested_limits(&mut self, requested: MotionLimits) {
-        self.requested_limits = requested;
+        self.set_limits_request(LimitsRequest::new(requested));
     }
 
-    /// The set in effect (requested, clamped to the ceilings).
+    /// Replace the requested shared set with its provenance (the control loop
+    /// forwards the API's value every tick): the game-written fields are held
+    /// to the operator's `[limits]` values (Issue #15). Takes effect at the
+    /// next `tick`.
+    pub fn set_limits_request(&mut self, req: LimitsRequest) {
+        self.requested_limits = req.requested;
+        self.game_fields = req.game_fields;
+    }
+
+    /// The cap the clamp applies to the game-written fields.
+    fn operator_cap(&self) -> OperatorCap {
+        OperatorCap { max: MotionLimits::from_config(&self.limits_cfg), fields: self.game_fields }
+    }
+
+    /// The set in effect: what the planner and SET_POSITION use (the clamped
+    /// request once its duty tuning is confirmed on every axis, see
+    /// [`Self::limits_pending`]).
     pub fn effective_limits(&self) -> MotionLimits {
         self.effective_limits
+    }
+
+    /// The clamped request (ceilings + stop-time rule), confirmed or not.
+    pub fn target_limits(&self) -> MotionLimits {
+        self.target_limits
+    }
+
+    /// The clamped request changes the firmware tuning and not every
+    /// connected axis has ACKed that SET_LIMITS yet.
+    pub fn limits_pending(&self) -> bool {
+        self.limits_pending
+    }
+
+    /// The deadline the stop-time rule enforces (`limits::stop_deadline`).
+    fn stop_deadline(&self) -> Duration {
+        motion_limits::stop_deadline(&self.timing)
     }
 
     /// Ceilings the requested set is clamped to: the minimum of the absolute
@@ -1370,19 +1471,57 @@ impl Supervisor {
             requested: self.requested_limits,
             ceiling: self.ceilings(),
             defaults: MotionLimits::from_config(&self.limits_cfg),
+            operator_max: MotionLimits::from_config(&self.limits_cfg),
+            game_fields: self.game_fields,
             limited: self.limited.clone(),
+            reasons: self.limit_reasons.clone(),
+            pending: self.limits_pending,
         }
     }
 
+    /// Clamp the request into `target_limits`, then decide what the planner
+    /// may use now (Issue #15 M3):
+    /// - the target's SET_LIMITS content equals the one in force → apply at
+    ///   once (velocity / acceleration / gain changes never wait);
+    /// - otherwise wait until every connected axis that speaks SET_LIMITS has
+    ///   ACKed the target tuning (`reconcile_limits` sends it), and meanwhile
+    ///   keep the confirmed set, taking only the *lowered* components of the
+    ///   target (a lowered cap is safe with the old tuning; a raised velocity
+    ///   with an unconfirmed duty cap is the FOLLOWING_ERROR the issue
+    ///   describes). The stop-time rule survives the component-wise minimum:
+    ///   both sets satisfy `acc ≥ vel / deadline`, so their minima do too.
     fn recompute_limits(&mut self) {
-        let (e, l) = motion_limits::clamp(&self.requested_limits, &self.ceilings());
-        self.effective_limits = e;
-        self.limited = l;
+        let c =
+            motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
+        self.target_limits = c.effective;
+        self.limited = c.limited;
+        self.limit_reasons = c.reasons;
+        let want = self.desired_tuning();
+        let in_force = FwTuning::new(&self.limits_cfg, &self.effective_limits);
+        let confirmed = want == in_force
+            || self
+                .axes
+                .iter()
+                .filter(|t| t.connected && t.supports_limits())
+                .all(|t| t.limits_acked == Some(want));
+        if confirmed {
+            self.effective_limits = self.target_limits;
+            self.limits_pending = false;
+        } else {
+            let (t, e) = (&self.target_limits, &self.effective_limits);
+            self.effective_limits = MotionLimits {
+                max_gain: e.max_gain.min(t.max_gain),
+                max_vel_count_s: e.max_vel_count_s.min(t.max_vel_count_s),
+                max_acc_count_s2: e.max_acc_count_s2.min(t.max_acc_count_s2),
+                duty_max_percent: e.duty_max_percent,
+            };
+            self.limits_pending = true;
+        }
     }
 
-    /// The SET_LIMITS content for the current effective set.
+    /// The SET_LIMITS content for the clamped request (`target_limits`).
     fn desired_tuning(&self) -> FwTuning {
-        FwTuning::new(&self.limits_cfg, &self.effective_limits)
+        FwTuning::new(&self.limits_cfg, &self.target_limits)
     }
 
     /// Send SET_LIMITS to every connected axis on which the desired tuning is
@@ -1391,6 +1530,8 @@ impl Supervisor {
     /// the rig is latched (HOST_FAULT first). An ACK whose LIMITS never
     /// arrives is re-sent after `LIMITS_RETRY` with a new request_id (a
     /// resend of the same request would only be DUPLICATE, without LIMITS).
+    /// A tuning that changed while the previous SET_LIMITS was in flight goes
+    /// out as soon as that one is ACKed (the ACK handler sets no retry wait).
     fn reconcile_limits(&mut self, now: Instant) {
         if matches!(self.phase, Phase::Fault { .. }) {
             return;
@@ -1564,6 +1705,7 @@ impl Supervisor {
         if rebooted || reconnect {
             t.status = None;
             t.status_at = None;
+            t.rest_since = None;
             t.configured_epoch = None;
             t.config_rejected = None;
             // A new link / boot has not seen our HOST_FAULT.
@@ -1647,6 +1789,15 @@ impl Supervisor {
         if status.flags & status_flags::CONFIGURED == 0 {
             t.configured_epoch = None;
         }
+        // Measured rest (Issue #15 H1): judged on every STATUS, the dwell
+        // counted from the first one that qualified (a new boot starts over).
+        let at_rest = status.velocity_count_s.unsigned_abs() <= self.timing.rest_velocity_count_s
+            && status.following_error_count.unsigned_abs() <= self.timing.rest_error_count;
+        t.rest_since = match (at_rest, rebooted) {
+            (false, _) => None,
+            (true, true) => Some(received_at),
+            (true, false) => t.rest_since.or(Some(received_at)),
+        };
         t.status = Some(status);
         t.status_at = Some(received_at);
         t.status_ev = self.ev;
@@ -1721,6 +1872,16 @@ impl Supervisor {
             if let (Some(h), Some(b)) = (t.hello, t.boot_id) {
                 self.stale_refs.remove(&(h.device_id, b));
             }
+            // Issue #15 H3: the MCU's origin / stroke / sign are now the
+            // measured ones; the configured geometry this server arms with
+            // was approved for the old ones. Revoke until a restart with the
+            // exported config (the flag lives only in memory).
+            self.calibration_stale[i] = Some((r.n_end_count, r.neutral_count));
+            self.event(
+                now,
+                "calibration_stale",
+                serde_json::json!({"axis": axis, "stroke": r.n_end_count, "neutral": r.neutral_count}),
+            );
         }
     }
 
@@ -1761,6 +1922,7 @@ impl Supervisor {
         t.port = None;
         t.status = None;
         t.status_at = None;
+        t.rest_since = None;
         t.configured_epoch = None;
         t.config_rejected = None;
         t.group_ok = false;
@@ -1876,11 +2038,14 @@ impl Supervisor {
                         }
                     }
                     Purpose::SetLimits => {
+                        let want = self.desired_tuning();
                         let t = &mut self.axes[i];
                         t.limits_acked = t.limits_inflight.take();
                         t.limits_rejected = None;
-                        // LIMITS should follow at once; if it is lost, resend after this.
-                        t.limits_retry_at = Some(now + LIMITS_RETRY);
+                        // LIMITS should follow at once; if it is lost, resend after
+                        // this. A tuning that changed while this one was in flight
+                        // goes out at the next tick instead (Issue #15 M3).
+                        t.limits_retry_at = (t.limits_acked == Some(want)).then_some(now + LIMITS_RETRY);
                     }
                     _ => {}
                 }
@@ -2229,11 +2394,37 @@ impl Supervisor {
             }
         }
         let fresh = self.last_pose.as_ref().filter(|p| p.fresh_until > now);
-        if source == ActiveSource::Game && fresh.is_none() {
-            return Err(AdminError::new(
-                admin_error::NO_FRESH_POSE,
-                vec!["no_fresh_pose: no fresh game pose in the last tick".into()],
-            ));
+        if source == ActiveSource::Game {
+            let Some(p) = fresh else {
+                return Err(AdminError::new(
+                    admin_error::NO_FRESH_POSE,
+                    vec!["no_fresh_pose: no fresh game pose in the last tick".into()],
+                ));
+            };
+            // Pose-magnitude interlock (Issue #15 M4): the pose START would
+            // hand to the planner must be near where the axes are held, or a
+            // forgotten tab's extreme pose launches the seat at full speed.
+            let (targets, _, _) = self.pose_targets(&p.checked);
+            let hold = self.hold_positions();
+            let max = self.game.start_max_offset_count;
+            let far: Vec<String> = (0..AXIS_COUNT)
+                .filter_map(|i| {
+                    let d = targets[i] - hold[i];
+                    (d.abs() > f64::from(max)).then(|| {
+                        format!(
+                            "{}: axis{} target {:.0} is {:+.0} counts from hold {:.0} (max {max})",
+                            admin_error::POSE_NOT_NEAR_HOLD,
+                            i + 1,
+                            targets[i],
+                            d,
+                            hold[i]
+                        )
+                    })
+                })
+                .collect();
+            if !far.is_empty() {
+                return Err(AdminError::new(admin_error::POSE_NOT_NEAR_HOLD, far));
+            }
         }
         self.drive_session = match source {
             ActiveSource::Game => fresh.map(|p| p.session_gen),
@@ -2470,59 +2661,76 @@ impl Supervisor {
                         entered: now,
                     };
                 } else if elapsed(now, since) > ms(self.timing.arm_timeout_ms) {
-                    let (axis, actual) = self.first_axis_not_in(McuState::Active);
-                    self.latch(
-                        RigFault::AxisStateMismatch {
-                            axis,
-                            expected: McuState::Active,
-                            actual,
-                        },
-                        Some("START not confirmed in time".into()),
-                        now,
-                    );
+                    // Name the real cause: an axis not ACTIVE, else one whose
+                    // START ACK never came (normally caught earlier by
+                    // `expire_pending`; this is the backstop).
+                    let (axis, detail) = match self.axes.iter().position(|t| t.mcu_state() != Some(McuState::Active)) {
+                        Some(i) => (
+                            AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                            format!(
+                                "axis{} not ACTIVE within {} ms (reports {:?})",
+                                i + 1,
+                                self.timing.arm_timeout_ms,
+                                self.axes[i].mcu_state().unwrap_or(McuState::Boot)
+                            ),
+                        ),
+                        None => {
+                            let i = self.axes.iter().position(|t| !t.group_ok).unwrap_or(0);
+                            (
+                                AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
+                                format!("ack_timeout: START on axis{} not ACKed (MCU reports ACTIVE)", i + 1),
+                            )
+                        }
+                    };
+                    self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
                 }
             }
             Phase::Holding {
                 start: None,
                 settling: Some(since),
             } => {
-                if all_ok && all_in(McuState::Holding) {
+                // Trajectory stopped (all HOLDING) AND the mechanism measured at
+                // rest (Issue #15 H1): a HOLDING MCU can still be moving.
+                if all_ok && all_in(McuState::Holding) && self.all_at_rest(now) {
                     self.group = None;
                     self.phase = Phase::Holding {
                         start: None,
                         settling: None,
                     };
                 } else if elapsed(now, since) > ms(self.timing.stop_settle_timeout_ms) {
-                    self.latch(
-                        RigFault::StopTimeout,
-                        Some("center stop did not settle".into()),
-                        now,
-                    );
+                    let detail = format!("center stop did not settle: {}", self.rest_detail(now));
+                    self.latch(RigFault::StopTimeout, Some(detail), now);
                 }
             }
             Phase::Holding { .. } | Phase::Active { .. } => {}
             Phase::Stopping { sub, started } => match sub {
                 StopSub::Decel => {
-                    if self.planner_settled && all_ok && all_in(McuState::Holding) {
+                    // Planner settled, every MCU HOLDING (its trajectory at
+                    // velocity 0) AND every axis measured at rest.
+                    if self.planner_settled && all_ok && all_in(McuState::Holding) && self.all_at_rest(now) {
                         self.phase = Phase::Stopping {
                             sub: StopSub::Hold { since: now },
                             started,
                         };
                     } else if elapsed(now, started) > ms(self.timing.stop_settle_timeout_ms) {
-                        self.latch(
-                            RigFault::StopTimeout,
-                            Some("deceleration did not settle".into()),
-                            now,
-                        );
+                        let detail = format!("deceleration did not settle: {}", self.rest_detail(now));
+                        self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
                 StopSub::Hold { since } => {
-                    if elapsed(now, since) >= ms(self.timing.stop_hold_ms) {
+                    // Brake only on a mechanism at rest: `stop_hold_ms` is the
+                    // minimum hold; an axis that drifted meanwhile gets
+                    // `stop_settle_timeout_ms` more to come back to rest.
+                    let held = elapsed(now, since);
+                    if held >= ms(self.timing.stop_hold_ms) && self.all_at_rest(now) {
                         self.send_group_disarm(now);
                         self.phase = Phase::Stopping {
                             sub: StopSub::Disarming { since: now },
                             started,
                         };
+                    } else if held > ms(self.timing.stop_hold_ms) + ms(self.timing.stop_settle_timeout_ms) {
+                        let detail = format!("hold did not come to rest before the brake: {}", self.rest_detail(now));
+                        self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
                 StopSub::Disarming { since } => {
@@ -2842,12 +3050,26 @@ impl Supervisor {
 
     // ------------------------------------------------------------ drive
 
-    /// pose → mix → saturate → virtual_to_count → clamp_soft → step_track.
+    /// pose → orient → mix → saturate → virtual_to_count → clamp_soft → step_track.
     fn track_game(&mut self, pose: &AcceptedPose, dt: f64) -> Vec<LimitReason> {
-        let checked = &pose.checked;
-        let mixed = compat::mix(checked.pose, checked.effective_gain);
-        let (virt, saturated) =
-            compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
+        let (targets, virt, mut limits) = self.pose_targets(&pose.checked);
+        let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
+        limits.extend(out.limits);
+        self.drive.virtual_targets = virt;
+        limits
+    }
+
+    /// The count targets a checked pose commands: mix → saturate →
+    /// virtual_to_count → clamp_soft (the one path for tracking and for the
+    /// START interlock), with the virtual positions and the reasons that
+    /// clipped them.
+    fn pose_targets(
+        &self,
+        checked: &compat::CheckedPose,
+    ) -> ([f64; AXIS_COUNT], [f64; AXIS_COUNT], Vec<LimitReason>) {
+        let oriented = compat::orient(checked.pose, self.game.orientation());
+        let mixed = compat::mix(oriented, checked.effective_gain);
+        let (virt, saturated) = compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
         let mut limits = Vec::new();
         if saturated {
             limits.push(LimitReason::VirtualSaturated);
@@ -2861,10 +3083,17 @@ impl Supervisor {
         if soft {
             limits.push(LimitReason::SoftLimited);
         }
-        let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
-        limits.extend(out.limits);
-        self.drive.virtual_targets = virt.map(|v| v.0);
-        limits
+        (targets, virt.map(|v| v.0), limits)
+    }
+
+    /// Where the axes are held: the planner's positions once it was
+    /// initialised (ARMING → HOLDING), else the measured counts.
+    fn hold_positions(&self) -> [f64; AXIS_COUNT] {
+        if self.planner.is_initialized() {
+            self.planner.positions()
+        } else {
+            self.actual_counts().map(f64::from)
+        }
     }
 
     /// Planner limits: the shared effective set (the same for every axis),
@@ -3041,6 +3270,23 @@ impl Supervisor {
                         t.limits_retry_at = Some(now + LIMITS_RETRY);
                     }
                 }
+                // A START whose ACK never came while we wait for it: the axis
+                // cannot be confirmed (the MCU may well be ACTIVE already —
+                // say so, instead of a state mismatch that names no mismatch).
+                if p.purpose == Purpose::Start
+                    && self.group == Some((Purpose::Start, p.gen))
+                    && matches!(self.phase, Phase::Holding { start: Some(_), .. })
+                {
+                    if let Some(axis) = AxisId::from_index(p.axis) {
+                        let reports = self.axes[p.axis].mcu_state().map_or("no STATUS".to_string(), |s| format!("{s:?}"));
+                        let detail = format!(
+                            "ack_timeout: START on axis{} not ACKed within {} ms (MCU reports {reports})",
+                            axis.get(),
+                            ACK_TIMEOUT.as_millis()
+                        );
+                        self.latch(RigFault::StartTimeout { axis }, Some(detail), now);
+                    }
+                }
                 // An unanswered CALIBRATE(1) must not leave the axis "pending"
                 // forever (no calibrate, no CONFIG retry, cancels on every Stop).
                 // Treated like a rejection: the power axis unanswered cancels
@@ -3073,21 +3319,52 @@ impl Supervisor {
         })
     }
 
-    fn first_axis_not_in(&self, s: McuState) -> (AxisId, McuState) {
-        for (i, t) in self.axes.iter().enumerate() {
-            let st = t.mcu_state();
-            if st != Some(s) {
-                return (
-                    AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
-                    st.unwrap_or(McuState::Boot),
-                );
-            }
-        }
-        (AxisId::ALL[0], s)
+    /// Measured rest (Issue #15 H1): the axis's STATUS has shown
+    /// |velocity_count_s| <= `timing.rest_velocity_count_s` and
+    /// |following_error_count| <= `timing.rest_error_count` for at least
+    /// `timing.rest_dwell_ms`. No STATUS (or a disconnected axis) is not at rest.
+    fn axis_at_rest(&self, i: usize, now: Instant) -> bool {
+        let t = &self.axes[i];
+        t.connected
+            && t.status.is_some()
+            && t
+                .rest_since
+                .is_some_and(|since| elapsed(now, since) >= ms(self.timing.rest_dwell_ms))
+    }
+
+    fn all_at_rest(&self, now: Instant) -> bool {
+        (0..AXIS_COUNT).all(|i| self.axis_at_rest(i, now))
+    }
+
+    /// The axes not at rest with their measured numbers, for a fault detail:
+    /// `axis2 vel -180 count/s fe +212` … `(rest: |vel| <= 50, |fe| <= 50 for 200 ms)`.
+    fn rest_detail(&self, now: Instant) -> String {
+        let moving: Vec<String> = (0..AXIS_COUNT)
+            .filter(|&i| !self.axis_at_rest(i, now))
+            .map(|i| match self.axes[i].status {
+                Some(s) => format!(
+                    "axis{} vel {:+} count/s fe {:+}",
+                    i + 1,
+                    s.velocity_count_s,
+                    s.following_error_count
+                ),
+                None => format!("axis{} no STATUS", i + 1),
+            })
+            .collect();
+        format!(
+            "{} (rest: |vel| <= {}, |fe| <= {} for {} ms)",
+            moving.join(", "),
+            self.timing.rest_velocity_count_s,
+            self.timing.rest_error_count,
+            self.timing.rest_dwell_ms
+        )
     }
 
     fn axis_calibration_valid(&self, i: usize) -> bool {
-        self.operator_valid[i] && self.cal_error[i].is_none() && self.axes[i].referenced()
+        self.operator_valid[i]
+            && self.cal_error[i].is_none()
+            && self.calibration_stale[i].is_none()
+            && self.axes[i].referenced()
     }
 
     fn status_timeout(&self) -> Duration {

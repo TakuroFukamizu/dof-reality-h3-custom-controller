@@ -130,7 +130,7 @@
 </section>
 
 <section>
-  <h2 style="margin-top:0">動きの制限 <span class="dim small">WS の limits メッセージ（送信中だけ送れる）。上限はファームの申告値（status の motion_limits.ceiling）。POST /v1/session で設定ファイルの初期値に戻る</span></h2>
+  <h2 style="margin-top:0">動きの制限 <span class="dim small">WS の limits メッセージ（送信中だけ送れる）。ゲーム経路は操作者の [limits] の値（status の motion_limits.operator_max）より上げられない（operator_limited）。それ以上はファームの上限（motion_limits.ceiling）まで POST /v1/limits で。POST /v1/session で設定ファイルの初期値に戻る</span></h2>
   <label class="sl">max_gain <input type="range" id="limGain" min="0.05" max="1" step="0.05" value="0.5"><span id="limGainV">0.50</span></label>
   <label class="sl">max_vel <input type="range" id="limVel" min="100" max="6000" step="100" value="3000"><span id="limVelV">3000</span></label>
   <label class="sl">max_acc <input type="range" id="limAcc" min="500" max="40000" step="500" value="15000"><span id="limAccV">15000</span></label>
@@ -289,15 +289,27 @@
   }
   function renderLimits(ml) {
     if (!ml) return;
-    $('limEff').textContent = limitsText(ml.effective) + ((ml.limited && ml.limited.length) ? ' (clamped: ' + ml.limited.join(',') + ')' : '');
-    $('limCeil').textContent = limitsText(ml.ceiling);
-    if (ml.ceiling) {
-      state.limitsCeiling = ml.ceiling;
-      // The sliders' maxima follow the firmware's absolute ceilings.
-      $('limGain').max = String(ml.ceiling.max_gain);
-      $('limVel').max = String(ml.ceiling.max_vel_count_s);
-      $('limAcc').max = String(ml.ceiling.max_acc_count_s2);
-      $('limDuty').max = String(ml.ceiling.duty_max_percent);
+    // `limited` = fields the clamp changed, `reasons` = why (ceiling_clamped / operator_limited /
+    // stop_time_limited), `pending` = waiting for every axis to ACK the new duty cap before the
+    // planner uses it.
+    const why = (ml.limited && ml.limited.length)
+      ? ' (clamped: ' + ml.limited.join(',') + ((ml.reasons && ml.reasons.length) ? ' — ' + ml.reasons.join(',') : '') + ')'
+      : '';
+    $('limEff').textContent = limitsText(ml.effective) + why + (ml.pending ? ' [pending: SET_LIMITS 未 ACK]' : '');
+    $('limCeil').textContent = limitsText(ml.ceiling)
+      + (ml.operator_max ? ' / ゲーム経路の上限 ' + limitsText(ml.operator_max) : '');
+    // This page sends over the WS game channel, which is held to the operator's
+    // [limits] (operator_max); the sliders' maxima follow that (and the firmware
+    // ceilings where a unit reports lower ones).
+    const cap = ml.operator_max && ml.ceiling
+      ? Object.fromEntries(LIMIT_FIELDS.map((k) => [k, Math.min(ml.operator_max[k], ml.ceiling[k])]))
+      : (ml.operator_max || ml.ceiling);
+    if (cap) {
+      state.limitsCeiling = cap;
+      $('limGain').max = String(cap.max_gain);
+      $('limVel').max = String(cap.max_vel_count_s);
+      $('limAcc').max = String(cap.max_acc_count_s2);
+      $('limDuty').max = String(cap.duty_max_percent);
     }
     if (ml.effective && typeof ml.effective.max_gain === 'number' && ml.effective.max_gain !== state.maxGain) {
       setMaxGain(ml.effective.max_gain);
@@ -418,7 +430,8 @@
     set(c[14], fmt(a.following_error_count), 'num');
     set(c[15], fmt(a.pwm_permille), 'num');
     set(c[16], a.status_age_ms === null || a.status_age_ms === undefined ? '—' : a.status_age_ms.toFixed(0) + ' ms', 'num');
-    set(c[17], a.reference_stale ? '要再基準化' : '—', a.reference_stale ? 'bad' : '');
+    const stale = [a.reference_stale ? '要再基準化' : '', a.calibration_stale ? '再校正済み（export→再起動）' : ''].filter(Boolean);
+    set(c[17], stale.join(' / ') || '—', stale.length ? 'bad' : '');
     set(c[18], calText(a), calClass(a));
   }
   function calText(a) {

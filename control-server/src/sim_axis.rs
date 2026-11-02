@@ -1696,6 +1696,10 @@ struct Shared {
     mcu: Mutex<SimMcu>,
     corrupt_next_tx: AtomicBool,
     tx_dropped: AtomicU64,
+    /// Zero of the model's `now_us`. Shared by every runner attached to this
+    /// model, so a re-attached runner never feeds time backwards
+    /// (`SimMcu::advance_to` would ignore it).
+    origin: Instant,
 }
 
 impl Shared {
@@ -1809,6 +1813,8 @@ impl SimHandle {
     pub fn tx_dropped(&self) -> u64 {
         self.shared.tx_dropped.load(Ordering::SeqCst)
     }
+    /// True when no runner is attached or the attached one has ended (its
+    /// host end was dropped, or it was stopped).
     pub fn is_finished(&self) -> bool {
         self.task.as_ref().is_none_or(|t| t.is_finished())
     }
@@ -1821,6 +1827,32 @@ impl SimHandle {
             let _ = task.await;
         }
     }
+    /// A second handle on the same model without a runner of its own:
+    /// inspection / fault injection (`snapshot`, `set_*`, `with`) work;
+    /// dropping it stops nothing. For code that only watches the simulator
+    /// while another owner (the server's sim port task) runs it.
+    pub fn view(&self) -> SimHandle {
+        SimHandle { shared: self.shared.clone(), shutdown: None, task: None }
+    }
+    /// (Re)attach the model to a fresh byte stream and return the host end:
+    /// the previous runner, if any, is stopped and a new one started on the
+    /// same [`SimMcu`] (same state, boot_id, reference, position, clock).
+    /// How the server reopens a simulated port after its link closed
+    /// (`status_timeout` after a host sleep, Issue #15).
+    pub fn attach(&mut self) -> DuplexStream {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let (host, mcu) = tokio::io::duplex(DUPLEX_BUF);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let latency = Duration::from_millis(self.shared.lock().params().link_latency_ms);
+        self.task = Some(tokio::spawn(run_sim_axis(mcu, self.shared.clone(), latency, stop_rx)));
+        self.shutdown = Some(stop_tx);
+        host
+    }
 }
 
 impl Drop for SimHandle {
@@ -1831,22 +1863,27 @@ impl Drop for SimHandle {
     }
 }
 
-/// Run a [`SimMcu`] on one side of a duplex stream: COBS frames in, model
-/// ticked every 1 ms with `tokio::time`, COBS frames out.
-pub fn spawn_sim_axis(io: DuplexStream, params: SimParams) -> SimHandle {
-    let latency = Duration::from_millis(params.link_latency_ms);
+/// A [`SimMcu`] with no byte stream yet: [`SimHandle::attach`] starts a
+/// runner on it (and again after the host end closed).
+pub fn sim_detached(params: SimParams) -> SimHandle {
     let shared = Arc::new(Shared {
         mcu: Mutex::new(SimMcu::new(params)),
         corrupt_next_tx: AtomicBool::new(false),
         tx_dropped: AtomicU64::new(0),
+        origin: Instant::now(),
     });
+    SimHandle { shared, shutdown: None, task: None }
+}
+
+/// Run a [`SimMcu`] on one side of a duplex stream: COBS frames in, model
+/// ticked every 1 ms with `tokio::time`, COBS frames out.
+pub fn spawn_sim_axis(io: DuplexStream, params: SimParams) -> SimHandle {
+    let mut h = sim_detached(params);
+    let latency = Duration::from_millis(h.shared.lock().params().link_latency_ms);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let task = tokio::spawn(run_sim_axis(io, shared.clone(), latency, stop_rx));
-    SimHandle {
-        shared,
-        shutdown: Some(stop_tx),
-        task: Some(task),
-    }
+    h.task = Some(tokio::spawn(run_sim_axis(io, h.shared.clone(), latency, stop_rx)));
+    h.shutdown = Some(stop_tx);
+    h
 }
 
 /// A simulated axis plus the host end of its byte stream.
@@ -1865,7 +1902,7 @@ async fn run_sim_axis(
     let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>(TX_QUEUE_FRAMES);
     let writer = tokio::spawn(write_frames(wr, rx));
 
-    let origin = Instant::now();
+    let origin = shared.origin;
     let now_us = || origin.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     let mut acc = FrameAccumulator::new(MAX_ENCODED_LEN);
     let mut oversize_seen = 0u64;

@@ -85,12 +85,14 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::calibration_export::{self, AxisExport};
 use crate::config::{bounded_ms, Config};
-use crate::limits::{self as motion_limits, Ceilings, LimitsPatch, MotionLimits, PatchError, SharedLimits};
+use crate::limits::{
+    self as motion_limits, Ceilings, LimitsPatch, LimitsRequest, MotionLimits, PatchError, SharedLimits, Source,
+};
 use crate::protocol::CalResultCode;
 use crate::session::{AckMsg, AcceptedPose, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
 use crate::supervisor::{AdminCmd, AdminError, AdminOk, StatusSnapshot};
 use crate::telemetry::{lock_events, shared_event_log, SharedEventLog};
-use crate::types::{AxisId, Counts, LimitReason};
+use crate::types::{AxisId, Counts};
 
 /// How long an admin request may wait for the control loop (→ 503).
 pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -217,24 +219,41 @@ impl AppState {
         self.inner.status_rx.borrow().motion_limits.ceiling
     }
 
+    /// The requested set clamped as the control loop will clamp it (same
+    /// ceilings, same operator cap on the game-written fields, same stop
+    /// deadline).
+    fn clamped(&self) -> motion_limits::Clamped {
+        let req = motion_limits::read(&self.inner.limits);
+        motion_limits::clamp(
+            &req.requested,
+            &self.ceilings(),
+            &req.operator_cap(self.limits_defaults()),
+            motion_limits::stop_deadline(&self.inner.cfg.timing),
+        )
+    }
+
     /// The gain ceiling in effect for pose / gain messages.
     fn current_max_gain(&self) -> f64 {
-        motion_limits::clamp(&motion_limits::read(&self.inner.limits), &self.ceilings()).0.max_gain
+        self.clamped().effective.max_gain
     }
 
     /// `GET /v1/limits` body (also the `POST` answer): the requested set and
-    /// what it clamps to right now.
+    /// what it clamps to right now (`effective` here is the clamped request;
+    /// whether the control loop has applied it yet is status
+    /// `motion_limits.pending`).
     fn limits_view(&self) -> Value {
-        let requested = motion_limits::read(&self.inner.limits);
-        let ceiling = self.ceilings();
-        let (effective, limited) = motion_limits::clamp(&requested, &ceiling);
+        let c = self.clamped();
+        let req = motion_limits::read(&self.inner.limits);
         json!({
             "ok": true,
-            "effective": effective,
-            "requested": requested,
-            "ceiling": ceiling,
+            "effective": c.effective,
+            "requested": req.requested,
+            "ceiling": self.ceilings(),
             "defaults": self.limits_defaults(),
-            "limited": limited,
+            "operator_max": self.limits_defaults(),
+            "game_fields": req.game_fields,
+            "limited": c.limited,
+            "reasons": c.reasons,
         })
     }
 
@@ -660,8 +679,9 @@ async fn new_session(State(st): State<AppState>) -> Response {
         let id = s.new_session();
         // Under the lock: no pose of the old session can land after this.
         st.inner.pose_tx.send_replace(None);
-        // A new session starts from the configured limits (design §5.2).
-        motion_limits::write(&st.inner.limits, defaults);
+        // A new session starts from the configured limits (design §5.2),
+        // with no field under the operator cap yet (nothing game-written).
+        motion_limits::write(&st.inner.limits, LimitsRequest::new(defaults));
         id
     };
     tracing::info!("new game session issued");
@@ -684,8 +704,10 @@ async fn get_limits(State(st): State<AppState>) -> Response {
 }
 
 /// `POST /v1/limits` (admin): apply a [`LimitsPatch`] to the requested set.
-/// Values above the ceilings are clamped (reported in `limited`), invalid
-/// ones are 400.
+/// Values above the firmware ceilings are clamped (reported in `limited`),
+/// invalid ones are 400. Unlike the game channel, the admin may raise a
+/// field above the operator's `[limits]` value (and releases it from the
+/// operator cap).
 async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
     if !loop_alive(&st) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
@@ -693,7 +715,7 @@ async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
     let Ok(patch) = serde_json::from_slice::<LimitsPatch>(&body) else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    match apply_limits_patch(&st, &patch) {
+    match apply_limits_patch(&st, &patch, Source::Admin) {
         Ok(()) => {
             // Same as the WS path: a lowered gain ceiling reaches the tracked pose now.
             let max_gain = st.current_max_gain();
@@ -709,12 +731,11 @@ async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
     }
 }
 
-/// Replace the present fields of the shared requested set.
-fn apply_limits_patch(st: &AppState, patch: &LimitsPatch) -> Result<(), PatchError> {
+/// Replace the present fields of the shared requested set, recording who
+/// wrote them (`Source::Game` → held to the operator's values by the clamp).
+fn apply_limits_patch(st: &AppState, patch: &LimitsPatch, source: Source) -> Result<(), PatchError> {
     let mut guard = st.inner.limits.lock().unwrap_or_else(|e| e.into_inner());
-    let next = patch.apply(*guard)?;
-    *guard = next;
-    Ok(())
+    guard.apply(patch, source)
 }
 
 /// False once the control loop has ended (its status sender is gone).
@@ -853,24 +874,25 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
     }
     if let ClientMsg::Limits(l) = &msg {
         // Header rules, then the patch; the seq is consumed only on success.
-        // Freshness is never extended by a limits message.
-        let ceiling = st.ceilings();
+        // Freshness is never extended by a limits message. The patch is
+        // applied whole before clamping, so velocity and acceleration are
+        // judged together by the stop-time rule. Written as the game: the
+        // fields are held to the operator's `[limits]` values (Issue #15).
         let r = s.accept_limits(l, || {
-            apply_limits_patch(st, &l.patch).map_err(|e| match e {
+            apply_limits_patch(st, &l.patch, Source::Game).map_err(|e| match e {
                 PatchError::NonFinite => RejectReason::NonFinite,
                 PatchError::OutOfRange => RejectReason::OutOfRange,
             })?;
-            Ok(motion_limits::clamp(&motion_limits::read(&st.inner.limits), &ceiling))
+            Ok(st.clamped())
         });
         return match r {
-            Ok((effective, limited)) => {
+            Ok(c) => {
                 // The new gain ceiling applies to the pose being tracked now
                 // (freshness unchanged), not only to the next one.
-                if let Some(p) = s.reapply_gain_ceiling(&cfg.game, effective.max_gain) {
+                if let Some(p) = s.reapply_gain_ceiling(&cfg.game, c.effective.max_gain) {
                     st.inner.pose_tx.send_replace(Some(p));
                 }
-                let reasons = if limited.is_empty() { Vec::new() } else { vec![LimitReason::CeilingClamped] };
-                AckMsg::accepted_limits(seq, effective, reasons, s.is_fresh(recv_at))
+                AckMsg::accepted_limits(seq, c.effective, c.reasons, s.is_fresh(recv_at))
             }
             Err(r) => {
                 let fresh = r != RejectReason::StaleSession && s.is_fresh(recv_at);
