@@ -104,6 +104,12 @@ constexpr uint16_t CONFIGURED = 1u << 3;
 constexpr uint16_t POWER_CONTROLLER = 1u << 4;
 constexpr uint16_t CURRENT_VALID = 1u << 5;
 constexpr uint16_t CLOCK_SYNCED = 1u << 6;
+// r10（Issue #44・#46）: 保護の監視（include/v1_supervisor.h）。いずれも FAULT ではない（mcu_state は変えない）。protocol.md §3.4
+constexpr uint16_t LOAD_LIMITED = 1u << 7;        // 過負荷: 飽和のまま 1 s 進まず → PWM 0 ＋ ブレーキ作動。DISARMED に戻す（再 ARM）まで続く
+constexpr uint16_t FEEDBACK_UNCERTAIN = 1u << 8;  // 見えない走行の予算切れ → PWM 0 ＋ ブレーキ作動。DISARMED に戻す（再 ARM）まで続く
+constexpr uint16_t END_BRAKING = 1u << 9;         // 端の手前の制動: 実測速度で止まれないのでソフトリミットと反対向きに duty_max
+constexpr uint16_t PARKED = 1u << 11;            // 静止した保持をブレーキで駐車している（FAULT ではない。目標が動けば自動で戻る）
+constexpr uint16_t LIMIT_RECOVERY = 1u << 10;     // ソフトリミットの少し外から内側へ戻している、または追従誤差の上限超えが戻りつつある（猶予中。どちらも既定 OFF）
 }  // namespace flags
 
 namespace role_flags {

@@ -13,6 +13,7 @@
 #include "v1_codec.h"
 
 struct V1RxFrame {
+  uint64_t rx_us;                     // 区切りを受けた時刻（esp_timer_get_time()）。Issue #45: 再生バッファの時刻印。キューで値ごと渡す
   uint16_t len;                       // COBS 符号化のまま（区切りなし）
   uint8_t data[v1::MAX_ENCODED_LEN];
 };

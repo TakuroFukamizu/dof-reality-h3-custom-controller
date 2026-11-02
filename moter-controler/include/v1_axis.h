@@ -25,6 +25,8 @@
 #include "config.h"
 #include "motor_profile.h"
 #include "v1_codec.h"
+#include "v1_supervisor.h"
+#include "v1_playout.h"
 
 // 調整値。既定は config.h（実機で詰めるまでの仮値）。テストで差し替えられるよう構造体にしている。
 struct V1Tuning {
@@ -60,6 +62,14 @@ struct V1Tuning {
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
   uint32_t status_period_ms = 20;
   uint32_t velocity_window_ms = 100;
+  // Issue #45（config.h V1_PLAYOUT）: 再生バッファの遅れ [ms]。0 なら従来の profile_step（目標ごとに行って止まる）
+  uint32_t playout_delay_ms = V1_PLAYOUT ? V1_PLAYOUT_DELAY_MS : 0;
+  uint32_t playout_window_ms = V1_PLAYOUT_WINDOW_MS;
+  uint32_t playout_extrap_ms = V1_PLAYOUT_EXTRAP_MS;
+  double playout_kp_per_s = V1_PLAYOUT_KP_PER_S;
+  // Issue #46: ソフトリミットに向かう参照速度の上限（再生バッファの経路だけ）。soft_brake_acc ≤ 0 で無効
+  double soft_brake_acc_count_s2 = V1_SOFT_BRAKE_ACC_COUNT_S2;
+  int32_t soft_reserve_count = V1_SOFT_RESERVE_COUNT;
   // Issue #25 r6（config.h V1_FF_DIRECTIONAL）: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス。
   // directional = false なら r5 までの経路（上の床 E・補助 T・不感帯 deadband/deadband_out・Ki 0.1）。
   bool ff_directional = V1_FF_DIRECTIONAL != 0;
@@ -89,12 +99,38 @@ struct V1Tuning {
   double vel_kd_permille_per_count_s = 0.0;           // Kd [permille / (count/s)]。コンストラクタで既定を入れる
   int vel_d_max_permille = V1_VEL_D_MAX_PERMILLE;     // |u_d| の上限
   uint32_t v_fast_window_ms = V1_V_FAST_WINDOW_MS;    // 速い速度推定の窓
+  // r10（Issue #44・#46。config.h V1_SUPERVISOR）: 保護の監視 V1Supervisor。方向別の経路だけで効く（従来の経路では常に false 扱い）。
+  // true のとき「進まない → ENCODER_FAULT」の 2 つの判定（走行中の無パルス・静止 2 s の監視）は出さず、見えない走行の予算
+  //（FEEDBACK_UNCERTAIN）・過負荷（LOAD_LIMITED）・端の手前の制動・SOFT_LIMIT / FOLLOWING_ERROR の猶予に置き換わる
+  bool supervisor = false;  // コンストラクタで既定を入れる
+  V1SupTuning sup;
+  // r10（実測 2）: 保持出力の学習（config.h V1_HOLD_LEARN）。方向別の経路だけ。false なら r6〜r9 と同じ（HOLD で出力 0・I を捨てる）
+  bool hold_learn = false;  // コンストラクタで既定を入れる
+  int hold_i_max_ratio_percent = V1_HOLD_I_MAX_RATIO_PERCENT;
+  double hold_ki_permille_per_count_s = V1_HOLD_KI_PERMILLE_PER_COUNT_S;
+  int hold_i_rate_permille_per_s = V1_HOLD_I_RATE_PERMILLE_PER_S;
+  // 2026-11-02 の操作者の決定: 静止した保持のブレーキ駐車（config.h V1_PARK）。監視 ON の方向別の経路だけ
+  bool park = false;  // コンストラクタで既定を入れる
+  uint32_t park_still_ms = V1_PARK_STILL_MS;
+  uint32_t brake_engage_ms = V1_BRAKE_ENGAGE_MS;
+  int32_t park_ref_vel_count_s = V1_PARK_REF_VEL_COUNT_S;
+  int32_t park_target_span_count = V1_PARK_TARGET_SPAN_COUNT;
+  int32_t park_unpark_count = V1_PARK_UNPARK_COUNT;
+  // r10（supervisor のときだけ）: 静止目標での力の段階的な引き上げ（step 0 で無効）と小さな残り誤差の受け入れ（band 0 で無効）。config.h
+  int escalate_step_permille = V1_ESCALATE_STEP_PERMILLE;
+  uint32_t escalate_window_ms = V1_ESCALATE_WINDOW_MS;
+  int32_t residual_band = V1_RESIDUAL_BAND_COUNT;
+  int32_t residual_exit = V1_RESIDUAL_EXIT_COUNT;
+  int residual_max_pulses = V1_RESIDUAL_MAX_PULSES;
 
   // directional の既定はコンパイルスイッチ。テストは V1Tuning(true) / V1Tuning(false) で経路を選ぶ（r6 の派生値もここで揃える）。
   explicit V1Tuning(bool directional = V1_FF_DIRECTIONAL != 0) : ff_directional(directional) {
     if (directional) {
       ki_permille_per_count_s = V1_KI_DIRECTIONAL_PERMILLE_PER_COUNT_S;
       vel_kd_permille_per_count_s = V1_VEL_DAMPING ? V1_VEL_KD_PERMILLE_PER_COUNT_S : 0.0;
+      supervisor = V1_SUPERVISOR != 0;
+      hold_learn = V1_HOLD_LEARN != 0;
+      park = V1_PARK != 0;
     }
   }
   // 静止の帯の入口／出口（r6 は hold_enter / hold_exit、従来は deadband / deadband_out）。v1_duty_command・整定判定・静止監視で共用
@@ -137,6 +173,9 @@ struct V1DutyState {
   bool in_band = false;   // 静止の不感帯の中（入る側 deadband / 出る側 deadband_out）
   bool floor_on = false;  // 床（Duty 下限）の適用状態（ON: |誤差| > deadband_out かつ向き一致 / OFF: |誤差| ≤ floor_off か向き不一致）
   double i_pm = 0.0;      // 積分項 [permille]（Issue #25 手順 9「F」。|i_pm| ≤ i_max_permille。位置制御が止まれば 0）
+  int64_t hold_best_abs = 0;  // r10（hold_learn）: この保持の間に一番目標に近かった |誤差|（そこから 1 count 離れたら bias を詰める）
+  double bias_pm = 0.0;       // r10（hold_learn、P1a）: 保持の偏り（荷重・乗員の補償）[permille]。止まっている間だけ学ぶ。|bias| ≤ duty_max × 90 %
+  int last_vel_sign = 0;      // r10（hold_learn）: 直前の軌道速度の向き（反転で追従の I を 0 に）
 };
 
 // 位置制御の指令値（カウントが増える向きを正とした permille = 0.1 %）。err = 目標 − 実位置、vel = 軌道の目標速度 [count/s]。
@@ -187,6 +226,12 @@ inline double v1_ff_directional_pm(double vel, const V1Tuning& t) {
 // 5. r9（Issue #35）の減衰項: has_v_fast（V1Axis の 40 ms 窓の速度推定が使える）かつ kd > 0 なら
 //    u_d = clamp(kd × (vel − v_fast), ±vel_d_max) を合成に足す（u = FF + P + I + u_d）。保持の中では足さない（出力 0 のまま）。
 //    飽和・アンチワインドアップ・動き出しパルスの「合成」は u_d 込みの u で見る（四捨五入は合成で 1 回）。
+// 6. r10（Issue #44 の実測 2、t.hold_learn）: 保持出力の学習。PR #50 の Codex 事前レビュー P1a で「保持の偏り bias」と「追従の I」を分けた:
+//    - bias: 軌道速度 0 のとき（保持の中を含む）だけ Ki_hold / hold_i_rate で積む。|bias| ≤ duty_max × hold_i_max_ratio。走行中は凍結。
+//      保持の中では、その保持で一番近かった所から 1 count 離れた（沈んだ）ときだけ詰める
+//    - 追従の I: 走行中だけ従来の Ki / i_rate で積み、|I| ≤ i_max_permille（3 %）。|I| を減らす向きは V1_TRACK_I_UNWIND_RATE で速く。
+//      軌道速度の向きが反転したら 0。止まっている間は同じ速さで 0 へ戻す
+//    - 出力 = FF + P + bias + I + u_d（保持の中は bias + I）。動き出しパルスの tick は両方凍結
 inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st, const V1Tuning& t, V1DutyTerms& o,
                                        double dt_s, bool settle_ok, bool breakaway, bool has_v_fast, double v_fast) {
   const int64_t err_abs = err < 0 ? -err : err;
@@ -199,23 +244,62 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
       if (err_abs > t.hold_exit) st.in_band = false;
     } else if (err_abs <= t.hold_enter && settle_ok) {
       st.in_band = true;
-      st.i_pm = 0.0;  // 保持に入ったら I を捨てる（#1 は中立付近で自己保持する。出力 0）
+      st.hold_best_abs = err_abs;
+      if (!t.hold_learn) st.i_pm = 0.0;  // r6〜r9: 保持に入ったら I を捨てる（#1 は無負荷なら中立付近で自己保持する。出力 0）
     }
   } else {
     st.in_band = false;
   }
+  if (t.hold_learn) {
+    // 軌道速度の向きの反転: 追従の I を 0（古い向きの誤差を持ち越さない）
+    const int vs = vel > 0.0 ? 1 : (vel < 0.0 ? -1 : 0);
+    if (vs != 0 && st.last_vel_sign != 0 && vs != st.last_vel_sign) st.i_pm = 0.0;
+    if (vs != 0) st.last_vel_sign = vs;
+  }
+  const double bias_cap = static_cast<double>(duty_max_pm) * t.hold_i_max_ratio_percent / 100.0;
+  const double i_cap = static_cast<double>(t.i_max_permille);
+  const bool still = t.hold_learn && vel == 0.0;  // 軌道が止まっている: bias を学ぶ・追従の I は 0 へ
+  // 追従の I を 0 へ戻す（止まっている間、速い戻し）
+  auto decay_i = [&]() {
+    if (dt_s <= 0.0) return;
+    const double step = static_cast<double>(V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S) * dt_s;
+    if (st.i_pm > step) st.i_pm -= step;
+    else if (st.i_pm < -step) st.i_pm += step;
+    else st.i_pm = 0.0;
+  };
   if (st.in_band) {
     o.in_band = true;
     o.mode = V1DutyMode::HOLD;
-    o.cmd_permille = 0;
-    return 0;
+    if (!t.hold_learn) {
+      o.cmd_permille = 0;
+      return 0;
+    }
+    // r10: 保持の出力 = bias（＋戻りきっていない追従の I）。この保持の間に一番近かった所から 1 count 以上離れた（荷重で沈んだ）ときだけ
+    // bias を詰める（静止摩擦で目標の 1〜2 count 手前に止まっている無負荷の軸では育てない）
+    if (err_abs < st.hold_best_abs) st.hold_best_abs = err_abs;
+    if (dt_s > 0.0 && t.hold_ki_permille_per_count_s > 0.0 && err_abs >= 1 && err_abs >= st.hold_best_abs + 1) {
+      double db = t.hold_ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const double db_max = static_cast<double>(t.hold_i_rate_permille_per_s) * dt_s;
+      if (db > db_max) db = db_max;
+      if (db < -db_max) db = -db_max;
+      st.bias_pm += db;
+      if (st.bias_pm > bias_cap) st.bias_pm = bias_cap;
+      if (st.bias_pm < -bias_cap) st.bias_pm = -bias_cap;
+    }
+    decay_i();
+    long h = lround(st.bias_pm + st.i_pm);
+    if (h > duty_max_pm) h = duty_max_pm;
+    if (h < -duty_max_pm) h = -duty_max_pm;
+    o.i_permille = v1_clamp_i16(st.i_pm + st.bias_pm);
+    o.cmd_permille = static_cast<int16_t>(h);
+    return static_cast<int>(h);
   }
   const double p_pm = static_cast<double>(err * t.kp_percent_per_100) * V1_PERMILLE_PER_PERCENT / 100.0;
   const double ff_pm = v1_ff_directional_pm(vel, t);
   o.p_permille = v1_clamp_i16(p_pm);
   o.ff_permille = v1_clamp_i16(ff_pm);
-  o.i_permille = v1_clamp_i16(st.i_pm);
-  // r9: 速度誤差の減衰項（保持の外だけ。上の HOLD で 0 を返した後なので保持中は出ない）
+  o.i_permille = v1_clamp_i16(st.i_pm + st.bias_pm);  // 計器の I は bias 込み
+  // r9: 速度誤差の減衰項（保持の外だけ。上の HOLD で返した後なので保持中は出ない）
   double d_pm = 0.0;
   if (has_v_fast && t.vel_kd_permille_per_count_s > 0.0) {
     const double d_max = static_cast<double>(t.vel_d_max_permille < 0 ? -t.vel_d_max_permille : t.vel_d_max_permille);
@@ -224,7 +308,7 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
     if (d_pm < -d_max) d_pm = -d_max;
   }
   o.d_permille = v1_clamp_i16(d_pm);
-  const double u_raw = ff_pm + p_pm + st.i_pm + d_pm;
+  const double u_raw = ff_pm + p_pm + st.i_pm + st.bias_pm + d_pm;
   const long u = lround(u_raw);  // 四捨五入は 1 回（u_d 込み）
   const bool saturated = (u >= duty_max_pm) || (u <= -duty_max_pm);
   long mag = u < 0 ? -u : u;
@@ -248,20 +332,37 @@ inline int v1_duty_command_directional(int64_t err, double vel, V1DutyState& st,
   const int out = static_cast<int>(dir * mag);
   o.cmd_permille = static_cast<int16_t>(out);
   // 積分の更新（次の tick のため）。パルス中は凍結
-  if (dt_s > 0.0 && t.ki_permille_per_count_s > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
-    double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
-    const double di_max = static_cast<double>(t.i_rate_permille_per_s) * dt_s;
-    if (di > di_max) di = di_max;
-    if (di < -di_max) di = -di_max;
-    const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
-    const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
-    if (!deeper || unwinding) {
-      st.i_pm += di;
-      const double i_max = static_cast<double>(t.i_max_permille);
-      if (st.i_pm > i_max) st.i_pm = i_max;
-      if (st.i_pm < -i_max) st.i_pm = -i_max;
+  if (dt_s > 0.0 && err != 0 && o.mode != V1DutyMode::BRK) {
+    if (still) {
+      // bias（止まっている間）: Ki_hold・hold_i_rate。飽和した向きへは積み増さない
+      double db = t.hold_ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const double db_max = static_cast<double>(t.hold_i_rate_permille_per_s) * dt_s;
+      if (db > db_max) db = db_max;
+      if (db < -db_max) db = -db_max;
+      const bool deeper = saturated && ((db > 0.0) == (u > 0));
+      if (!deeper) {
+        st.bias_pm += db;
+        if (st.bias_pm > bias_cap) st.bias_pm = bias_cap;
+        if (st.bias_pm < -bias_cap) st.bias_pm = -bias_cap;
+      }
+    } else if (t.ki_permille_per_count_s > 0.0) {
+      // 追従の I（走行中、または学習 OFF のとき）: 増やす向きは i_rate、戻す向きは（学習 ON なら）速く
+      double di = t.ki_permille_per_count_s * static_cast<double>(err) * dt_s;
+      const bool unwinding = (st.i_pm > 0.0 && di < 0.0) || (st.i_pm < 0.0 && di > 0.0);  // |I| を減らす向きは常に許す
+      const double rate = (unwinding && t.hold_learn) ? static_cast<double>(V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S)
+                                                       : static_cast<double>(t.i_rate_permille_per_s);
+      const double di_max = rate * dt_s;
+      if (di > di_max) di = di_max;
+      if (di < -di_max) di = -di_max;
+      const bool deeper = saturated && ((di > 0.0) == (u > 0));  // 飽和した向きへ積み増す
+      if (!deeper || unwinding) {
+        st.i_pm += di;
+        if (st.i_pm > i_cap) st.i_pm = i_cap;
+        if (st.i_pm < -i_cap) st.i_pm = -i_cap;
+      }
     }
   }
+  if (still && o.mode != V1DutyMode::BRK) decay_i();
   return out;
 }
 
@@ -415,6 +516,7 @@ class V1Axis {
     vel_anchor_raw_ = raw;
     vel_anchor_us_ = now_us;
     reset_v_fast();
+    sup_.reset_trust(raw, now_us);
     state_ = v1::state::DISARMED;
     cal_phase_ = CalPhase::Idle;
     cal_.cfg = cal_config;
@@ -449,24 +551,30 @@ class V1Axis {
   // --- 入力 ---------------------------------------------------------------
 
   // COBS 符号化済み（区切りなし）の 1 フレーム。復号できなければ rx_error を数えるだけで応答しない。
-  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us) {
+  // rx_us（Issue #45）: リンク層がフレームを受け取った時刻（≤ now_us）。再生バッファの時刻印だけに使う。期限（valid_for）・lease・
+  // 応答の時刻は従来どおり now_us（制御タスクが取り出した時刻）で数える（バッファに残っているからといって鮮度は延ばさない）。
+  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us) { handle_frame(encoded, n, now_us, now_us); }
+  void handle_frame(const uint8_t* encoded, size_t n, uint64_t now_us, uint64_t rx_us) {
     v1::HostMsg m;
     if (!v1::decode_host_encoded(encoded, n, &m)) {
       record_rx_error();
       return;
     }
-    handle(m, now_us);
+    handle(m, now_us, rx_us);
   }
 
   // 復号済みメッセージ。物理は進めない（tick が進める）。ACK → STATUS の順で outbox に積む。
-  void handle(const v1::HostMsg& m, uint64_t now_us) {
+  void handle(const v1::HostMsg& m, uint64_t now_us) { handle(m, now_us, now_us); }
+  void handle(const v1::HostMsg& m, uint64_t now_us, uint64_t rx_us) {
     now_us_ = now_us;
-    dispatch(m, now_us);
+    dispatch(m, now_us, rx_us > now_us ? now_us : rx_us);
     emit_status_if_changed();
   }
 
   // 5 ms ごと。タイマー → 軌道 → 異常検出 → Duty → STATUS。
-  void tick(uint64_t now_us, int64_t raw) {
+  // flash_write_in_gap: 前の tick からこの tick までの間に、main が NVS（フラッシュ）を書いていた（control_task が数える）。
+  // フラッシュの書き込み中はキャッシュが止まり、両コアの制御タスクが数十 ms 走れない（校正直後の保存で CONTROL_OVERRUN になった。2026-11-02）。
+  void tick(uint64_t now_us, int64_t raw, bool flash_write_in_gap = false) {
     if (!began_) return;
     const uint64_t dt_us = now_us > last_tick_us_ ? now_us - last_tick_us_ : 0;
     last_tick_us_ = now_us;
@@ -476,13 +584,25 @@ class V1Axis {
     update_v_fast(now_us);  // r9（Issue #35）: 40 ms 窓の速い速度推定。tick ごと
 
     // 制御周期の逸脱。止まっている状態（DISARMED / FAULT）では見ない（起動直後や待機中の間隔は制御に影響しない）。
+    // 間隔が NVS の書き込みと重なり、その間の出力が PWM 0・ブレーキ作動（前の tick の指令。この時点ではまだ書き換えていない）なら、
+    // 機構は動かしていないので異常にせず数えるだけにする（校正の終了手順・POWER_HOLD、ARMING の電源待ちなど）。
+    // 駆動中（PWM ≠ 0 またはブレーキ解除）に重なったら従来どおり CONTROL_OVERRUN（main は止まっている状態でしか書かない）。
     if (!parked() && dt_us > static_cast<uint64_t>(tuning.overrun_ms) * 1000ull) {
-      latch_fault(v1::fault::CONTROL_OVERRUN, now_us);
+      if (flash_write_in_gap && duty_permille_ == 0 && !brake_release_cmd_) {
+        flash_gap_count_ += 1;
+        if (dt_us > flash_gap_max_us_) flash_gap_max_us_ = static_cast<uint32_t>(dt_us > UINT32_MAX ? UINT32_MAX : dt_us);
+      } else {
+        latch_fault(v1::fault::CONTROL_OVERRUN, now_us);
+      }
     }
 
     check_timers(now_us);
     if (position_control_on()) {
-      update_setpoint(static_cast<double>(dt_us) / 1e6);
+      if (park_ == ParkPhase::None) {
+        update_setpoint(static_cast<double>(dt_us) / 1e6);
+      } else {
+        setpoint_vel_ = 0.0;  // 駐車中・ブレーキ解除待ちは参照を駐車した位置で止める（再生バッファにはフレームが溜まる）
+      }
       check_motion_faults(now_us);
     }
     if (state_ == v1::state::STOPPING && setpoint_vel_ == 0.0) {
@@ -503,7 +623,10 @@ class V1Axis {
     const uint8_t prev = selected_axis_;
     selected_axis_ = axis;
     has_config_ = false;
+    playout_clock_.reset();
+    playout_.clear();
     referenced_ = false;
+    sup_.reset_trust(raw_, now_us);  // r10: 別の系統の位置は信用の起点にならない
     v1::McuMsg m;
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::AXIS_SELECT;
@@ -560,6 +683,13 @@ class V1Axis {
   int16_t pwm_permille() const {                            // 正が count の増える向き。実際に出している permille そのもの
     return static_cast<int16_t>(-static_cast<int>(effective_sign()) * duty_permille_);
   }
+  // 止まっている間（PWM 0・ブレーキ作動）の NVS 書き込みで、CONTROL_OVERRUN にせず見逃した長い tick 間隔の回数と最大 [us]
+  uint32_t flash_gap_count() const { return flash_gap_count_; }
+  uint32_t flash_gap_max_us() const { return flash_gap_max_us_; }
+  void reset_flash_gap_stats() {  // 画面の tick 行のタップ（制御タスクの reset_stats）
+    flash_gap_count_ = 0;
+    flash_gap_max_us_ = 0;
+  }
 
   // --- 参照 -----------------------------------------------------------------
 
@@ -574,6 +704,13 @@ class V1Axis {
   int32_t target_count() const { return to_count(setpoint_); }
   int32_t control_target_count() const { return to_count(control_target_); }
   int32_t velocity_count_s() const { return velocity_; }
+  // 参照（軌道）の速度 [count/s]。FF・r9 の減衰・保持／整定の判定・動き出しパルスが使う値そのもの（丸めない）
+  double setpoint_vel() const { return setpoint_vel_; }
+  double setpoint_pos() const { return setpoint_; }
+  // Issue #45: 直近の tick の再生バッファの推定（has / starved / pos / vel / 点の数）と時刻の付け直しの周期 [us]（0 = 未確定）
+  const V1PlayoutFit& playout_fit() const { return playout_fit_; }
+  double playout_period_us() const { return playout_clock_.valid() ? playout_clock_.period_us() : 0.0; }
+  uint32_t playout_reseeds() const { return playout_clock_.reseeds(); }  // 周期の変化で時刻の付け直しを取り直した回数
   // r9（Issue #35）: 40 ms 窓の速い速度推定 [count/s]（生カウントの向き = カウント増が正）。推定が無ければ valid = false・値 0
   bool v_fast_valid() const { return v_fast_valid_; }
   double v_fast_count_s() const { return v_fast_valid_ ? v_fast_ : 0.0; }
@@ -602,11 +739,30 @@ class V1Axis {
   int stall_boost_permille() const { return stall_boost_; }
   // 積分項（Issue #25 手順 9「F」）の現在値 [permille]（四捨五入前の値を丸めたもの）。画面の計器行 `I`。STATUS には載せない
   int integral_permille() const { return static_cast<int>(lround(duty_state_.i_pm)); }
+  // r10（hold_learn、P1a）: 保持の偏り（荷重・乗員の補償）[permille]。画面の I は追従の I と bias の和
+  int bias_permille() const { return static_cast<int>(lround(duty_state_.bias_pm)); }
+  // r10: 静止目標での引き上げ [permille]（0 = なし）と、小さな残り誤差を受け入れて出力 0 にしているか（画面・テスト用）
+  int escalation_permille() const { return esc_level_; }
+  bool residual_accepted() const { return residual_accepted_; }
   // 動き出しパルス（Issue #25 r6）: 進まないまま打った数と、いま出しているか（画面・テスト用）
   int breakaway_pulses() const { return brk_pulses_; }
   bool breakaway_active() const { return brk_active_; }
   // 位置ループの各項（Issue #25 手順 8 の計器）。直近の update_duty で計算したもの。位置制御が動いていなければ全部 0
   const V1DutyTerms& duty_terms() const { return terms_; }
+  // r10（Issue #44・#46）: 保護の監視が効いているか（方向別の経路かつ tuning.supervisor）と、その計器（画面・テスト用）
+  bool supervisor_on() const { return tuning.ff_directional && tuning.supervisor; }
+  V1SupInfo supervisor_info() const {
+    V1SupInfo s = sup_.info(now_us_, supervisor_on());
+    s.parked = brake_parked();
+    return s;
+  }
+  // ブレーキ駐車（PARKED）: 入りかけ（ブレーキが掴むまで保持出力）と駐車中。戻りかけ（ブレーキ解除待ち）は含めない
+  bool brake_parked() const { return park_ == ParkPhase::Engaging || park_ == ParkPhase::Parked; }
+  bool unparking() const { return park_ == ParkPhase::Releasing; }
+  int park_count() const { return park_count_; }
+  // 持続する停止（FEEDBACK_UNCERTAIN / LOAD_LIMITED）: PWM 0 ＋ ブレーキ作動（主電源は保つ）。DISARMED に戻すまで続く
+  bool supervisor_inhibited() const { return supervisor_on() && sup_.inhibited(); }
+  const V1Supervisor& supervisor() const { return sup_; }
   // ENCODER_FAULT を判定し始める |Duty| [permille]（Issue #15 M2）= max(stall_duty, duty_max × ratio / 100) × 10。
   // 整数 % で切り捨ててから permille にするので効き目は整数 % のときと同じ: duty_max 20 → 150、14 → 10 % → 100（下限）
   int encoder_fault_duty_threshold_permille() const {
@@ -615,6 +771,7 @@ class V1Axis {
   }
   // duty_max がしきい値より低く、無パルスの ENCODER_FAULT が決して出ない（SET_LIMITS は受理するが画面で警告する）
   bool encoder_fault_check_disabled() const {
+    if (supervisor_on()) return false;  // r10: 無パルスの ENCODER_FAULT 自体が無い（見えない走行の予算が代わりに守る）
     return encoder_fault_duty_threshold_permille() > v1_permille(tuning.duty_max);
   }
 
@@ -627,6 +784,13 @@ class V1Axis {
     if (brake_release_cmd_) f |= v1::flags::BRAKE_RELEASE_CMD;
     if (referenced_) f |= v1::flags::POSITION_REFERENCED;
     if (has_config_) f |= v1::flags::CONFIGURED;
+    if (supervisor_on()) {  // r10（Issue #44・#46）
+      if (sup_.load_limited()) f |= v1::flags::LOAD_LIMITED;
+      if (sup_.feedback_uncertain()) f |= v1::flags::FEEDBACK_UNCERTAIN;
+      if (brake_parked()) f |= v1::flags::PARKED;
+      if (sup_.end_braking()) f |= v1::flags::END_BRAKING;
+      if (sup_.soft_recovery() || sup_.fe_recovery()) f |= v1::flags::LIMIT_RECOVERY;
+    }
     return f;
   }
 
@@ -675,6 +839,8 @@ class V1Axis {
   uint64_t boot_origin_us_ = 0;
   uint64_t last_tick_us_ = 0;
   uint64_t now_us_ = 0;  // 直近に handle / tick へ渡された時刻（即時 STATUS の mcu_time_us 用）
+  uint32_t flash_gap_count_ = 0;   // NVS 書き込みと重なった長い間隔を、止まっていたので見逃した回数（起動から。reset_flash_gap_stats で 0）
+  uint32_t flash_gap_max_us_ = 0;  // 同、間隔の最大
 
   // --- 状態 ---
   uint8_t state_ = v1::state::BOOT;
@@ -714,6 +880,9 @@ class V1Axis {
   double control_target_ = 0.0;
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
+  V1PlayoutBuffer playout_{};  // Issue #45: ACTIVE で受けた目標（受信時刻つき）。START・hold_here で空にする
+  V1PlayoutFit playout_fit_{};  // 直近の tick の軌道の推定（計器・テスト用）
+  V1PlayoutClock playout_clock_{};  // Issue #45: 有効な SET_POSITION 全部（HOLDING 中も）の (seq, 受信時刻) から時刻を付け直す
   int duty_permille_ = 0;  // MD13S の向きの符号付き permille
   V1DutyTerms terms_{};  // 直近の位置ループの各項（計器）
 
@@ -733,6 +902,30 @@ class V1Axis {
   size_t vf_count_ = 0;
   bool v_fast_valid_ = false;
   double v_fast_ = 0.0;  // [count/s]
+
+  // r10（Issue #44・#46）: 保護の監視
+  V1Supervisor sup_{};
+  // r10: 静止目標での引き上げ（update_escalation）と小さな残り誤差の受け入れ
+  bool esc_running_ = false;
+  int esc_dir_ = 0;
+  int esc_level_ = 0;  // [permille]
+  uint64_t esc_win_start_us_ = 0;
+  int64_t esc_anchor_raw_ = 0;
+  int last_combined_pm_ = 0;  // 直近の v1_duty_command の結果（引き上げの起点）
+  bool residual_accepted_ = false;
+  bool hold_pulses_spent_ = false;
+  // ブレーキ駐車（2026-11-02 の操作者の決定）
+  enum class ParkPhase : uint8_t { None, Engaging, Parked, Releasing };
+  ParkPhase park_ = ParkPhase::None;
+  uint64_t park_phase_us_ = 0;
+  int park_hold_out_ = 0;        // 入るときの保持出力 [permille、カウント増が正]。戻るときもこの値を出してからブレーキを解除する
+  bool park_release_armed_ = false;  // 戻りかけ: 保持出力を出した次の tick でブレーキを解除する
+  double park_target_ = 0.0;     // 駐車した目標（フレームの目標の幅の中央）
+  bool still_running_ = false;   // 静止の窓を数えている
+  uint64_t still_start_us_ = 0;
+  double still_min_ = 0.0, still_max_ = 0.0;
+  uint64_t park_cooldown_until_us_ = 0;
+  int park_count_ = 0;  // r10（hold_learn）: 保持の帯の近くで進まないパルスを打ち切った（以後は I が詰める）
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
@@ -859,19 +1052,20 @@ class V1Axis {
     setpoint_ = a;
     setpoint_vel_ = 0.0;
     control_target_ = a;
+    playout_.clear();
   }
 
   // ------------------------------------------------------------------------
   // 命令の振り分け（protocol.md §4）
   // ------------------------------------------------------------------------
 
-  void dispatch(const v1::HostMsg& m, uint64_t now) {
+  void dispatch(const v1::HostMsg& m, uint64_t now, uint64_t rx_us) {
     has_rx_ = true;
     last_rx_us_ = now;
     switch (m.type) {
       case v1::msg::HELLO_REQ: on_hello_req(m.hello_req.request_id); break;
       case v1::msg::CLOCK_SYNC: on_clock_sync(m.clock_sync, now); break;
-      case v1::msg::SET_POSITION: on_set_position(m.set_position, now); break;
+      case v1::msg::SET_POSITION: on_set_position(m.set_position, now, rx_us); break;
       case v1::msg::HOST_FAULT: on_host_fault(m.host_fault, now); break;
       case v1::msg::CONFIG: command(m, m.config.request_id, now); break;
       case v1::msg::ARM_PREPARE: command(m, m.arm_prepare.request_id, now); break;
@@ -1004,6 +1198,8 @@ class V1Axis {
       last_rx_seq_ = 0;  // seq の単調性は epoch ごと
     }
     config_ = c;
+    playout_clock_.reset();  // Issue #45（PR #49 レビュー P2b）: セッションが変わったら時刻の付け直しを取り直す
+    playout_.clear();
     if (config_.max_vel_count_s > V1_ABS_MAX_VEL_COUNT_S) config_.max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
     if (config_.max_acc_count_s2 > V1_ABS_MAX_ACC_COUNT_S2) config_.max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     has_config_ = true;
@@ -1055,6 +1251,7 @@ class V1Axis {
     if (now > valid_until_us_) return v1::ack_reason::BAD_STATE;  // 受理しても次の tick で期限切れになる
     state_ = v1::state::ACTIVE;
     control_target_ = setpoint_;
+    playout_.clear();  // 前の ACTIVE の残りや HOLDING 中のフレームは再生しない（目標は次の SET_POSITION まで保持位置）
     frame_max_vel_ = static_cast<double>(config_.max_vel_count_s);
     frame_max_acc_ = static_cast<double>(config_.max_acc_count_s2);
     return v1::ack_reason::NONE;
@@ -1062,7 +1259,7 @@ class V1Axis {
 
   // SET_POSITION: ACK なし。古い → stale_drop、apply_at ≠ 0 → rx_error、有効 → lease。ACTIVE でだけ目標に反映。
   // 校正中は捨てる（数えない。protocol.md §1.2）。
-  void on_set_position(const v1::SetPosition& m, uint64_t now) {
+  void on_set_position(const v1::SetPosition& m, uint64_t now, uint64_t rx_us) {
     if (state_ == v1::state::CALIBRATING) return;
     if (!has_config_ || m.session_epoch != config_.session_epoch || m.seq <= last_rx_seq_) {
       if (stale_drop_count_ < 0xFFFF) stale_drop_count_ += 1;
@@ -1073,6 +1270,7 @@ class V1Axis {
       return;
     }
     last_rx_seq_ = m.seq;
+    playout_clock_.push(m.seq, rx_us);  // Issue #45: START 前（HOLDING）から周期を掴んでおく
     lease_us_ = now;
     valid_until_us_ = now + ms_to_us(m.valid_for_ms);
     if (state_ == v1::state::ACTIVE) {
@@ -1080,6 +1278,7 @@ class V1Axis {
       if (target < config_.soft_min_count) target = config_.soft_min_count;
       if (target > config_.soft_max_count) target = config_.soft_max_count;
       control_target_ = static_cast<double>(target);
+      playout_.push(m.seq, rx_us, target);  // Issue #45: 受信時刻で時刻印（再生バッファの経路だけが読む）
       const uint32_t vmax = m.max_vel_count_s < config_.max_vel_count_s ? m.max_vel_count_s : config_.max_vel_count_s;
       const uint32_t amax =
           m.max_acc_count_s2 < config_.max_acc_count_s2 ? m.max_acc_count_s2 : config_.max_acc_count_s2;
@@ -1119,6 +1318,7 @@ class V1Axis {
     if (state_ != v1::state::FAULT) return v1::ack_reason::BAD_STATE;
     if (fault_cause_present()) return v1::ack_reason::FAULT_CAUSE_PRESENT;
     if (fault_code_ == v1::fault::ENCODER_FAULT) referenced_ = false;
+    sup_.clear_episode();  // r10: FAULT_RESET は FEEDBACK_UNCERTAIN の明示的な解除のひとつ（位置の上限は戻さない）
     state_ = v1::state::DISARMED;
     fault_code_ = v1::fault::NONE;
     stop_kind_ = StopKind::Hold;
@@ -1141,6 +1341,7 @@ class V1Axis {
     reference_offset_ = raw_ - static_cast<int64_t>(reference_count);
     hold_here();
     referenced_ = true;
+    sup_.reset_trust(raw_, now_us_);  // r10: 基準の取り直しは信用の取り直し（見えない走行の包絡線をすべて 0 に）
     return v1::ack_reason::NONE;
   }
 
@@ -1305,7 +1506,8 @@ class V1Axis {
   void check_timers(uint64_t now) {
     if (state_ == v1::state::ARMING) {
       const uint64_t t = now - arming_started_us_;
-      if (!brake_release_cmd_ && t >= ms_to_us(tuning.power_settle_ms)) {
+      // r10: 持続する停止の間はブレーキを解除し直さない（解除は DISARMED → ARM_PREPARE の手順だけ）
+      if (!brake_release_cmd_ && !supervisor_inhibited() && t >= ms_to_us(tuning.power_settle_ms)) {
         // 電源が落ち着いた。ソフトリミット外ではブレーキを解除しない（解除直後に SOFT_LIMIT になるパルスを避ける）
         if (!inside_soft_window()) {
           latch_fault(v1::fault::SOFT_LIMIT, now);
@@ -1348,12 +1550,16 @@ class V1Axis {
     }
   }
 
-  // 速度・加速度制限つきの setpoint（sim_axis.rs の update_setpoint / profile_step と同じ）
+  // 速度・加速度制限つきの setpoint（sim_axis.rs の update_setpoint / profile_step と同じ。ただし Issue #45 の再生バッファ（既定）では
+  // ACTIVE の参照を playout_step で作るので、PC 側の参照モデルとは ACTIVE の軌道の時刻・形が違う（STOPPING 以降は同じ）
   void update_setpoint(double dt) {
     if (!has_config_) return;
+    playout_clock_.refit_if_dirty();  // Issue #45: 時刻の付け直しの当てはめは 1 tick に 1 回まで（push は O(1)）
     const double lo = static_cast<double>(config_.soft_min_count);
     const double hi = static_cast<double>(config_.soft_max_count);
-    if (state_ == v1::state::ACTIVE) {
+    if (state_ == v1::state::ACTIVE && tuning.playout_delay_ms > 0) {
+      playout_step(dt, lo, hi);  // Issue #45: 再生バッファから参照を作る（既定）
+    } else if (state_ == v1::state::ACTIVE) {
       double p = setpoint_;
       double v = setpoint_vel_;
       profile_step(control_target_, frame_max_vel_, frame_max_acc_, dt, &p, &v);
@@ -1363,7 +1569,9 @@ class V1Axis {
       // 減速は最後に適用したフレームの max_acc で（CONFIG には絶対上限が入るので、そちらでは 40000 count/s² の急減速になる。
       // motion-limits 設計 §4.4）。frame_max_acc_ は START で CONFIG の値から初期化され SET_POSITION ごとに更新されるが、
       // フレームが max_acc = 0 を運ぶと 0 になり減速できないので、そのときだけ CONFIG の値に戻す。
-      const double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      // PR #49 レビュー P1b: ごく小さい max_acc（1 など）でも止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする
+      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
       const double dv = amax * dt;
       double v = setpoint_vel_;
       if (fabs(v) <= dv) {
@@ -1379,7 +1587,118 @@ class V1Axis {
     }
   }
 
+  // 再生バッファの参照が減速に使う加速度 [count/s²]: 最後のフレームの max_acc（CONFIG で頭打ち済み）。0・ごく小さい値でも
+  // 止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする（PR #49 レビュー P1b）。加速はフレームの max_acc のまま（0 なら加速しない）
+  float playout_decel() const {
+    const float a = frame_max_acc_ > 0.0 ? static_cast<float>(frame_max_acc_) : 0.0f;
+    const float lo = static_cast<float>(V1_MIN_DECEL_COUNT_S2);
+    return a > lo ? a : lo;
+  }
+
+  // Issue #45: 再生バッファの参照（ACTIVE、playout_delay_ms > 0）。playout 時刻 tp = いま − 遅れ での軌道の推定
+  //（V1PlayoutBuffer::fit。位置 p_t と傾き v_t）に、参照（setpoint_ / setpoint_vel_）を速度・加速度の制限の中で追従させる:
+  //   v_des = v_t + 補正、補正 = 向き(e) × min(kp × |e|, sqrt(a_dec × |e|))（= 減速度 / 2 の制動曲線）、e = p_t − 参照の次の位置
+  //  （p_t はソフトリミットで clamp。kp は目標が止まっていれば KP_FLAT、動いていれば playout_kp_per_s）
+  //   v_des を ±max_vel と、次の 2 つの制動曲線で切る（どちらも減速度の 8 割。加速度制限いっぱいだと 1 tick 遅れて越える）:
+  //    - 途絶の上限（PR #49 レビュー P1a）: 受けた最新の目標 + V1_PLAYOUT_LOSS_MARGIN_COUNT の先へは止まれる速さまで。
+  //      フレームが途切れても（外挿 → 減速、期限切れ → STOPPING）参照は最新の目標を約 MARGIN 以上越えない。遅い軌道では
+  //      最新の目標は遅れ（40 ms）の分だけ先にあり効かないが、速い軌道（≳ 270 count/s）では参照の遅れが v² / (2 × 0.8 × a_dec)
+  //      まで増える（600 count/s・2000 count/s² で約 110 count。従来の profile_step も約 90 count 遅れていた）
+  //    - Issue #46: ソフトリミットに向かう速度は v ≤ sqrt(2 × a_brake × max(0, d − reserve))（d = 参照から進む向きの端まで）。
+  //      参照は端の reserve 手前で止まる（その内側にいれば端に向かっては動かない。離れる向きは制限しない）。
+  //   Δv は加速なら ±max_acc × dt、減速なら ±a_dec × dt に制限して積分する（速度を一気に 0 にしない）。
+  // 目標が止まった（窓の中の目標がすべて同じ → v_t がちょうど 0）・参照が p_t の SNAP 以内・1 tick で止まれる速さなら、
+  // 参照を p_t に乗せて速度をちょうど 0 にする（保持・整定・停止の判定と、PR #48 の静止の監視は setpoint_vel_ == 0.0 を見る）。
+  // まだ tp に届くフレームが無い（START 直後の遅れの間）・新しいフレームが外挿の上限を越えて途切れた → v_des = 0（a_dec で減速）。
+  // 期限（valid_for）・lease・STOP・FAULT はこれまでどおり状態機械が決める（バッファにフレームが残っていても鮮度は延びない）。
+  // 単精度（ESP32-S3 の FPU）。位置は参照からの差で float にする。
+  void playout_step(double dt, double lo, double hi) {
+    const uint64_t delay = ms_to_us(tuning.playout_delay_ms);
+    const uint64_t tp = now_us_ > delay ? now_us_ - delay : 0;
+    const V1PlayoutFit f =
+        playout_.fit(tp, ms_to_us(tuning.playout_window_ms), ms_to_us(tuning.playout_extrap_ms), playout_clock_);
+    playout_fit_ = f;
+    const float dtf = static_cast<float>(dt);
+    const float vmax = frame_max_vel_ > 0.0 ? static_cast<float>(frame_max_vel_) : 0.0f;
+    const float amax = frame_max_acc_ > 0.0 ? static_cast<float>(frame_max_acc_) : 0.0f;
+    const float adec = playout_decel();
+    const double p0 = setpoint_;
+    float v = static_cast<float>(setpoint_vel_);
+    const float v_before = v;
+    const bool tracking = f.has && !f.starved;
+    double p_t = p0;
+    float v_des = 0.0f;
+    if (tracking) {
+      p_t = f.pos < lo ? lo : (f.pos > hi ? hi : f.pos);
+      const float e = static_cast<float>(p_t - p0) - v * dtf;  // この tick で進む分を見込んで比べる（参照が 1 tick 先行しないように）
+      const float ea = fabsf(e);
+      // 目標が止まっている（傾きちょうど 0）なら硬いゲインで寄せる（指数の尾を短く。ステップ目標でも従来の軌道と同程度で着く）。
+      // 動いている間は推定の量子化の揺れを拾わないよう柔らかいゲイン
+      const float kp = f.vel == 0.0 ? static_cast<float>(V1_PLAYOUT_KP_FLAT_PER_S) : static_cast<float>(tuning.playout_kp_per_s);
+      float corr = kp * ea;
+      const float brake = sqrtf(adec * ea);
+      if (brake < corr) corr = brake;
+      v_des = static_cast<float>(f.vel) + (e >= 0.0f ? corr : -corr);
+    }
+    if (v_des > vmax) v_des = vmax;
+    if (v_des < -vmax) v_des = -vmax;
+    const float a_cap = 0.8f * adec;
+    // 途絶の上限（P1a）: 受けた最新の目標 ± MARGIN まで止まれる速さ
+    if (!playout_.empty()) {
+      const float y = static_cast<float>(static_cast<double>(playout_.newest_pos()) - p0);
+      const float m = static_cast<float>(V1_PLAYOUT_LOSS_MARGIN_COUNT);
+      const float d_up = y + m;
+      const float d_dn = m - y;
+      const float cap_up = d_up > 0.0f ? sqrtf(2.0f * a_cap * d_up) : 0.0f;
+      const float cap_dn = d_dn > 0.0f ? sqrtf(2.0f * a_cap * d_dn) : 0.0f;
+      if (v_des > cap_up) v_des = cap_up;
+      if (v_des < -cap_dn) v_des = -cap_dn;
+    }
+    // Issue #46: ソフトリミットの手前
+    if (tuning.soft_brake_acc_count_s2 > 0.0) {
+      const float sb = static_cast<float>(tuning.soft_brake_acc_count_s2);
+      const float ab = sb < a_cap ? sb : a_cap;
+      const float r = static_cast<float>(tuning.soft_reserve_count);
+      const float d_up = static_cast<float>(hi - p0) - r;
+      const float d_dn = static_cast<float>(p0 - lo) - r;
+      const float cap_up = d_up > 0.0f ? sqrtf(2.0f * ab * d_up) : 0.0f;
+      const float cap_dn = d_dn > 0.0f ? sqrtf(2.0f * ab * d_dn) : 0.0f;
+      if (v_des > cap_up) v_des = cap_up;
+      if (v_des < -cap_dn) v_des = -cap_dn;
+    }
+    float dv = v_des - v;
+    const bool decelerating = (v > 0.0f && dv < 0.0f) || (v < 0.0f && dv > 0.0f);
+    const float dv_max = (decelerating ? adec : amax) * dtf;
+    if (dv > dv_max) dv = dv_max;
+    if (dv < -dv_max) dv = -dv_max;
+    float v_new = v + dv;
+    if (decelerating && v_new != 0.0f && ((v_new > 0.0f) != (v > 0.0f))) {
+      // 0 を越えた分は逆向きの加速: max_acc × dt まで（max_acc 0 ならちょうど 0 で止まる。小さな残りの速度が消えなくなるのを防ぐ）
+      const float acc_lim = amax * dtf;
+      if (v_new > acc_lim) v_new = acc_lim;
+      if (v_new < -acc_lim) v_new = -acc_lim;
+    }
+    v = v_new;
+    double p = p0 + static_cast<double>(v) * dt;
+    if (tracking && f.vel == 0.0 && fabs(p_t - p) <= V1_PLAYOUT_SNAP_COUNT && fabsf(v_before) <= adec * dtf) {
+      p = p_t;  // 目標が止まった: 参照を乗せて速度をちょうど 0（1 tick で止まれる速さのときだけ。減速度の制限の中）
+      v = 0.0f;
+    }
+    if (p < lo) {
+      p = lo;
+      if (v < 0.0f) v = 0.0f;
+    }
+    if (p > hi) {
+      p = hi;
+      if (v > 0.0f) v = 0.0f;
+    }
+    setpoint_ = p;
+    setpoint_vel_ = static_cast<double>(v);
+  }
+
   // 目標へ向かって加速度制限で加減速、速度制限を超えない、到達（通過）で目標に乗せて速度 0。
+  // Issue #45: playout_delay_ms = 0（-DV1_PLAYOUT=0）のときだけ使う従来の経路。100 Hz の整数の目標ではゆっくりの区間で
+  // 毎フレーム追いついて速度が 0 に落ちる（FF が抜ける）。
   static void profile_step(double target, double vmax, double amax, double dt, double* pos, double* vel) {
     const double err = target - *pos;
     if (vmax < 0) vmax = 0;
@@ -1405,15 +1724,77 @@ class V1Axis {
     }
   }
 
+  // r10: 保護の監視への 1 tick の入力（座標は actual_count、速度は v_fast が使えればそれ、無ければ 100 ms 窓）
+  V1Supervisor::Ctx sup_ctx(uint64_t now) const {
+    V1Supervisor::Ctx c;
+    c.now_us = now;
+    c.raw = raw_;
+    c.ref_offset = reference_offset_;
+    c.err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
+    c.soft_min = config_.soft_min_count;
+    c.soft_max = config_.soft_max_count;
+    c.vel = v_fast_valid_ ? v_fast_ : static_cast<double>(velocity_);
+    c.duty_max_pm = v1_permille(tuning.duty_max);
+    c.hold_exit = tuning.hold_exit;
+    // r10（実測 2）: 保持出力の扱い。軌道が止まっていて目標の近くなら、学んだ保持出力（I）の分は包絡線に積まない（V1Supervisor）
+    c.i_pm = duty_state_.bias_pm;  // P1a: 保持の偏り（追従の I は含めない）
+    // 駐車の入りかけ（ブレーキ作動の指令から V1_BRAKE_ENGAGE_MS）はまだ掴んでいないとみなし、露出を積む（Codex 最終レビュー P1）
+    c.brake_released = brake_release_cmd_ || park_ == ParkPhase::Engaging;
+    const int64_t ea = c.err < 0 ? -c.err : c.err;
+    // 目標の近くで止まりかけ（参照速度 ≤ 駐車の入口 30 count/s・|誤差| ≤ 6）: 整定・保持の小さな出力（学んだ保持出力 + 4 % まで）は
+    // 積まない（実機 12712ac の FAIL 1: 下の参照の止まる所への寄せの終わりで、参照速度が 0 になる前の小さな出力を一律の包絡線で積み、
+    // 端の余裕 250 を使い切って停止した）
+    const double sv_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+    c.stationary_near = tuning.hold_learn && sv_abs <= static_cast<double>(tuning.park_ref_vel_count_s) && ea <= escalation_floor();
+    c.park_ok = park_conditions(ea);
+    // 駐車から戻りかけ（ブレーキ解除待ち、参照は駐車した位置で止めている）: 動かないのが正しい。出力（駐車に入ったときの保持出力）は
+    // 学んだ保持出力として扱い（|誤差| が帯を超えていても）、期限の露出は積まない（実機 27eaf6b: 駐車中に 9 count ずれた軸が、
+    // 戻りかけの −1 permille を一律の包絡線で積まれて 0.3 s で FEEDBACK_UNCERTAIN → 参照だけ進んで FOLLOWING_ERROR）
+    if (park_ == ParkPhase::Releasing) {
+      c.stationary_near = tuning.hold_learn;
+      c.deadline_hold = true;
+    }
+    // ARMING のブレーキ解除待ち・駐車の入りかけ: 露出は積むが、止めるのは余裕 + arm_grace まで待つ（落ち着けば駐車に入る）
+    c.deadline_defer = state_ == v1::state::ARMING || park_ == ParkPhase::Engaging;
+    return c;
+  }
+
+  // FOLLOWING_ERROR → OVERSPEED → SOFT_LIMIT の順。r10（Issue #46、supervisor_on のときだけ。どちらの猶予も既定 OFF = 従来どおり即ラッチ。
+  // -DV1_FE_GRACE=1 / -DV1_SOFT_GRACE=1、または tuning.sup.fe_grace_max_ms / soft_grace で ON。PR #48 の Codex 事前レビュー P1c）:
+  //  - FOLLOWING_ERROR（ON のとき）: 上限そのものは変えない。超えていても、エンコーダが生きていて（直近 100 ms にカウント変化）|誤差| が減っている
+  //    （100 ms ごとに 2 以上）間は最長 2 s ラッチしない（LIMIT_RECOVERY）。超えた直後の 200 ms は減り始めるのを待つ（超えた瞬間は
+  //    必ず増えている）。減らなくなった・2 s 経った・|誤差| ≥ 上限 × 1.5・カウントが 100 ms 動かない・FEEDBACK_UNCERTAIN ならラッチ。
+  //  - SOFT_LIMIT（ON のとき）: 少し越えただけで目標が内側なら内側へ戻す（外向きの出力は V1Supervisor::filter が 0 にする。LIMIT_RECOVERY）。
+  //    機械端（ソフトリミット ∓ 50）から 20 以内・外向きに 200 ms 動き続けた・2 s 外に居続けた・目標が外ならラッチ。
+  //  - OVERSPEED は変えない。
   void check_motion_faults(uint64_t now) {
     if (!has_config_) return;
+    const bool sup = supervisor_on();
+    V1Supervisor::Ctx c;
+    if (sup) {
+      sup_.t = tuning.sup;  // 調整値は V1Tuning が持つ（テスト・将来の SET_LIMITS で差し替え）
+      c = sup_ctx(now);
+      sup_.observe(c);  // 前の tick の出力の包絡線を積み、確かな動きなら予算を戻す（異常判定より前）
+    }
     const int64_t fe = static_cast<int64_t>(actual_count()) - static_cast<int64_t>(target_count());
     const int64_t fe_abs = fe < 0 ? -fe : fe;
     const int64_t vel_abs = velocity_ < 0 ? -static_cast<int64_t>(velocity_) : velocity_;
-    if (fe_abs > static_cast<int64_t>(config_.following_error_limit_count)) {
+    bool fe_over = fe_abs > static_cast<int64_t>(config_.following_error_limit_count);
+    if (sup) {
+      if (fe_over && sup_.fe_may_wait(c, fe_abs, config_.following_error_limit_count)) {
+        fe_over = false;
+      } else if (!fe_over) {
+        sup_.fe_within();
+      }
+    }
+    if (fe_over) {
       latch_fault(v1::fault::FOLLOWING_ERROR, now);
     } else if (vel_abs > static_cast<int64_t>(config_.overspeed_count_s)) {
       latch_fault(v1::fault::OVERSPEED, now);
+    } else if (sup && tuning.sup.soft_grace) {
+      if (sup_.decide_soft_limit(c, actual_count(), target_count()) == V1SoftDecision::Latch) {
+        latch_fault(v1::fault::SOFT_LIMIT, now);
+      }
     } else if (!inside_soft_window()) {
       latch_fault(v1::fault::SOFT_LIMIT, now);
     }
@@ -1509,6 +1890,7 @@ class V1Axis {
       const MotorProfile& p = cal_.profile;
       reference_offset_ = cal_.origin_raw;  // P 端 = 0
       referenced_ = true;
+      sup_.reset_trust(raw_, now);  // r10: 端当てで基準を取り直した
       sign_ = p.sign < 0 ? -1 : 1;
       dirty_profile_ = p;
       dirty_profile_.motor = selected_axis_;
@@ -1594,6 +1976,8 @@ class V1Axis {
   void update_duty(uint64_t now, uint64_t dt_us = 0) {
     if (!position_control_on()) {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
+      sup_.end_session(raw_, now);  // r10: その回だけの状態（飽和・過負荷・制動・猶予）を捨てる
+      if (state_ == v1::state::DISARMED) sup_.clear_episode();  // DISARM の完了: FEEDBACK_UNCERTAIN の明示的な解除（再 ARM が要る）
       stall_running_ = false;
       duty_state_ = V1DutyState{};
       reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
@@ -1601,10 +1985,54 @@ class V1Axis {
       reset_track_assist();
       reset_breakaway();
       reset_stall_boost();
+      reset_escalation();
+      residual_accepted_ = false;
+      hold_pulses_spent_ = false;
+      park_ = ParkPhase::None;  // STOP 以外で位置制御が止まった（DISARMED / FAULT など）: 駐車も終わり（ブレーキはどのみち作動）
+      still_running_ = false;
       terms_ = V1DutyTerms{};
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
+    const int64_t err_abs = err < 0 ? -err : err;
+    // ブレーキ駐車（2026-11-02 の操作者の決定）。駐車中（ブレーキ作動・PWM 0）だけは監視を通さない。入りかけ・戻りかけは保持出力を
+    // 監視（予算・期限・停止・基準を消す）に通し、停止なら駐車をやめて即ブレーキの停止にする（Codex 最終レビュー P1）
+    if (parking_enabled()) {
+      int park_out = 0;
+      const ParkAct pa = park_step(err_abs, now, &park_out);
+      if (pa == ParkAct::Parked) {
+        sup_.note_parked();
+        apply_park_output(0, V1DutyMode::HOLD);
+        return;
+      }
+      if (pa == ParkAct::Transition) {
+        int out = park_out;
+        if (has_config_) {
+          sup_.t = tuning.sup;
+          out = sup_.filter(sup_ctx(now), out);
+          if (sup_.take_reference_lost()) referenced_ = false;
+          if (sup_.inhibited()) {
+            park_ = ParkPhase::None;  // 停止が駐車より先: ブレーキ作動・PWM 0（戻りかけでも即）
+            still_running_ = false;
+            out = 0;
+            brake_release_cmd_ = false;
+            duty_state_ = V1DutyState{};
+            reset_breakaway();
+            reset_track_assist();
+            reset_stall_boost();
+          }
+        }
+        apply_park_output(out, V1DutyMode::HOLD);
+        return;
+      }
+    }
+    // r10: 小さな残り誤差の受け入れの解除（|誤差| が出口を超えた・軌道が動いた・ブレーキ作動・監視 OFF）
+    if (residual_accepted_ && (!supervisor_on() || err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || !brake_release_cmd_)) {
+      residual_accepted_ = false;
+    }
+    if (hold_pulses_spent_ && (err_abs > tuning.residual_exit || setpoint_vel_ != 0.0 || duty_state_.in_band || !brake_release_cmd_)) {
+      hold_pulses_spent_ = false;
+    }
     // 停止ブースト（Issue #15 H4）: 対象外になった・誤差の符号が反転した tick は、Duty を計算する前に上乗せを 0 に戻す
     //（戻す前に計算すると、最大上乗せのまま反対向きや軌道の立ち上がりに 1 tick だけ強いパルスが出る）
     stall_boost_gate(err, now);
@@ -1612,8 +2040,58 @@ class V1Axis {
     const double dt_s = static_cast<double>(dt_us < dt_cap_us ? dt_us : dt_cap_us) / 1e6;
     const bool settle_ok = update_settle_dwell(err, dt_us);
     const bool assist = update_track_assist(err, now) || update_breakaway(err, now);  // r6 では後者（動き出しパルス）だけ
-    const int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
-                                    assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
+    update_escalation(err, now);  // r10: 静止目標での引き上げ（esc_level_）
+    // r10（PR #50 の Codex 事前レビュー P1b）: 積分のアンチワインドアップは実際に出した出力で見る。引き上げ・端の手前の制動・ソフトリミットの
+    // 外の外向き 0・過負荷・予算・停止が出力を決めた tick は、bias も追従の I も積まない（ここで取っておいた値に戻す）
+    const double i_before = duty_state_.i_pm;
+    const double bias_before = duty_state_.bias_pm;
+    int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
+                              assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
+    last_combined_pm_ = cmd;
+    const int cmd_ctrl = cmd;  // 位置ループが出した値（上書きの判定用）
+    // r10（supervisor_on）: 静止目標（軌道速度 0・保持でない）での出力の形
+    //  - |誤差| ≤ residual_band か残り誤差の受け入れ中: 動き出しパルスの間だけ出す。それ以外は 0（I も 0）。受け入れ中はパルスも無い
+    //  - |誤差| > residual_band で進まない: 誤差の向きに max(合成, 引き上げ) を出す（duty_max まで）
+    // （保持出力の学習 hold_learn が ON なら、小さな誤差での出力 0 は使わない: 乗員の荷重で沈むので保持出力 I を出し続ける）
+    if (supervisor_on() && setpoint_vel_ == 0.0 && !duty_state_.in_band) {
+      if (!tuning.hold_learn &&
+          (residual_accepted_ || (tuning.residual_band > 0 && err_abs <= tuning.residual_band && !brk_active_))) {
+        cmd = 0;
+        duty_state_.i_pm = 0.0;
+        terms_.cmd_permille = 0;
+        if (residual_accepted_) terms_.mode = V1DutyMode::HOLD;
+      } else if (esc_level_ > 0) {
+        const int dir = err > 0 ? 1 : -1;
+        long mag = (cmd != 0 && (cmd > 0) == (dir > 0)) ? (cmd < 0 ? -cmd : cmd) : 0;
+        if (mag < esc_level_) mag = esc_level_;
+        const long cap = v1_permille(tuning.duty_max);
+        if (mag > cap) mag = cap;
+        cmd = static_cast<int>(dir * mag);
+        terms_.cmd_permille = static_cast<int16_t>(cmd);
+        terms_.mode = V1DutyMode::BRK;
+      }
+    }
+    // r10（Issue #44・#46）: 保護の監視が出力を決める（見えない走行の予算・過負荷・端の手前の制動・ソフトリミットの外の外向き 0）
+    if (supervisor_on() && has_config_) {
+      sup_.t = tuning.sup;
+      cmd = sup_.filter(sup_ctx(now), cmd);
+      if (sup_.take_reference_lost()) referenced_ = false;  // P0: 駐車できないまま期限の露出が余裕の全部に届いた → 基準を消す
+      if (sup_.inhibited()) {
+        // 持続する停止（PR #48 の Codex 事前レビュー P0）: PWM 0 ＋ ブレーキ作動（G13 を作動側へ）。主電源は保つ（powered_state のまま）。
+        // 制御器の状態（積分・動き出しパルス・補助）も捨てる（再開は DISARMED → ARM_PREPARE の通常の手順で、目標は現在位置から）
+        cmd = 0;
+        brake_release_cmd_ = false;
+        duty_state_ = V1DutyState{};
+        reset_breakaway();
+        reset_track_assist();
+        reset_stall_boost();
+        terms_.cmd_permille = 0;
+      }
+    }
+    if (tuning.hold_learn && cmd != cmd_ctrl && !sup_.inhibited()) {  // 停止のときは上で捨てている（学習 OFF は従来どおり）
+      duty_state_.i_pm = i_before;
+      duty_state_.bias_pm = bias_before;
+    }
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;
@@ -1629,7 +2107,9 @@ class V1Axis {
     //    止まっている間は検出できず、目標が動けば STALL_MS で出る）。
     //  - しきい値を duty_max の 75 % 以上にするのは、kp を上げたとき数百 count の誤差だけで 10 % に届き、荷重で動けない軸が
     //    FOLLOWING_ERROR の前に ENCODER_FAULT になって基準を失うのを避けるため。上限近くまで出しても止まっているときだけ異常。
-    if (mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
+    // r10（supervisor_on）: この判定は出さない（荷重で動けない軸を「エンコーダ断」と取り違える。Issue #44）。見えない走行は
+    // V1Supervisor の予算が止める
+    if (!supervisor_on() && mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
       if (!stall_running_) {
         stall_running_ = true;
         stall_start_us_ = now;
@@ -1730,6 +2210,26 @@ class V1Axis {
   bool update_breakaway(int64_t err, uint64_t now) {
     if (!tuning.ff_directional || tuning.breakaway_window_ms == 0) { reset_breakaway(); return false; }
     const int64_t err_abs = err < 0 ? -err : err;
+    // r10（supervisor_on）: 静止目標では、小さな残り誤差（≤ residual_band）だけパルスで詰める。それより大きい誤差は引き上げ
+    //（update_escalation）が受け持ち、受け入れ中は打たない
+    if (supervisor_on() && setpoint_vel_ == 0.0 &&
+        (residual_accepted_ || (tuning.escalate_step_permille > 0 && err_abs > escalation_floor()))) {
+      reset_breakaway();
+      return false;
+    }
+    // r10（hold_learn）: 保持の帯の近くのパルスは、I がまだ動き出しの Duty に育っていない間だけ。荷重で目標から離れている（沈んでいる）
+    // 間は打たない（パルスで持ち上げても出力が落ちればまた沈む往復になる。I が詰める）。進まないパルス 3 回で打ち切る
+    if (tuning.hold_learn && setpoint_vel_ == 0.0 && err != 0) {
+      const int edir = err > 0 ? 1 : -1;
+      long need = edir > 0 ? tuning.breakaway_up_permille : tuning.breakaway_down_permille;
+      if (need < 0) need = -need;
+      const double v = v_fast_valid_ ? v_fast_ : static_cast<double>(velocity_);
+      const bool sagging = static_cast<double>(edir) * v < -static_cast<double>(tuning.breakaway_moving_max_vel_count_s);
+      if (hold_pulses_spent_ || static_cast<double>(edir) * duty_state_.i_pm >= static_cast<double>(need) || sagging) {
+        reset_breakaway();
+        return false;
+      }
+    }
     int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
     const bool traj_moving = setpoint_vel_ != 0.0;
     const double traj_abs = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
@@ -1793,6 +2293,20 @@ class V1Axis {
         brk_active_ = false;  // 進まずに終わった
         ++brk_pulses_;
         if (brk_pulses_ >= tuning.breakaway_max_pulses) brk_exhausted_ = true;
+        // r10: 静止目標の小さな残り誤差で進まないパルスが residual_max_pulses 回 → 打ち切る。hold_learn なら以後は I が詰める
+        //（出力 0 で受け入れない）。hold_learn が OFF なら従来の B（受け入れて出力 0）
+        if (mode == 0 && tuning.residual_max_pulses > 0 && brk_pulses_ >= tuning.residual_max_pulses) {
+          if (tuning.hold_learn) {
+            hold_pulses_spent_ = true;
+            reset_breakaway();
+            return false;
+          }
+          if (supervisor_on() && tuning.residual_band > 0 && err_abs <= tuning.residual_band) {
+            residual_accepted_ = true;
+            reset_breakaway();
+            return false;
+          }
+        }
         if (band) brk_cooldown_until_us_ = now + ms_to_us(tuning.breakaway_band_cooldown_ms);
         brk_phase_start_us_ = now;
         brk_anchor_raw_ = raw_;
@@ -1817,6 +2331,184 @@ class V1Axis {
       return true;
     }
     return false;
+  }
+
+  bool parking_enabled() const { return supervisor_on() && tuning.park; }
+  // 駐車してよい瞬間の条件（時間を除く）: ACTIVE / HOLDING・ブレーキ解除中・参照が止まっている・目標の近く・実測で止まっている・戻した直後でない・停止でない
+  bool park_conditions(int64_t err_abs) const {
+    if (!parking_enabled() || park_ != ParkPhase::None) return false;
+    if (state_ != v1::state::ACTIVE && state_ != v1::state::HOLDING) return false;
+    const double sv = setpoint_vel_ < 0.0 ? -setpoint_vel_ : setpoint_vel_;
+    const int32_t v = velocity_ < 0 ? -velocity_ : velocity_;
+    return brake_release_cmd_ && sv <= static_cast<double>(tuning.park_ref_vel_count_s) && err_abs <= tuning.hold_exit &&
+           v <= tuning.settled_meas_vel && now_us_ >= park_cooldown_until_us_ && !sup_.inhibited();
+  }
+  int holding_output_permille() const {
+    long h = lround(duty_state_.bias_pm + duty_state_.i_pm);
+    const long cap = v1_permille(tuning.duty_max);
+    if (h > cap) h = cap;
+    if (h < -cap) h = -cap;
+    return static_cast<int>(h);
+  }
+  void apply_park_output(int out_count_positive, V1DutyMode mode) {
+    duty_permille_ = -static_cast<int>(sign_) * out_count_positive;
+    terms_ = V1DutyTerms{};
+    terms_.mode = mode;
+    terms_.in_band = true;
+    terms_.cmd_permille = static_cast<int16_t>(out_count_positive);
+    terms_.i_permille = v1_clamp_i16(duty_state_.bias_pm + duty_state_.i_pm);
+  }
+  enum class ParkAct : uint8_t { None, Transition, Parked };
+  void enter_park(uint64_t now) {
+    park_ = ParkPhase::Engaging;
+    park_phase_us_ = now;
+    park_target_ = 0.5 * (still_min_ + still_max_);
+    if (!still_running_) park_target_ = control_target_;
+    // いまの保持出力（直前に実際に出していた値 = bias + I + P）をブレーキが掴むまで保ち、戻るときもこの値を出す（duty_max で頭打ち）
+    park_hold_out_ = pwm_permille();
+    const int cap = v1_permille(tuning.duty_max);
+    if (park_hold_out_ > cap) park_hold_out_ = cap;
+    if (park_hold_out_ < -cap) park_hold_out_ = -cap;
+    brake_release_cmd_ = false;
+    still_running_ = false;
+    ++park_count_;
+    reset_breakaway();
+    reset_track_assist();
+    reset_stall_boost();
+    reset_escalation();
+    hold_pulses_spent_ = false;
+    duty_state_.in_band = false;
+    settle_dwell_us_ = 0;
+  }
+  // 駐車の状態機械。Parked: 駐車中（PWM 0、監視を通さない）。Transition: 入りかけ・戻りかけ（*out の保持出力を監視に通して出す）。
+  // None: 通常の制御。DISARMING など ACTIVE / HOLDING / STOPPING 以外では駐車をやめて何もしない（Codex 最終レビュー P1: DISARMING を
+  // 上書きしない。DISARMING は従来どおりブレーキ作動のまま位置制御の出力を BRAKE_APPLY_WAIT_MS 出す）。STOPPING で戻りかけなら
+  // ブレーキ解除をやめて入りかけに戻す（保持出力を出したまま掴むまで待つ）
+  ParkAct park_step(int64_t err_abs, uint64_t now, int* out) {
+    if (state_ != v1::state::ACTIVE && state_ != v1::state::HOLDING && state_ != v1::state::STOPPING) {
+      park_ = ParkPhase::None;
+      still_running_ = false;
+      return ParkAct::None;
+    }
+    if (state_ != v1::state::ACTIVE && park_ == ParkPhase::Releasing) {
+      // STOP（STOPPING、止まっていれば同じ tick で HOLDING）: 戻りかけをやめてブレーキを掴み直す（保持出力を出したまま掴むまで待つ）
+      park_ = ParkPhase::Engaging;
+      park_phase_us_ = now;
+      brake_release_cmd_ = false;
+    }
+    const double ct_dev = fabs(control_target_ - park_target_);
+    switch (park_) {
+      case ParkPhase::None: {
+        const bool ok = park_conditions(err_abs);
+        if (ok) {
+          if (!still_running_) {
+            still_running_ = true;
+            still_start_us_ = now;
+            still_min_ = still_max_ = control_target_;
+          } else {
+            if (control_target_ < still_min_) still_min_ = control_target_;
+            if (control_target_ > still_max_) still_max_ = control_target_;
+            if (still_max_ - still_min_ > static_cast<double>(tuning.park_target_span_count)) {
+              still_start_us_ = now;  // 目標が動いた: 窓を取り直す
+              still_min_ = still_max_ = control_target_;
+            }
+          }
+        } else {
+          still_running_ = false;
+        }
+        const bool timed = ok && still_running_ && now - still_start_us_ >= ms_to_us(tuning.park_still_ms);
+        const bool deadline = sup_.take_park_request() && ok;  // 期限の露出が半分に届いた
+        if (!timed && !deadline) return ParkAct::None;
+        enter_park(now);
+        *out = park_hold_out_;
+        return ParkAct::Transition;
+      }
+      case ParkPhase::Engaging:
+        brake_release_cmd_ = false;
+        if (now - park_phase_us_ >= ms_to_us(tuning.brake_engage_ms)) {
+          park_ = ParkPhase::Parked;
+          park_phase_us_ = now;
+          return ParkAct::Parked;
+        }
+        *out = park_hold_out_;
+        return ParkAct::Transition;
+      case ParkPhase::Parked:
+        brake_release_cmd_ = false;
+        if (ct_dev > static_cast<double>(tuning.park_unpark_count) && state_ == v1::state::ACTIVE) {
+          // 戻る: まず駐車に入ったときの保持出力を出す（ブレーキはこの tick はまだ作動）。次の tick でブレーキを解除する
+          park_ = ParkPhase::Releasing;
+          park_phase_us_ = now;
+          park_release_armed_ = false;
+          setpoint_vel_ = 0.0;
+          *out = park_hold_out_;
+          return ParkAct::Transition;
+        }
+        return ParkAct::Parked;
+      case ParkPhase::Releasing:
+        if (!park_release_armed_) {
+          park_release_armed_ = true;  // 保持出力は前の tick から出ている: ここでブレーキを解除し、解除待ちを数え始める
+          park_phase_us_ = now;
+        }
+        brake_release_cmd_ = true;
+        if (now - park_phase_us_ >= ms_to_us(tuning.brake_release_wait_ms)) {
+          park_ = ParkPhase::None;
+          park_cooldown_until_us_ = now + ms_to_us(tuning.park_still_ms);
+          still_running_ = false;
+          sup_.begin_fresh_window();  // 期限は通常の制御に入ってから新しい窓で（残りの予算までに抑える）
+          return ParkAct::None;  // この tick から通常の制御（参照は次の tick から追いつく）
+        }
+        *out = park_hold_out_;
+        return ParkAct::Transition;
+    }
+    return ParkAct::None;
+  }
+
+  void reset_escalation() {
+    esc_running_ = false;
+    esc_dir_ = 0;
+    esc_level_ = 0;
+  }
+  // 引き上げの対象になる |誤差| の下限（これを超えたら）。小さな残り誤差の帯が無効なら保持の出口
+  int64_t escalation_floor() const { return tuning.residual_band > 0 ? tuning.residual_band : tuning.hold_exit; }
+
+  // r10（Issue #44 の 14:22 の実測）: 静止目標での力の段階的な引き上げ。Duty を計算する前に呼び、esc_level_ を決める。
+  // 対象: 監視 ON・軌道速度 0・保持でない・小さな残り誤差の受け入れ中でない・|誤差| > escalation_floor・ブレーキ解除指令中・停止中でない。
+  // 窓（escalate_window_ms）の間に誤差の向きへ breakaway_min_move 進まなければ、0 なら max(動き出し Duty, |合成|) + step、以後は窓ごとに
+  // + step（duty_max まで）。進んだ窓では保つ。向きの反転・対象外で 0。出力は V1Supervisor::filter を通る（予算・過負荷・停止）。
+  void update_escalation(int64_t err, uint64_t now) {
+    if (!supervisor_on() || tuning.escalate_step_permille <= 0) { reset_escalation(); return; }
+    const int64_t err_abs = err < 0 ? -err : err;
+    const int dir = err > 0 ? 1 : (err < 0 ? -1 : 0);
+    const bool eligible = setpoint_vel_ == 0.0 && !duty_state_.in_band && !residual_accepted_ && err_abs > escalation_floor() &&
+                          brake_release_cmd_ && !sup_.inhibited() && dir != 0;
+    if (!eligible) { reset_escalation(); return; }
+    if (!esc_running_ || dir != esc_dir_) {
+      reset_escalation();
+      esc_running_ = true;
+      esc_dir_ = dir;
+      esc_win_start_us_ = now;
+      esc_anchor_raw_ = raw_;
+      return;
+    }
+    if (now - esc_win_start_us_ < ms_to_us(tuning.escalate_window_ms)) return;
+    const bool progress = static_cast<int64_t>(dir) * (raw_ - esc_anchor_raw_) >= tuning.breakaway_min_move;
+    if (!progress) {
+      const long cap = v1_permille(tuning.duty_max);
+      long level = esc_level_;
+      if (level == 0) {
+        long brk = dir > 0 ? tuning.breakaway_up_permille : tuning.breakaway_down_permille;
+        if (brk < 0) brk = -brk;
+        const long comb = (last_combined_pm_ != 0 && (last_combined_pm_ > 0) == (dir > 0))
+                              ? (last_combined_pm_ < 0 ? -last_combined_pm_ : last_combined_pm_)
+                              : 0;
+        level = brk > comb ? brk : comb;
+      }
+      level += tuning.escalate_step_permille;
+      if (level > cap) level = cap;
+      esc_level_ = static_cast<int>(level);
+    }
+    esc_win_start_us_ = now;
+    esc_anchor_raw_ = raw_;
   }
 
   void reset_stall_boost() {
@@ -1879,8 +2571,9 @@ class V1Axis {
     if (tuning.ff_directional) {
       // Issue #25 r6: 床が無いので上乗せもしない。静止 2 s の監視（対象のまま stall_boost_min_move 未満しか進まない →
       // ENCODER_FAULT）だけを残す。時計を戻すのは上の「動いた」だけで、動き出しパルス（update_breakaway）は戻さない。
+      // r10（supervisor_on）: ラッチしない（押さえられた軸を ENCODER_FAULT にしない。Issue #44）。V1Supervisor が代わりに守る
       stall_boost_ = 0;
-      if (timed_out && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
+      if (timed_out && !supervisor_on() && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
       return;
     }
     if (now - boost_window_start_us_ < ms_to_us(tuning.stall_boost_ms)) return;

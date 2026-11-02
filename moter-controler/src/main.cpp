@@ -1042,7 +1042,7 @@ char notice[32];
 uint32_t notice_until_ms = 0;
 char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
 
-enum class V1Action : uint8_t { Motor, Estop };
+enum class V1Action : uint8_t { Motor, Estop, ResetTick };
 
 struct V1Button {
   int x;
@@ -1053,7 +1053,7 @@ struct V1Button {
 };
 
 constexpr int kMargin = 6;
-V1Button v1_buttons[2];
+V1Button v1_buttons[3];
 
 void showNotice(const char* text) {
   snprintf(notice, sizeof(notice), "%s", text);
@@ -1064,6 +1064,7 @@ void showNotice(const char* text) {
 void layoutV1(int width, int height) {
   v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
   v1_buttons[1] = {kMargin, height - 42, width - kMargin * 2, 36, V1Action::Estop};  // 上に USB 診断行と制御項の行を置く
+  v1_buttons[2] = {kMargin, 166, width - kMargin * 2, 14, V1Action::ResetTick};       // tick 行（タップで計器を 0 に）
 }
 
 const V1Button* hitV1(int x, int y) {
@@ -1150,6 +1151,10 @@ void onV1Button(const V1Button& b) {
     case V1Action::Estop:
       control_v1_set_estop(!vsnap.estop_latched);
       showNotice(vsnap.estop_latched ? "非常停止を解除" : "非常停止");
+      break;
+    case V1Action::ResetTick:
+      control_v1_reset_tick_stats();
+      showNotice("tick 計器を 0 に");
       break;
   }
 }
@@ -1259,6 +1264,26 @@ void renderV1() {
   canvas.setTextColor(vsnap.configured && vsnap.referenced && !vsnap.encoder_fault_check_disabled ? kGreen : kAmber,
                       TFT_BLACK);
   canvas.drawString(flag_text, 8, 124);
+  // r10（Issue #44・#46）: 保護の監視。フラグ行の右側に、立っている状態と見えない走行の残り予算（上/下 count）・活動の経過
+  if (vsnap.sup.enabled) {
+    const V1SupInfo& sp = vsnap.sup;
+    char sup_text[64];
+    // 不確か = FEEDBACK_UNCERTAIN（再 ARM まで出力 0）、過負荷 = LOAD_LIMITED、端制動 = END_BRAKING、戻し = LIMIT_RECOVERY、予 = 平常。
+    // 続く数は上/下の残り予算 [count] と、カウントが最後に変わってからの秒（左の CONFIG/基準/電源担当と重ならない幅に収める）
+    const char* what = sp.parked ? "駐車"
+                       : sp.feedback_uncertain ? "不確か"
+                       : sp.load_limited     ? "過負荷"
+                       : sp.end_braking      ? "端制動"
+                       : (sp.soft_recovery || sp.fe_recovery) ? "戻し"
+                                                               : "予";
+    snprintf(sup_text, sizeof(sup_text), "%s %ld/%ld %lus", what, static_cast<long>(sp.budget_up),
+             static_cast<long>(sp.budget_down), static_cast<unsigned long>(sp.activity_age_ms / 1000));
+    canvas.setTextDatum(middle_right);
+    const bool any = sp.feedback_uncertain || sp.load_limited || sp.end_braking || sp.soft_recovery || sp.fe_recovery || sp.parked;
+    canvas.setTextColor(sp.feedback_uncertain ? kRed : (any ? kAmber : kGray), TFT_BLACK);
+    canvas.drawString(sup_text, width - 8, 124);
+    canvas.setTextDatum(middle_left);
+  }
 
   // リンク行
   char link_text[80];
@@ -1304,12 +1329,26 @@ void renderV1() {
   }
   canvas.drawString(cal_text, 8, 155);
 
-  // tick 行（周期の守りの確認用）
-  char tick_text[64];
-  snprintf(tick_text, sizeof(tick_text), "tick %lu  最大間隔 %lu us%s%s", static_cast<unsigned long>(vsnap.tick_count),
-           static_cast<unsigned long>(vsnap.max_tick_gap_us), boot_error[0] ? "  ERR " : "", boot_error);
+  // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す。nvs は 0 に戻す）。
+  // gap = tick 間隔の最大、act = ACTIVE 中の間隔の最大、exe = 処理時間の最大 / 直近 1 s の最大 [us]
+  char tick_text[96];
+  // nvs = NVS の書き込みと重なった長い間隔を、止まっていたので異常にしなかった回数 / 最大 [ms]。1 回でもあれば tick 数の代わりに出す
+  //（行は 6 px × 52 文字で切れる。tick 数を残すと入らない）。タップで 0 に戻すと tick 数の表示に戻る
+  char head_text[32];
+  if (vsnap.flash_gap_count > 0) {
+    snprintf(head_text, sizeof(head_text), "nvs %lu/%lums", static_cast<unsigned long>(vsnap.flash_gap_count),
+             static_cast<unsigned long>(vsnap.flash_gap_max_us / 1000));
+  } else {
+    snprintf(head_text, sizeof(head_text), "tick %lu", static_cast<unsigned long>(vsnap.tick_count));
+  }
+  snprintf(tick_text, sizeof(tick_text), "%s gap %lu act %lu exe %lu/%lu us%s%s", head_text,
+           static_cast<unsigned long>(vsnap.max_tick_gap_us), static_cast<unsigned long>(vsnap.active_max_tick_gap_us),
+           static_cast<unsigned long>(vsnap.exec_max_us), static_cast<unsigned long>(vsnap.exec_recent_us),
+           boot_error[0] ? " ERR " : "", boot_error);
+  canvas.setFont(&fonts::Font0);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
 
   // USB 診断行（Issue #11）。6x8 の ASCII フォント。意味は usb_diag_format() のコメント。
   canvas.setFont(&fonts::Font0);
@@ -1359,6 +1398,18 @@ void renderV1() {
   canvas.pushSprite(0, 0);
 }
 
+// NVS（Preferences）を書いてよいか。フラッシュの書き込み中は両コアが止まり、制御タスクの tick が数十 ms 空く
+//（校正直後の保存で CONTROL_OVERRUN になった。2026-11-02）。止まっていて、次の tick までに駆動へ移らない状態でだけ書く:
+// DISARMED / FAULT / BOOT、または校正後の POWER_HOLD（ARM も校正も受け付けず、DISARMED を経ないと動かない）。
+// どれも PWM 0・ブレーキ作動。スナップショットは最大 50 ms 古いので、書く間に ARM が来ても制御タスクは書き込みと重なった
+// 間隔を知っていて（control_v1_nvs_write_begin / end）、PWM 0・ブレーキ作動のままなら異常にしない。
+// 書けないときは見送るだけ（profile_dirty は残り、止まったときに保存する。ARM 中ずっと「保存待ち」のこともある）。
+bool nvsWriteSafe(const V1Snapshot& s) {
+  if (s.duty_permille != 0 || s.brake_release_cmd) return false;
+  if (s.state == v1::state::DISARMED || s.state == v1::state::FAULT || s.state == v1::state::BOOT) return true;
+  return s.state == v1::state::CALIBRATING && s.cal_live_step == v1::cal_step::POWER_HOLD;
+}
+
 bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
   return a.state != b.state || a.fault_code != b.fault_code || a.flags != b.flags ||
          a.selected_axis != b.selected_axis || a.power_on_cmd != b.power_on_cmd ||
@@ -1372,6 +1423,11 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.terms.d_permille / 5) != (b.terms.d_permille / 5) ||  // r9 の減衰項（±10 permille）は 0.5 % 刻みで見る
          (a.pwm_permille / 10) != (b.pwm_permille / 10) ||
          a.encoder_fault_check_disabled != b.encoder_fault_check_disabled || a.actual != b.actual ||
+         a.sup.feedback_uncertain != b.sup.feedback_uncertain || a.sup.load_limited != b.sup.load_limited ||
+         a.sup.end_braking != b.sup.end_braking || a.sup.soft_recovery != b.sup.soft_recovery ||
+         a.sup.fe_recovery != b.sup.fe_recovery || a.sup.parked != b.sup.parked || (a.sup.budget_up / 100) != (b.sup.budget_up / 100) ||
+         (a.sup.budget_down / 100) != (b.sup.budget_down / 100) ||
+         (a.sup.activity_age_ms / 1000) != (b.sup.activity_age_ms / 1000) ||
          a.target != b.target || a.velocity != b.velocity || a.following_error != b.following_error ||
          a.configured != b.configured || a.referenced != b.referenced || a.estop_latched != b.estop_latched ||
          a.has_rx != b.has_rx || a.rx_error_count != b.rx_error_count || a.stale_drop_count != b.stale_drop_count ||
@@ -1382,7 +1438,7 @@ bool snapChanged(const V1Snapshot& a, const V1Snapshot& b) {
          (a.tick_count / 200) != (b.tick_count / 200) || a.cal_live_step != b.cal_live_step ||
          strcmp(a.cal_live_reason, b.cal_live_reason) != 0 || a.cal_result_valid != b.cal_result_valid ||
          a.cal_result != b.cal_result || a.cal_n_end != b.cal_n_end || a.cal_neutral != b.cal_neutral ||
-         a.profile_dirty != b.profile_dirty;
+         a.profile_dirty != b.profile_dirty || a.flash_gap_count != b.flash_gap_count;
 }
 
 void noteBootError(const char* what) {
@@ -1454,15 +1510,23 @@ void loop() {
     const V1Snapshot previous = vsnap;
     vsnap = control_v1_snapshot();
     // 系統の選択は制御タスク（V1Axis）が DISARMED のときだけ受け付ける。受け付けられた値だけ NVS に保存する。
-    if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis)) {
+    // 書くのは止まっている間だけ（nvsWriteSafe。選択直後に ARM されていたら DISARMED に戻ってから書く）
+    const bool nvs_ok = nvsWriteSafe(vsnap);
+    if (vsnap.selected_axis != saved_motor && profile_motor_ok(vsnap.selected_axis) && nvs_ok) {
+      control_v1_nvs_write_begin();
       profile_store_select_motor(vsnap.selected_axis);
+      control_v1_nvs_write_end();
       saved_motor = vsnap.selected_axis;
     }
     // 校正に成功した系統プロファイル（行程・中立・符号）を NVS に保存する。従来 env と同じく loop() 側で書く
     //（制御タスクで Preferences を書くと 5 ms 周期が崩れる）。失敗したら flag を残し 2 s 後に再試行する
     //（Issue #15 M6。以前は成否に関わらず下ろしていた）。保存は 1 キーの blob なので途中で切れても混ざらない（profile_blob.h）。
-    if (vsnap.profile_dirty && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
-      if (profile_store_save(vsnap.profile)) {
+    // 止まっている間だけ書く（nvsWriteSafe）。校正の終了手順（ブレーキ作動待ち）の間は見送り、DISARMED か POWER_HOLD で書く。
+    if (vsnap.profile_dirty && nvs_ok && static_cast<int32_t>(millis() - next_profile_save_ms) >= 0) {
+      control_v1_nvs_write_begin();
+      const bool saved = profile_store_save(vsnap.profile);
+      control_v1_nvs_write_end();
+      if (saved) {
         showNotice("校正を保存");
         control_v1_clear_profile_dirty();
         nvs_save_failures = 0;

@@ -14,6 +14,8 @@
 #if MC_PROTO_V1
 #include <esp_timer.h>
 
+#include <atomic>
+
 #include "v1_axis.h"
 #include "v1_link.h"
 #endif
@@ -249,6 +251,7 @@ struct V1Inputs {
   bool estop_pulse = false;
   bool estop_value = false;
   bool clear_dirty_pulse = false;
+  bool reset_stats_pulse = false;  // tick の計器（処理時間・ACTIVE 中の間隔）を 0 に戻す（画面の tick 行をタップ）
 };
 
 void copy_text(char* dest, size_t size, const char* text) {
@@ -262,15 +265,21 @@ V1Snapshot g_v1_snap;
 int8_t g_signs[4] = {1, 1, 1, 1};
 MotorProfile g_profiles[4];  // NVS の各系統のプロファイル（校正の端当てで行程の見積もりに使う。校正成功で更新）
 uint8_t g_selected = 1;
+// main が NVS を書く前と後に 1 ずつ増やす（奇数 = 書き込み中）。制御タスクは前の tick から変わったか・奇数かで、
+// その間隔が書き込みと重なったかを知る（フラッシュの書き込み中は両コアが止まり、tick の間隔が数十 ms 空く）
+std::atomic<uint32_t> g_nvs_write_seq{0};
 
 int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
 int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
 // 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
-void write_outputs(bool power_on, bool brake_release, int duty_permille) {
+// 書く順: 主電源 → PWM → ブレーキ（r10 の Codex 最終レビュー P2）。ブレーキを解除する tick には、保持出力がもう出ているようにする
+//（駐車から戻るときは、V1Axis が保持出力を出した次の tick でブレーキを解除するので、順序に頼らなくても先に出ている）
+// PWM は待たない版（反転は PWM 0 の tick を挟んで次の tick 以降に出る。以前は tick の中で delay(DIR_COAST_MS) していた）
+void write_outputs(bool power_on, bool brake_release, int duty_permille, uint64_t now_us) {
   digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
+  motor_output_write_permille_at(duty_permille, now_us);
   digitalWrite(PIN_MOTOR_BRAKE, brake_release ? BRAKE_ON_LEVEL : brake_off_level());
-  motor_output_write_permille(duty_permille);
 }
 
 void v1_task_main(void*) {
@@ -284,6 +293,14 @@ void v1_task_main(void*) {
   uint32_t ticks = 0;
   uint32_t max_gap_us = 0;
   uint64_t prev_now = static_cast<uint64_t>(esp_timer_get_time());
+  // PR #49 レビュー P2c: 制御 tick の処理時間（入口の now から出力・送信キューまで）と、ACTIVE 中の tick 間隔の最大。
+  // 画面の tick 行に出し、タップで 0 に戻す（プロトコルは変えない）。recent = 直近 1 s（200 tick）の最大
+  uint32_t exec_max_us = 0;
+  uint32_t exec_win_max_us = 0;
+  uint32_t exec_recent_us = 0;
+  uint32_t exec_win_ticks = 0;
+  uint32_t active_max_gap_us = 0;
+  uint32_t nvs_seq_prev = g_nvs_write_seq.load();
 
   for (;;) {
     V1Inputs in;
@@ -292,7 +309,18 @@ void v1_task_main(void*) {
     g_v1_in.select_pulse = false;
     g_v1_in.estop_pulse = false;
     g_v1_in.clear_dirty_pulse = false;
+    g_v1_in.reset_stats_pulse = false;
     portEXIT_CRITICAL(&g_mux);
+
+    if (in.reset_stats_pulse) {
+      max_gap_us = 0;
+      exec_max_us = 0;
+      exec_win_max_us = 0;
+      exec_recent_us = 0;
+      exec_win_ticks = 0;
+      active_max_gap_us = 0;
+      g_axis.reset_flash_gap_stats();
+    }
 
     if (in.clear_dirty_pulse) {
       g_axis.clear_profile_dirty();
@@ -302,6 +330,11 @@ void v1_task_main(void*) {
     const uint64_t gap = now - prev_now;
     prev_now = now;
     if (gap > max_gap_us) max_gap_us = static_cast<uint32_t>(gap);
+    if (g_axis.state() == v1::state::ACTIVE && gap > active_max_gap_us) active_max_gap_us = static_cast<uint32_t>(gap);
+    // 前の tick からの間に NVS の書き込みが始まった・終わった、または今も書き込み中（奇数）
+    const uint32_t nvs_seq = g_nvs_write_seq.load();
+    const bool nvs_write_in_gap = nvs_seq != nvs_seq_prev || (nvs_seq & 1u) != 0;
+    nvs_seq_prev = nvs_seq;
 
     // 画面の非常停止は受信フレームより先に（この周期の出力に必ず反映する）
     if (in.estop_pulse) {
@@ -311,9 +344,11 @@ void v1_task_main(void*) {
     for (uint32_t d = v1_link_take_rx_dropped(); d > 0; --d) {
       g_axis.record_rx_error();
     }
+    // Issue #45: 溜まったフレームも 1 つずつ受信時刻つきで再生バッファへ（途中の目標を捨てない）。期限・lease・応答は従来どおり now。
+    // now を取った後に積まれたフレームは受信時刻が now より新しいことがあるので now で頭打ち（V1Axis::handle も同じく頭打ちする）
     V1RxFrame frame;
     while (v1_link_rx_pop(&frame)) {
-      g_axis.handle_frame(frame.data, frame.len, now);
+      g_axis.handle_frame(frame.data, frame.len, now, frame.rx_us < now ? frame.rx_us : now);
     }
     if (in.select_pulse) {
       if (g_axis.select_axis(in.select_axis, now)) {
@@ -322,8 +357,8 @@ void v1_task_main(void*) {
       }
     }
 
-    g_axis.tick(now, encoder_count());
-    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille());
+    g_axis.tick(now, encoder_count(), nvs_write_in_gap);
+    write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille(), now);
 
     // 校正に成功した系統の符号を、次の系統切り替え（set_sign）に反映する。NVS への保存は loop() が行う
     //（Preferences の書き込みは数十 ms 止まることがあり、5 ms の制御タスクでは CONTROL_OVERRUN になる）。
@@ -359,6 +394,7 @@ void v1_task_main(void*) {
     snap.terms = g_axis.duty_terms();
     snap.pwm_permille = g_axis.pwm_permille();
     snap.encoder_fault_check_disabled = g_axis.encoder_fault_check_disabled();
+    snap.sup = g_axis.supervisor_info();
     snap.actual = g_axis.actual_count();
     snap.target = g_axis.target_count();
     snap.velocity = g_axis.velocity_count_s();
@@ -374,8 +410,24 @@ void v1_task_main(void*) {
     snap.tx_deferred = v1_link_tx_deferred();
     snap.tx_stale_dropped = v1_link_tx_stale_dropped();
     ticks += 1;
+    {
+      const uint64_t done = static_cast<uint64_t>(esp_timer_get_time());
+      const uint32_t exec_us = static_cast<uint32_t>(done - now);  // 反転の待ち（DIR_COAST_MS）は tick をまたぐので入らない
+      if (exec_us > exec_max_us) exec_max_us = exec_us;
+      if (exec_us > exec_win_max_us) exec_win_max_us = exec_us;
+      if (++exec_win_ticks >= 200) {
+        exec_recent_us = exec_win_max_us;
+        exec_win_max_us = 0;
+        exec_win_ticks = 0;
+      }
+    }
     snap.tick_count = ticks;
+    snap.flash_gap_count = g_axis.flash_gap_count();
+    snap.flash_gap_max_us = g_axis.flash_gap_max_us();
     snap.max_tick_gap_us = max_gap_us;
+    snap.active_max_tick_gap_us = active_max_gap_us;
+    snap.exec_max_us = exec_max_us;
+    snap.exec_recent_us = exec_recent_us > exec_win_max_us ? exec_recent_us : exec_win_max_us;
     snap.device_id = id.device_id;
     snap.boot_id = id.boot_id;
     snap.cal_live_step = g_axis.cal_live_step();
@@ -433,6 +485,15 @@ void control_v1_set_estop(bool latched) {
 void control_v1_clear_profile_dirty() {
   portENTER_CRITICAL(&g_mux);
   g_v1_in.clear_dirty_pulse = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void control_v1_nvs_write_begin() { g_nvs_write_seq.fetch_add(1); }
+void control_v1_nvs_write_end() { g_nvs_write_seq.fetch_add(1); }
+
+void control_v1_reset_tick_stats() {
+  portENTER_CRITICAL(&g_mux);
+  g_v1_in.reset_stats_pulse = true;
   portEXIT_CRITICAL(&g_mux);
 }
 

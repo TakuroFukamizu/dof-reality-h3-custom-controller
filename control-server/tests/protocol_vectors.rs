@@ -300,6 +300,60 @@ fn vectors() -> Vec<Vector> {
             frame_hex: "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB",
             wire_hex: "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00",
         },
+        Vector {
+            // r10 (Issues #44 / #46): protection-supervisor flag bits 7..10. Same layout as 7.15; only the
+            // meaning of formerly unused flag bits is new.
+            title: "STATUS（r10 の保護フラグ）",
+            msg: Msg::Mcu(McuMsg::Status(Status {
+                boot_id: BOOT_ID,
+                mcu_time_us: 1_234_567_890,
+                mcu_state: 4, // ACTIVE
+                selected_axis: 1,
+                fault_code: FaultCode::None,
+                // 0x001F | LOAD_LIMITED | FEEDBACK_UNCERTAIN | END_BRAKING | LIMIT_RECOVERY
+                flags: 0x079F,
+                pwm_permille: 0, // inhibited
+                actual_count: -1230,
+                target_count: -1080,
+                velocity_count_s: 0,
+                following_error_count: -150,
+                last_applied_frame: 1234,
+                last_applied_seq: 1000,
+                last_rx_seq: 1000,
+                current_ma: 0,
+                rx_error_count: 1,
+                stale_drop_count: 2,
+            })),
+            frame_hex: "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 9F 07 00 00 32 FB FF FF C8 FB FF FF 00 00 00 00 6A FF FF FF D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 8F 3A",
+            wire_hex: "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 03 9F 07 01 09 32 FB FF FF C8 FB FF FF 01 01 01 07 6A FF FF FF D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 03 8F 3A 00",
+        },
+        Vector {
+            // Operator decision 2026-11-02: still hold parked on the brake (bit 11).
+            // Brake applied (no BRAKE_RELEASE_CMD), main power on, PWM 0.
+            title: "STATUS（ブレーキ駐車 PARKED）",
+            msg: Msg::Mcu(McuMsg::Status(Status {
+                boot_id: BOOT_ID,
+                mcu_time_us: 1_234_567_890,
+                mcu_state: 4, // ACTIVE
+                selected_axis: 1,
+                fault_code: FaultCode::None,
+                // POWER_ON_CMD | POSITION_REFERENCED | CONFIGURED | POWER_CONTROLLER | PARKED
+                flags: 0x081D,
+                pwm_permille: 0,
+                actual_count: -1230,
+                target_count: -1230,
+                velocity_count_s: 0,
+                following_error_count: 0,
+                last_applied_frame: 1234,
+                last_applied_seq: 1000,
+                last_rx_seq: 1000,
+                current_ma: 0,
+                rx_error_count: 1,
+                stale_drop_count: 2,
+            })),
+            frame_hex: "01 83 38 00 EF CD AB 89 D2 02 96 49 00 00 00 00 04 01 00 00 1D 08 00 00 32 FB FF FF 32 FB FF FF 00 00 00 00 00 00 00 00 D2 04 00 00 E8 03 00 00 E8 03 00 00 00 00 00 00 01 00 02 00 00 E6",
+            wire_hex: "04 01 83 38 09 EF CD AB 89 D2 02 96 49 01 01 01 03 04 01 01 03 1D 08 01 09 32 FB FF FF 32 FB FF FF 01 01 01 01 01 01 01 03 D2 04 01 03 E8 03 01 03 E8 03 01 01 01 01 01 02 01 02 02 01 02 E6 00",
+        },
     ]
 }
 

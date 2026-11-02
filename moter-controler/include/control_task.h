@@ -52,11 +52,12 @@ struct V1Snapshot {
   uint8_t selected_axis = 0;
   bool power_on_cmd = false;
   bool brake_release_cmd = false;
-  int duty_permille = 0;         // 符号付き permille（MD13S の向き。motor_output_write_permille に渡した値）
+  int duty_permille = 0;         // 符号付き permille（MD13S の向き。motor_output_write_permille_at に渡した値。反転待ちの tick はピンでは 0）
   int stall_boost_permille = 0;  // 停止ブースト（Issue #15 H4）で下限に上乗せしている permille（0 = なし）
   V1DutyTerms terms{};           // 位置ループの各項（Issue #25 手順 8 の計器行。permille、カウント増が正）
   int16_t pwm_permille = 0;      // STATUS と同じ pwm_permille（カウント増が正）
   bool encoder_fault_check_disabled = false;  // duty_max がしきい値より低く無パルスの ENCODER_FAULT が出ない（Issue #15 M2）
+  V1SupInfo sup{};               // r10（Issue #44・#46）: 保護の監視の計器（活動の経過・飽和時間・残りの予算・フラグ）
   int32_t actual = 0;
   int32_t target = 0;
   int32_t velocity = 0;          // count/s（100 ms 窓）
@@ -72,7 +73,12 @@ struct V1Snapshot {
   uint32_t tx_deferred = 0;      // TX リングに空きが無く次の poll に回した回数（Issue #15 M7）
   uint32_t tx_stale_dropped = 0; // 古い／入らない STATUS と期限切れの保留を捨てた数
   uint32_t tick_count = 0;
-  uint32_t max_tick_gap_us = 0;  // 起動からの tick 間隔の最大
+  uint32_t flash_gap_count = 0;  // NVS 書き込みと重なった長い間隔を、止まっていたので CONTROL_OVERRUN にしなかった回数
+  uint32_t flash_gap_max_us = 0; // 同、間隔の最大 [us]
+  uint32_t max_tick_gap_us = 0;  // 起動から（またはリセットから）の tick 間隔の最大
+  uint32_t active_max_tick_gap_us = 0;  // ACTIVE 中の tick 間隔の最大（PR #49 レビュー P2c。画面のタップで 0 に戻す）
+  uint32_t exec_max_us = 0;      // 制御 tick の処理時間の最大 [us]（入口の now から出力・送信キューまで）
+  uint32_t exec_recent_us = 0;   // 同、直近 1 s の最大
   uint64_t device_id = 0;
   uint32_t boot_id = 0;
   // 校正（CALIBRATING / CAL_RESULT）
@@ -94,5 +100,10 @@ void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis);  /
 void control_v1_select_axis(uint8_t axis);   // DISARMED のときだけ V1Axis が受け付ける
 void control_v1_set_estop(bool latched);     // 画面の非常停止（ラッチ / 解除）
 void control_v1_clear_profile_dirty();       // loop() が NVS に保存した後に呼ぶ
+void control_v1_reset_tick_stats();
+// main が NVS（Preferences）を書く直前と直後に呼ぶ。その間に空いた tick 間隔は、止まっている（PWM 0・ブレーキ作動）なら
+// CONTROL_OVERRUN にせず数えるだけになる（V1Axis::tick の flash_write_in_gap）。駆動中なら従来どおり異常
+void control_v1_nvs_write_begin();
+void control_v1_nvs_write_end();          // tick の計器（間隔の最大・処理時間・ACTIVE 中の間隔）を 0 に戻す
 V1Snapshot control_v1_snapshot();
 #endif

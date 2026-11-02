@@ -325,4 +325,25 @@ pub mod status_flags {
     pub const POWER_CONTROLLER: u16 = 1 << 4;
     pub const CURRENT_VALID: u16 = 1 << 5;
     pub const CLOCK_SYNCED: u16 = 1 << 6;
+    /// r10 (Issues #44 / #46): protection-supervisor states. None of them is a
+    /// fault/latch; the MCU stays in its state (e.g. ACTIVE).
+    /// Overload: saturated for 1 s without progress -> PWM 0 + brake applied
+    /// (main power kept), persistent until the axis is DISARMED (re-ARM).
+    pub const LOAD_LIMITED: u16 = 1 << 7;
+    /// Blind-drive budget exhausted (no credible encoder motion) -> PWM 0 +
+    /// brake applied (main power kept), persistent until the axis is DISARMED
+    /// (re-ARM). Replaces the old "no progress -> ENCODER_FAULT" latches.
+    /// Follow-up: the server should stop the whole seat when any axis sets
+    /// LOAD_LIMITED or FEEDBACK_UNCERTAIN (today it only displays them).
+    pub const FEEDBACK_UNCERTAIN: u16 = 1 << 8;
+    /// Measured velocity cannot stop before the soft limit: full opposite duty.
+    pub const END_BRAKING: u16 = 1 << 9;
+    /// Recovering inward from slightly outside the soft window, or a following
+    /// error over the limit that is shrinking (grace instead of a latch). Both
+    /// graces are off in the default firmware.
+    pub const LIMIT_RECOVERY: u16 = 1 << 10;
+    /// Still hold parked on the mechanical brake (brake applied, PWM 0, main
+    /// power kept, learned holding bias kept). Not a fault; the MCU resumes
+    /// automatically when the target moves (operator decision 2026-11-02).
+    pub const PARKED: u16 = 1 << 11;
 }

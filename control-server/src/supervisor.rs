@@ -185,6 +185,10 @@ pub mod stop_reason {
     pub const ADMIN: u8 = 1;
     pub const SOURCE_STALE: u8 = 2;
     pub const CENTER_REACHED: u8 = 3;
+    /// An axis reported FEEDBACK_UNCERTAIN or LOAD_LIMITED (r10 firmware
+    /// braked inhibit): the whole seat stops instead of letting the other
+    /// axes keep moving and the inhibited one end in FOLLOWING_ERROR.
+    pub const AXIS_INHIBITED: u8 = 4;
 }
 
 /// `AdminError::error` codes.
@@ -197,6 +201,9 @@ pub mod admin_error {
     /// START (game): the fresh pose would command an axis farther than
     /// `game.start_max_offset_count` from its hold position (Issue #15 M4).
     pub const POSE_NOT_NEAR_HOLD: &str = "pose_not_near_hold";
+    /// START / CENTER while an axis reports the r10 braked inhibit
+    /// (FEEDBACK_UNCERTAIN / LOAD_LIMITED): DISARM and ARM again first.
+    pub const AXIS_INHIBITED: &str = "axis_inhibited";
     pub const FAULT_LATCHED: &str = "fault_latched";
     pub const NOT_FAULTED: &str = "not_faulted";
     pub const RESET_IN_PROGRESS: &str = "reset_in_progress";
@@ -423,6 +430,14 @@ pub struct AxisSnapshot {
     pub brake_release_cmd: Option<bool>,
     /// STATUS flag POWER_CONTROLLER: the MCU's own idea of its main-power role.
     pub power_controller: Option<bool>,
+    /// STATUS flags of the r10 protection supervisor (Issues #44 / #46,
+    /// protocol §3.4 bits 7..10). Display only: none of them is a fault.
+    pub load_limited: Option<bool>,
+    pub feedback_uncertain: Option<bool>,
+    pub end_braking: Option<bool>,
+    pub limit_recovery: Option<bool>,
+    /// STATUS flag PARKED (protocol §3.4 bit 11): still hold parked on the brake.
+    pub parked: Option<bool>,
     /// Amperes, only when the MCU sets CURRENT_VALID.
     pub current_a: Option<f64>,
     pub last_applied_frame: Option<u32>,
@@ -981,7 +996,7 @@ impl Supervisor {
 
     /// Why ARM is (or would be) refused right now. Empty = ready.
     pub fn blockers(&self, now: Instant) -> Vec<String> {
-        let mut b = Vec::new();
+        let mut b = self.inhibited_axes();
         for (i, t) in self.axes.iter().enumerate() {
             let n = i + 1;
             if !t.connected {
@@ -1217,6 +1232,7 @@ impl Supervisor {
         self.reconcile_limits(now);
         self.check_status_age(now);
         self.check_frame_skew(now);
+        self.check_axis_inhibit(now);
 
         let mut drive_limits = Vec::new();
         self.drive.requested_counts = None;
@@ -1382,6 +1398,11 @@ impl Supervisor {
                     power_on_cmd: s.map(|s| s.flags & status_flags::POWER_ON_CMD != 0),
                     brake_release_cmd: s.map(|s| s.flags & status_flags::BRAKE_RELEASE_CMD != 0),
                     power_controller: s.map(|s| s.flags & status_flags::POWER_CONTROLLER != 0),
+                    load_limited: s.map(|s| s.flags & status_flags::LOAD_LIMITED != 0),
+                    feedback_uncertain: s.map(|s| s.flags & status_flags::FEEDBACK_UNCERTAIN != 0),
+                    end_braking: s.map(|s| s.flags & status_flags::END_BRAKING != 0),
+                    limit_recovery: s.map(|s| s.flags & status_flags::LIMIT_RECOVERY != 0),
+                    parked: s.map(|s| s.flags & status_flags::PARKED != 0),
                     current_a: s
                         .filter(|s| s.flags & status_flags::CURRENT_VALID != 0)
                         .map(|s| f64::from(s.current_ma) / 1000.0),
@@ -2414,6 +2435,10 @@ impl Supervisor {
             ));
         }
         self.refuse_if_calibrating()?;
+        let inhibited = self.inhibited_axes();
+        if !inhibited.is_empty() {
+            return Err(AdminError::new(admin_error::AXIS_INHIBITED, inhibited));
+        }
         match self.phase {
             Phase::Holding {
                 start: None,
@@ -2859,6 +2884,50 @@ impl Supervisor {
                 self.send_config(i, Purpose::Sync, now);
                 self.axes[i].config_retry_at = Some(now + CONFIG_RETRY);
             }
+        }
+    }
+
+    /// r10 firmware: an axis in its braked inhibit (FEEDBACK_UNCERTAIN /
+    /// LOAD_LIMITED) holds PWM 0 with the brake applied while its reference
+    /// would keep following the game. Stop the whole seat (CONTROLLED_STOP to
+    /// every axis) so the reference decelerates instead of running away into a
+    /// FOLLOWING_ERROR on the inhibited axis. Resuming needs the operator
+    /// (DISARM → ARM, as the firmware requires).
+    /// Blocker lines for axes in the r10 braked inhibit.
+    fn inhibited_axes(&self) -> Vec<String> {
+        (0..AXIS_COUNT)
+            .filter_map(|i| {
+                let t = &self.axes[i];
+                let f = t.status.map_or(0, |s| s.flags);
+                if !t.connected || f & (status_flags::FEEDBACK_UNCERTAIN | status_flags::LOAD_LIMITED) == 0 {
+                    return None;
+                }
+                let why = if f & status_flags::FEEDBACK_UNCERTAIN != 0 { "FEEDBACK_UNCERTAIN" } else { "LOAD_LIMITED" };
+                Some(format!("{}: axis{} reports {why} (DISARM and ARM again)", admin_error::AXIS_INHIBITED, i + 1))
+            })
+            .collect()
+    }
+
+    fn check_axis_inhibit(&mut self, now: Instant) {
+        // ACTIVE, and a START still pending (HOLDING → ACTIVE): stop the seat.
+        let driving = matches!(self.phase, Phase::Active { .. } | Phase::Holding { start: Some(_), .. });
+        if !driving {
+            return;
+        }
+        let mask = status_flags::FEEDBACK_UNCERTAIN | status_flags::LOAD_LIMITED;
+        let hit = (0..AXIS_COUNT).find(|&i| self.axes[i].connected && self.axes[i].flag(mask));
+        if let Some(i) = hit {
+            let flags = self.axes[i].status.map_or(0, |s| s.flags);
+            self.event(
+                now,
+                "axis_inhibited",
+                serde_json::json!({
+                    "axis": i + 1,
+                    "feedback_uncertain": flags & status_flags::FEEDBACK_UNCERTAIN != 0,
+                    "load_limited": flags & status_flags::LOAD_LIMITED != 0,
+                }),
+            );
+            self.begin_stop(stop_reason::AXIS_INHIBITED, now);
         }
     }
 

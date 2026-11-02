@@ -249,13 +249,245 @@ constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
 constexpr double V1_VEL_KD_PERMILLE_PER_COUNT_S = 0.05;  // Kd: 速度誤差 1 count/s あたり 0.05 permille（200 count/s で上限 10）
 constexpr int V1_VEL_D_MAX_PERMILLE = 10;                // |u_d| の上限 1 %
 constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定の窓
+// r10（Issue #44・#46）: 保護の監視 V1Supervisor（include/v1_supervisor.h）。方向別の経路（V1_FF_DIRECTIONAL）だけで効く。
+// 「進まない → ENCODER_FAULT」の 2 つの判定（走行中の無パルス・静止 2 s の監視）を置き換える。電流検出が無いので「エンコーダは
+// 生きているが完全に止まっている（乗員の荷重）」と「エンコーダ断」はファームでは区別できない。そこで ENCODER_FAULT はラッチせず、
+// 「見えないまま動けた距離（見えない走行）」を実際に出した PWM から積算して上限で止める（FEEDBACK_UNCERTAIN）。過負荷（生きているのに
+// 進まない）は飽和 1 s で LOAD_LIMITED。どちらも **PWM 0 ＋ ブレーキ作動（主電源は保つ）の持続する停止**で、自動では戻らない
+//（DISARM → 再 ARM の通常の ARMING 手順だけが戻す。PR #48 の Codex 事前レビュー P0）。いずれも仮値で、実機で詰める。
+// -DV1_SUPERVISOR=0 で切れる（r9 と同じ判定）。
+#ifndef V1_SUPERVISOR
+#define V1_SUPERVISOR 1
+#endif
+// 見えない走行の包絡線速度: 既定は Issue #44 の仕様どおり |Duty| > 0 なら一律 V1_SUP_ENV_COUNT_S（2500 count/s）。
+// -DV1_SUP_ENV_PROPORTIONAL=1 で |Duty| に比例（V1_SUP_ENV_PROP_REF_PERMILLE = 20 % で 2500。上限なし）に切り替える（初期の検証では使わない）。
+// 一律の注意: 保持に入る前の整定（P + I が数 permille で動かない）や 1 count だけの補正も 2500 count/s で積むので、確かな動き（2 count）が
+// 無いまま小さな補正が続くと中央付近でも 400 ms 分で止まる（実機で頻度を見る）。
+#ifndef V1_SUP_ENV_PROPORTIONAL
+#define V1_SUP_ENV_PROPORTIONAL 0
+#endif
+constexpr int32_t V1_SUP_ENV_COUNT_S = 2500;
+constexpr int V1_SUP_ENV_PROP_REF_PERMILLE = 200;
+constexpr int V1_SUP_ENV_REF_PERMILLE = V1_SUP_ENV_PROPORTIONAL ? V1_SUP_ENV_PROP_REF_PERMILLE : 0;  // 0 = 一律
+// 予算（count）= min(V1_SUP_BUDGET_MAX_COUNT, max(0, D − V1_SUP_END_RESERVE_COUNT))。D = 最後に信用できた位置から駆動の向きの機械端
+// までの距離。機械端は CONFIG のソフトリミットから V1_MECH_DECEL_ZONE_COUNT だけ外（PC の calibration.rs が soft ≥ mechanical +
+// decel_zone を検証している。bringup.toml の decel_zone は 50。PC がこれより小さい decel_zone を使うとここは楽観側になる）。
+// 2500 count/s なら中央付近 400 ms、D = 650 で 100 ms、D ≤ 400 で 0（先読みは最悪の tick 間隔 V1_OVERRUN_MS で見るので実際は 1 tick 弱短い）。
+// 運用の注意: 既定では端から 400 count 以内（機械端基準）で端へ向かう出力は出せない → PC の目標は機械端から 400 より内側に置く。
+constexpr int32_t V1_SUP_BUDGET_MAX_COUNT = 1000;
+constexpr int32_t V1_SUP_END_RESERVE_COUNT = 400;
+constexpr int32_t V1_MECH_DECEL_ZONE_COUNT = 50;
+// 再生バッファ（Issue #45）の参照が端の手前で止まる位置に残す、見えない走行の予算の余裕 [count]。参照の止まる位置 =
+// ソフトリミットから V1_SUP_END_RESERVE_COUNT − V1_MECH_DECEL_ZONE_COUNT + これ（V1_SOFT_RESERVE_COUNT、下の再生バッファの節）。
+// 最悪の tick の先読み（2500 count/s × V1_OVERRUN_MS 15 ms = 37.5）以上が要る（static_assert）。さらに、参照の寄せの終わり（減速の尾。
+// 参照速度が数十 count/s の間は FF の切片が端の向きに出るのに、軸は 2 count 確かに動くまで時間が掛かる）の包絡線もここから払う。
+// ホストの PWM プラント（test_r10_integrated_playout_stops_outside_no_drive_zone）では余裕 100 だと寄せの終わりで尽き、150 で残り 86、
+// 250 で残り 125 以上だったので 250 にした（仮値。実機の慣性・遅れで要確認）。代償: 参照はソフトリミットから 600（機械端から 650）の
+// 手前で止まる（ストローク 5551 なら使えるのは約 4250）。一律の包絡線と予算 D − 400 のまま範囲を広げるには、比例の包絡線
+//（V1_SUP_ENV_PROPORTIONAL）か最小予算（V1_SUP_MIN_BUDGET）の検証が要る
+constexpr int32_t V1_SUP_END_MARGIN_COUNT = 250;
+// 確認のための最小の予算（仕様からの逸脱。既定 0 = 仕様どおり）: -DV1_SUP_MIN_BUDGET=1 で min(50, max(0, D − V1_END_HARD_MARGIN_COUNT))
+// を下限にする（端から 400 以内でも 20 ms 分は端へ出せる）
+#ifndef V1_SUP_MIN_BUDGET
+#define V1_SUP_MIN_BUDGET 0
+#endif
+constexpr int32_t V1_SUP_MIN_BUDGET_VARIANT_COUNT = 50;
+constexpr int32_t V1_SUP_MIN_BUDGET_COUNT = V1_SUP_MIN_BUDGET ? V1_SUP_MIN_BUDGET_VARIANT_COUNT : 0;
+// 「エンコーダが確かに動いた」（予算を戻す唯一の根拠）: 出している Duty の向きへ、窓の中の最も戻った所から V1_SUP_RENEW_MOVE_COUNT 以上の
+// 正味の移動。±1 のちらつき・片相のトグル（n ↔ n+1）は 1 にしかならないので戻さない。窓は半分（100 ms）ずつ 2 つを持つ滑り窓の近似
+// （実効 100〜200 ms）。Duty 0・向きの反転で窓を取り直す。既知の穴: ±2 以上の雑音の往復は戻してしまう（PCNT のフィルタが無効）
+// r10（実測 2）: 既定ではどちら向きの正味の移動でも数える（-DV1_SUP_RENEW_DIRECTIONAL=1 で「出している向きだけ」）。乗員の荷重で
+// 沈む（出力と逆向きに動く）軸を「エンコーダ断」と同じに扱うと、保持出力を学ぶ間に予算が尽きる。逆向きでも 2 count の正味の移動は
+// エンコーダが生きている証拠（±1 のちらつき・片相のトグルは 1 にしかならないのは同じ）
+#ifndef V1_SUP_RENEW_DIRECTIONAL
+#define V1_SUP_RENEW_DIRECTIONAL 0
+#endif
+constexpr int32_t V1_SUP_RENEW_MOVE_COUNT = 2;
+constexpr uint32_t V1_SUP_RENEW_WINDOW_MS = 200;
+// 過負荷（LOAD_LIMITED）: |出力| ≥ duty_max × 99 % で誤差の向きに出している（飽和）のに、100 ms の窓ごとに向きへ 5 count 進む・
+// |誤差| が 3 減る、のどちらも無いまま 1 s → PWM 0 ＋ ブレーキ作動の持続する停止（自動では戻らない。安全に保てる通電の保持 Duty が
+// 分からないので機械のブレーキで保つ。人が乗った状態の保持 Duty と発熱を測ってから見直す）
+constexpr int V1_LOAD_SAT_RATIO_PERMILLE = 990;
+constexpr uint32_t V1_LOAD_SAT_MAX_MS = 1000;
+constexpr uint32_t V1_LOAD_WINDOW_MS = 100;
+constexpr int32_t V1_LOAD_PROGRESS_COUNT = 5;
+constexpr int32_t V1_LOAD_ERR_DROP_COUNT = 3;
+// Issue #46: 実測速度を見た端の手前の制動（END_BRAKING、ラッチしない）。実測速度（40 ms 窓の v_fast、無ければ 100 ms 窓）の向きの
+// ソフトリミットまでの残り d に対し、停止距離 v² / (2 × V1_BRAKE_GUARD_ACC_COUNT_S2) > d なら反対向きに duty_max を出す。
+// 減速度 1000 count/s² は実機が確実に止まれる値の仮置き（要計測）。|v| < V1_BRAKE_GUARD_MIN_VEL_COUNT_S は見ない。
+// 解除: |v| < 最小速度 / 2、または停止距離 ≤ d − V1_BRAKE_GUARD_HYST_COUNT。この出力も見えない走行の予算に積み、尽きれば停止（P1a）
+constexpr int32_t V1_BRAKE_GUARD_ACC_COUNT_S2 = 1000;
+constexpr int32_t V1_BRAKE_GUARD_MIN_VEL_COUNT_S = 50;
+constexpr int32_t V1_BRAKE_GUARD_HYST_COUNT = 20;
+// Issue #46: SOFT_LIMIT の猶予（既定 OFF = 外れたら即ラッチ。-DV1_SOFT_GRACE=1 で ON）。ON のとき、少し越えただけではラッチせず内側へ
+// 戻す（外向きの出力は 0）。ラッチ: 機械端（上の推定）から V1_END_HARD_MARGIN_COUNT 以内、外向きに V1_SOFT_OUT_VEL_COUNT_S を超える
+// 速度で V1_SOFT_OUTWARD_GRACE_MS 動き続けた、外に V1_SOFT_RECOVER_MAX_MS 居続けた、目標が外、のどれか。速度と遅れに応じた停止余裕を
+// 入れるまでは既定で使わない（PR #48 の Codex 事前レビュー P1c）
+#ifndef V1_SOFT_GRACE
+#define V1_SOFT_GRACE 0
+#endif
+constexpr int32_t V1_END_HARD_MARGIN_COUNT = 20;
+constexpr int32_t V1_SOFT_OUT_VEL_COUNT_S = 20;
+constexpr uint32_t V1_SOFT_OUTWARD_GRACE_MS = 200;
+constexpr uint32_t V1_SOFT_RECOVER_MAX_MS = 2000;
+// Issue #46: FOLLOWING_ERROR の猶予（既定 OFF = 従来どおり超えたら即ラッチ。-DV1_FE_GRACE=1 で ON）。ON のとき、上限そのものは変えず、
+// 超えていても「エンコーダが生きている（直近 V1_FE_ACTIVITY_MS にカウント変化）」かつ「超えてから V1_FE_TURN_MS 以内か、|誤差| が
+// 減っている（V1_FE_WINDOW_MS ごとに V1_FE_MIN_DROP_COUNT 以上）」間は最長 V1_FE_GRACE_MAX_MS ラッチしない（LIMIT_RECOVERY）。
+// 戻りの動特性を実機で確かめるまでは既定で使わない（P1c）
+#ifndef V1_FE_GRACE
+#define V1_FE_GRACE 0
+#endif
+constexpr uint32_t V1_FE_ACTIVITY_MS = 100;
+constexpr uint32_t V1_FE_WINDOW_MS = 100;
+constexpr int32_t V1_FE_MIN_DROP_COUNT = 2;
+constexpr uint32_t V1_FE_GRACE_MAX_MS = V1_FE_GRACE ? 2000 : 0;  // 0 = 猶予なし
+constexpr uint32_t V1_FE_GRACE_VARIANT_MS = 2000;
+constexpr uint32_t V1_FE_TURN_MS = 200;             // 超えた直後に減り始めるのを待つ時間（超えた瞬間の |誤差| は必ず増えている）
+constexpr int V1_FE_HARD_RATIO_PERCENT = 150;       // |誤差| が上限の 1.5 倍以上なら猶予なしでラッチ（猶予中の行き過ぎの上限）
+// r10（Issue #44 の 14:22 の実測、PR #48）: 静止目標での力の段階的な引き上げと、小さな残り誤差の受け入れ。監視（V1_SUPERVISOR）が ON の
+// 方向別の経路だけ。どちらの出力も見えない走行の予算に積む。
+// A. 引き上げ: 軌道が止まっていて保持でなく |誤差| > V1_RESIDUAL_BAND_COUNT のまま、V1_ESCALATE_WINDOW_MS の窓の間に誤差の向きへ
+//    breakaway_min_move（3）進まなければ、誤差の向きの |出力| を max(動き出し Duty, 合成) + V1_ESCALATE_STEP_PERMILLE から窓ごとに
+//    V1_ESCALATE_STEP_PERMILLE ずつ duty_max まで上げる（#1 は最下端で 26 count 行き過ぎ、P 78 + I 30 = 10.8 % のまま 2 s 動けず
+//    ENCODER_FAULT になった）。進んだ窓では上げずに保つ（下げると止まってまた上げ直す鋸歯になる）。誤差の向きの反転・保持・
+//    |誤差| ≤ 帯・軌道が動く・停止で 0 に戻す。duty_max でも進まなければ LOAD_LIMITED（飽和 1 s）か、カウントが全く動かなければ
+//    その前に見えない走行の予算（中央付近 400 ms）で停止（どちらも PWM 0 ＋ ブレーキ）。ENCODER_FAULT にはしない。
+//    刻みは 50 ms ごとに 3 %: 一律の包絡線の予算（1000 count = 400 ms）の中で、再生バッファ（Issue #45）の参照が目標に寄り切るまでの
+//    出力の分を引いても duty_max 20 % に届く（止まってから約 150〜200 ms）ように選んだ（100 ms ごとに 1 % だと 20 % まで 1 s 掛かり、
+//    予算が先に尽きる。r10 統合の前は 2 % だったが、参照の寄せの分で 19 % 止まりになった）
+constexpr int V1_ESCALATE_STEP_PERMILLE = 30;
+constexpr uint32_t V1_ESCALATE_WINDOW_MS = 50;
+// B. 小さな残り誤差: 軌道が止まっていて保持でなく |誤差| ≤ V1_RESIDUAL_BAND_COUNT のときは、出力は動き出しパルスだけ（その間の P + I は
+//    0。数 permille の P + I は静止摩擦に届かず、熱と見えない走行の予算を使うだけ）。進まないパルスが V1_RESIDUAL_MAX_PULSES 回に
+//    なったら残り誤差を受け入れて出力 0（パルスも打たない）。|誤差| > V1_RESIDUAL_EXIT_COUNT か軌道が動くまで続ける。
+//    トレードオフ: 静止の精度は ±6 count まで落ちうる（#2 は 6 % で下がらず、0.2〜0.3 s ごとのパルスが体感のガクガクだった）。
+//    r6 の「4 で止まったまま P + I が流れ続ける」は起きない（受け入れ中・パルスの合間は出力 0）
+constexpr int32_t V1_RESIDUAL_BAND_COUNT = 6;
+constexpr int32_t V1_RESIDUAL_EXIT_COUNT = 12;
+constexpr int V1_RESIDUAL_MAX_PULSES = 3;
+// Issue #45: 再生バッファ（playout）で SET_POSITION の列から参照（位置・速度）を作る。既定 1、-DV1_PLAYOUT=0 で従来の
+// 「目標ごとに行って止まる」軌道（profile_step）に戻る（V1Tuning::playout_delay_ms = 0 と同じ）。
+// 従来の欠陥: 100 Hz の整数の目標を毎回の移動先として扱い、追いつくと速度を加速度制限を迂回して 0 にしていた → ゆっくり
+//（≲ 70 count/s）では FF（切片 4.6 % を |v| < 30 でテーパ）と r9 の減衰が 1 tick で約 50 permille 抜ける。
+// 新しい経路: 受信時刻つきでフレームをリングに積み、playout 時刻 = いま − DELAY で、その前後 WINDOW の最小二乗直線から
+// 位置・速度を出し、速度・加速度の制限（フレームの max_vel / max_acc。CONFIG で頭打ち）の中で参照を追従させる。
+// 新しいフレームが途切れたら EXTRAP_MS までは直線で外挿、それを越えたら max_acc で減速する（期限 valid_for の扱いは従来どおり）。
+#ifndef V1_PLAYOUT
+#define V1_PLAYOUT 1
+#endif
+#ifndef V1_PLAYOUT_DELAY_MS
+#define V1_PLAYOUT_DELAY_MS 40                            // 再生の遅れ（20 / 40 / 60 を実機で比べる。Issue #45）
+#endif
+constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを推定する窓（playout 時刻を中心に ±窓/2）
+constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
+constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）。目標が動いている間
+constexpr double V1_PLAYOUT_KP_FLAT_PER_S = 40.0;         // 同、目標が止まっている（窓の目標がすべて同じ）とき
+// PR #49 レビュー P1a: フレームが途切れても参照が「受けた最新の目標」をこれ以上越えないよう、最新の目標 + これまでに止まれる速さに抑える
+constexpr int32_t V1_PLAYOUT_LOSS_MARGIN_COUNT = 5;
+// PR #49 レビュー P1b: 減速（再生バッファの制動・途切れ・STOPPING）に使う加速度の下限 [count/s²]。フレームの max_acc が 0・ごく小さくても止まる
+constexpr uint32_t V1_MIN_DECEL_COUNT_S2 = 500;
+constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
+// Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
+// ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。
+// !!! A_BRAKE・RESERVE は仮値。実機が実際に止まれる減速度と、全速（600 count/s）から止めたときの行き過ぎを計測して決めること。
+// r10 統合（PR #48 × #49）: どちらも保護の監視の値から作る（一元化。上の V1_SUP_END_RESERVE_COUNT / V1_MECH_DECEL_ZONE_COUNT /
+// V1_SUP_END_MARGIN_COUNT / V1_BRAKE_GUARD_ACC_COUNT_S2 を変えれば両方が動く）。
+//  - A_BRAKE = 端の手前の制動（END_BRAKING）の減速度。参照の減速度 ≤ 制動の減速度なので、参照どおりに追従している限り制動は掛からない
+//  - RESERVE = 監視の「端へ出せない帯」（機械端から V1_SUP_END_RESERVE_COUNT = ソフトリミットから 400 − 50 = 350）の外に、
+//    V1_SUP_END_MARGIN_COUNT（250）だけ見えない走行の予算を残す所 = ソフトリミットから 600。最後の寄せ（ゆっくり近づく間は確かな動き
+//    2 count までの包絡線を積む）と最悪の tick（15 ms = 37.5 count）の先読みを、その予算で賄う
+constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = static_cast<double>(V1_BRAKE_GUARD_ACC_COUNT_S2);
+constexpr int32_t V1_SOFT_RESERVE_COUNT = V1_SUP_END_RESERVE_COUNT - V1_MECH_DECEL_ZONE_COUNT + V1_SUP_END_MARGIN_COUNT;
+// r10（Issue #44 の実測 2、14:43: 乗員が座った状態の HOLDING で、9 % の動き出しパルスで 2〜4 count 持ち上げては、出力が 1〜4 % に
+// 落ちて重さで沈む往復を 0.2〜0.3 s ごとに繰り返し、#2 は静止の監視で ENCODER_FAULT）: 保持出力の学習。方向別の経路だけ。-DV1_HOLD_LEARN=0 で r9 と同じ。
+// r6〜r9 は「荷重が無ければ自分で止まっている」前提で、保持（HOLD）に入ると出力 0・I を捨て、|I| ≤ 3 % だった。乗員の荷重で逆に回る
+//（back-drive する）軸は、それでは保てない。
+//  - I の上限を duty_max × V1_HOLD_I_MAX_RATIO_PERCENT（90 %）に上げる（走行中も同じ I。保持出力は向きによらない荷重の補償）
+//  - 軌道が止まっているときの積分は Ki = V1_HOLD_KI（15 permille/(count·s)）、変化率 ≤ V1_HOLD_I_RATE（60 permille/s）。走行中は従来の
+//    Ki 0.2・10 permille/s のまま（反転時に I が暴れないよう遅く）。60 permille/s の理由: 乗員の保持 Duty（6〜10 %）を 1〜2 s で
+//    覚える（従来の 10 permille/s では 9 s 掛かり、その間沈み続ける）。速くすると静止摩擦が切れるまでの遅れ（約 100 ms）の間に
+//    I が行き過ぎる量が増える（60 permille/s で約 6 permille。静止摩擦と動摩擦の差 3〜4 % より十分小さい）
+//  - 保持（HOLD）に入っても I を捨てず、出力 = I（保持出力。P は保持の帯の外だけ）。HOLD の中でも |誤差| ≥ hold_enter（2）なら
+//    同じ Ki で I を詰める（±1 のちらつきでは積まない: 無負荷の軸が静止摩擦の中で I を育てて往復しないように）
+//  - I を捨てるのは DISARM / FAULT / 系統切替 / 基準の取り直し / ブレーキの停止（位置制御が止まるとき）だけ
+//  - 保持の帯の近くの動き出しパルスは、I がまだ動き出しの Duty に育っていない間だけ（荷重で目標から離れている＝沈んでいる間は打たない。
+//    進まないパルス 3 回でやめ、あとは I が詰める）。B の「出力 0 で残差を受け入れる」は使わない（乗員がいると沈み続ける）
+#ifndef V1_HOLD_LEARN
+#define V1_HOLD_LEARN 1
+#endif
+constexpr int V1_HOLD_I_MAX_RATIO_PERCENT = 90;
+constexpr double V1_HOLD_KI_PERMILLE_PER_COUNT_S = 15.0;
+constexpr int V1_HOLD_I_RATE_PERMILLE_PER_S = 60;
+// 見えない走行の予算との関係: 軌道が止まっていて |誤差| ≤ V1_RESIDUAL_BAND_COUNT のとき、最後に確かな動きを見た時点の I（保持出力。
+// エンコーダが生きていた間に学んだ値）＋ V1_HOLD_ALLOW_TRIM_PERMILLE までの出力は包絡線に積まない（それを超えた分は従来どおり積む）。
+// 荷重に釣り合う保持出力は動かすための出力ではない、という扱い。余裕 4 % は静止摩擦と動摩擦の差（3〜4 %）: 静止摩擦で止まった軸の I が
+// 動き出しまで育つ間は積まない。それを超えた分は、超過に比例した包絡線（20 % の超過で 2500 count/s）で積む（一律にしない。上乗せが
+// 小さければ動ける速さも小さい。仕様の一律の包絡線からの逸脱で、目標の近くで静止中だけ）。残る穴: 保持中にエンコーダが死に、荷重が変わる（乗員が降りる）と、保持出力（I の上限 = duty_max の 90 %
+// まで）で見えないまま動きうる（電流検出が無いと区別できない。PR #50 のリスクに記載）
+constexpr int V1_HOLD_ALLOW_TRIM_PERMILLE = 40;
+// PR #50 の Codex 事前レビュー（b6a93fb）P1a: 保持の偏り（bias、荷重・乗員の補償）と追従の I を分ける。
+//  - bias: 軌道が止まっている間（保持の中を含む）だけ、上の V1_HOLD_KI / V1_HOLD_I_RATE で学ぶ。上限は duty_max × 90 %。走行中は凍結
+//  - 追従の I: 走行中だけ従来の Ki 0.2・10 permille/s で積み、上限は従来の 3 %（V1_I_MAX_PERMILLE）。戻す向き（|I| を減らす）は
+//    V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S で速く戻す。軌道速度の向きが反転したら 0（古い向きの誤差を持ち越さない）。止まったら同じ速さで 0 へ
+constexpr int V1_TRACK_I_UNWIND_RATE_PERMILLE_PER_S = 100;
+// P1c: bias を「保持出力」として認める（見えない走行の予算に積まない分の基準にする）のは、確かな動きの後、位置が ±1 の中に
+// V1_HOLD_CERTIFY_MS 留まったとき（沈み・戻りが止まって保てている）だけ。動いただけでは認めない
+constexpr uint32_t V1_HOLD_CERTIFY_MS = 300;
+// P0: 確かな動きが無いまま位置制御（ブレーキ解除）を続けられる期限。積分しない保持出力・PWM 0 の逆回り（荷重で沈む）でも、見えないまま
+// 動ける距離を上下別に積み（露出）、端までの余裕（位置の上限 = 信用できた位置から機械端まで − 400）を超える前に PWM 0 ＋ ブレーキの停止
+//（FEEDBACK_UNCERTAIN）。目標・状態の変化や ±1 のちらつきでは戻さず、確かな動き（その向き）と基準の取り直しだけが戻す。
+//  - 露出の速さ: 出力の向きに、出力の包絡線（既定は Duty に比例: 20 % で 2500 count/s。-DV1_SUP_DEADLINE_PROPORTIONAL=0 で一律 2500）。
+//    下向き（カウント減 = FF の向きの決め方で「下」）には、出力に関係なく V1_SUP_BACKDRIVE_COUNT_S（荷重で逆に回る速さ、仮値）を足す
+//  - 2026-11-02 の操作者の決定（静止した保持が数秒で止まるのは不可）: 目標の近くで静止して落ち着いているなら、露出が余裕の半分に届く前に
+//    ブレーキで駐車する（下の V1_PARK_*。FAULT でも停止でもなく、目標が動けば自動で戻る）。駐車できない状態（動いている・誤差が大きい）
+//    で露出が余裕の全部に届いたら PWM 0 ＋ ブレーキの停止（FEEDBACK_UNCERTAIN）にし、基準を消す（見えないまま余裕の全部を動いたかも
+//    しれないので位置を信用しない。ARM_PREPARE は NOT_REFERENCED、SET_REFERENCE か校正が要る）。露出は再 ARM でも駐車でも戻さない
+#ifndef V1_SUP_DEADLINE_PROPORTIONAL
+#define V1_SUP_DEADLINE_PROPORTIONAL 1
+#endif
+constexpr int32_t V1_SUP_BACKDRIVE_COUNT_S = 200;
+// PR #50 の Codex 事前レビュー（e6ee0ef）: 期限の露出は DISARM / FAULT_RESET / 駐車・戻りでも戻さない（位置が分かる = 確かな動き・
+// SET_REFERENCE・校正のときだけ戻す）。露出が余裕の全部に届いた向き d があっても、出力が d から離れる向き（> 4 %）なら止めない
+//（離れる向きはその向きの露出・予算で見る。端の近くで止まった後に離れられないのを防ぐ）。ARMING（ブレーキ解除待ち）と駐車の入りかけ
+// では止めるのを待つ（落ち着けば駐車する）が、余裕の全部 + V1_SUP_ARM_GRACE_COUNT を超えたら止めて基準を消す（短い ARM を繰り返して
+// 見えない走行を延ばせないように）
+constexpr int32_t V1_SUP_ARM_GRACE_COUNT = 100;
+// 2026-11-02 の操作者の決定: 静止した保持はブレーキで駐車する（PARKED。FAULT でも停止でもない。主電源は保つ。自動で戻る）。監視 ON の方向別の経路だけ。
+//  - 入る: 参照が止まっている（|参照速度| ≤ V1_PARK_REF_VEL_COUNT_S）・目標（フレームの目標）の幅が V1_PARK_TARGET_SPAN_COUNT 以内・
+//    |誤差| ≤ 保持の出口（4）・|実測速度| ≤ 10 が V1_PARK_STILL_MS 続いた（ACTIVE でも HOLDING でも）。または期限の露出が余裕の半分に届く
+//    とき（上の V1_SUP_DEADLINE）。戻した直後の V1_PARK_STILL_MS は入らない
+//  - 入るとき: ブレーキ解除指令を落とし、いまの保持出力を V1_BRAKE_ENGAGE_MS 出し続けてから（ブレーキが掴むまで沈まないように）PWM 0。
+//    学んだ保持の偏り（bias）は捨てない。駐車中は見えない走行の予算・期限の露出を積まない（ブレーキ作動・PWM 0）。参照は駐車した位置で止める
+//  - 戻る: フレームの目標が駐車した目標から V1_PARK_UNPARK_COUNT を超えて離れたら、保持出力（bias）を出してからブレーキを解除し、
+//    BRAKE_RELEASE_WAIT_MS の間は参照を駐車した位置に止めたまま（再生バッファにはフレームが溜まる）、その後は通常の制御（参照は
+//    max_vel / max_acc の中で追いつく）。戻った後は通常の予算・期限が効く
+//  - 参照速度「ちょうど 0」ではなく ≤ 30 count/s、目標「±1」ではなく幅 2 にしたのは、フレームの ±1 の揺れで再生バッファの参照速度が
+//    0 にならず駐車できない（期限まで止まらない）のを避けるため。戻る判定は駐車した目標（幅の中央）からの距離だけ（±1 の揺れでは戻らない）
+#ifndef V1_PARK
+#define V1_PARK 1
+#endif
+constexpr uint32_t V1_PARK_STILL_MS = 500;
+constexpr uint32_t V1_BRAKE_ENGAGE_MS = 150;  // ブレーキが掴むまでの時間（仮値、要計測）
+constexpr int32_t V1_PARK_REF_VEL_COUNT_S = 30;
+constexpr int32_t V1_PARK_TARGET_SPAN_COUNT = 2;
+constexpr int32_t V1_PARK_UNPARK_COUNT = 2;
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
 constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
-constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
+// r10 統合: 参照の止まる位置の余裕は、最悪の tick の先読みの包絡線より大きくなければならない
+static_assert(static_cast<int64_t>(V1_SUP_END_MARGIN_COUNT) * 1000 >= static_cast<int64_t>(V1_SUP_ENV_COUNT_S) * V1_OVERRUN_MS,
+              "V1_SUP_END_MARGIN_COUNT must cover one worst-case tick of the blind-drive envelope");
+// ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで。2026-11-02: 300 ms では 24 V が立ち上がる前に HOLDING になり、
+// HOLDING 直後の START（ジョイスティックの自動開始）で 2 軸とも Duty 20 % で 0.47 s 動かず ENCODER_FAULT（ARM から 1.5 s 後でも
+// 動かなかった）。校正は CAL_POWER_SETTLE_MS 5000 で待っている。暫定 2500（BRAKE_RELEASE_WAIT_MS と合わせて ARM 全体 5000 ms の内側）。
+// 電圧の監視入力は使えない（操作者）ので待ち時間で対処。ホストテストは -DV1_ARM_POWER_SETTLE_MS=300 で従来の時刻のまま回す
+#ifndef V1_ARM_POWER_SETTLE_MS
+#define V1_ARM_POWER_SETTLE_MS 2500
+#endif
+constexpr uint32_t POWER_SETTLE_MS = V1_ARM_POWER_SETTLE_MS;
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）

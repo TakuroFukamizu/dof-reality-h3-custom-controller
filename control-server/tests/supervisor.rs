@@ -987,6 +987,65 @@ fn happy_path_arm_start_track_stale_stop_hold_disarm() {
     assert_eq!(r.sup.state(), RigState::BrakedDisarmed);
 }
 
+/// r10 firmware braked inhibit (FEEDBACK_UNCERTAIN / LOAD_LIMITED) on one
+/// axis while ACTIVE → the server stops the whole seat (CONTROLLED_STOP to all
+/// three axes), logs `axis_inhibited`, and does not keep driving.
+#[test]
+fn axis_inhibit_flag_stops_the_whole_seat() {
+    for flag in [status_flags::FEEDBACK_UNCERTAIN, status_flags::LOAD_LIMITED] {
+        let cfg = sim_cfg();
+        let mut r = Rig::new(cfg.clone());
+        r.ready();
+        r.admin(AdminCmd::Arm).unwrap();
+        r.wait_state(RigState::Holding, 2000);
+        r.set_game(Some((POSE_A, 0.3)));
+        r.run_ms(30);
+        r.admin(AdminCmd::Start).unwrap();
+        r.wait_state(RigState::Active, 500);
+        r.run_ms(500);
+        let mark = r.sent.len();
+        let t_flag = r.now;
+        r.flip_flags[1] = flag;
+        r.wait_state(RigState::Stopping, 100);
+        assert!(r.now - t_flag <= Duration::from_millis(40), "{:?}", r.now - t_flag);
+        assert_eq!(r.count(mark, msg_type::CONTROLLED_STOP), [1, 1, 1]);
+        let snap = r.sup.snapshot(r.now);
+        assert!(snap.fault.is_none(), "a coordinated stop, not a rig fault");
+        // Holding or stopping is left alone (the flag only matters while driving).
+        r.flip_flags[1] = 0;
+    }
+}
+
+/// An inhibit while HOLDING rejects START / CENTER (blocker text), and an
+/// inhibit that appears while a START is pending stops the seat.
+#[test]
+fn axis_inhibit_blocks_start_and_stops_a_pending_start() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.ready();
+    r.admin(AdminCmd::Arm).unwrap();
+    r.wait_state(RigState::Holding, 2000);
+    r.set_game(Some((POSE_A, 0.3)));
+    r.run_ms(30);
+    r.flip_flags[2] = status_flags::FEEDBACK_UNCERTAIN;
+    r.run_ms(30);
+    let e = r.admin(AdminCmd::Start).unwrap_err();
+    assert_eq!(e.error, admin_error::AXIS_INHIBITED);
+    assert!(has(&e.blockers, "axis_inhibited: axis3 reports FEEDBACK_UNCERTAIN"), "{:?}", e.blockers);
+    assert_eq!(r.admin(AdminCmd::Center).unwrap_err().error, admin_error::AXIS_INHIBITED);
+    assert!(has(&r.blockers(), "axis_inhibited: axis3"), "{:?}", r.blockers());
+    r.flip_flags[2] = 0;
+    r.run_ms(30);
+    // Inhibit appears while the START is pending (the ACK of axis 1 is lost, so START stays pending).
+    r.drop_start_ack[0] = true;
+    let mark = r.sent.len();
+    r.admin(AdminCmd::Start).unwrap();
+    r.run_ms(10);
+    r.flip_flags[1] = status_flags::LOAD_LIMITED;
+    r.wait_state(RigState::Stopping, 200);
+    assert!(r.count(mark, msg_type::CONTROLLED_STOP).iter().all(|&c| c == 1));
+}
+
 #[test]
 fn late_pose_after_stop_does_not_restart() {
     let cfg = sim_cfg();
@@ -1812,6 +1871,11 @@ fn snapshot_json_shape() {
         "power_on_cmd",
         "brake_release_cmd",
         "power_controller",
+        "load_limited",
+        "feedback_uncertain",
+        "end_braking",
+        "limit_recovery",
+        "parked",
         "current_a",
         "last_applied_frame",
         "status_age_ms",
