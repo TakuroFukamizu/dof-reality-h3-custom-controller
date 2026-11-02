@@ -163,22 +163,31 @@ class V1Supervisor {
       env_ep_[idx(d)] += add;
       env_cum_[idx(d)] += add;
     }
-    // 確かな動き: 出している向きへ、窓の中で最も戻った所から renew_move 以上
+    // 確かな動き: 出している向きへ、窓の中で最も戻った所から renew_move 以上。窓は半分ずつ 2 つ（いまの半分と 1 つ前の半分）を
+    // 持つ滑り窓の近似（実効 renew_window / 2 〜 renew_window）。区切りをまたいだ 2 count も拾う
     if (d == 0) {
       ren_dir_ = 0;
     } else {
-      if (ren_dir_ != d || c.now_us - ren_start_us_ >= ms(t.renew_window_ms)) {
+      const uint64_t half = ms(t.renew_window_ms) / 2;
+      if (ren_dir_ != d) {
         ren_dir_ = d;
         ren_start_us_ = c.now_us;
         ren_ext_ = raw_before;  // この区間の始まりのカウント（区間の動きはこの出力の結果）
+        ren_ext_prev_ = raw_before;
+      } else if (c.now_us - ren_start_us_ >= half) {
+        ren_ext_prev_ = ren_ext_;
+        ren_ext_ = raw_before;
+        ren_start_us_ = c.now_us;
       }
-      if (static_cast<int64_t>(d) * (c.raw - ren_ext_) >= t.renew_move_count) {
+      if ((d > 0 && c.raw < ren_ext_) || (d < 0 && c.raw > ren_ext_)) ren_ext_ = c.raw;  // 最も戻った所
+      const int64_t lowest = d > 0 ? (ren_ext_ < ren_ext_prev_ ? ren_ext_ : ren_ext_prev_)
+                                   : (ren_ext_ > ren_ext_prev_ ? ren_ext_ : ren_ext_prev_);
+      if (static_cast<int64_t>(d) * (c.raw - lowest) >= t.renew_move_count) {
         trusted_raw_ = c.raw;
         for (int i = 0; i < 2; ++i) { env_ep_[i] = 0.0; env_cum_[i] = 0.0; }
         ren_start_us_ = c.now_us;
         ren_ext_ = c.raw;
-      } else if ((d > 0 && c.raw < ren_ext_) || (d < 0 && c.raw > ren_ext_)) {
-        ren_ext_ = c.raw;  // 最も戻った所
+        ren_ext_prev_ = c.raw;
       }
     }
     // FOLLOWING_ERROR の猶予に使う |誤差| の傾向（fe_window ごとに比べる）
@@ -360,6 +369,7 @@ class V1Supervisor {
   int ren_dir_ = 0;
   uint64_t ren_start_us_ = 0;
   int64_t ren_ext_ = 0;
+  int64_t ren_ext_prev_ = 0;
   bool sat_running_ = false;
   uint64_t sat_start_us_ = 0;
   uint64_t load_win_start_us_ = 0;

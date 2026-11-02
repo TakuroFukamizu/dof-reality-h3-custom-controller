@@ -1457,6 +1457,7 @@ class V1Axis {
     const bool sup = supervisor_on();
     V1Supervisor::Ctx c;
     if (sup) {
+      sup_.t = tuning.sup;  // 調整値は V1Tuning が持つ（テスト・将来の SET_LIMITS で差し替え）
       c = sup_ctx(now);
       sup_.observe(c);  // 前の tick の出力の包絡線を積み、確かな動きなら予算を戻す（異常判定より前）
     }
@@ -1683,7 +1684,10 @@ class V1Axis {
     int cmd = v1_duty_command(err, setpoint_vel_, duty_state_, tuning, stall_boost_, &terms_, dt_s, settle_ok,
                               assist, v_fast_valid_, v_fast_);  // カウント増の向きが正 [permille]。r9 は v_fast を減衰項に
     // r10（Issue #44・#46）: 保護の監視が出力を決める（見えない走行の予算・過負荷・端の手前の制動・ソフトリミットの外の外向き 0）
-    if (supervisor_on() && has_config_) cmd = sup_.filter(sup_ctx(now), cmd);
+    if (supervisor_on() && has_config_) {
+      sup_.t = tuning.sup;
+      cmd = sup_.filter(sup_ctx(now), cmd);
+    }
     const int mag = cmd < 0 ? -cmd : cmd;
     // カウントを増やしたいなら −sign × duty
     duty_permille_ = -static_cast<int>(sign_) * cmd;

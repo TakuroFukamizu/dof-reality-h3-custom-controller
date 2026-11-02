@@ -58,6 +58,18 @@ struct Harness {
   double cal_count_s_per_percent = 100.0;  // 実測の 1 % ≈ 100〜130 count/s の下側
   std::vector<v1::McuMsg> out;    // これまでの全出力
   std::vector<uint8_t> seen_states;
+  // r10（Issue #44・#46）: PWM で動くプラント（pwm_plant = true のとき、位置制御中は上の「目標に追従する」プラントの代わり）。
+  // 物理位置 phys（小数）とエンコーダの値 raw を分ける: enc_connected = false なら raw は止まったまま（テストが手で書き換えてもよい）、
+  // phys だけが動く。速度 = pwm_permille（カウント増が正）× pwm_count_s_per_permille を ±plant_max_vel で頭打ち（荷重で遅い）、
+  // |pwm| ≤ pwm_deadband_permille は 0、held なら 0（乗員が押さえている）、ext_vel（外力。count/s）を足す。ブレーキ作動中は ext_vel だけ。
+  bool pwm_plant = false;
+  bool enc_connected = true;
+  bool held = false;
+  double phys = 0.0;
+  double pwm_count_s_per_permille = 12.0;  // 20 % で 2400 count/s（比例の包絡線 12.5 の下）
+  double plant_max_vel = 1e9;
+  int pwm_deadband_permille = 0;
+  double ext_vel = 0.0;
 
   explicit Harness(uint8_t axis = 1, int8_t sign = 1, int64_t raw0 = 0, bool reference = true) {
     V1Identity id;
@@ -193,7 +205,18 @@ struct Harness {
   // 1 tick（既定 5 ms）。プラントは位置制御中だけ setpoint に追従する。校正中は Duty に応じて端まで動く。
   void step(uint32_t dt_ms = 5) {
     now += dt_ms * MS;
-    if (!stall && ax.brake_release_cmd()) {
+    if (pwm_plant && ax.state() != st::CALIBRATING) {
+      double v = 0.0;
+      const int u = ax.pwm_permille();
+      if (ax.brake_release_cmd() && !held && (u > pwm_deadband_permille || u < -pwm_deadband_permille)) {
+        v = static_cast<double>(u) * pwm_count_s_per_permille;
+        if (v > plant_max_vel) v = plant_max_vel;
+        if (v < -plant_max_vel) v = -plant_max_vel;
+      }
+      v += ext_vel;
+      phys += v * static_cast<double>(dt_ms) / 1000.0;
+      if (enc_connected) raw = static_cast<int64_t>(floor(phys));
+    } else if (!stall && ax.brake_release_cmd()) {
       if (ax.state() == st::CALIBRATING) {
         const double v = -static_cast<double>(plant_sign) * ax.duty_permille() / 10.0 * cal_count_s_per_percent;  // count/s（Duty は permille）
         raw += llround(v * static_cast<double>(dt_ms) / 1000.0);

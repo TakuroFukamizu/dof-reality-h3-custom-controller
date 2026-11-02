@@ -22,6 +22,7 @@ int g_fail = 0;
 // USB プロトコル v1（CHECK を使うのでこの位置で include する）
 #include "test_v1_codec.h"
 #include "test_v1_axis.h"
+#include "test_v1_r10.h"
 #include "test_profile_blob.h"
 #include "test_v1_tx_pump.h"
 
@@ -700,6 +701,7 @@ int main() {
   test_manual_guard_sign_reversal_restarts_window();
   v1test::run_all();
   v1axis_test::run_all();
+  v1r10_test::run_all();
   profile_blob_test::run_all();
   v1txpump_test::run_all();
   std::printf("%d passed, %d failed\n", g_pass, g_fail);
