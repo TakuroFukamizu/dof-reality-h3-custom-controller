@@ -588,6 +588,8 @@ class V1Axis {
   bool estop_latched() const { return estop_latched_; }
   bool has_rx() const { return has_rx_; }
   uint64_t last_rx_us() const { return last_rx_us_; }
+  // HELLO_REQ を処理した回数。0 はまだホストと話していない。
+  uint32_t hello_seen() const { return hello_seen_; }
   uint16_t rx_error_count() const { return rx_error_count_; }
   uint16_t stale_drop_count() const { return stale_drop_count_; }
   uint32_t last_rx_seq() const { return last_rx_seq_; }
@@ -705,6 +707,7 @@ class V1Axis {
   uint16_t stale_drop_count_ = 0;
   bool has_rx_ = false;
   uint64_t last_rx_us_ = 0;
+  uint32_t hello_seen_ = 0;
 
   // --- 位置・軌道 ---
   int64_t raw_ = 0;
@@ -963,6 +966,7 @@ class V1Axis {
   }
 
   void on_hello_req(uint32_t request_id) {
+    hello_seen_ += 1;  // HELLO のたびに PMIC のスナップショットを送り直す（サーバ再起動でも届く）
     v1::McuMsg m;
     memset(&m, 0, sizeof(m));
     m.type = v1::msg::HELLO;

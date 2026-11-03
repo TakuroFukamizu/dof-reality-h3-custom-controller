@@ -9,6 +9,61 @@ use h3cs::protocol::cobs::FrameAccumulator;
 use h3cs::protocol::*;
 use h3cs::types::{DeviceId, FaultCode};
 
+fn sample_pmic() -> PmicReport {
+    let mut regs = [0u8; PMIC_REG_LEN];
+    let mut reg_valid = 0u64;
+    for (i, v) in [
+        (0usize, 0x21u8),
+        (1, 0x08),
+        (2, 0x48),
+        (3, 0x33),
+        (4, 0x36),
+        (5, 0x38),
+        (7, 0x05),
+        (10, 0x03),
+        (12, 0x01),
+        (13, 0x20),
+        (15, 0x1F),
+        (19, 0x00),
+        (20, 0x00),
+        (21, 0x00),
+        (25, 0x01),
+    ] {
+        regs[i] = v;
+        reg_valid |= 1u64 << i;
+    }
+    PmicReport {
+        kind: pmic_kind::PERIODIC,
+        flags: pmic_flags::RTC_OK
+            | pmic_flags::MARK_OK
+            | pmic_flags::VBUS_OK
+            | pmic_flags::VSYS_OK
+            | pmic_flags::VBAT_OK
+            | pmic_flags::TS_OK
+            | pmic_flags::TDIE_OK,
+        read_ok: 14,
+        read_tried: 14,
+        reset_reason: 1,
+        por: 0,
+        seq: 3,
+        mcu_time_us: 5_000_000,
+        last_up_s: 120,
+        vbus: 5000,
+        vsys: 3300,
+        vbat: 4100,
+        ts: 4900,
+        tdie: 250,
+        last_vbus: 4980,
+        last_vsys: 3290,
+        last_vbat: 4080,
+        last_s0: 0x20,
+        last_s1: 0x08,
+        i2c_err: 0,
+        reg_valid,
+        regs,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Msg {
     Host(HostMsg),
@@ -299,6 +354,12 @@ fn vectors() -> Vec<Vector> {
             })),
             frame_hex: "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB",
             wire_hex: "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00",
+        },
+        Vector {
+            title: "PMIC_REPORT",
+            msg: Msg::Mcu(McuMsg::PmicReport(sample_pmic())),
+            frame_hex: "01 89 5C 00 02 7F 0E 00 0E 00 01 00 03 00 00 00 40 4B 4C 00 00 00 00 00 78 00 00 00 88 13 E4 0C 04 10 24 13 FA 00 74 13 DA 0C F0 0F 20 08 00 00 BF B4 38 02 00 00 00 00 21 08 48 33 36 38 00 05 00 00 03 00 01 20 00 1F 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9D 58",
+            wire_hex: "04 01 89 5C 04 02 7F 0E 02 0E 02 01 02 03 01 01 04 40 4B 4C 01 01 01 01 02 78 01 01 0A 88 13 E4 0C 04 10 24 13 FA 09 74 13 DA 0C F0 0F 20 08 01 05 BF B4 38 02 01 01 01 07 21 08 48 33 36 38 02 05 01 02 03 03 01 20 02 1F 01 01 01 01 01 01 01 01 02 01 01 01 01 01 01 01 01 01 01 01 01 01 01 03 9D 58 00",
         },
     ]
 }

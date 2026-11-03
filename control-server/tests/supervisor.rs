@@ -11,7 +11,10 @@ use h3cs::calibration;
 use h3cs::compat;
 use h3cs::config::Config;
 use h3cs::limits::{LimitedField, LimitsPatch, LimitsRequest, MotionLimits, Source};
-use h3cs::protocol::{capabilities, msg_type, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, SetPosition};
+use h3cs::protocol::{
+    capabilities, msg_type, pmic_flags, pmic_kind, Ack, AckReason, AckResult, Hello, HostMsg, McuMsg, PmicReport,
+    SetPosition, PMIC_REG_LEN,
+};
 use h3cs::session::{AcceptedPose, PoseIntake, PoseMsg};
 use h3cs::sim_axis::{SimMcu, SimParams};
 use h3cs::supervisor::{admin_error, ActiveSource, AdminCmd, LinkEvent, Supervisor, ACK_TIMEOUT, LIMITS_RETRY};
@@ -243,6 +246,10 @@ impl Rig {
                 },
                 McuMsg::Limits(limits) => match self.axis_of[i] {
                     Some(axis) => LinkEvent::Limits { axis, limits },
+                    None => continue,
+                },
+                McuMsg::PmicReport(report) => match self.axis_of[i] {
+                    Some(axis) => LinkEvent::Pmic { axis, report },
                     None => continue,
                 },
                 McuMsg::ClockSyncReply(_) => continue,
@@ -1820,6 +1827,7 @@ fn snapshot_json_shape() {
         "decode_errors",
         "calibration",
         "fw_limits",
+        "pmic",
     ];
     akeys.sort_unstable();
     awant.sort_unstable();
@@ -1845,6 +1853,83 @@ fn snapshot_json_shape() {
         v["axes"][1]["power_on_cmd"], false,
         "only the power-controller axis drives G2"
     );
+}
+
+fn pmic_periodic(seq: u32, reg21: u8) -> PmicReport {
+    let mut regs = [0u8; PMIC_REG_LEN];
+    regs[13] = reg21;
+    PmicReport {
+        kind: pmic_kind::PERIODIC,
+        flags: pmic_flags::VBUS_OK | pmic_flags::VSYS_OK | pmic_flags::VBAT_OK | pmic_flags::MARK_OK,
+        read_ok: 14,
+        read_tried: 14,
+        reset_reason: 1,
+        por: 0,
+        seq,
+        mcu_time_us: 1_000_000 + u64::from(seq),
+        last_up_s: 10,
+        vbus: 5000,
+        vsys: 3300,
+        vbat: 4100,
+        ts: 0,
+        tdie: 0,
+        last_vbus: 0,
+        last_vsys: 0,
+        last_vbat: 0,
+        last_s0: 0,
+        last_s1: 0,
+        i2c_err: 0,
+        reg_valid: 1u64 << 13,
+        regs,
+    }
+}
+
+/// Issue #68: スナップショットは毎回、周期は変化か 10 秒ごと。最新値は status、切断で消える。
+#[test]
+fn pmic_reports_are_logged_with_a_rate_limit_and_shown_on_status() {
+    let mut r = Rig::new(sim_cfg());
+    r.connect_all();
+    r.sup.drain_events();
+    let t0 = r.now;
+    let pre = PmicReport { kind: pmic_kind::PREBOOT, seq: 0, ..pmic_periodic(0, 0x20) };
+    r.sup.on_link_event(LinkEvent::Pmic { axis: ax(2), report: pre }, t0);
+    let (ev, _) = r.sup.drain_events();
+    let logged: Vec<_> = ev.iter().filter(|e| e.kind == "pmic").collect();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].detail["kind"], "preboot");
+    assert_eq!(logged[0].detail["axis"], 2);
+    assert_eq!(logged[0].detail["por"], 0);
+    assert_eq!(logged[0].detail["reg21"], 32);
+    assert_eq!(logged[0].detail["power_off"], serde_json::json!(["dcdc_uv"]));
+    assert_eq!(logged[0].detail["vbus_mv"], 5000);
+    assert!(r.sup.snapshot(t0).axes[1].pmic.is_some());
+
+    let first = pmic_periodic(1, 0x20);
+    r.sup.on_link_event(LinkEvent::Pmic { axis: ax(2), report: first }, t0 + Duration::from_secs(1));
+    let (ev, _) = r.sup.drain_events();
+    assert_eq!(ev.iter().filter(|e| e.kind == "pmic").count(), 1, "最初の周期は記録する");
+
+    let same = pmic_periodic(2, 0x20);
+    r.sup.on_link_event(LinkEvent::Pmic { axis: ax(2), report: same }, t0 + Duration::from_secs(2));
+    let (ev, _) = r.sup.drain_events();
+    assert!(ev.iter().all(|e| e.kind != "pmic"), "同じレジスタは 10 秒待つ");
+    assert_eq!(r.sup.snapshot(t0).axes[1].pmic.unwrap().seq, 2);
+
+    let changed = pmic_periodic(3, 0x01);
+    r.sup.on_link_event(LinkEvent::Pmic { axis: ax(2), report: changed }, t0 + Duration::from_secs(3));
+    let (ev, _) = r.sup.drain_events();
+    let logged: Vec<_> = ev.iter().filter(|e| e.kind == "pmic").collect();
+    assert_eq!(logged.len(), 1, "レジスタが変わったらすぐ記録する");
+    assert_eq!(logged[0].detail["power_off"], serde_json::json!(["key"]));
+
+    let still = pmic_periodic(4, 0x01);
+    // 変化を記録した t0+3s から 10 秒。
+    r.sup.on_link_event(LinkEvent::Pmic { axis: ax(2), report: still }, t0 + Duration::from_secs(13));
+    let (ev, _) = r.sup.drain_events();
+    assert_eq!(ev.iter().filter(|e| e.kind == "pmic").count(), 1, "10 秒経てば同じレジスタでも記録する");
+
+    r.disconnect(1);
+    assert!(r.sup.snapshot(t0).axes[1].pmic.is_none(), "切断で消える");
 }
 
 #[test]

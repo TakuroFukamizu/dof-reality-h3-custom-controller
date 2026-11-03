@@ -14,6 +14,9 @@
 #if MC_PROTO_V1
 #include <esp_timer.h>
 
+#include <cstring>
+
+#include "pmic_log.h"
 #include "v1_axis.h"
 #include "v1_link.h"
 #endif
@@ -266,6 +269,162 @@ uint8_t g_selected = 1;
 int relay_off_level() { return RELAY_ON_LEVEL ? 0 : 1; }
 int brake_off_level() { return BRAKE_ON_LEVEL ? 0 : 1; }
 
+// レジスタ 1 バイトを PMIC_REPORT の正規の位置へ。読めなかったものは載せない（valid ビットも 0）。
+void pmic_put_reg(v1::PmicReport* r, uint8_t addr, uint8_t val, bool ok) {
+  if (!ok) return;
+  for (int i = 0; i < v1::kPmicRegDefined; ++i) {
+    if (v1::kPmicRegAddr[i] != addr) continue;
+    r->regs[i] = val;
+    r->reg_valid |= 1ull << i;
+    return;
+  }
+}
+
+// どの kind でも共通: リセット理由、RTC の前回値、POR の目印、I2C 失敗回数。
+// 目印 REG04〜07 は mark_ok のとき全 kind に載せる（サーバが POR を 1 本で判定できる）。
+void pmic_report_base(v1::PmicReport* r, uint8_t kind) {
+  memset(r, 0, sizeof(*r));
+  r->kind = kind;
+  r->por = 0xFF;
+  PmicBootSnapshot boot{};
+  if (pmic_copy_boot(&boot)) {
+    r->reset_reason = static_cast<uint8_t>(boot.reset_reason);
+    if (boot.rtc_ok) {
+      r->flags = static_cast<uint8_t>(r->flags | v1::pmic_flags::RTC_OK);
+      r->last_up_s = boot.last_up;
+      r->last_vbus = boot.last_vbus;
+      r->last_vsys = boot.last_vsys;
+      r->last_vbat = boot.last_vbat;
+      r->last_s0 = boot.last_s0;
+      r->last_s1 = boot.last_s1;
+    }
+  }
+  PmicPreSnapshot pre{};
+  if (pmic_copy_pre(&pre) && pre.mark_ok) {
+    r->flags = static_cast<uint8_t>(r->flags | v1::pmic_flags::MARK_OK);
+    r->por = memcmp(pre.mark, kPmicMark, sizeof(kPmicMark)) == 0 ? 0 : 1;
+    for (int i = 0; i < 4; ++i) pmic_put_reg(r, static_cast<uint8_t>(0x04 + i), pre.mark[i], true);
+  }
+  const uint32_t err = pmic_i2c_error_count();
+  r->i2c_err = err > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(err);
+}
+
+bool pmic_make_pre(v1::McuMsg* m) {
+  PmicPreSnapshot pre{};
+  if (!pmic_copy_pre(&pre)) return false;
+  memset(m, 0, sizeof(*m));
+  m->type = v1::msg::PMIC_REPORT;
+  pmic_report_base(&m->pmic_report, v1::pmic_kind::PREBOOT);
+  m->pmic_report.seq = 0;
+  m->pmic_report.mcu_time_us = pre.t_us;
+  m->pmic_report.read_ok = pre.ok;
+  m->pmic_report.read_tried = pre.tried;
+  for (int i = 0; i < kPmicPreRegCount; ++i) {
+    pmic_put_reg(&m->pmic_report, kPmicPreRegs[i], pre.regs[i], pre.regs_ok[i]);
+  }
+  return true;
+}
+
+bool pmic_make_boot(v1::McuMsg* m) {
+  PmicBootSnapshot boot{};
+  if (!pmic_copy_boot(&boot)) return false;
+  memset(m, 0, sizeof(*m));
+  m->type = v1::msg::PMIC_REPORT;
+  pmic_report_base(&m->pmic_report, v1::pmic_kind::BOOT);
+  m->pmic_report.seq = 0;
+  m->pmic_report.mcu_time_us = boot.t_us;
+  m->pmic_report.read_ok = boot.read_ok;
+  m->pmic_report.read_tried = boot.read_tried;
+  pmic_put_reg(&m->pmic_report, 0x20, boot.on, boot.on_ok);
+  pmic_put_reg(&m->pmic_report, 0x21, boot.off, boot.off_ok);
+  pmic_put_reg(&m->pmic_report, 0x48, boot.irq48, boot.irq48_ok);
+  pmic_put_reg(&m->pmic_report, 0x49, boot.irq49, boot.irq49_ok);
+  pmic_put_reg(&m->pmic_report, 0x4A, boot.irq4a, boot.irq4a_ok);
+  for (int i = 0; i < kPmicBaselineRegCount; ++i) {
+    pmic_put_reg(&m->pmic_report, kPmicBaselineRegs[i], boot.baseline[i], boot.baseline_ok[i]);
+  }
+  return true;
+}
+
+bool pmic_make_periodic(v1::McuMsg* m, const PmicPeriodic& p) {
+  PmicBootSnapshot boot{};
+  const bool has_boot = pmic_copy_boot(&boot);
+  memset(m, 0, sizeof(*m));
+  m->type = v1::msg::PMIC_REPORT;
+  pmic_report_base(&m->pmic_report, v1::pmic_kind::PERIODIC);
+  v1::PmicReport& r = m->pmic_report;
+  r.seq = p.seq;
+  r.mcu_time_us = p.t_us;
+  r.read_ok = p.read_ok;
+  r.read_tried = p.read_tried;
+  r.vbus = p.vbus;
+  r.vsys = p.vsys;
+  r.vbat = p.vbat;
+  r.ts = p.ts;
+  r.tdie = static_cast<int16_t>(p.tdie_deci);
+  if (p.vbus_ok) r.flags = static_cast<uint8_t>(r.flags | v1::pmic_flags::VBUS_OK);
+  if (p.vsys_ok) r.flags = static_cast<uint8_t>(r.flags | v1::pmic_flags::VSYS_OK);
+  if (p.vbat_ok) r.flags = static_cast<uint8_t>(r.flags | v1::pmic_flags::VBAT_OK);
+  if (p.ts_ok) r.flags = static_cast<uint8_t>(r.flags | v1::pmic_flags::TS_OK);
+  if (p.tdie_ok) r.flags = static_cast<uint8_t>(r.flags | v1::pmic_flags::TDIE_OK);
+  pmic_put_reg(&r, 0x00, p.s0, p.s0_ok);
+  pmic_put_reg(&r, 0x01, p.s1, p.s1_ok);
+  pmic_put_reg(&r, 0x48, p.i48, p.i48_ok);
+  pmic_put_reg(&r, 0x49, p.i49, p.i49_ok);
+  pmic_put_reg(&r, 0x4A, p.i4a, p.i4a_ok);
+  pmic_put_reg(&r, 0x18, p.r18, p.r18_ok);
+  pmic_put_reg(&r, 0x68, p.r68, p.r68_ok);
+  pmic_put_reg(&r, 0x14, p.r14, p.r14_ok);
+  pmic_put_reg(&r, 0x23, p.r23, p.r23_ok);
+  // REG20 / REG21 は起動時にラッチした値（1 秒読みでは読み直さない。従来の PMIC 行と同じ）。
+  if (has_boot) {
+    pmic_put_reg(&r, 0x20, boot.on, boot.on_ok);
+    pmic_put_reg(&r, 0x21, boot.off, boot.off_ok);
+  }
+  return true;
+}
+
+// outbox を送ったあと。HELLO のたびに preboot → boot を 1 回ずつ。キューに入らなければ次の周期で再試行。
+// 1 秒読みは最初の HELLO のあと、起動している間ずっと（ホストが黙っている展示の待機でも電源を見る）。
+// どちらも I2C はしない。TX ポンプが空き不足の PMIC_REPORT を捨てるので、ACK の順番はここでも崩さない。
+void pmic_tx() {
+  static uint32_t hello_done = 0;
+  static uint8_t stage = 0;  // 0 なし、1 preboot、2 boot
+  static uint32_t sent_seq = 0;
+
+  const uint32_t seen = g_axis.hello_seen();
+  if (seen != hello_done) {
+    hello_done = seen;
+    stage = 1;
+  }
+  if (stage == 1) {
+    v1::McuMsg m{};
+    if (!pmic_make_pre(&m)) {
+      stage = 2;
+    } else if (!v1_link_tx_push(m)) {
+      return;
+    } else {
+      stage = 2;
+    }
+  }
+  if (stage == 2) {
+    v1::McuMsg m{};
+    if (!pmic_make_boot(&m)) {
+      stage = 0;
+    } else if (!v1_link_tx_push(m)) {
+      return;
+    } else {
+      stage = 0;
+    }
+  }
+  if (seen == 0) return;
+  PmicPeriodic p{};
+  if (!pmic_copy_periodic(&p) || p.seq == 0 || p.seq == sent_seq) return;
+  v1::McuMsg m{};
+  pmic_make_periodic(&m, p);
+  if (v1_link_tx_push(m)) sent_seq = p.seq;
+}
+
 // 主電源は電源担当軸（CONFIG role_flags bit0）のときだけ V1Axis が ON を指令する。それ以外は常に OFF レベル。
 void write_outputs(bool power_on, bool brake_release, int duty_permille) {
   digitalWrite(PIN_POWER_RELAY, power_on ? RELAY_ON_LEVEL : relay_off_level());
@@ -346,6 +505,8 @@ void v1_task_main(void*) {
         break;
       }
     }
+    // ACK / STATUS を積んだあと。PMIC は outbox に入れない（満杯のとき STATUS を押し出さない）。
+    pmic_tx();
 
     V1Snapshot snap;
     snap.state = g_axis.state();

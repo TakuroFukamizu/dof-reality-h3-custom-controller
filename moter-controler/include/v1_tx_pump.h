@@ -12,7 +12,10 @@
 //  STATUS（置き換えてよいフレーム。20 ms ごとに新しいものが来る）
 //   - age ≥ status_stale_ms なら送らない（DropStale）。詰まりが解けたときに古い STATUS を順に流さず、新しいものだけ送る。
 //   - 空きがフレーム長以上なら書く（Write）。無ければ捨てる（DropStale）。
-//  STATUS 以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT。**ここでは決して捨てない**。順序を保つ）
+//  PMIC_REPORT（診断。約 1 Hz。Issue #68）
+//   - 空きがフレーム長以上なら書く（古くても書く。スナップショットを 100 ms で捨てない）。
+//   - 無ければ捨てる（DropStale）。保留しない。後ろの ACK をこの 1 本で止めない。
+//  それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT。**ここでは決して捨てない**。順序を保つ）
 //   - 空きがフレーム長以上なら書く（Write。RINGBUF_TYPE_BYTEBUF の空きは byte 単位なので xRingbufferSend は待たずに入る。
 //     ISR はリングから取り出すだけなので、見てから書くまでに空きが減ることはない）。
 //   - 無ければ保留して順序を保つ（Defer。この poll はここで終わる。後ろはキューに残る）。
@@ -87,11 +90,15 @@ class TxPump {
         waited_ = false;
       }
       const bool is_status = held_.type == msg::STATUS;
+      const bool is_pmic = held_.type == msg::PMIC_REPORT;
       const uint32_t age = tx_age_ms(now_ms, held_.enqueued_ms);
       const uint32_t held_ms = waited_ ? tx_age_ms(now_ms, held_since_ms_) : 0;
       size_t free_bytes = 0;
-      if (!(is_status && age >= policy.status_stale_ms)) free_bytes = port.available_for_write();
-      const TxAction a = tx_decide(is_status, held_.len, free_bytes, age, held_ms, policy);
+      if (is_pmic || !(is_status && age >= policy.status_stale_ms)) free_bytes = port.available_for_write();
+      // PMIC は空きが無ければ捨てて次へ。保留すると後ろの ACK が止まる。
+      TxAction a = is_pmic
+                       ? (free_bytes >= held_.len ? TxAction::Write : TxAction::DropStale)
+                       : tx_decide(is_status, held_.len, free_bytes, age, held_ms, policy);
       switch (a) {
         case TxAction::Write:
         case TxAction::WriteThrough: {

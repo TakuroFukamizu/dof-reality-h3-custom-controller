@@ -82,8 +82,10 @@ void boardBegin() {
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
-#if MC_PMIC_LOG
-  pmic_log_preboot();  // M5Unified / M5GFX が REG23（DCDC 低電圧で切る機能）を書き換える前の値を読む（Issue #68）
+#if MC_PMIC_LOG || MC_PROTO_V1
+  // M5Unified / M5GFX が REG23（DCDC 低電圧で切る機能）を書き換える前の値を読む（Issue #68）。
+  // pmiclog はテキスト、v1 は RAM に残してあとで PMIC_REPORT にする。どちらも Serial への出し方は pmic_log 側で決める。
+  pmic_log_preboot();
 #endif
   auto cfg = M5.config();
   cfg.clear_display = true;
@@ -107,7 +109,7 @@ void boardBegin() {
   cfg.external_display_value = 0;
   cfg.external_speaker_value = 0;
   M5.begin(cfg);
-#if MC_PMIC_LOG
+#if MC_PMIC_LOG || MC_PROTO_V1
   pmic_log_boot();  // 前回の電源断要因（REG21）を、ほかの処理より先に読む
 #endif
 #if !MC_USB_POWER
@@ -1477,6 +1479,10 @@ void setup() {
 void loop() {
   M5.update();
   v1_link_poll();  // USB の受信 → 受信キュー、送信キュー → USB（描画の前後で呼び、描画中の取りこぼしを減らす）
+  // AXP2101 を 1 秒に 1 回読む（Issue #68）。制御タスクからは呼ばない。
+  // 内部 I2C は M5.update() と同じスレッドなので、ここで読めばタッチ／AW9523 と同時にバスを持たない。
+  // 失敗時は 1 トランザクションで打ち切る。USB は先に poll してある。
+  pmic_log_tick();
   pollTouchV1();
 
   if (notice[0] != '\0' && static_cast<int32_t>(millis() - notice_until_ms) >= 0) {

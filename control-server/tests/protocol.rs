@@ -732,8 +732,8 @@ fn unknown_type_rejected_including_cross_direction() {
         Err(DecodeError::UnknownType(0x00))
     );
     assert_eq!(
-        McuMsg::decode_payload(0x89, &[]),
-        Err(DecodeError::UnknownType(0x89))
+        McuMsg::decode_payload(0x8A, &[]),
+        Err(DecodeError::UnknownType(0x8A))
     );
 }
 
@@ -764,6 +764,7 @@ fn payload_length_tables_match_spec() {
         (AXIS_SELECT, 8),
         (CAL_RESULT, 28),
         (LIMITS, 24),
+        (PMIC_REPORT, 92),
     ];
     let mut n_host = 0;
     let mut n_mcu = 0;
@@ -778,8 +779,8 @@ fn payload_length_tables_match_spec() {
     for (t, n) in mcu {
         assert_eq!(mcu_payload_len(t), Some(n));
     }
-    // Largest frame fits comfortably within limits.
-    let largest = frame::HEADER_LEN + 56 + frame::CRC_LEN;
+    // Largest frame fits comfortably within limits (PMIC_REPORT is 92).
+    let largest = frame::HEADER_LEN + 92 + frame::CRC_LEN;
     assert!(largest <= MAX_FRAME_LEN);
     assert!(largest + largest / 254 < MAX_ENCODED_LEN);
 }
@@ -1211,6 +1212,32 @@ fn round_trip_every_mcu_message_edge_values() {
             deadband_out_count: h,
             abs_max_vel_count_s: u,
             abs_max_acc_count_s2: u,
+        }));
+        let mut regs = [b; PMIC_REG_LEN];
+        regs[13] = 0x20;
+        mcu_rt(McuMsg::PmicReport(PmicReport {
+            kind: b % 3,
+            flags: b,
+            read_ok: h,
+            read_tried: h,
+            reset_reason: b,
+            por: b,
+            seq: u,
+            mcu_time_us: w,
+            last_up_s: u,
+            vbus: h,
+            vsys: h,
+            vbat: h,
+            ts: h,
+            tdie: b as i16,
+            last_vbus: h,
+            last_vsys: h,
+            last_vbat: h,
+            last_s0: b,
+            last_s1: b,
+            i2c_err: h,
+            reg_valid: w,
+            regs,
         }));
     }
 }

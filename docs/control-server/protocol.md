@@ -63,7 +63,7 @@ frame:         header(4) payload(N) crc(2)
 - COBS の細目: 非ゼロ 254 byte の連続でデータが終わるときは末尾に空ブロック `0x01` を付けない（Wikipedia の例と同じ）。受信側は付いていても付いていなくても受け付ける。`0x00` が連続した空フレームは数えずに無視する。
 - 受信側は、CRC 不一致・`version` 不一致・未知の `msg_type`・`payload_len` が種別の定義長と異なるフレームを **破棄** し、破棄数を数える（STATUS の `rx_error_count`）。破棄したフレームに応答しない。`rx_error_count` には、v1 で扱えない `apply_at_us ≠ 0` の SET_POSITION（§4）も数える。
 - 将来の拡張でも既存種別の長さは変えない。必要なら新しい `msg_type` を足す。
-- MCU の送信はブロックしない（Issue #15 M7、ファーム `include/v1_tx_pump.h`）: USB CDC の TX リング（1024 byte）に空きが無いとき、**STATUS は捨てる**（次の 20 ms のものが新しい）、それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT）は **MCU 側で捨てない**: 順序を保って保留し、空きが戻ったら書く。保留が 100 ms 続いたら空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 最大 20 回 = 20 ms で有界。未接続なら HWCDC が古い内容を置き換えて即返る）。積まれてから 100 ms 以上経った STATUS は空きがあっても送らない（古い STATUS を順に流さず新しいものだけ）。STATUS 以外に滞在時間の期限は無い。PC が読んでいない間に MCU の受信（SET_POSITION）が止まらないための規則で、STATUS 側の値は PC の STATUS 途絶 200 ms（§6）より短い。詰まったリンクでは古い ACK が遅れて届くことがあり、PC は期限（1000 ms）を過ぎた ACK を無視する。
+- MCU の送信はブロックしない（Issue #15 M7、ファーム `include/v1_tx_pump.h`）: USB CDC の TX リング（1024 byte）に空きが無いとき、**STATUS は捨てる**（次の 20 ms のものが新しい）。**PMIC_REPORT も捨てる**（診断で約 1 Hz。空きがあれば古くても書く。保留しないので後ろの ACK を止めない）。それ以外（ACK・FAULT_EVENT・HELLO・LIMITS・CAL_RESULT・AXIS_SELECT）は **MCU 側で捨てない**: 順序を保って保留し、空きが戻ったら書く。保留が 100 ms 続いたら空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 最大 20 回 = 20 ms で有界。未接続なら HWCDC が古い内容を置き換えて即返る）。積まれてから 100 ms 以上経った STATUS は空きがあっても送らない（古い STATUS を順に流さず新しいものだけ）。STATUS 以外に滞在時間の期限は無い。PC が読んでいない間に MCU の受信（SET_POSITION）が止まらないための規則で、STATUS 側の値は PC の STATUS 途絶 200 ms（§6）より短い。詰まったリンクでは古い ACK が遅れて届くことがあり、PC は期限（1000 ms）を過ぎた ACK を無視する。
 
 ## 3. 共通の値
 
@@ -186,6 +186,7 @@ SET_POSITION の規則:
 | `0x85` | CLOCK_SYNC_REPLY | 0: u32 request_id / 4: u64 pc_time_us（エコー） / 12: u64 mcu_rx_us / 20: u64 mcu_tx_us | 28 |
 | `0x86` | AXIS_SELECT | 0: u32 boot_id / 4: u8 selected_axis（新しい値 1〜3、0 = 未選択） / 5: u8 prev_selected_axis / 6: u8 mcu_state / 7: u8 reserved=0 | 8 |
 | `0x88` | LIMITS | 0: u32 boot_id / 4: u8 duty_max_percent / 5: u8 duty_min_percent / 6: u8 kp_percent_per_100 / 7: u8 abs_duty_max_percent / 8: u16 ff_count_s_per_percent / 10: u16 deadband_count / 12: u16 deadband_out_count / 14: u16 reserved=0 / 16: u32 abs_max_vel_count_s / 20: u32 abs_max_acc_count_s2 | 24 |
+| `0x89` | PMIC_REPORT | AXP2101 の診断。固定 92 byte。フィールドは §8 | 92 |
 | `0x87` | CAL_RESULT | 0: u32 boot_id / 4: u8 result（0 = OK、1 = FAILED、2 = CANCELLED） / 5: u8 step（終了時の段階。0 = なし、1 = P 端へ、2 = N 端へ、3 = 中立へ。`KEEP_POWER` で電源を保持する軸は 4 = POWER_HOLD を使わず、校正が終わった段階（通常 3）を入れる。POWER_HOLD は STATUS の `mcu_state = CALIBRATING` と `POWER_ON_CMD` で分かる） / 6: u16 reserved=0 / 8: i32 n_end_count / 12: i32 neutral_count / 16: i8 sign（系統プロファイルの符号 ±1） / 17: u8 reserved=0 / 18: u16 reserved=0 / 20: u8[8] reason（ASCII、NUL 埋め。`ok` / `stall` / `slow` / `travel` / `timeout` / `stop` / `estop` など auto_move の理由） | 28 |
 
 - STATUS は MCU が自発的に 50Hz（20ms）で送る。状態遷移・FAULT 発生時は即時にも送ってよい。ACK との順序は §1（ACK より後の STATUS は遷移後の状態）。
@@ -196,6 +197,7 @@ SET_POSITION の規則:
 - `boot_id` が変わったら PC はその軸の校正状態を無効化し、再 ARM を要求する。
 - CAL_RESULT は校正が終わる（成功・失敗・中止）たびに 1 回、終了手順の後・DISARMED を示す STATUS の前に送る（§1.2）。
 - LIMITS は SET_LIMITS を受理した直後（ACK の後）に 1 回だけ送る。有効値（クランプ後）と、ファームの絶対上限 3 つ（`abs_*`: Duty 60 %、速度 6000 count/s、加速度 40000 count/s²。`config.h` の `V1_ABS_*`）。PC はこれを `status.axes[].fw_limits` に出し、接続中の軸の最小を実行時の制限値の上限にする。HELLO の直後に自発的には送らない（PC が識別直後に SET_LIMITS を送る）。
+- PMIC_REPORT は §8。HELLO のあと（サーバが HELLO_REQ を送るたび）に preboot と boot を 1 回ずつ、その後はホストが接続している間 1 秒ごとに periodic を送る。STATUS / ACK の送信キューには混ぜず、それらのあとから同じ TX 経路で送る。空きが無ければその 1 本だけ捨てる。
 - AXIS_SELECT は系統を切り替えたとき（DISARMED のときだけ、§1.1）に 1 回送る。ACK はない。`prev_selected_axis` は切り替え前の値。PC は AXIS_SELECT、または STATUS / HELLO の `selected_axis` の変化のどれでも割当を変える。ただし STATUS の 0 では割当を変えない（旧ファームの reserved=0 と区別できない。§1.1）。
 
 ## 5. 状態遷移（MCU）
@@ -456,4 +458,103 @@ wire  (24 byte): 04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 01 01 03 
 frame (30 byte): 01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB
 wire  (32 byte): 04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00
 ```
+
+### 7.23 PMIC_REPORT（`0x89`、MCU → PC）
+
+値: `{"kind":2,"flags":127,"read_ok":14,"read_tried":14,"reset_reason":1,"por":0,"seq":3,"mcu_time_us":5000000,"last_up_s":120,"vbus":5000,"vsys":3300,"vbat":4100,"ts":4900,"tdie":250,"last_vbus":4980,"last_vsys":3290,"last_vbat":4080,"last_s0":32,"last_s1":8,"i2c_err":0,"reg_valid":37270719,"regs":[33,8,72,51,54,56,0,5,0,0,3,0,1,32,0,31,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+
+```text
+frame (98 byte): 01 89 5C 00 02 7F 0E 00 0E 00 01 00 03 00 00 00 40 4B 4C 00 00 00 00 00 78 00 00 00 88 13 E4 0C 04 10 24 13 FA 00 74 13 DA 0C F0 0F 20 08 00 00 BF B4 38 02 00 00 00 00 21 08 48 33 36 38 00 05 00 00 03 00 01 20 00 1F 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9D 58
+wire  (100 byte): 04 01 89 5C 04 02 7F 0E 02 0E 02 01 02 03 01 01 04 40 4B 4C 01 01 01 01 02 78 01 01 0A 88 13 E4 0C 04 10 24 13 FA 09 74 13 DA 0C F0 0F 20 08 01 05 BF B4 38 02 01 01 01 07 21 08 48 33 36 38 02 05 01 02 03 03 01 20 02 1F 01 01 01 01 01 01 01 01 02 01 01 01 01 01 01 01 01 01 01 01 01 01 01 03 9D 58 00
+```
 <!-- VECTORS:END -->
+
+## 8. PMIC_REPORT（AXP2101、Issue #68）
+
+CoreS3 の AXP2101（内部 I2C、アドレス `0x34`）を、展示用 v1 ファームからも読む。v1 の USB CDC は COBS のバイナリだけを運ぶので、従来 env `m5stack-cores3-pmiclog` の `PMIC` / `PMICPRE` / `PMICBOOT` テキストは出さない。レジスタの並びは `moter-controler/src/pmic_log.cpp` と同じ。種別 `0x89`、payload は 92 byte 固定。
+
+### 8.1 いつ送るか
+
+- `kind = 0`（preboot）は `M5.begin()` より前のスナップショット。`kind = 1`（boot）は直後に読んだ電源断要因（REG21 など）。どちらも起動時に RAM へ残し、ホストが HELLO_REQ を送って MCU が HELLO を返した直後に、preboot → boot の順で 1 回ずつ送る。HELLO を受け取るたび（サーバの再起動を含む）に送り直す。
+- `kind = 2`（periodic）は最初の HELLO のあと、その起動のあいだ 1 秒ごと。展示サーバは DISARMED の待機中は無言なので、「直近にホストから何か来た」では切らない。USB を読んでいなければ送信リングが埋まって捨てられる。
+- 読み出しは UI の `loop()`（`M5.update()` と同じスレッド）だけが行う。制御タスクは I2C しない。送るのは制御タスクが outbox（ACK / STATUS）を送信キューへ移したあと、同じ TX 経路で通常の優先度。PMIC は outbox に入れない。
+- 送信リングにその 1 本の空きが無いときだけ捨てる。古さ（STATUS の 100 ms）では捨てない。空きが無いフレームを保持して、後ろの ACK を遅らせない。約 1 Hz で、STATUS（約 50 Hz）の帯域の横に 1 本（フレーム約 100 byte）増えるだけ。
+
+### 8.2 レイアウト（リトルエンディアン、予約の隙間は無い）
+
+| offset | 型 | フィールド |
+| ---: | --- | --- |
+| 0 | u8 | `kind`（0 = preboot、1 = boot、2 = periodic） |
+| 1 | u8 | `flags` |
+| 2 | u16 | `read_ok`（このスナップショットで読めた回数） |
+| 4 | u16 | `read_tried`（試した回数。バスを諦めて飛ばした分は失敗回数に数えない） |
+| 6 | u8 | `reset_reason`（`esp_reset_reason`。boot で読んだ値を全 kind に載せる） |
+| 7 | u8 | `por`（0 = 目印一致、1 = 不一致、`0xFF` = 未読） |
+| 8 | u32 | `seq`（periodic は 1 から。スナップショットは 0） |
+| 12 | u64 | `mcu_time_us` |
+| 20 | u32 | `last_up_s`（RTC メモリ。`RTC_OK` が 0 なら 0） |
+| 24 | u16 | `vbus`（1 mV/LSB。対応フラグが 0 なら 0） |
+| 26 | u16 | `vsys` |
+| 28 | u16 | `vbat` |
+| 30 | u16 | `ts` |
+| 32 | i16 | `tdie`（0.1 ℃） |
+| 34 | u16 | `last_vbus` |
+| 36 | u16 | `last_vsys` |
+| 38 | u16 | `last_vbat` |
+| 40 | u8 | `last_s0`（前回の REG00） |
+| 41 | u8 | `last_s1`（前回の REG01） |
+| 42 | u16 | `i2c_err`（起動以降の失敗回数。65535 で飽和。ファーム内部は 32 bit） |
+| 44 | u64 | `reg_valid`（bit i が 1 なら `regs[i]` を読めた） |
+| 52 | u8[40] | `regs`（下の表。33 以降は予約で 0、valid ビットも 0） |
+
+`flags`: bit0 `RTC_OK`（前回の最終値が RTC に残っていた。ESP32 だけのリセット）、bit1 `MARK_OK`（REG04〜07 を読めた）、bit2 `VBUS_OK`、bit3 `VSYS_OK`、bit4 `VBAT_OK`、bit5 `TS_OK`、bit6 `TDIE_OK`。
+
+`read_ok` / `read_tried` は I2C の回数で、`reg_valid` の立っているビット数とは一致しない（periodic は ADC 5 本を別フィールドに出す。preboot は目印の 4 byte を `tried` に含む）。
+
+POR の目印は REG04〜07 = `48 33 36 38`（ASCII `H368`）。`MARK_OK` のとき全 kind の `regs[2..5]` に載せる。`por` は一致で 0、読めたが違うとき 1、読んでいなければ `0xFF`。
+
+periodic の REG20（`on`）と REG21（`off`）は起動時にラッチした値で、1 秒ごとに読み直さない（従来の `PMIC` 行と同じ）。REG14 / REG23 は読み直す。
+
+`regs` の添字（アドレス順ではない。preboot / boot / periodic が同じ位置に同じレジスタを置く）:
+
+| i | addr | 内容 |
+| ---: | ---: | --- |
+| 0 | `0x00` | 状態 0 |
+| 1 | `0x01` | 状態 1 |
+| 2–5 | `0x04`–`0x07` | POR 目印 |
+| 6 | `0x10` | |
+| 7 | `0x14` | |
+| 8 | `0x15` | |
+| 9 | `0x16` | |
+| 10 | `0x18` | |
+| 11 | `0x19` | |
+| 12 | `0x20` | 電源オン要因 |
+| 13 | `0x21` | 電源オフ要因 |
+| 14 | `0x22` | |
+| 15 | `0x23` | |
+| 16 | `0x24` | |
+| 17 | `0x27` | |
+| 18 | `0x30` | |
+| 19 | `0x48` | IRQ1 |
+| 20 | `0x49` | IRQ2 |
+| 21 | `0x4A` | IRQ3 |
+| 22 | `0x50` | |
+| 23 | `0x62` | |
+| 24 | `0x64` | |
+| 25 | `0x68` | |
+| 26 | `0x80` | |
+| 27 | `0x82` | |
+| 28 | `0x83` | |
+| 29 | `0x84` | |
+| 30 | `0x85` | |
+| 31 | `0x86` | |
+| 32 | `0x90` | |
+| 33–39 | — | 予約 |
+
+REG21 のビット（電源オフ要因。POR まで残る）: b7 ダイ過熱、b6 DCDC 過電圧、b5 DCDC 低電圧、b4 VBUS 過電圧、b3 VSYS 低電圧、b1 ソフト、b0 キー。
+
+### 8.3 サーバ
+
+未知種別はデコードエラーのまま。`0x89` は既知。届いた報告は監視イベント `kind = "pmic"` にする。中身は軸、kind 名（`preboot` / `boot` / `periodic`）、`seq`、`mcu_time_us`、`read_ok` / `read_tried` / `i2c_err`、`reset_reason`、有効なレジスタの `AA=VV` を空白区切り（大文字 16 進）、`vbus_mv` / `vsys_mv` / `vbat_mv`（対応フラグが無いときは JSON null）、REG21 とそのビット名（`die_ot` `dcdc_ov` `dcdc_uv` `vbus_ov` `vsys_uv` `software` `key`）、`por`、目印 8 文字（`MARK_OK` のとき。無ければ null）。
+
+スナップショット（kind 0 と 1、未知の kind も）は毎回記録する。periodic は軸ごとに、直前の periodic から `reg_valid` か `regs` が変わったときすぐ、同じなら 10 秒に 1 回まで（電圧の揺れだけでは記録しない）。最新の 1 本は `GET /v1/status` の `axes[i].pmic` に出す。切断で null に戻す。プライマリ以外のポートから来た報告は STATUS と同じく捨てる。

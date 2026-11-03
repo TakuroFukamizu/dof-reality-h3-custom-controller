@@ -202,6 +202,22 @@ inline void test_pump_drops_status_under_backpressure_but_not_ack() {
         s.port.written_types[1] == v1::msg::STATUS);
 }
 
+// PMIC_REPORT は空きが無ければ捨て、同じ poll で後ろの ACK を通常どおり保留する（PMIC を抱えて ACK を止めない。Issue #68）
+inline void test_pump_drops_pmic_without_space_and_continues_to_ack() {
+  Sim s;
+  s.port.free_bytes = 10;
+  s.push(v1::msg::PMIC_REPORT, 100);
+  s.push(v1::msg::ACK);  // 既定 50 byte。空き 10 には入らないので保留
+  s.poll();
+  CHECK(s.pump.stats.stale_dropped == 1);
+  CHECK(s.pump.holding() && s.pump.held()->type == v1::msg::ACK);
+  CHECK(s.q.empty());
+  s.port.free_bytes = 1024;
+  s.poll();
+  CHECK(s.port.written_types.size() == 1 && s.port.written_types[0] == v1::msg::ACK);
+  CHECK(s.pump.stats.written_through == 0);
+}
+
 // 保留が hold_write_through_ms（100 ms）続いたら空きが無くても書く（捨てない。availableForWrite が 0 を返し続ける状態の退路）。
 // 後続もそれぞれ保留 → 書く、でキューは進む
 inline void test_pump_writes_through_after_long_hold_never_drops_ack() {
@@ -286,6 +302,7 @@ inline void run_all() {
   test_ack_survives_transient_small_space_with_status_traffic();
   test_pump_defers_ack_and_keeps_order_under_backpressure();
   test_pump_drops_status_under_backpressure_but_not_ack();
+  test_pump_drops_pmic_without_space_and_continues_to_ack();
   test_pump_writes_through_after_long_hold_never_drops_ack();
   test_non_status_is_never_expired();
   test_pump_skips_stale_status_after_backlog();

@@ -19,7 +19,7 @@ struct V1RxFrame {
 
 struct V1TxFrame {
   uint16_t len;                       // COBS 符号化 + 区切り 0x00
-  uint8_t type;                       // v1::msg::*（STATUS は空きが無ければ捨ててよい。v1_tx_pump.h）
+  uint8_t type;                       // v1::msg::*（STATUS と PMIC_REPORT は空きが無ければ捨ててよい。v1_tx_pump.h）
   uint32_t enqueued_ms;               // 積んだ時刻（millis()。古い STATUS を送らない判定に使う）
   uint8_t data[v1::MAX_WIRE_LEN];
 };

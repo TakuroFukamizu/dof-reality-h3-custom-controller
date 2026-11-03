@@ -189,6 +189,17 @@ inline bool eq_cal_result(const v1::McuMsg& a, const v1::McuMsg& b) {
          x.neutral_count == y.neutral_count && x.sign == y.sign &&
          std::memcmp(x.reason, y.reason, v1::CAL_REASON_LEN) == 0;
 }
+inline bool eq_pmic(const v1::McuMsg& a, const v1::McuMsg& b) {
+  const v1::PmicReport& x = a.pmic_report;
+  const v1::PmicReport& y = b.pmic_report;
+  return x.kind == y.kind && x.flags == y.flags && x.read_ok == y.read_ok && x.read_tried == y.read_tried &&
+         x.reset_reason == y.reset_reason && x.por == y.por && x.seq == y.seq && x.mcu_time_us == y.mcu_time_us &&
+         x.last_up_s == y.last_up_s && x.vbus == y.vbus && x.vsys == y.vsys && x.vbat == y.vbat && x.ts == y.ts &&
+         x.tdie == y.tdie && x.last_vbus == y.last_vbus && x.last_vsys == y.last_vsys &&
+         x.last_vbat == y.last_vbat && x.last_s0 == y.last_s0 && x.last_s1 == y.last_s1 &&
+         x.i2c_err == y.i2c_err && x.reg_valid == y.reg_valid &&
+         std::memcmp(x.regs, y.regs, v1::kPmicRegLen) == 0;
+}
 inline bool eq_limits(const v1::McuMsg& a, const v1::McuMsg& b) {
   const v1::Limits& x = a.limits;
   const v1::Limits& y = b.limits;
@@ -476,6 +487,69 @@ inline void test_vectors_mcu() {
     const size_t n = v1::encode_mcu_wire(m, w, sizeof(w));
     CHECK(n > 0);
     CHECK(v1::decode_mcu_encoded(w, n - 1, &d) && eq_limits(d, m));
+  }
+  {  // 7.23 PMIC_REPORT（periodic。kind 2、flags 0x7F、seq 3、電圧 mV、目印 H368、REG21=0x20）
+    v1::McuMsg m{};
+    m.type = v1::msg::PMIC_REPORT;
+    v1::PmicReport& r = m.pmic_report;
+    r.kind = v1::pmic_kind::PERIODIC;
+    r.flags = static_cast<uint8_t>(v1::pmic_flags::RTC_OK | v1::pmic_flags::MARK_OK | v1::pmic_flags::VBUS_OK |
+                                   v1::pmic_flags::VSYS_OK | v1::pmic_flags::VBAT_OK | v1::pmic_flags::TS_OK |
+                                   v1::pmic_flags::TDIE_OK);
+    r.read_ok = 14;
+    r.read_tried = 14;
+    r.reset_reason = 1;
+    r.por = 0;
+    r.seq = 3;
+    r.mcu_time_us = 5000000;
+    r.last_up_s = 120;
+    r.vbus = 5000;
+    r.vsys = 3300;
+    r.vbat = 4100;
+    r.ts = 4900;
+    r.tdie = 250;
+    r.last_vbus = 4980;
+    r.last_vsys = 3290;
+    r.last_vbat = 4080;
+    r.last_s0 = 0x20;
+    r.last_s1 = 0x08;
+    r.i2c_err = 0;
+    const int idx[] = {0, 1, 2, 3, 4, 5, 7, 10, 12, 13, 15, 19, 20, 21, 25};
+    const uint8_t val[] = {0x21, 0x08, 0x48, 0x33, 0x36, 0x38, 0x05, 0x03, 0x01, 0x20, 0x1F, 0x00, 0x00, 0x00, 0x01};
+    for (size_t i = 0; i < sizeof(idx) / sizeof(idx[0]); ++i) {
+      r.regs[idx[i]] = val[i];
+      r.reg_valid |= 1ull << idx[i];
+    }
+    check_mcu_vector(
+        "01 89 5C 00 02 7F 0E 00 0E 00 01 00 03 00 00 00 40 4B 4C 00 00 00 00 00 78 00 00 00 88 13 E4 0C 04 10 24 "
+        "13 FA 00 74 13 DA 0C F0 0F 20 08 00 00 BF B4 38 02 00 00 00 00 21 08 48 33 36 38 00 05 00 00 03 00 01 20 "
+        "00 1F 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9D 58",
+        "04 01 89 5C 04 02 7F 0E 02 0E 02 01 02 03 01 01 04 40 4B 4C 01 01 01 01 02 78 01 01 0A 88 13 E4 0C 04 10 "
+        "24 13 FA 09 74 13 DA 0C F0 0F 20 08 01 05 BF B4 38 02 01 01 01 07 21 08 48 33 36 38 02 05 01 02 03 03 01 "
+        "20 02 1F 01 01 01 01 01 01 01 01 02 01 01 01 01 01 01 01 01 01 01 01 01 01 01 03 9D 58 00",
+        m, eq_pmic);
+    CHECK(v1::mcu_payload_len(v1::msg::PMIC_REPORT) == v1::kPmicPayloadLen);
+    CHECK(v1::kPmicPayloadLen == 92);
+    // オフセット: 0 kind / 1 flags / 32 tdie / 44 reg_valid / 52 regs
+    uint8_t f[v1::MAX_FRAME_LEN];
+    CHECK(v1::encode_mcu_frame(m, f, sizeof(f)) == 4 + 92 + 2);
+    const uint8_t* p = f + 4;
+    CHECK(p[0] == 2 && p[1] == 0x7F);
+    CHECK(p[32] == 250 && p[33] == 0);  // tdie 250 = 0x00FA
+    CHECK(p[52] == 0x21 && p[54] == 0x48 && p[65] == 0x20);  // REG00、目印、REG21
+    // 負のダイ温度も往復する
+    r.tdie = -250;
+    uint8_t w[v1::MAX_WIRE_LEN];
+    const size_t n = v1::encode_mcu_wire(m, w, sizeof(w));
+    CHECK(n > 0);
+    v1::McuMsg d{};
+    CHECK(v1::decode_mcu_encoded(w, n - 1, &d) && eq_pmic(d, m) && d.pmic_report.tdie == -250);
+    // 長さ違いは捨てる
+    uint8_t q[92];
+    std::memcpy(q, p, 92);
+    CHECK(!v1::decode_mcu_payload(v1::msg::PMIC_REPORT, q, 91, &d));
+    uint8_t q93[93] = {0};
+    CHECK(!v1::decode_mcu_payload(v1::msg::PMIC_REPORT, q93, 93, &d));
   }
 }
 
