@@ -3343,6 +3343,23 @@ inline void test_settled_on_keeps_stationary_stall_fault() {
 }
 
 
+// 2026-11-03 20:11: 人の荷重で目標の 14 count 手前から動けなくても、|誤差| ≤ stationary_fault_min_err（20）なら静止 2 s の監視で FAULT にしない。
+// 25 count 手前なら従来どおり ENCODER_FAULT（上の test_settled_on_keeps_stationary_stall_fault）
+inline void test_stationary_small_error_under_load_is_not_encoder_fault() {
+  Harness h;
+  v1::Config c = base_config();
+  c.following_error_limit_count = 100000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.stall = true;
+  h.raw -= 14;
+  h.step();
+  h.drive(6000, h.ax.actual_count() + 14);
+  CHECK(h.ax.state() == st::HOLDING);
+  CHECK(h.ax.fault_code() == fc::NONE);
+  CHECK(h.ax.referenced());
+}
+
 // ---- Issue #25 手順 9「T」: 追従中の動き出し補助 ----------------------------------------------------------------
 
 // 軌道 110 count/s で動いているのにカウントが動かず |誤差| が増え続けて 150 ms → |誤差| ≈ 17（床の 20 未満）でも床 7 % を掛ける。
@@ -3666,6 +3683,7 @@ inline void test_r6_breakaway_pulses_then_stall_watchdog_at_2s() {
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // カウントを 1 刻みで跳ばすので v_fast が跳ねる。r6/r8 の仕組みを見る試験なので減衰（r9）は切る
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;
+  h.ax.tuning.stationary_fault_min_err = 0;  // 静止 2 s の監視の従来の挙動を見る試験（11-03 の緩和を外す）
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
   h.stall = true;
@@ -3730,6 +3748,7 @@ inline void test_r6_breakaway_releases_on_progress_and_down_direction() {
   Harness k;
   k.ax.tuning = r6_tuning(2);
   k.ax.tuning.breakaway_window_ms = 0;
+  k.ax.tuning.stationary_fault_min_err = 0;  // 静止 2 s の監視の従来の挙動を見る試験（11-03 の緩和を外す）
   Harness::accepted(k.config_with(c));
   k.reach_holding_from_configured();
   k.stall = true;
@@ -3924,6 +3943,7 @@ inline void test_r7_stationary_error_3_gets_breakaway_and_watchdog() {
   CHECK(h.ax.duty_terms().mode == V1DutyMode::HOLD && h.ax.duty_permille() == 0);
   Harness g;
   g.ax.tuning = r6_tuning(6);
+  g.ax.tuning.stationary_fault_min_err = 0;  // 静止 2 s の監視の従来の挙動を見る試験（11-03 の緩和を外す）
   Harness::accepted(g.config_with(c));
   g.reach_holding_from_configured();
   g.stall = true;
@@ -4305,6 +4325,7 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
   Harness k;
   r9_holding(k);
   k.ax.tuning.overrun_ms = V1_OVERRUN_MS;
+  k.ax.tuning.stationary_fault_min_err = 0;  // 静止 2 s の監視の従来の挙動を見る試験（11-03 の緩和を外す）
   k.raw -= 10;
   k.step();
   const uint64_t t0 = k.now;
@@ -5049,6 +5070,7 @@ inline void run_all() {
   test_settled_entry_requires_dwell_with_measured_rest();
   test_settled_blocked_by_measured_motion_and_legacy_immediate();
   test_settled_on_keeps_stationary_stall_fault();
+  test_stationary_small_error_under_load_is_not_encoder_fault();
   test_track_assist_triggers_after_150ms_and_releases_on_motion();
   test_track_assist_requires_trajectory_speed_and_can_be_disabled();
   test_track_assist_does_not_block_following_error_or_moving_stall_fault();
