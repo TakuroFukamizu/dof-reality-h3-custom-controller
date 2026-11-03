@@ -624,7 +624,8 @@ fn route_event(sup: &Supervisor, port: String, ev: LinkEvent) -> Option<LinkEven
         LinkEvent::Status { axis, .. }
         | LinkEvent::Ack { axis, .. }
         | LinkEvent::FaultEvent { axis, .. }
-        | LinkEvent::CalResult { axis, .. } => is_primary(axis).then_some(ev),
+        | LinkEvent::CalResult { axis, .. }
+        | LinkEvent::Pmic { axis, .. } => is_primary(axis).then_some(ev),
         LinkEvent::Disconnected { axis, .. } if !is_primary(axis) => Some(LinkEvent::PortClosed { port }),
         ev => Some(ev),
     }

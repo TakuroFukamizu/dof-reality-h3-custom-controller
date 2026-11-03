@@ -45,7 +45,39 @@ pub mod msg_type {
     pub const CAL_RESULT: u8 = 0x87;
     /// Effective tuning and the firmware's absolute ceilings (§4.3).
     pub const LIMITS: u8 = 0x88;
+    /// AXP2101 diagnostic snapshot (protocol §8, Issue #68). About 1 Hz.
+    pub const PMIC_REPORT: u8 = 0x89;
 }
+
+/// PMIC_REPORT `kind`（protocol §8）。
+pub mod pmic_kind {
+    pub const PREBOOT: u8 = 0;
+    pub const BOOT: u8 = 1;
+    pub const PERIODIC: u8 = 2;
+}
+
+/// PMIC_REPORT `flags`（protocol §8）。
+pub mod pmic_flags {
+    pub const RTC_OK: u8 = 1 << 0;
+    pub const MARK_OK: u8 = 1 << 1;
+    pub const VBUS_OK: u8 = 1 << 2;
+    pub const VSYS_OK: u8 = 1 << 3;
+    pub const VBAT_OK: u8 = 1 << 4;
+    pub const TS_OK: u8 = 1 << 5;
+    pub const TDIE_OK: u8 = 1 << 6;
+}
+
+/// `regs` の長さ。添字 0..33 が定義済み、残りは予約。
+pub const PMIC_REG_LEN: usize = 40;
+pub const PMIC_REG_DEFINED: usize = 33;
+pub const PMIC_PAYLOAD_LEN: usize = 92;
+
+/// `regs[i]` の AXP2101 アドレス。ファームの `kPmicRegAddr` と同じ。
+pub const PMIC_REG_ADDR: [u8; PMIC_REG_LEN] = [
+    0x00, 0x01, 0x04, 0x05, 0x06, 0x07, 0x10, 0x14, 0x15, 0x16, 0x18, 0x19, 0x20, 0x21, 0x22, 0x23,
+    0x24, 0x27, 0x30, 0x48, 0x49, 0x4A, 0x50, 0x62, 0x64, 0x68, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86,
+    0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// ACK result (protocol §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -163,6 +195,49 @@ pub struct Limits {
     pub deadband_out_count: u16,
     pub abs_max_vel_count_s: u32,
     pub abs_max_acc_count_s2: u32,
+}
+
+/// serde は `[u8; 40]` を既定でシリアライズしない（32 まで）。数値の配列にする。
+fn ser_pmic_regs<S: serde::Serializer>(
+    regs: &[u8; PMIC_REG_LEN],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(PMIC_REG_LEN))?;
+    for b in regs {
+        seq.serialize_element(b)?;
+    }
+    seq.end()
+}
+
+/// PMIC_REPORT payload（`0x89`、92 byte 固定）。電圧は 1 mV/LSB。
+/// `tdie` は 0.1 ℃。`reg_valid` の bit i が 1 のとき `regs[i]` が有効。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PmicReport {
+    pub kind: u8,
+    pub flags: u8,
+    pub read_ok: u16,
+    pub read_tried: u16,
+    pub reset_reason: u8,
+    /// 0 = 目印一致（POR していない）、1 = 不一致、0xFF = 未読。
+    pub por: u8,
+    pub seq: u32,
+    pub mcu_time_us: u64,
+    pub last_up_s: u32,
+    pub vbus: u16,
+    pub vsys: u16,
+    pub vbat: u16,
+    pub ts: u16,
+    pub tdie: i16,
+    pub last_vbus: u16,
+    pub last_vsys: u16,
+    pub last_vbat: u16,
+    pub last_s0: u8,
+    pub last_s1: u8,
+    pub i2c_err: u16,
+    pub reg_valid: u64,
+    #[serde(serialize_with = "ser_pmic_regs")]
+    pub regs: [u8; PMIC_REG_LEN],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -392,6 +467,7 @@ pub enum McuMsg {
     AxisSelect(AxisSelect),
     CalResult(CalResult),
     Limits(Limits),
+    PmicReport(PmicReport),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -487,6 +563,7 @@ pub const fn mcu_payload_len(msg_type: u8) -> Option<usize> {
         AXIS_SELECT => 8,
         CAL_RESULT => 28,
         LIMITS => 24,
+        PMIC_REPORT => PMIC_PAYLOAD_LEN,
         _ => return None,
     })
 }
@@ -828,6 +905,7 @@ impl McuMsg {
             McuMsg::AxisSelect(_) => t::AXIS_SELECT,
             McuMsg::CalResult(_) => t::CAL_RESULT,
             McuMsg::Limits(_) => t::LIMITS,
+            McuMsg::PmicReport(_) => t::PMIC_REPORT,
         }
     }
 
@@ -913,6 +991,29 @@ impl McuMsg {
                 .u16(0)
                 .u32(l.abs_max_vel_count_s)
                 .u32(l.abs_max_acc_count_s2),
+            McuMsg::PmicReport(r) => w
+                .u8(r.kind)
+                .u8(r.flags)
+                .u16(r.read_ok)
+                .u16(r.read_tried)
+                .u8(r.reset_reason)
+                .u8(r.por)
+                .u32(r.seq)
+                .u64(r.mcu_time_us)
+                .u32(r.last_up_s)
+                .u16(r.vbus)
+                .u16(r.vsys)
+                .u16(r.vbat)
+                .u16(r.ts)
+                .i16(r.tdie)
+                .u16(r.last_vbus)
+                .u16(r.last_vsys)
+                .u16(r.last_vbat)
+                .u8(r.last_s0)
+                .u8(r.last_s1)
+                .u16(r.i2c_err)
+                .u64(r.reg_valid)
+                .bytes(&r.regs),
         };
         w.finish()
     }
@@ -1052,6 +1153,30 @@ impl McuMsg {
                     abs_max_acc_count_s2: r.u32()?,
                 })
             }
+            t::PMIC_REPORT => McuMsg::PmicReport(PmicReport {
+                kind: r.u8()?,
+                flags: r.u8()?,
+                read_ok: r.u16()?,
+                read_tried: r.u16()?,
+                reset_reason: r.u8()?,
+                por: r.u8()?,
+                seq: r.u32()?,
+                mcu_time_us: r.u64()?,
+                last_up_s: r.u32()?,
+                vbus: r.u16()?,
+                vsys: r.u16()?,
+                vbat: r.u16()?,
+                ts: r.u16()?,
+                tdie: r.i16()?,
+                last_vbus: r.u16()?,
+                last_vsys: r.u16()?,
+                last_vbat: r.u16()?,
+                last_s0: r.u8()?,
+                last_s1: r.u8()?,
+                i2c_err: r.u16()?,
+                reg_valid: r.u64()?,
+                regs: r.take()?,
+            }),
             other => return Err(DecodeError::UnknownType(other)),
         })
     }

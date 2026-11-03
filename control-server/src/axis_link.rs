@@ -615,6 +615,10 @@ impl Link {
                 axis: claimed.axis,
                 limits,
             },
+            Ok(McuMsg::PmicReport(report)) => LinkEvent::Pmic {
+                axis: claimed.axis,
+                report,
+            },
             Ok(McuMsg::Hello(h)) => {
                 if h.device_id != claimed.hello.device_id {
                     return Err(ReadEnd::Disconnected(format!(

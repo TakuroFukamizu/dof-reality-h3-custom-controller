@@ -47,6 +47,7 @@ constexpr uint8_t CLOCK_SYNC_REPLY = 0x85;
 constexpr uint8_t AXIS_SELECT = 0x86;
 constexpr uint8_t CAL_RESULT = 0x87;
 constexpr uint8_t LIMITS = 0x88;  // SET_LIMITS 受理直後の有効値と絶対上限（motion-limits 設計 §4.3）
+constexpr uint8_t PMIC_REPORT = 0x89;  // AXP2101 の診断（Issue #68）。約 1 Hz。空きが無ければ捨ててよい
 }  // namespace msg
 
 // --- 共通の値（protocol.md §3） ---
@@ -144,6 +145,34 @@ constexpr uint8_t KEEP_POWER = 0x01;
 
 constexpr size_t CAL_REASON_LEN = 8;  // CAL_RESULT の reason（ASCII、NUL 埋め。8 文字ちょうどなら終端なし）
 
+// PMIC_REPORT（0x89、92 byte 固定）。kind と flags は protocol.md §8。
+namespace pmic_kind {
+constexpr uint8_t PREBOOT = 0;    // M5.begin() より前
+constexpr uint8_t BOOT = 1;       // M5.begin() の直後（電源断要因）
+constexpr uint8_t PERIODIC = 2;   // 1 秒ごと
+}  // namespace pmic_kind
+
+namespace pmic_flags {
+constexpr uint8_t RTC_OK = 1u << 0;    // 前回の最終値が RTC メモリに残っていた
+constexpr uint8_t MARK_OK = 1u << 1;   // REG04〜07 を読めた
+constexpr uint8_t VBUS_OK = 1u << 2;
+constexpr uint8_t VSYS_OK = 1u << 3;
+constexpr uint8_t VBAT_OK = 1u << 4;
+constexpr uint8_t TS_OK = 1u << 5;
+constexpr uint8_t TDIE_OK = 1u << 6;
+}  // namespace pmic_flags
+
+// regs[] の添字 → AXP2101 のアドレス。33 個が定義、34〜40 は予約（0、valid ビットも 0）。
+// 並びはアドレス順ではない。preboot / boot / 1 秒読みが同じ位置に同じレジスタを置く。
+constexpr int kPmicRegLen = 40;
+constexpr int kPmicRegDefined = 33;
+constexpr uint8_t kPmicRegAddr[kPmicRegLen] = {
+    0x00, 0x01, 0x04, 0x05, 0x06, 0x07, 0x10, 0x14, 0x15, 0x16, 0x18, 0x19, 0x20, 0x21, 0x22, 0x23,
+    0x24, 0x27, 0x30, 0x48, 0x49, 0x4A, 0x50, 0x62, 0x64, 0x68, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86,
+    0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+constexpr int kPmicPayloadLen = 92;
+
 // --- 種別ごとの payload 長。未知の種別は -1 ---
 inline int host_payload_len(uint8_t type) {
   switch (type) {
@@ -174,6 +203,7 @@ inline int mcu_payload_len(uint8_t type) {
     case msg::AXIS_SELECT: return 8;
     case msg::CAL_RESULT: return 28;
     case msg::LIMITS: return 24;
+    case msg::PMIC_REPORT: return kPmicPayloadLen;
     default: return -1;
   }
 }
@@ -458,6 +488,33 @@ struct Limits {
   uint32_t abs_max_acc_count_s2;   // 絶対上限（V1_ABS_MAX_ACC_COUNT_S2）
 };
 
+// PMIC_REPORT の payload。構造体の並びはワイヤと違う（パディングがある）ので、memcpy しない。
+// オフセットは encode / decode と protocol.md §8。
+struct PmicReport {
+  uint8_t kind;             // pmic_kind::*
+  uint8_t flags;            // pmic_flags::*
+  uint16_t read_ok;
+  uint16_t read_tried;
+  uint8_t reset_reason;     // esp_reset_reason。boot で読んだ値（他の kind でも同じ）
+  uint8_t por;              // 0 = 目印一致、1 = 不一致、0xFF = 目印を読んでいない
+  uint32_t seq;             // periodic は 1 から。スナップショットは 0
+  uint64_t mcu_time_us;
+  uint32_t last_up_s;       // RTC。flags の RTC_OK が 0 なら値も 0
+  uint16_t vbus;            // 1 mV/LSB。flags の *_OK が 0 なら 0
+  uint16_t vsys;
+  uint16_t vbat;
+  uint16_t ts;
+  int16_t tdie;             // 0.1 ℃
+  uint16_t last_vbus;
+  uint16_t last_vsys;
+  uint16_t last_vbat;
+  uint8_t last_s0;
+  uint8_t last_s1;
+  uint16_t i2c_err;         // 起動以降の失敗回数。65535 で飽和
+  uint64_t reg_valid;       // bit i が 1 なら regs[i] を読めた
+  uint8_t regs[kPmicRegLen];
+};
+
 // PC → MCU の 1 メッセージ。type で union の有効な要素が決まる。
 struct HostMsg {
   uint8_t type;
@@ -490,6 +547,7 @@ struct McuMsg {
     AxisSelect axis_select;
     CalResult cal_result;
     Limits limits;
+    PmicReport pmic_report;
   };
 };
 
@@ -679,6 +737,32 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       // 14: u16 reserved = 0
       put_u32(out + 16, l.abs_max_vel_count_s);
       put_u32(out + 20, l.abs_max_acc_count_s2);
+      break;
+    }
+    case msg::PMIC_REPORT: {
+      const PmicReport& r = m.pmic_report;
+      put_u8(out + 0, r.kind);
+      put_u8(out + 1, r.flags);
+      put_u16(out + 2, r.read_ok);
+      put_u16(out + 4, r.read_tried);
+      put_u8(out + 6, r.reset_reason);
+      put_u8(out + 7, r.por);
+      put_u32(out + 8, r.seq);
+      put_u64(out + 12, r.mcu_time_us);
+      put_u32(out + 20, r.last_up_s);
+      put_u16(out + 24, r.vbus);
+      put_u16(out + 26, r.vsys);
+      put_u16(out + 28, r.vbat);
+      put_u16(out + 30, r.ts);
+      put_i16(out + 32, r.tdie);
+      put_u16(out + 34, r.last_vbus);
+      put_u16(out + 36, r.last_vsys);
+      put_u16(out + 38, r.last_vbat);
+      put_u8(out + 40, r.last_s0);
+      put_u8(out + 41, r.last_s1);
+      put_u16(out + 42, r.i2c_err);
+      put_u64(out + 44, r.reg_valid);
+      memcpy(out + 52, r.regs, kPmicRegLen);
       break;
     }
     default:
@@ -873,6 +957,32 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       l.abs_max_vel_count_s = get_u32(p + 16);
       l.abs_max_acc_count_s2 = get_u32(p + 20);
       break;  // 14 の予約は読まない
+    }
+    case msg::PMIC_REPORT: {
+      PmicReport& r = out->pmic_report;
+      r.kind = get_u8(p + 0);
+      r.flags = get_u8(p + 1);
+      r.read_ok = get_u16(p + 2);
+      r.read_tried = get_u16(p + 4);
+      r.reset_reason = get_u8(p + 6);
+      r.por = get_u8(p + 7);
+      r.seq = get_u32(p + 8);
+      r.mcu_time_us = get_u64(p + 12);
+      r.last_up_s = get_u32(p + 20);
+      r.vbus = get_u16(p + 24);
+      r.vsys = get_u16(p + 26);
+      r.vbat = get_u16(p + 28);
+      r.ts = get_u16(p + 30);
+      r.tdie = get_i16(p + 32);
+      r.last_vbus = get_u16(p + 34);
+      r.last_vsys = get_u16(p + 36);
+      r.last_vbat = get_u16(p + 38);
+      r.last_s0 = get_u8(p + 40);
+      r.last_s1 = get_u8(p + 41);
+      r.i2c_err = get_u16(p + 42);
+      r.reg_valid = get_u64(p + 44);
+      memcpy(r.regs, p + 52, kPmicRegLen);
+      break;
     }
     default:
       return false;

@@ -150,8 +150,10 @@ use crate::limits::{
 use crate::planner::{AxisLimits, Planner};
 use crate::prehistory::{self, FaultEventRecord, FaultPrehistory, StatusRing, TraceSample};
 use crate::protocol::{
-    self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
-    CalResultCode, FaultEvent, Hello, HostMsg, Limits, SetPosition, Status,
+    self, calibrate_flags, calibrate_mode, capabilities, pmic_flags, pmic_kind, role_flags, Ack, AckReason,
+    AckResult,
+    CalResult, CalResultCode, FaultEvent, Hello, HostMsg, Limits, PmicReport, SetPosition, Status,
+    PMIC_REG_ADDR, PMIC_REG_DEFINED,
 };
 use crate::session::AcceptedPose;
 use crate::types::{
@@ -256,6 +258,11 @@ pub enum LinkEvent {
     Limits {
         axis: AxisId,
         limits: Limits,
+    },
+    /// AXP2101 の診断（protocol §8）。スナップショットと、変化した周期報告はすぐ記録する。
+    Pmic {
+        axis: AxisId,
+        report: PmicReport,
     },
     /// Link lost (port closed, STATUS silent past the deadline, write error).
     Disconnected {
@@ -438,6 +445,8 @@ pub struct AxisSnapshot {
     /// ceilings. `None` until the first SET_LIMITS of this connection was
     /// answered.
     pub fw_limits: Option<Limits>,
+    /// この接続で最後に受け取った PMIC_REPORT。切断で消える。
+    pub pmic: Option<PmicReport>,
 }
 
 /// GET /v1/status body (DESIGN.md §7.2). `session` and `telemetry` are filled
@@ -595,6 +604,12 @@ struct AxisTrack {
     calibration: Option<CalibrationResult>,
     /// Last LIMITS of this connection.
     fw_limits: Option<Limits>,
+    /// 最後に受け取った PMIC_REPORT（GET /v1/status の axes[i].pmic）。
+    pmic: Option<PmicReport>,
+    /// 直前の周期報告。レジスタが変わったかの比較に使う。スナップショットでは更新しない。
+    pmic_periodic: Option<PmicReport>,
+    /// 周期報告をイベントに書いた時刻。同じレジスタなら 10 秒に 1 回まで。
+    pmic_periodic_logged_at: Option<Instant>,
     /// Tuning the MCU ACKed (SET_LIMITS) in this connection.
     limits_acked: Option<FwTuning>,
     /// SET_LIMITS sent and not yet answered.
@@ -778,6 +793,91 @@ pub struct Supervisor {
     events: VecDeque<SupervisorEvent>,
     events_dropped: u64,
     last_state: RigState,
+}
+
+fn pmic_kind_name(kind: u8) -> &'static str {
+    match kind {
+        pmic_kind::PREBOOT => "preboot",
+        pmic_kind::BOOT => "boot",
+        pmic_kind::PERIODIC => "periodic",
+        _ => "unknown",
+    }
+}
+
+fn pmic_regs_hex(r: &PmicReport) -> String {
+    let mut parts = Vec::new();
+    for i in 0..PMIC_REG_DEFINED {
+        if r.reg_valid & (1u64 << i) != 0 {
+            parts.push(format!("{:02X}={:02X}", PMIC_REG_ADDR[i], r.regs[i]));
+        }
+    }
+    parts.join(" ")
+}
+
+fn pmic_power_off(reg21: u8) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if reg21 & 0x80 != 0 {
+        v.push("die_ot");
+    }
+    if reg21 & 0x40 != 0 {
+        v.push("dcdc_ov");
+    }
+    if reg21 & 0x20 != 0 {
+        v.push("dcdc_uv");
+    }
+    if reg21 & 0x10 != 0 {
+        v.push("vbus_ov");
+    }
+    if reg21 & 0x08 != 0 {
+        v.push("vsys_uv");
+    }
+    if reg21 & 0x02 != 0 {
+        v.push("software");
+    }
+    if reg21 & 0x01 != 0 {
+        v.push("key");
+    }
+    v
+}
+
+/// 監視イベント "pmic" の中身。電圧はフラグが立っているときだけ mV。
+fn pmic_event_detail(axis: AxisId, r: &PmicReport) -> serde_json::Value {
+    let mv = |bit: u8, v: u16| {
+        if r.flags & bit != 0 {
+            serde_json::json!(v)
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let reg21_i = 13usize;
+    let reg21 = (r.reg_valid & (1u64 << reg21_i) != 0).then_some(r.regs[reg21_i]);
+    let power_off = reg21.map(pmic_power_off).unwrap_or_default();
+    let mark = if r.flags & pmic_flags::MARK_OK != 0 {
+        serde_json::Value::String(format!(
+            "{:02X}{:02X}{:02X}{:02X}",
+            r.regs[2], r.regs[3], r.regs[4], r.regs[5]
+        ))
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "axis": axis,
+        "kind": pmic_kind_name(r.kind),
+        "seq": r.seq,
+        "mcu_time_us": r.mcu_time_us,
+        "read_ok": r.read_ok,
+        "read_tried": r.read_tried,
+        "i2c_err": r.i2c_err,
+        "reset_reason": r.reset_reason,
+        "regs": pmic_regs_hex(r),
+        "vbus_mv": mv(pmic_flags::VBUS_OK, r.vbus),
+        "vsys_mv": mv(pmic_flags::VSYS_OK, r.vsys),
+        "vbat_mv": mv(pmic_flags::VBAT_OK, r.vbat),
+        "reg21": reg21,
+        "power_off": power_off,
+        "por": r.por,
+        "mark": mark,
+    })
 }
 
 impl Supervisor {
@@ -1146,6 +1246,7 @@ impl Supervisor {
             LinkEvent::FaultEvent { axis, ev } => self.on_fault_event(axis.index(), ev, now),
             LinkEvent::CalResult { axis, result } => self.on_cal_result(axis.index(), result, now),
             LinkEvent::Limits { axis, limits } => self.on_limits(axis.index(), limits, now),
+            LinkEvent::Pmic { axis, report } => self.on_pmic(axis.index(), report, now),
             LinkEvent::Disconnected { axis, reason } => {
                 self.on_disconnected(axis.index(), reason, now)
             }
@@ -1395,6 +1496,7 @@ impl Supervisor {
                     decode_errors: t.decode_errors,
                     calibration: t.calibration.clone(),
                     fw_limits: t.fw_limits,
+                    pmic: t.pmic,
                 }
             })
             .collect();
@@ -1591,6 +1693,41 @@ impl Supervisor {
         t.limits_retry_at = None;
         self.event(now, "limits", serde_json::json!({"axis": axis, "limits": limits}));
         self.recompute_limits();
+    }
+
+    /// PMIC_REPORT。最新値は常に status へ。イベントはスナップショットは毎回、
+    /// 周期はレジスタが前回と違うときすぐ、同じなら 10 秒に 1 回。
+    fn on_pmic(&mut self, i: usize, report: PmicReport, now: Instant) {
+        let Some(axis) = AxisId::from_index(i) else {
+            return;
+        };
+        if !self.axes[i].connected {
+            return;
+        }
+        let log = match report.kind {
+            pmic_kind::PREBOOT | pmic_kind::BOOT => true,
+            pmic_kind::PERIODIC => {
+                let changed = self.axes[i].pmic_periodic.as_ref().is_none_or(|prev| {
+                    prev.reg_valid != report.reg_valid || prev.regs != report.regs
+                });
+                let due = self.axes[i]
+                    .pmic_periodic_logged_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(10));
+                changed || due
+            }
+            _ => true,
+        };
+        let t = &mut self.axes[i];
+        t.pmic = Some(report);
+        if report.kind == pmic_kind::PERIODIC {
+            t.pmic_periodic = Some(report);
+            if log {
+                t.pmic_periodic_logged_at = Some(now);
+            }
+        }
+        if log {
+            self.event(now, "pmic", pmic_event_detail(axis, &report));
+        }
     }
 
     // ------------------------------------------------------------ link events
@@ -1964,6 +2101,9 @@ impl Supervisor {
         t.config_rejected = None;
         t.group_ok = false;
         t.clear_limits();
+        t.pmic = None;
+        t.pmic_periodic = None;
+        t.pmic_periodic_logged_at = None;
         self.pending.retain(|_, p| p.axis != i);
         if let Some(q) = self.outbox.get_mut(i) {
             q.clear();
