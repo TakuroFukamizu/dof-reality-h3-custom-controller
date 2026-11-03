@@ -279,9 +279,10 @@ fn vectors() -> Vec<Vector> {
                 ff_count_s_per_percent: 100,
                 deadband_count: 10,
                 deadband_out_count: 20,
+                stop_acc_count_s2: 20000,
             })),
-            frame_hex: "01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 00 00 40 08",
-            wire_hex: "04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 01 01 03 40 08 00",
+            frame_hex: "01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 20 4E AC A7",
+            wire_hex: "04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 05 20 4E AC A7 00",
         },
         Vector {
             title: "LIMITS",
@@ -294,11 +295,12 @@ fn vectors() -> Vec<Vector> {
                 ff_count_s_per_percent: 100,
                 deadband_count: 10,
                 deadband_out_count: 20,
+                stop_acc_count_s2: 20000,
                 abs_max_vel_count_s: 6000,
                 abs_max_acc_count_s2: 40000,
             })),
-            frame_hex: "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB",
-            wire_hex: "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00",
+            frame_hex: "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 20 4E 70 17 00 00 40 9C 00 00 1C CE",
+            wire_hex: "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 05 20 4E 70 17 01 03 40 9C 01 03 1C CE 00",
         },
     ]
 }

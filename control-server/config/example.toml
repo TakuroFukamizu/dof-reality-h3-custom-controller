@@ -75,6 +75,23 @@ deadband_out_count = 20          # 同（出る側）
 following_error_limit_count = 800
 overspeed_count_s = 9000         # ≥ 1.5 × max_vel_count_s（検査される）。1.5 × ファーム絶対上限 6000
 
+# 追従ガバナ（省略時はここの既定値）。1 軸が負荷で遅れ Duty が張り付くと、
+# 全軸の追跡速度を s、加速度を s² に下げる。停止の減速度は変えない。
+# fe_release < fe_start < fe_hard < following_error_limit_count。
+[governor]
+enabled = true
+fe_start = 120
+fe_hard = 200
+fe_release = 60
+s_min = 0.25
+down_rate = 4.0
+up_rate = 0.5
+sat_ms = 60
+release_ms = 300
+stale_ms = 100
+# 原因軸の実位置が目標へ 20 count 以上進まない状態がこれだけ続いたら coordinated stop
+no_progress_ms = 1500
+
 [backend]
 kind = "serial"
 # 軸は各 CoreS3 で選択した系統（HELLO / STATUS の selected_axis、protocol.md §1.1）で

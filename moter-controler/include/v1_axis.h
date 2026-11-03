@@ -737,6 +737,11 @@ class V1Axis {
   double control_target_ = 0.0;
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
+  // SET_LIMITS の stop_acc。0 は未設定（制御された停止は CONFIG の max_acc）。
+  // 系統の切り替えでは消さない（Duty の tuning と同じ。再起動で 0 に戻る）。
+  uint16_t stop_acc_count_s2_ = 0;
+  // STOPPING に入ったときに決める減速度 [count/s²]。制御された停止は stop_acc（未設定なら CONFIG）、異常停止はフレーム（begin_stop）。
+  double stopping_amax_ = 0.0;
   V1PlayoutBuffer playout_{};  // Issue #45: ACTIVE で受けた目標（受信時刻つき）。START・hold_here で空にする
   V1PlayoutFit playout_fit_{};  // 直近の tick の軌道の推定（計器・テスト用）
   V1PlayoutClock playout_clock_{};  // Issue #45: 有効な SET_POSITION 全部（HOLDING 中も）の (seq, 受信時刻) から時刻を付け直す
@@ -1057,6 +1062,15 @@ class V1Axis {
     tuning.ff_count_s_per_percent = l.ff_count_s_per_percent;
     tuning.deadband = l.deadband_count;
     tuning.deadband_out = l.deadband_out_count;
+    // 0 は未設定のまま。非 0 は絶対上限でクランプする（拒否はしない）。
+    // 減速中でも保存だけする。いまの stopping_amax_ は入口で決めた値のまま（次の停止から効く）。
+    if (l.stop_acc_count_s2 == 0) {
+      stop_acc_count_s2_ = 0;
+    } else {
+      uint32_t a = l.stop_acc_count_s2;
+      if (a > V1_ABS_MAX_ACC_COUNT_S2) a = V1_ABS_MAX_ACC_COUNT_S2;
+      stop_acc_count_s2_ = static_cast<uint16_t>(a);
+    }
     return v1::ack_reason::NONE;
   }
 
@@ -1217,6 +1231,19 @@ class V1Axis {
     state_ = v1::state::STOPPING;
     stop_kind_ = kind;
     stopping_started_us_ = now;
+    // 入口で減速度を決める。制御された停止（CONTROLLED_STOP・valid_for 期限・DISARM）は
+    // SET_LIMITS の stop_acc（操作者の max_acc。0 は未設定で CONFIG の max_acc）。
+    // 直前の SET_POSITION がガバナで下げた値は使わない。
+    // 異常停止（COMMAND_TIMEOUT）は従来どおり最後のフレーム（0 は CONFIG、下限 V1_MIN_DECEL）。
+    // すでに STOPPING の途中で Fault に変わるときはここを通らないので、入口の減速度を保つ。
+    if (kind == StopKind::Fault) {
+      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
+      stopping_amax_ = amax;
+    } else {
+      const uint32_t op = stop_acc_count_s2_;
+      stopping_amax_ = op > 0 ? static_cast<double>(op) : static_cast<double>(config_.max_acc_count_s2);
+    }
   }
 
   // 減速してからラッチする異常（COMMAND_TIMEOUT）。止まっていれば即ラッチ。
@@ -1224,7 +1251,8 @@ class V1Axis {
     if (setpoint_vel_ == 0.0) {
       latch_fault(code, now);
     } else if (state_ == v1::state::STOPPING) {
-      stop_kind_ = StopKind::Fault;  // 減速の開始時刻はそのまま（stop_timeout の起点を保つ）
+      // 減速の開始時刻と減速度は入口のまま（stop_timeout の起点を保つ。制御停止の途中でフレーム加速度に戻さない）
+      stop_kind_ = StopKind::Fault;
       stop_fault_code_ = code;
     } else {
       begin_stop(StopKind::Fault, now);
@@ -1397,12 +1425,8 @@ class V1Axis {
       setpoint_ = p < lo ? lo : (p > hi ? hi : p);
       setpoint_vel_ = v;
     } else if (state_ == v1::state::STOPPING) {
-      // 減速は最後に適用したフレームの max_acc で（CONFIG には絶対上限が入るので、そちらでは 40000 count/s² の急減速になる。
-      // motion-limits 設計 §4.4）。frame_max_acc_ は START で CONFIG の値から初期化され SET_POSITION ごとに更新されるが、
-      // フレームが max_acc = 0 を運ぶと 0 になり減速できないので、そのときだけ CONFIG の値に戻す。
-      // PR #49 レビュー P1b: ごく小さい max_acc（1 など）でも止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする
-      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
-      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
+      // 減速度は begin_stop で決めた値（制御された停止は stop_acc、未設定なら CONFIG。異常停止だけフレーム）。
+      const double amax = stopping_amax_;
       const double dv = amax * dt;
       double v = setpoint_vel_;
       if (fabs(v) <= dv) {
@@ -2122,6 +2146,7 @@ class V1Axis {
     m.limits.ff_count_s_per_percent = static_cast<uint16_t>(tuning.ff_count_s_per_percent);
     m.limits.deadband_count = static_cast<uint16_t>(tuning.deadband);
     m.limits.deadband_out_count = static_cast<uint16_t>(tuning.deadband_out);
+    m.limits.stop_acc_count_s2 = stop_acc_count_s2_;  // 0 は未設定のまま返す
     m.limits.abs_max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
     m.limits.abs_max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     push(m);

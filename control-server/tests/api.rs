@@ -558,7 +558,7 @@ const STATUS_KEYS: &[&str] = &[
     "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
     "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
     "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "axis_conflict", "measured_angles",
-    "physical_estop", "telemetry", "motion_limits",
+    "physical_estop", "telemetry", "motion_limits", "governor",
 ];
 const AXIS_KEYS: &[&str] = &[
     "axis_id", "name", "connected", "port", "device_id", "expected_device_id", "assignment", "claimants",
@@ -583,6 +583,7 @@ fn check_status_shape(v: &Value) {
     }
     assert_keys(&v["session"], SESSION_KEYS, "session");
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
+    assert_keys(&v["governor"], &["scale", "active", "axis", "reason"], "governor");
     assert_keys(
         &v["motion_limits"],
         &["effective", "requested", "ceiling", "defaults", "operator_max", "game_fields", "limited", "reasons", "pending"],

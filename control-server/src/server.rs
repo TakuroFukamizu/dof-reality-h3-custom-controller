@@ -6,7 +6,9 @@
 //! Every `planner_period_ms` (interval with `MissedTickBehavior::Skip`):
 //! take new links → drain link events (routed by port) → drain admin commands
 //! → `Supervisor::tick` with the latest pose → deliver admin messages, then
-//! SET_POSITION → telemetry → publish the status snapshot.
+//! SET_POSITION. CONTROLLED_STOP is an ordinary admin frame: it is queued
+//! with the other admin messages and does not wait for a SET_POSITION.
+//! Then telemetry → publish the status snapshot.
 //!
 //! # Decisions not spelled out in DESIGN.md
 //!
@@ -165,7 +167,8 @@ impl Drop for RunningServer {
 }
 
 /// Validate, bind, start the backend, the control loop and the API.
-pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
+pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
+    cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
     cfg.validate()?;
     let addr = match opts.bind_override {
         Some(a) => a,
@@ -500,6 +503,12 @@ impl ControlLoop {
     }
 
     /// Deliver admin messages, then SET_POSITION, per axis (order matters for START).
+    ///
+    /// Each axis is independent: one link's send error is recorded for the
+    /// fault note, and the other axes are still attempted. CONTROLLED_STOP is
+    /// queued with the rest of the admin messages. It does not wait for a
+    /// SET_POSITION. The firmware decelerates a controlled stop at CONFIG
+    /// `max_acc`, so a governed frame left in force does not slow the stop.
     fn dispatch(&mut self, out: TickOutput, now: Instant) {
         let TickOutput { admin_msgs, set_position } = out;
         let mut failure: Option<String> = None;
@@ -524,13 +533,12 @@ impl ControlLoop {
                     }
                 }
             }
-            if failure.is_some() {
-                continue;
-            }
             if let Some(sp) = set_position.as_ref().and_then(|s| s.get(axis.index())) {
                 if let Err(e) = link.set_position(*sp) {
                     if self.send_error_is_fault(e) {
-                        failure.get_or_insert_with(|| format!("link_send_failed: {axis} set_position {e}"));
+                        failure.get_or_insert_with(|| {
+                            format!("link_send_failed: {axis} set_position {e}")
+                        });
                     }
                 }
             }

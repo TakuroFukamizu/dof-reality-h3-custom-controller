@@ -135,9 +135,10 @@ pub mod fw_absolute {
 }
 
 /// SET_LIMITS payload (`0x0D`, 16 bytes): position-loop tuning the PC
-/// distributes from its `[limits]`. Values above the firmware's absolute
-/// ceilings are clamped there (never rejected); the MCU answers with ACK and
-/// then one LIMITS.
+/// distributes from its `[limits]`, plus the operator's controlled-stop
+/// acceleration. `stop_acc_count_s2 == 0` means unset (the MCU falls back to
+/// CONFIG `max_acc`). Values above the firmware's absolute ceilings are
+/// clamped there (never rejected); the MCU answers with ACK and then one LIMITS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SetLimits {
     pub request_id: u32,
@@ -147,10 +148,13 @@ pub struct SetLimits {
     pub ff_count_s_per_percent: u16,
     pub deadband_count: u16,
     pub deadband_out_count: u16,
+    /// Controlled-stop deceleration [count/s²]. 0 = unset → CONFIG `max_acc`.
+    pub stop_acc_count_s2: u16,
 }
 
 /// LIMITS payload (`0x88`, 24 bytes): the tuning in effect after a
-/// SET_LIMITS plus the firmware's absolute ceilings.
+/// SET_LIMITS plus the firmware's absolute ceilings. Offset 14 echoes the
+/// stored `stop_acc_count_s2` (0 = unset; old firmware leaves it 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Limits {
     pub boot_id: u32,
@@ -161,6 +165,10 @@ pub struct Limits {
     pub ff_count_s_per_percent: u16,
     pub deadband_count: u16,
     pub deadband_out_count: u16,
+    /// Effective controlled-stop deceleration the MCU stored. 0 = unset
+    /// (old firmware, which ignores SET_LIMITS offset 14 and still stops
+    /// at CONFIG `max_acc`).
+    pub stop_acc_count_s2: u16,
     pub abs_max_vel_count_s: u32,
     pub abs_max_acc_count_s2: u32,
 }
@@ -684,13 +692,13 @@ impl HostMsg {
                 .u16(l.ff_count_s_per_percent)
                 .u16(l.deadband_count)
                 .u16(l.deadband_out_count)
-                .u16(0),
+                .u16(l.stop_acc_count_s2),
         };
         w.finish()
     }
 
     /// Decode from `msg_type` + payload (used by the MCU-side simulator).
-    /// Reserved fields are ignored.
+    /// The reserved byte at SET_LIMITS offset 7 is ignored.
     pub fn decode_payload(msg_type: u8, payload: &[u8]) -> Result<Self, DecodeError> {
         use self::msg_type as t;
         check_len(msg_type, payload, host_payload_len)?;
@@ -795,7 +803,7 @@ impl HostMsg {
                 let ff_count_s_per_percent = r.u16()?;
                 let deadband_count = r.u16()?;
                 let deadband_out_count = r.u16()?;
-                r.skip(2)?;
+                let stop_acc_count_s2 = r.u16()?;
                 HostMsg::SetLimits(SetLimits {
                     request_id,
                     duty_max_percent,
@@ -804,6 +812,7 @@ impl HostMsg {
                     ff_count_s_per_percent,
                     deadband_count,
                     deadband_out_count,
+                    stop_acc_count_s2,
                 })
             }
             other => return Err(DecodeError::UnknownType(other)),
@@ -910,7 +919,7 @@ impl McuMsg {
                 .u16(l.ff_count_s_per_percent)
                 .u16(l.deadband_count)
                 .u16(l.deadband_out_count)
-                .u16(0)
+                .u16(l.stop_acc_count_s2)
                 .u32(l.abs_max_vel_count_s)
                 .u32(l.abs_max_acc_count_s2),
         };
@@ -1038,7 +1047,7 @@ impl McuMsg {
                 let ff_count_s_per_percent = r.u16()?;
                 let deadband_count = r.u16()?;
                 let deadband_out_count = r.u16()?;
-                r.skip(2)?;
+                let stop_acc_count_s2 = r.u16()?;
                 McuMsg::Limits(Limits {
                     boot_id,
                     duty_max_percent,
@@ -1048,6 +1057,7 @@ impl McuMsg {
                     ff_count_s_per_percent,
                     deadband_count,
                     deadband_out_count,
+                    stop_acc_count_s2,
                     abs_max_vel_count_s: r.u32()?,
                     abs_max_acc_count_s2: r.u32()?,
                 })

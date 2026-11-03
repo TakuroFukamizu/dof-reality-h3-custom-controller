@@ -11,6 +11,7 @@
 //! - Axis 2/3 values must be measured on their own; do not copy axis 1.
 
 use crate::calibration::AxisCalibration;
+use crate::governor::GovernorConfig;
 use crate::types::{AxisId, DeviceId, AXIS_COUNT, VIRTUAL_MAX, VIRTUAL_MIN};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -44,6 +45,9 @@ pub struct Config {
     /// values distributed to the MCUs (design 2026-11-01 §2).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// 追従ガバナ。節が無いときは [`GovernorConfig::default`]。
+    #[serde(default)]
+    pub governor: GovernorConfig,
     pub backend: BackendConfig,
     /// The only axis whose MCU drives the shared main-power relay (G2).
     pub power_controller_axis: AxisId,
@@ -246,6 +250,11 @@ pub struct LimitsConfig {
     /// Must be ≥ 1.5 × `max_vel_count_s`; also caps runtime velocity
     /// requests at `overspeed / 1.5`.
     pub overspeed_count_s: u32,
+    /// Old firmware ACKs SET_LIMITS but reports `stop_acc` 0 (LIMITS offset
+    /// 14 was reserved) and still stops at CONFIG `max_acc`. When false, ARM
+    /// stays blocked until every axis echoes the requested non-zero
+    /// `stop_acc`. When true, a 0 echo is accepted.
+    pub allow_legacy_stop_acc: bool,
 }
 
 impl Default for LimitsConfig {
@@ -262,6 +271,7 @@ impl Default for LimitsConfig {
             deadband_out_count: 20,
             following_error_limit_count: 800,
             overspeed_count_s: 9000,
+            allow_legacy_stop_acc: false,
         }
     }
 }
@@ -386,7 +396,9 @@ impl Config {
     }
 
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(text)?;
+        let mut cfg: Config = toml::from_str(text)?;
+        // 節が無く工場しきい値のとき、limit が fe_hard 以下なら比率へ縮めてから検査する。
+        cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -672,6 +684,11 @@ impl Config {
                     crate::limits::OVERSPEED_MARGIN
                 ));
             }
+        }
+
+        // 追従ガバナ。FAULT のしきい値より手前で倍率を下げ切る。
+        for e in self.governor.validation_errors(self.limits.following_error_limit_count) {
+            errs.push(e);
         }
 
         // Backend.
