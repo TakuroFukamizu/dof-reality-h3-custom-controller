@@ -127,6 +127,12 @@ constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始
 // 「エンコーダが死んだ」と判定する。それ未満の無パルスは FOLLOWING_ERROR（と下の停止ブースト）に任せる。
 // duty_max < V1_STALL_DUTY の SET_LIMITS は受理するが検出が無効になる（画面に警告。docs/control-server/limits.md）。
 constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
+// v1 の無パルス判定の時間。2026-11-03 19:31 / 18:31 に、人が乗った状態で START 直後や動き出しで 200 ms では止まった（#1 / #3）。
+// 操作者の判断で検出を緩める（荷重がかかった機構の動き出しの時間は未測定。PR #64 の測定で見直す）。従来 env の STALL_MS（200）は変えない。
+constexpr uint32_t V1_STALL_MS = 600;
+// 静止 2 s の監視で FAULT にしない |誤差| の上限（2026-11-03 20:11、人の荷重で 14 count 手前から持ち上げられず ENCODER_FAULT）。
+// 既定は deadband_out と同じ 20。0 で従来どおり（どんな小さな誤差でも 2 s で FAULT）
+constexpr int32_t V1_STATIONARY_FAULT_MIN_ERR = 20;
 // permille 換算（Issue #25 手順 8 b）。位置ループは v1_duty_command から PWM まで permille（0.1 %）で運ぶ。SET_LIMITS / LIMITS の
 // 線上は整数 % のまま（V1Tuning の duty_min / duty_max / stall_duty も %）で、しきい値はここの定数と v1_permille() で換算する。
 constexpr int V1_PERMILLE_PER_PERCENT = PERMILLE_PER_PERCENT;
@@ -249,13 +255,47 @@ constexpr int32_t V1_BREAKAWAY_BAND_MIN_MOVE = 1;
 constexpr double V1_VEL_KD_PERMILLE_PER_COUNT_S = 0.05;  // Kd: 速度誤差 1 count/s あたり 0.05 permille（200 count/s で上限 10）
 constexpr int V1_VEL_D_MAX_PERMILLE = 10;                // |u_d| の上限 1 %
 constexpr uint32_t V1_V_FAST_WINDOW_MS = 40;             // 速い速度推定の窓
+// Issue #45: 再生バッファ（playout）で SET_POSITION の列から参照（位置・速度）を作る。既定 1、-DV1_PLAYOUT=0 で従来の
+// 「目標ごとに行って止まる」軌道（profile_step）に戻る（V1Tuning::playout_delay_ms = 0 と同じ）。
+// 従来の欠陥: 100 Hz の整数の目標を毎回の移動先として扱い、追いつくと速度を加速度制限を迂回して 0 にしていた → ゆっくり
+//（≲ 70 count/s）では FF（切片 4.6 % を |v| < 30 でテーパ）と r9 の減衰が 1 tick で約 50 permille 抜ける。
+// 新しい経路: 受信時刻つきでフレームをリングに積み、playout 時刻 = いま − DELAY で、その前後 WINDOW の最小二乗直線から
+// 位置・速度を出し、速度・加速度の制限（フレームの max_vel / max_acc。CONFIG で頭打ち）の中で参照を追従させる。
+// 新しいフレームが途切れたら EXTRAP_MS までは直線で外挿、それを越えたら max_acc で減速する（期限 valid_for の扱いは従来どおり）。
+#ifndef V1_PLAYOUT
+#define V1_PLAYOUT 1
+#endif
+#ifndef V1_PLAYOUT_DELAY_MS
+#define V1_PLAYOUT_DELAY_MS 40                            // 再生の遅れ（20 / 40 / 60 を実機で比べる。Issue #45）
+#endif
+constexpr uint32_t V1_PLAYOUT_WINDOW_MS = 80;             // 軌道の傾きを推定する窓（playout 時刻を中心に ±窓/2）
+constexpr uint32_t V1_PLAYOUT_EXTRAP_MS = 40;             // 最新フレームを越えて直線で外挿してよい時間。越えたら減速
+constexpr double V1_PLAYOUT_KP_PER_S = 15.0;              // 参照の位置の追従ゲイン [1/s]（推定位置 − 参照 → 速度の補正）。目標が動いている間
+constexpr double V1_PLAYOUT_KP_FLAT_PER_S = 40.0;         // 同、目標が止まっている（窓の目標がすべて同じ）とき
+// PR #49 レビュー P1a: フレームが途切れても参照が「受けた最新の目標」をこれ以上越えないよう、最新の目標 + これまでに止まれる速さに抑える
+constexpr int32_t V1_PLAYOUT_LOSS_MARGIN_COUNT = 5;
+// PR #49 レビュー P1b: 減速（再生バッファの制動・途切れ・STOPPING）に使う加速度の下限 [count/s²]。フレームの max_acc が 0・ごく小さくても止まる
+constexpr uint32_t V1_MIN_DECEL_COUNT_S2 = 500;
+constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっていて参照がここまで近く、1 tick で止まれるなら速度を 0 に
+// Issue #46: ソフトリミットに向かう参照速度の上限 v ≤ sqrt(2 × A_BRAKE × max(0, d − RESERVE))（d = 参照位置から進む向きの
+// ソフトリミットまでの距離）。参照は端の RESERVE 手前で止まる。保護（SOFT_LIMIT / FOLLOWING_ERROR）は変えない。
+// !!! A_BRAKE・RESERVE は仮値。実機が実際に止まれる減速度と、全速（600 count/s）から止めたときの行き過ぎを計測して決めること。
+constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = 1000.0;     // 端に向かうときの想定減速度 [count/s²]（CONFIG の max_acc より小さく）
+constexpr int32_t V1_SOFT_RESERVE_COUNT = 100;            // ソフトリミットの手前に残す距離 [count]
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
 constexpr uint32_t V1_TX_TIMEOUT_MS = 1;         // v1 の HWCDC tx timeout（従来 env は 20 ms）。空きを見てから書くので通常は待たない。WriteThrough のときの上限が 20 × これ
 constexpr size_t V1_TX_RING_BYTES = 1024;        // HWCDC の TX リング（既定 256 = STATUS 約 5 本）。Serial.begin() の前に setTxBufferSize で広げる
 constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこれを超えたら CONTROL_OVERRUN（周期 5 ms）
-constexpr uint32_t POWER_SETTLE_MS = 300;       // ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで
+// ARMING: 主電源 ON 指令からソフトリミット確認・位置制御開始まで。2026-11-02: 300 ms では 24 V が立ち上がる前に HOLDING になり、
+// HOLDING 直後の START（ジョイスティックの自動開始）で 2 軸とも Duty 20 % で 0.47 s 動かず ENCODER_FAULT（ARM から 1.5 s 後でも
+// 動かなかった）。校正は CAL_POWER_SETTLE_MS 5000 で待っている。暫定 2500（BRAKE_RELEASE_WAIT_MS と合わせて ARM 全体 5000 ms の内側）。
+// 本筋は VIOUT（G10）で電源の立ち上がりを見ること（未実装）。ホストテストは -DV1_ARM_POWER_SETTLE_MS=300 で従来の時刻のまま回す
+#ifndef V1_ARM_POWER_SETTLE_MS
+#define V1_ARM_POWER_SETTLE_MS 2500
+#endif
+constexpr uint32_t POWER_SETTLE_MS = V1_ARM_POWER_SETTLE_MS;
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）

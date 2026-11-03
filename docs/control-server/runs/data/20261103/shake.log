@@ -1,0 +1,91 @@
+18:21:10 [yaw-a6000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 6000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:21:16 [yaw-a6000-d20] yaw: actual p-p={1: 0, 2: 0, 3: 426} target p-p={1: 0, 2: 0, 3: 428} fe_max={1: 1, 2: 1, 3: 6} sat%={1: 0, 2: 0, 3: 0}
+18:21:19 [yaw-a6000-d20] pitch: actual p-p={1: 476, 2: 461, 3: 0} target p-p={1: 470, 2: 465, 3: 0} fe_max={1: 7, 2: 5, 3: 2} sat%={1: 0, 2: 0, 3: 0}
+18:21:22 [yaw-a6000-d20] roll: actual p-p={1: 436, 2: 430, 3: 0} target p-p={1: 438, 2: 432, 3: 0} fe_max={1: 5, 2: 4, 3: 2} sat%={1: 0, 2: 0, 3: 0}
+18:21:23 [yaw-a6000-d20] STOP True
+18:21:24 [yaw-a6000-d20] end BRAKED_DISARMED None
+18:21:33 [yaw-a20000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:21:40 [yaw-a20000-d20] yaw: actual p-p={1: 2, 2: 0, 3: 443} target p-p={1: 0, 2: 0, 3: 431} fe_max={1: 4, 2: 2, 3: 14} sat%={1: 0, 2: 0, 3: 0}
+18:21:43 [yaw-a20000-d20] pitch: actual p-p={1: 414, 2: 417, 3: 1} target p-p={1: 396, 2: 406, 3: 0} fe_max={1: 13, 2: 9, 3: 3} sat%={1: 0, 2: 0, 3: 0}
+18:21:46 [yaw-a20000-d20] roll: actual p-p={1: 430, 2: 409, 3: 0} target p-p={1: 417, 2: 399, 3: 0} fe_max={1: 8, 2: 10, 3: 3} sat%={1: 0, 2: 4, 3: 0}
+18:21:47 [yaw-a20000-d20] STOP True
+18:21:48 [yaw-a20000-d20] end BRAKED_DISARMED None
+18:21:52 [yaw-a40000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 40000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:21:58 [yaw-a40000-d20] yaw: actual p-p={1: 6, 2: 5, 3: 426} target p-p={1: 0, 2: 0, 3: 409} fe_max={1: 6, 2: 4, 3: 18} sat%={1: 0, 2: 0, 3: 2}
+18:22:01 [yaw-a40000-d20] pitch: actual p-p={1: 448, 2: 431, 3: 3} target p-p={1: 420, 2: 415, 3: 0} fe_max={1: 19, 2: 14, 3: 4} sat%={1: 14, 2: 0, 3: 0}
+18:22:04 [yaw-a40000-d20] roll: actual p-p={1: 426, 2: 430, 3: 4} target p-p={1: 408, 2: 418, 3: 0} fe_max={1: 18, 2: 14, 3: 4} sat%={1: 2, 2: 4, 3: 0}
+18:22:05 [yaw-a40000-d20] STOP True
+18:22:06 [yaw-a40000-d20] end BRAKED_DISARMED None
+18:22:20 [hit-a6000-d20-4hz] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 6000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:22:27 [hit-a6000-d20-4hz] yaw: actual p-p={1: 0, 2: 0, 3: 139} target p-p={1: 0, 2: 0, 3: 138} fe_max={1: 1, 2: 1, 3: 8} sat%={1: 0, 2: 0, 3: 0}
+18:22:29 [hit-a6000-d20-4hz] pitch: actual p-p={1: 186, 2: 159, 3: 0} target p-p={1: 187, 2: 152, 3: 0} fe_max={1: 7, 2: 6, 3: 2} sat%={1: 0, 2: 0, 3: 0}
+18:22:32 [hit-a6000-d20-4hz] roll: actual p-p={1: 128, 2: 118, 3: 0} target p-p={1: 123, 2: 122, 3: 0} fe_max={1: 9, 2: 7, 3: 2} sat%={1: 0, 2: 0, 3: 0}
+18:22:33 [hit-a6000-d20-4hz] STOP True
+18:22:34 [hit-a6000-d20-4hz] end BRAKED_DISARMED None
+18:22:37 [hit-a20000-d20-4hz] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:22:44 [hit-a20000-d20-4hz] yaw: actual p-p={1: 4, 2: 1, 3: 202} target p-p={1: 0, 2: 0, 3: 183} fe_max={1: 4, 2: 3, 3: 17} sat%={1: 0, 2: 0, 3: 0}
+18:22:46 [hit-a20000-d20-4hz] pitch: actual p-p={1: 193, 2: 186, 3: 0} target p-p={1: 173, 2: 165, 3: 0} fe_max={1: 15, 2: 14, 3: 2} sat%={1: 0, 2: 0, 3: 0}
+18:22:49 [hit-a20000-d20-4hz] roll: actual p-p={1: 125, 2: 129, 3: 1} target p-p={1: 118, 2: 114, 3: 0} fe_max={1: 11, 2: 15, 3: 3} sat%={1: 0, 2: 0, 3: 0}
+18:22:50 [hit-a20000-d20-4hz] STOP True
+18:22:51 [hit-a20000-d20-4hz] end BRAKED_DISARMED None
+18:22:54 [hit-a40000-d20-4hz] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 40000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:23:01 [hit-a40000-d20-4hz] yaw: actual p-p={1: 3, 2: 2, 3: 195} target p-p={1: 0, 2: 0, 3: 159} fe_max={1: 3, 2: 1, 3: 21} sat%={1: 0, 2: 0, 3: 19}
+18:23:03 [hit-a40000-d20-4hz] pitch: actual p-p={1: 203, 2: 203, 3: 0} target p-p={1: 174, 2: 166, 3: 0} fe_max={1: 19, 2: 23, 3: 1} sat%={1: 5, 2: 11, 3: 0}
+18:23:06 [hit-a40000-d20-4hz] roll: actual p-p={1: 211, 2: 155, 3: 5} target p-p={1: 176, 2: 119, 3: 0} fe_max={1: 18, 2: 20, 3: 6} sat%={1: 10, 2: 10, 3: 0}
+18:23:07 [hit-a40000-d20-4hz] STOP True
+18:23:08 [hit-a40000-d20-4hz] end BRAKED_DISARMED None
+18:23:37 [hit-a20000-d30-4hz] limits -> {"duty_max_percent": 30, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:23:43 [hit-a20000-d30-4hz] yaw: actual p-p={1: 3, 2: 0, 3: 154} target p-p={1: 0, 2: 0, 3: 135} fe_max={1: 2, 2: 1, 3: 17} sat%={1: 0, 2: 0, 3: 0}
+18:23:46 [hit-a20000-d30-4hz] pitch: actual p-p={1: 206, 2: 198, 3: 0} target p-p={1: 202, 2: 186, 3: 0} fe_max={1: 17, 2: 15, 3: 1} sat%={1: 0, 2: 0, 3: 0}
+18:23:49 [hit-a20000-d30-4hz] roll: actual p-p={1: 156, 2: 159, 3: 2} target p-p={1: 141, 2: 141, 3: 0} fe_max={1: 10, 2: 14, 3: 3} sat%={1: 0, 2: 0, 3: 0}
+18:23:49 [hit-a20000-d30-4hz] STOP True
+18:23:50 [hit-a20000-d30-4hz] end BRAKED_DISARMED None
+18:23:54 [hit-a40000-d30-4hz] limits -> {"duty_max_percent": 30, "max_acc_count_s2": 40000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+18:24:00 [hit-a40000-d30-4hz] yaw: actual p-p={1: 2, 2: 1, 3: 201} target p-p={1: 0, 2: 0, 3: 169} fe_max={1: 2, 2: 1, 3: 17} sat%={1: 0, 2: 0, 3: 0}
+18:24:03 [hit-a40000-d30-4hz] pitch: actual p-p={1: 148, 2: 200, 3: 4} target p-p={1: 122, 2: 174, 3: 0} fe_max={1: 19, 2: 16, 3: 4} sat%={1: 0, 2: 0, 3: 0}
+18:24:05 [hit-a40000-d30-4hz] roll: actual p-p={1: 171, 2: 171, 3: 3} target p-p={1: 143, 2: 143, 3: 0} fe_max={1: 24, 2: 18, 3: 4} sat%={1: 0, 2: 0, 3: 0}
+18:24:06 [hit-a40000-d30-4hz] STOP True
+18:24:07 [hit-a40000-d30-4hz] end BRAKED_DISARMED None
+17:45:17 [ends-a6000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 6000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+17:45:26 [ends-a6000-d20] yaw+0.85: actual min/max={1: (2775, 2775), 2: (2755, 2755), 3: (5305, 5475)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (5306, 5469)} fe_max={1: 3, 2: 2, 3: 9} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:45:34 [ends-a6000-d20] yaw-0.85: actual min/max={1: (2775, 2775), 2: (2755, 2756), 3: (775, 889)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (772, 887)} fe_max={1: 3, 2: 3, 3: 9} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:45:41 [ends-a6000-d20] pitch+0.85: actual min/max={1: (4736, 4920), 2: (4678, 4865), 3: (3100, 3100)} target min/max={1: (4735, 4916), 2: (4672, 4862), 3: (3103, 3103)} fe_max={1: 5, 2: 13, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:45:48 [ends-a6000-d20] pitch-0.85: actual min/max={1: (750, 841), 2: (692, 835), 3: (3100, 3100)} target min/max={1: (756, 842), 2: (695, 834), 3: (3103, 3103)} fe_max={1: 6, 2: 7, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:45:56 [ends-a6000-d20] roll+0.85: actual min/max={1: (4798, 4881), 2: (670, 818), 3: (3100, 3100)} target min/max={1: (4799, 4883), 2: (671, 819), 3: (3103, 3103)} fe_max={1: 6, 2: 6, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:03 [ends-a6000-d20] roll-0.85: actual min/max={1: (677, 854), 2: (4671, 4848), 3: (3100, 3100)} target min/max={1: (684, 854), 2: (4663, 4846), 3: (3103, 3103)} fe_max={1: 8, 2: 10, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:06 [ends-a6000-d20] STOP True
+17:46:07 [ends-a6000-d20] end BRAKED_DISARMED None
+17:46:11 [ends-a20000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+17:46:20 [ends-a20000-d20] yaw+0.85: actual min/max={1: (2775, 2777), 2: (2751, 2751), 3: (5367, 5533)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (5377, 5519)} fe_max={1: 3, 2: 2, 3: 16} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:27 [ends-a20000-d20] yaw-0.85: actual min/max={1: (2773, 2779), 2: (2751, 2752), 3: (725, 947)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (734, 934)} fe_max={1: 5, 2: 2, 3: 18} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:34 [ends-a20000-d20] pitch+0.85: actual min/max={1: (4754, 4936), 2: (4697, 4871), 3: (3100, 3100)} target min/max={1: (4765, 4925), 2: (4705, 4863), 3: (3103, 3103)} fe_max={1: 14, 2: 13, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:42 [ends-a20000-d20] pitch-0.85: actual min/max={1: (722, 864), 2: (715, 871), 3: (3100, 3100)} target min/max={1: (732, 860), 2: (729, 865), 3: (3103, 3103)} fe_max={1: 14, 2: 17, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:49 [ends-a20000-d20] roll+0.85: actual min/max={1: (4706, 4927), 2: (640, 873), 3: (3100, 3100)} target min/max={1: (4712, 4918), 2: (650, 870), 3: (3103, 3103)} fe_max={1: 13, 2: 16, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:56 [ends-a20000-d20] roll-0.85: actual min/max={1: (691, 879), 2: (4638, 4824), 3: (3100, 3100)} target min/max={1: (710, 875), 2: (4638, 4811), 3: (3103, 3103)} fe_max={1: 19, 2: 13, 3: 3} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:46:59 [ends-a20000-d20] STOP True
+17:47:00 [ends-a20000-d20] end BRAKED_DISARMED None
+17:47:15 [ends092-a20000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+17:47:24 [ends092-a20000-d20] yaw+0.92: actual min/max={1: (2774, 2778), 2: (2751, 2751), 3: (5539, 5689)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (5551, 5678)} fe_max={1: 4, 2: 2, 3: 16} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:47:31 [ends092-a20000-d20] yaw-0.92: actual min/max={1: (2773, 2778), 2: (2751, 2751), 3: (594, 755)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (601, 741)} fe_max={1: 5, 2: 2, 3: 15} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:47:39 [ends092-a20000-d20] pitch+0.92: actual min/max={1: (4904, 5052), 2: (4866, 5011), 3: (3102, 3102)} target min/max={1: (4917, 5042), 2: (4873, 5006), 3: (3103, 3103)} fe_max={1: 14, 2: 10, 3: 1} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:47:46 [ends092-a20000-d20] pitch-0.92: actual min/max={1: (537, 703), 2: (524, 713), 3: (3102, 3102)} target min/max={1: (550, 698), 2: (536, 702), 3: (3103, 3103)} fe_max={1: 14, 2: 14, 3: 1} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:47:53 [ends092-a20000-d20] roll+0.92: actual min/max={1: (4869, 5072), 2: (499, 675), 3: (3101, 3101)} target min/max={1: (4880, 5067), 2: (505, 668), 3: (3103, 3103)} fe_max={1: 12, 2: 17, 3: 2} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:48:01 [ends092-a20000-d20] roll-0.92: actual min/max={1: (563, 710), 2: (4801, 4962), 3: (3101, 3101)} target min/max={1: (579, 708), 2: (4802, 4949), 3: (3103, 3103)} fe_max={1: 16, 2: 13, 3: 2} sat%={1: 0, 2: 0, 3: 0} limits=['acceleration_limited', 'velocity_limited']
+17:48:03 [ends092-a20000-d20] STOP True
+17:48:05 [ends092-a20000-d20] end BRAKED_DISARMED None
+17:48:27 [steps-a20000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+17:48:41 [steps-a20000-d20] yaw steps ±1: actual min/max={1: (2773, 2778), 2: (2754, 2754), 3: (2844, 5808)} target min/max={1: (2778, 2778), 2: (2753, 2753), 3: (2840, 5804)} fe_max={1: 5, 2: 1, 3: 9} limits=['acceleration_limited', 'velocity_limited']
+17:48:51 [steps-a20000-d20] pitch steps ±1: actual min/max={1: (2129, 5157), 2: (2113, 5106), 3: (3101, 3101)} target min/max={1: (2142, 5156), 2: (2120, 5107), 3: (3103, 3103)} fe_max={1: 13, 2: 8, 3: 2} limits=['acceleration_limited', 'velocity_limited']
+17:49:01 [steps-a20000-d20] roll steps ±1: actual min/max={1: (2162, 5156), 2: (406, 3391), 3: (3101, 3101)} target min/max={1: (2172, 5156), 2: (405, 3384), 3: (3103, 3103)} fe_max={1: 10, 2: 11, 3: 2} limits=['acceleration_limited', 'velocity_limited']
+17:49:01 [steps-a20000-d20] STOP True
+17:49:02 [steps-a20000-d20] end BRAKED_DISARMED None
+17:49:15 [steps5s-a20000-d20] limits -> {"duty_max_percent": 20, "max_acc_count_s2": 20000, "max_gain": 1.0, "max_vel_count_s": 1200} reasons []
+17:49:35 [steps5s-a20000-d20] yaw steps ±1: actual min/max={1: (2774, 2777), 2: (2752, 2753), 3: (406, 5811)} target min/max={1: (2778, 2779), 2: (2753, 2753), 3: (405, 5806)} fe_max={1: 4, 2: 1, 3: 10} limits=['acceleration_limited', 'velocity_limited']
+17:49:50 [steps5s-a20000-d20] pitch steps ±1: actual min/max={1: (400, 5157), 2: (402, 5106), 3: (3104, 3105)} target min/max={1: (405, 5156), 2: (405, 5107), 3: (3103, 3103)} fe_max={1: 12, 2: 12, 3: 2} limits=['acceleration_limited', 'velocity_limited']
+17:50:05 [steps5s-a20000-d20] roll steps ±1: actual min/max={1: (400, 5156), 2: (406, 5106), 3: (3105, 3105)} target min/max={1: (405, 5156), 2: (405, 5107), 3: (3103, 3103)} fe_max={1: 10, 2: 8, 3: 2} limits=['acceleration_limited', 'velocity_limited']
+17:50:05 [steps5s-a20000-d20] STOP True
+17:50:06 [steps5s-a20000-d20] end BRAKED_DISARMED None
+18:25:24 [steps-a20000-d25] someone is driving - abort
+18:25:26 [ends092-a20000-d25] someone is driving - abort
+18:25:28 [steps-a20000-d30] someone is driving - abort
+18:25:31 [ends092-a20000-d30] someone is driving - abort

@@ -82,6 +82,9 @@ void boardBegin() {
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
+#if MC_PMIC_LOG
+  pmic_log_preboot();  // M5Unified / M5GFX が REG23（DCDC 低電圧で切る機能）を書き換える前の値を読む（Issue #68）
+#endif
   auto cfg = M5.config();
   cfg.clear_display = true;
 #if MC_USB_POWER
@@ -1042,7 +1045,7 @@ char notice[32];
 uint32_t notice_until_ms = 0;
 char boot_error[24] = "";         // pcnt / nvs / sprite / link の初期化失敗（USB には出さないので画面へ）
 
-enum class V1Action : uint8_t { Motor, Estop };
+enum class V1Action : uint8_t { Motor, Estop, ResetTick };
 
 struct V1Button {
   int x;
@@ -1053,7 +1056,7 @@ struct V1Button {
 };
 
 constexpr int kMargin = 6;
-V1Button v1_buttons[2];
+V1Button v1_buttons[3];
 
 void showNotice(const char* text) {
   snprintf(notice, sizeof(notice), "%s", text);
@@ -1064,6 +1067,7 @@ void showNotice(const char* text) {
 void layoutV1(int width, int height) {
   v1_buttons[0] = {kMargin, 2, 48, 24, V1Action::Motor};
   v1_buttons[1] = {kMargin, height - 42, width - kMargin * 2, 36, V1Action::Estop};  // 上に USB 診断行と制御項の行を置く
+  v1_buttons[2] = {kMargin, 166, width - kMargin * 2, 14, V1Action::ResetTick};       // tick 行（タップで計器を 0 に）
 }
 
 const V1Button* hitV1(int x, int y) {
@@ -1151,17 +1155,53 @@ void onV1Button(const V1Button& b) {
       control_v1_set_estop(!vsnap.estop_latched);
       showNotice(vsnap.estop_latched ? "非常停止を解除" : "非常停止");
       break;
+    case V1Action::ResetTick:
+      control_v1_reset_tick_stats();
+      showNotice("tick 計器を 0 に");
+      break;
   }
 }
 
+// 画面の非常停止は、押し続けたときだけ効かせる。2026-11-02 19:15 / 19:36 に、誰も触れていないのに #2 で
+// 非常停止が入り（タッチの誤検出とみられる）、1 回のタップで入れる・外すが切り替わる作りだったので、誤検出で外れる恐れもあった。
+// 入れるのは 300 ms、外すのは 1500 ms 押し続けたとき。途中で指が離れるかボタンの外へ出たら取り消す。
+// 本命の非常停止は物理ボタン（主電源の遮断）で、これは補助。
+constexpr uint32_t V1_ESTOP_LATCH_HOLD_MS = 300;
+constexpr uint32_t V1_ESTOP_RELEASE_HOLD_MS = 1500;
+bool estop_press_active = false;
+bool estop_press_done = false;
+uint32_t estop_press_start_ms = 0;
+
 void pollTouchV1() {
   const auto touch = M5.Touch.getDetail();
+  const uint32_t now = millis();
+  if (estop_press_active) {
+    const V1Button* held = touch.isPressed() ? hitV1(touch.x, touch.y) : nullptr;
+    if (held == nullptr || held->action != V1Action::Estop) {
+      estop_press_active = false;
+      return;
+    }
+    const uint32_t need = vsnap.estop_latched ? V1_ESTOP_RELEASE_HOLD_MS : V1_ESTOP_LATCH_HOLD_MS;
+    if (!estop_press_done && now - estop_press_start_ms >= need) {
+      estop_press_done = true;
+      onV1Button(*held);
+    }
+    return;
+  }
   if (!touch.wasPressed()) return;
   // 同じ押下で wasPressed が 2 回成立することがある（実機で確認）。250 ms 以内の再押下は無視する。
-  const uint32_t now = millis();
   if (now - last_press_ms < 250) return;
   last_press_ms = now;
-  if (const V1Button* b = hitV1(touch.x, touch.y)) onV1Button(*b);
+  const V1Button* b = hitV1(touch.x, touch.y);
+  if (b == nullptr) return;
+  if (b->action == V1Action::Estop) {
+    estop_press_active = true;
+    estop_press_done = false;
+    estop_press_start_ms = now;
+    showNotice(vsnap.estop_latched ? "1.5 秒押し続けて解除" : "押し続けて非常停止");
+    return;
+  }
+  onV1Button(*b);
 }
 
 void renderV1() {
@@ -1304,12 +1344,17 @@ void renderV1() {
   }
   canvas.drawString(cal_text, 8, 155);
 
-  // tick 行（周期の守りの確認用）
-  char tick_text[64];
-  snprintf(tick_text, sizeof(tick_text), "tick %lu  最大間隔 %lu us%s%s", static_cast<unsigned long>(vsnap.tick_count),
-           static_cast<unsigned long>(vsnap.max_tick_gap_us), boot_error[0] ? "  ERR " : "", boot_error);
+  // tick 行（周期の守りの確認用。PR #49 レビュー P2c）。6x8 の ASCII フォント。タップで計器を 0 に戻す（tick 数は残す）。
+  // gap = tick 間隔の最大、act = ACTIVE 中の間隔の最大、exe = 処理時間の最大 / 直近 1 s の最大 [us]
+  char tick_text[96];
+  snprintf(tick_text, sizeof(tick_text), "tick %lu gap %lu act %lu exe %lu/%lu us%s%s",
+           static_cast<unsigned long>(vsnap.tick_count), static_cast<unsigned long>(vsnap.max_tick_gap_us),
+           static_cast<unsigned long>(vsnap.active_max_tick_gap_us), static_cast<unsigned long>(vsnap.exec_max_us),
+           static_cast<unsigned long>(vsnap.exec_recent_us), boot_error[0] ? " ERR " : "", boot_error);
+  canvas.setFont(&fonts::Font0);
   canvas.setTextColor(boot_error[0] ? kRed : kGray, TFT_BLACK);
   canvas.drawString(tick_text, 8, 170);
+  canvas.setFont(&fonts::lgfxJapanGothic_16);
 
   // USB 診断行（Issue #11）。6x8 の ASCII フォント。意味は usb_diag_format() のコメント。
   canvas.setFont(&fonts::Font0);
