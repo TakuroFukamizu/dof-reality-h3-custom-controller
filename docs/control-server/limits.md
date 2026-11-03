@@ -54,7 +54,7 @@ PC は制限値を 3 段で持つ: `requested`（API が書いた値）→ `targ
 
 段 1・段 2 の上限はそのままで、追跡中だけ一時的に倍率を掛ける。負荷で 1 軸が目標の進行方向に遅れ（`following_error = actual − setpoint` の符号が目標速度と逆。行き過ぎは対象外）、かつ Duty が `duty_max` 付近に `sat_ms`（既定 60 ms）以上張り付いて `|FE| ≥ fe_start`（120）、または `|FE| ≥ fe_hard`（200）が約 60 ms 縮まないとき、全軸の `step_track` に渡す `max_vel` を同じ `s`、`max_acc` を `s²` にする。`s` は `1 − (|FE| − fe_start) / (following_error_limit_count − fe_start)` を `[s_min, 1]` に切った値の、遅れている軸の最小。`|FE|` が `following_error_limit_count` のとき `s` は `s_min`（0.25）になる（bring-up の保護は 400）。下げる速さは `down_rate`（4/s）、上げるのは全 active 軸が `|FE| < fe_release`（60）かつ非飽和を `release_ms`（300 ms）続けたあと `up_rate`（0.5/s）だけ。STATUS が `stale_ms`（100 ms）より古い軸があると上げない。
 
-ACTIVE（ゲーム）と CENTER の SET_POSITION が運ぶ `max_vel` / `max_acc` も同じ `s` / `s²` にする。ファームの位置補正はこのフレーム上限で動くので、ここが素のままだとガバナより速く追いつける。停止（`step_stop` と STOP の SET_POSITION）の減速度は全開のまま（センターの倍率も `s²` も掛けない）。ファームは ACTIVE のあいだだけその加速度を取り込み、STOPPING では直前の値で減速する。そのため各軸リンクは、CONTROLLED_STOP の直前に全開の SET_POSITION（今のプランナー位置と全開の速度・加速度）を書く。
+ACTIVE（ゲーム）と CENTER の SET_POSITION が運ぶ `max_vel` / `max_acc` も同じ `s` / `s²` にする。ファームの位置補正はこのフレーム上限で動くので、ここが素のままだとガバナより速く追いつける。停止（`step_stop`）のプランナー減速度は全開のまま（センターの倍率も `s²` も掛けない）。MCU の制御された STOPPING（CONTROLLED_STOP・期限切れ・DISARM）は、直前フレームの加速度ではなく CONFIG の `max_acc` で減速する。CONTROLLED_STOP の前に別の SET_POSITION は書かない。
 
 `s < 1` のあいだ、遅れている軸ごとに無進捗の窓を持つ。実位置が窓の開始から 20 count 以上動かない状態が `no_progress_ms`（既定 1500 ms、`[governor]`）続くと、サーバがいまの coordinated stop を出す（基準は残す。ファームの FAULT しきい値は変えない）。イベントは `governor_no_progress`、status の `limits` に `governor_no_progress`。原因軸が入れ替わっても、目標が実位置を横切っても、目標だけ着いて速度が 0 になっても、開いた窓は捨てない。20 count 動いた軸だけ、その窓を開き直す。
 
@@ -180,7 +180,8 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ## 6. 変更履歴
 
-- 2026-11-03: 追従ガバナ（§1.3）。1 軸が目標方向に遅れて Duty 飽和、または大きな追従誤差が縮まないとき、追跡の `max_vel` を全軸共通の `s`、`max_acc` を `s²` にする。ACTIVE / CENTER の SET_POSITION も同じ倍率。停止の減速度は全開で、CONTROLLED_STOP の直前にその全開フレームを各軸へ書く（ファームは ACTIVE 中だけ加速度を取り込む）。遅れている軸ごとに `no_progress_ms` の窓を持ち、実位置が 20 count 動かなければ coordinated stop（`governor_no_progress`。原因が入れ替わっても、目標だけ着いても窓はやり直さない）。status の `governor` と `limits` の `tracking_governed`。任意の `[governor]`（省略時は有効・既定値。limit が 200 以下ならしきい値を比率で縮める）。
+- 2026-11-03: 制御された STOPPING の減速度はファームが CONFIG の `max_acc` で決める（直前フレームの加速度は使わない。異常停止の COMMAND_TIMEOUT はフレームのまま）。サーバは CONTROLLED_STOP の前に全開の SET_POSITION を書かない。
+- 2026-11-03: 追従ガバナ（§1.3）。1 軸が目標方向に遅れて Duty 飽和、または大きな追従誤差が縮まないとき、追跡の `max_vel` を全軸共通の `s`、`max_acc` を `s²` にする。ACTIVE / CENTER の SET_POSITION も同じ倍率。停止のプランナー減速度は全開。MCU の制御された停止は CONFIG の `max_acc` で減速する。遅れている軸ごとに `no_progress_ms` の窓を持ち、実位置が 20 count 動かなければ coordinated stop（`governor_no_progress`。原因が入れ替わっても、目標だけ着いても窓はやり直さない）。status の `governor` と `limits` の `tracking_governed`。任意の `[governor]`（省略時は有効・既定値。limit が 200 以下ならしきい値を比率で縮める）。
 - 2026-11-02（Issue #15 追加分）: ゲーム経路の上限（§1）。WS `limits` で書いた項目は操作者の `[limits]` の値を超えない（`operator_limited`）。`POST /v1/limits` だけがファームの上限まで上げる。`GET/POST /v1/limits` と status の `motion_limits` に `operator_max` / `game_fields`。試験ページのスライダーの上限もそれに追従。
 - 2026-11-02（Issue #15 H2 / M3）: 停止時間の規則（§1.1。設定の検査と実行時 clamp の下限、`stop_time_limited`、`GET/POST /v1/limits` と status に `reasons`）、要求と適用の分離（§1.2。Duty 上限が変わる要求は全軸の SET_LIMITS ACK まで planner に効かない、status `motion_limits.pending`）。同じ PR で START の姿勢関門 `[game].start_max_offset_count`（M4、DESIGN.md §5）。
 - 2026-11-02（Issue #35 r9、ファーム。未焼き込み・実機未検証）: 方向別の経路に速度誤差の減衰項（`V1_VEL_DAMPING`、既定 1）。`u_d = clamp(0.05 × (軌道速度 − v_fast), ±10)` permille、v_fast は 40 ms 窓の速度推定。SET_LIMITS の項目と意味は変えない（Kd・上限・窓は `config.h` の定数で、変えるにはファームを焼き直す）。r8 と同じく kp 30 前提。protocol.md §5 の r9。

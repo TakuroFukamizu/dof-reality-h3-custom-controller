@@ -2320,39 +2320,39 @@ fn config_velocity_and_acceleration_are_clamped_to_the_absolute_ceilings() {
 }
 
 #[test]
-fn stopping_decelerates_with_the_last_frames_acceleration() {
-    // The same stop from the same speed: a frame max_acc of 2000 takes far
-    // longer to settle than the CONFIG ceiling would (design §4.4).
-    fn stop_time_ms(frame_acc: u32) -> u64 {
+fn controlled_stop_decelerates_at_config_max_acc() {
+    // CONFIG max_acc is 20000. A frame of 1250 and a frame equal to CONFIG
+    // both stop at that rate. The 1250 case would take ~1 s if the frame won.
+    fn stop_time_ms(frame_acc: u32, drive_ticks: u32) -> u64 {
         let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
         h.reach_active();
-        // Accelerate toward a far target with the frame's limits (1.2 s: the
-        // slow case reaches its 2000 count/s plateau, 600 counts of travel).
-        for _ in 0..120 {
-            let mut m = h.set_position_msg(2600);
+        for _ in 0..drive_ticks {
+            let mut m = h.set_position_msg(2700);
             m.max_vel_count_s = 2000;
             m.max_acc_count_s2 = frame_acc;
             h.send(HostMsg::SetPosition(m));
             h.idle(10);
         }
-        assert_eq!(h.state(), McuState::Active);
+        assert_eq!(h.state(), McuState::Active, "frame_acc {frame_acc}");
         accepted(h.stop());
-        // SET_POSITION keeps flowing during the stop (lease), as the PC does.
         let mut ms = 0;
         while h.state() == McuState::Stopping && ms < 3000 {
-            let mut m = h.set_position_msg(2600);
+            let mut m = h.set_position_msg(2700);
             m.max_vel_count_s = 2000;
             m.max_acc_count_s2 = frame_acc;
             h.send(HostMsg::SetPosition(m));
             h.idle(10);
             ms += 10;
         }
-        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc}");
+        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc} after {ms} ms");
         ms
     }
-    let slow = stop_time_ms(2000);
-    let fast = stop_time_ms(40000);
-    // 2000 count/s at 2000 count/s² ≈ 1 s; at 40000 count/s² = 50 ms (one 10 ms poll ≥ 10 ms).
-    assert!((800..=1300).contains(&slow), "slow {slow} ms");
-    assert!(fast <= 200, "fast {fast} ms");
+    // 1.0 s at 1250 count/s² → 1250 count/s. CONFIG 20000 stops that in 62.5 ms
+    // (the 10 ms poll reports 70). The frame's own rate would take 1 s.
+    let reduced = stop_time_ms(1250, 100);
+    assert!((50..=100).contains(&reduced), "frame 1250 stopped in {reduced} ms");
+    // Frame == CONFIG. 0.4 s reaches the 2000 count/s cap and is still short of
+    // the target. 2000 / 20000 = 100 ms, the same rate as before this rule.
+    let same = stop_time_ms(20000, 40);
+    assert!((80..=130).contains(&same), "frame == CONFIG stopped in {same} ms");
 }

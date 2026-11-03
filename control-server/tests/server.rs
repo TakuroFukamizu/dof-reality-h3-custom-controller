@@ -938,11 +938,11 @@ async fn admin_routes_need_no_token_by_default() {
     srv.shutdown().await;
 }
 
-/// After the governor has scaled the live frames, a game STOP must put a
-/// full-limit SET_POSITION on each axis wire before CONTROLLED_STOP. The sim
-/// latches acceleration only in ACTIVE, the same way the firmware does.
+/// CONTROLLED_STOP is enqueued on its own. A governed SET_POSITION may still
+/// be the frame already on the wire, but the stop does not wait for a
+/// full-limit SET_POSITION to be written first.
 #[tokio::test]
-async fn governed_stop_writes_full_limits_before_controlled_stop_on_each_axis() {
+async fn controlled_stop_is_enqueued_without_waiting_for_set_position() {
     let mut cfg = fast_cfg();
     cfg.governor.no_progress_ms = 10_000;
     // 軸 2 を仮想端（約 400 count）まで振る。既定の POSE は数十 count しか
@@ -1012,17 +1012,23 @@ async fn governed_stop_writes_full_limits_before_controlled_stop_on_each_axis() 
         assert!(stop_at > 0, "axis {axis}: {rx:?}");
         let prev = rx[stop_at - 1];
         assert_eq!(prev.msg_type, msg_type::SET_POSITION, "axis {axis}: {rx:?}");
-        assert_eq!(prev.max_vel_count_s, full_vel, "axis {axis} vel");
-        assert_eq!(prev.max_acc_count_s2, full_acc, "axis {axis} acc");
+        // The stop went out against the governed frame already in force.
+        // Nothing rewrote that frame up to the full limits first.
+        assert!(
+            prev.max_acc_count_s2 + 1 < full_acc,
+            "axis {axis} waited for a full-limit SET_POSITION ({prev:?}, full acc {full_acc})"
+        );
         assert!(
             rx[..stop_at].iter().any(|n| {
                 n.msg_type == msg_type::SET_POSITION && n.max_acc_count_s2 + 1 < full_acc
             }),
             "axis {axis} had no governed frame before the stop"
         );
-        let (vel, acc) = handle.frame_limits();
-        assert!((vel - f64::from(full_vel)).abs() < 1.0, "axis {axis} latched vel {vel}");
-        assert!((acc - f64::from(full_acc)).abs() < 1.0, "axis {axis} latched acc {acc}");
+        let (_vel, acc) = handle.frame_limits();
+        assert!(
+            acc + 1.0 < f64::from(full_acc),
+            "axis {axis} latched the full acc {acc} while still ACTIVE"
+        );
     }
     let _ = streamer.stop().await;
     srv.shutdown().await;

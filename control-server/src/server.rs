@@ -6,9 +6,9 @@
 //! Every `planner_period_ms` (interval with `MissedTickBehavior::Skip`):
 //! take new links → drain link events (routed by port) → drain admin commands
 //! → `Supervisor::tick` with the latest pose → deliver admin messages, then
-//! SET_POSITION. CONTROLLED_STOP is queued only after that frame is published,
-//! so each link writes the full-limit SET_POSITION while the MCU is still
-//! ACTIVE. Then telemetry → publish the status snapshot.
+//! SET_POSITION. CONTROLLED_STOP is an ordinary admin frame: it is queued
+//! with the other admin messages and does not wait for a SET_POSITION.
+//! Then telemetry → publish the status snapshot.
 //!
 //! # Decisions not spelled out in DESIGN.md
 //!
@@ -504,10 +504,11 @@ impl ControlLoop {
 
     /// Deliver admin messages, then SET_POSITION, per axis (order matters for START).
     ///
-    /// CONTROLLED_STOP is queued only after this tick's SET_POSITION is published.
-    /// The link then writes that frame before the stop. The firmware copies
-    /// `max_acc` only in ACTIVE and decelerates in STOPPING at whatever it
-    /// last latched, so a governed frame must not be the one still in force.
+    /// Each axis is independent: one link's send error is recorded for the
+    /// fault note, and the other axes are still attempted. CONTROLLED_STOP is
+    /// queued with the rest of the admin messages. It does not wait for a
+    /// SET_POSITION. The firmware decelerates a controlled stop at CONFIG
+    /// `max_acc`, so a governed frame left in force does not slow the stop.
     fn dispatch(&mut self, out: TickOutput, now: Instant) {
         let TickOutput { admin_msgs, set_position } = out;
         let mut failure: Option<String> = None;
@@ -522,16 +523,7 @@ impl ControlLoop {
                 }
                 continue;
             };
-            let mut early = Vec::new();
-            let mut stops = Vec::new();
             for msg in msgs {
-                if matches!(msg, HostMsg::ControlledStop { .. }) {
-                    stops.push(msg);
-                } else {
-                    early.push(msg);
-                }
-            }
-            for msg in early {
                 let host_fault = matches!(msg, HostMsg::HostFault { .. });
                 if let Err(e) = link.send_admin(msg) {
                     if !host_fault && self.send_error_is_fault(e) {
@@ -541,23 +533,12 @@ impl ControlLoop {
                     }
                 }
             }
-            if failure.is_none() {
-                if let Some(sp) = set_position.as_ref().and_then(|s| s.get(axis.index())) {
-                    if let Err(e) = link.set_position(*sp) {
-                        if self.send_error_is_fault(e) {
-                            failure.get_or_insert_with(|| {
-                                format!("link_send_failed: {axis} set_position {e}")
-                            });
-                        }
-                    }
-                }
-            }
-            for msg in stops {
-                if let Err(e) = link.send_admin(msg) {
+            if let Some(sp) = set_position.as_ref().and_then(|s| s.get(axis.index())) {
+                if let Err(e) = link.set_position(*sp) {
                     if self.send_error_is_fault(e) {
-                        failure.get_or_insert_with(|| format!("link_send_failed: {axis} admin {e}"));
-                    } else {
-                        tracing::debug!(%axis, "admin send failed: {e}");
+                        failure.get_or_insert_with(|| {
+                            format!("link_send_failed: {axis} set_position {e}")
+                        });
                     }
                 }
             }
