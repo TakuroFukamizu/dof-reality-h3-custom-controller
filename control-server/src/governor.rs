@@ -320,6 +320,8 @@ pub struct TrackingGovernor {
     clear_since: Option<Instant>,
     /// `s < 1` のあいだ残す、最後に効いた軸と理由。
     cause: Option<(AxisId, GovernReason)>,
+    /// この tick で遅れと判定した軸。最悪の 1 軸だけではなく全部。
+    lagging: [bool; AXIS_COUNT],
     mem: [AxisMem; AXIS_COUNT],
 }
 
@@ -334,12 +336,19 @@ impl TrackingGovernor {
             last_now: None,
             clear_since: None,
             cause: None,
+            lagging: [false; AXIS_COUNT],
             mem: Default::default(),
         }
     }
 
     pub fn config(&self) -> &GovernorConfig {
         &self.cfg
+    }
+
+    /// この tick で「目標方向に遅れ、かつ飽和または硬い誤差」だった軸。
+    /// status の `axis` は最悪の 1 本だけだが、無進捗の窓は全部を見る。
+    pub fn lagging_axes(&self) -> [bool; AXIS_COUNT] {
+        self.lagging
     }
 
     pub fn status(&self) -> GovernorStatus {
@@ -383,6 +392,7 @@ impl TrackingGovernor {
         let mut worst: Option<(usize, f64, GovernReason)> = None;
 
         for i in 0..AXIS_COUNT {
+            self.lagging[i] = false;
             let sample = &axes[i];
             if !sample.active {
                 self.mem[i] = AxisMem::default();
@@ -411,6 +421,7 @@ impl TrackingGovernor {
             let sat_lag = sat_long && abs_fe >= self.cfg.fe_start;
             let hard_lag = abs_fe >= self.cfg.fe_hard && not_falling;
             if behind && (sat_lag || hard_lag) {
+                self.lagging[i] = true;
                 let reason = if hard_lag {
                     GovernReason::FollowingError
                 } else {
@@ -487,6 +498,7 @@ impl TrackingGovernor {
         self.last_now = None;
         self.clear_since = None;
         self.cause = None;
+        self.lagging = [false; AXIS_COUNT];
         self.mem = Default::default();
     }
 

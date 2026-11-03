@@ -657,6 +657,75 @@ async fn admin_messages_are_written_before_set_position() {
     );
 }
 
+/// Both frames are pending together. Admin is normally preferred, but a
+/// CONTROLLED_STOP must not pass the newest SET_POSITION: the firmware
+/// latches acceleration only while ACTIVE.
+#[tokio::test(start_paused = true)]
+async fn controlled_stop_is_preceded_by_the_pending_full_limit_set_position() {
+    let (tx, mut rx) = events();
+    let (peer, link) = peer_link(
+        PeerOpts {
+            hello: Some(hello(dev(1), 5)),
+            ..PeerOpts::default()
+        },
+        "p",
+        tx,
+    );
+    wait_identified(&mut rx, "p").await;
+
+    let mut governed = setpos(7, 1);
+    governed.max_vel_count_s = 300;
+    governed.max_acc_count_s2 = 1250;
+    governed.target_count = 10;
+    link.set_position(governed).unwrap();
+    sleep(Duration::from_millis(30)).await;
+
+    // No yield between the two sends: the writer wakes with both pending.
+    let mut full = setpos(7, 2);
+    full.max_vel_count_s = 1200;
+    full.max_acc_count_s2 = 20000;
+    full.target_count = 42;
+    link.set_position(full).unwrap();
+    link.send_admin(HostMsg::ControlledStop {
+        request_id: 9,
+        session_epoch: 7,
+        reason: 1,
+    })
+    .unwrap();
+    sleep(Duration::from_millis(30)).await;
+
+    let msgs: Vec<HostMsg> = peer
+        .log()
+        .into_iter()
+        .filter(|m| !matches!(m, HostMsg::HelloReq { .. }))
+        .collect();
+    let stop_at = msgs
+        .iter()
+        .position(|m| matches!(m, HostMsg::ControlledStop { .. }))
+        .expect("stop on the wire");
+    assert!(stop_at > 0, "{msgs:?}");
+    match &msgs[stop_at - 1] {
+        HostMsg::SetPosition(sp) => {
+            assert_eq!(sp.seq, 2);
+            assert_eq!(sp.target_count, 42);
+            assert_eq!(sp.max_vel_count_s, 1200);
+            assert_eq!(sp.max_acc_count_s2, 20000);
+        }
+        other => panic!("frame before stop: {other:?}"),
+    }
+    assert!(
+        msgs[..stop_at - 1].iter().any(|m| matches!(
+            m,
+            HostMsg::SetPosition(sp) if sp.max_acc_count_s2 == 1250 && sp.max_vel_count_s == 300
+        )),
+        "governed frame missing: {msgs:?}"
+    );
+    assert!(msgs[stop_at + 1..].iter().all(|m| !matches!(
+        m,
+        HostMsg::SetPosition(sp) if sp.max_acc_count_s2 == 1250
+    )));
+}
+
 #[tokio::test(start_paused = true)]
 async fn set_position_on_admin_queue_is_refused() {
     let (tx, mut rx) = events();

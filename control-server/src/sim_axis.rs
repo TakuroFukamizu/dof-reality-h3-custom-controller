@@ -374,6 +374,8 @@ pub struct SimMcu {
 
     /// Recently ACCEPTED commands for resend detection (oldest first).
     recent_accepted: VecDeque<(u32, HostMsg)>,
+    /// Recently decoded host frames (oldest first), including ones later dropped.
+    host_rx: VecDeque<HostRx>,
 
     // Fault injection.
     stall: bool,
@@ -428,6 +430,7 @@ impl SimMcu {
             frame_max_vel: 0.0,
             frame_max_acc: 0.0,
             recent_accepted: VecDeque::with_capacity(DEDUPE_DEPTH),
+            host_rx: VecDeque::with_capacity(HOST_RX_KEEP),
             stall: false,
             drop_rx: false,
             freeze_tx: false,
@@ -723,7 +726,23 @@ impl SimMcu {
     // Message dispatch: one handler per message type (protocol.md §4)
     // ------------------------------------------------------------------
 
+    fn note_host_rx(&mut self, msg: &HostMsg) {
+        let (max_vel_count_s, max_acc_count_s2) = match msg {
+            HostMsg::SetPosition(sp) => (sp.max_vel_count_s, sp.max_acc_count_s2),
+            _ => (0, 0),
+        };
+        if self.host_rx.len() == HOST_RX_KEEP {
+            self.host_rx.pop_front();
+        }
+        self.host_rx.push_back(HostRx {
+            msg_type: msg.msg_type(),
+            max_vel_count_s,
+            max_acc_count_s2,
+        });
+    }
+
     fn dispatch(&mut self, msg: &HostMsg, now: u64) {
+        self.note_host_rx(msg);
         match *msg {
             HostMsg::HelloReq { request_id } => self.on_hello_req(request_id),
             HostMsg::ClockSync {
@@ -1690,6 +1709,17 @@ const RUNNER_TICK: Duration = Duration::from_millis(1);
 const TX_QUEUE_FRAMES: usize = 256;
 /// Duplex buffer used by [`sim_pair`].
 const DUPLEX_BUF: usize = 64 * 1024;
+/// Host frames kept per axis so a test can see what arrived just before a stop.
+const HOST_RX_KEEP: usize = 128;
+
+/// One host frame the simulator decoded, in arrival order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostRx {
+    pub msg_type: u8,
+    /// SET_POSITION limits. Zero for every other message.
+    pub max_vel_count_s: u32,
+    pub max_acc_count_s2: u32,
+}
 
 #[derive(Debug)]
 struct Shared {
@@ -1767,6 +1797,15 @@ impl SimHandle {
     }
     pub fn set_stall(&self, stall: bool) {
         self.shared.lock().set_stall(stall);
+    }
+    /// Frame limits latched while ACTIVE. STOPPING does not update them.
+    pub fn frame_limits(&self) -> (f64, f64) {
+        let m = self.shared.lock();
+        (m.frame_max_vel, m.frame_max_acc)
+    }
+    /// Host frames decoded on this axis, oldest first. Capped.
+    pub fn host_rx(&self) -> Vec<HostRx> {
+        self.shared.lock().host_rx.iter().copied().collect()
     }
     pub fn nudge_actual(&self, delta: Counts) {
         self.shared.lock().nudge_actual(delta);

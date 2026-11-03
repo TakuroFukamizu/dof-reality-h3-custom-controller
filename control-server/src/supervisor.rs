@@ -618,10 +618,9 @@ struct AxisTrack {
     mcu_target_sign: i8,
 }
 
-/// ACTIVE でガバナが軸 k を原因に `s < 1` のあいだ、その軸の実位置が進んだか。
-#[derive(Debug, Clone)]
+/// 遅れている軸それぞれの無進捗窓。基準は窓を開いたときの実位置。
+#[derive(Debug, Clone, Copy)]
 struct NoProgressWatch {
-    axis: usize,
     since: Instant,
     actual0: i32,
 }
@@ -760,8 +759,8 @@ pub struct Supervisor {
     planner: Planner,
     /// 追跡中の目標が実機に対して逃げないよう、全軸共通の倍率を出す。
     governor: TrackingGovernor,
-    /// ガバナが原因軸を下げているあいだの無進捗ウォッチ。
-    no_progress: Option<NoProgressWatch>,
+    /// 遅れている軸ごとの無進捗窓。原因軸が替わっても捨てない。
+    no_progress: [Option<NoProgressWatch>; AXIS_COUNT],
     /// 無進捗で coordinated stop した。次に Active へ入るまで status の limits に残す。
     governor_no_progress: bool,
     planner_settled: bool,
@@ -860,7 +859,7 @@ impl Supervisor {
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             governor: TrackingGovernor::new(cfg.governor.clone(), cfg.limits.following_error_limit_count),
-            no_progress: None,
+            no_progress: [None; AXIS_COUNT],
             governor_no_progress: false,
             planner_settled: false,
             center_commanded_at: None,
@@ -2750,7 +2749,7 @@ impl Supervisor {
                 if all_ok && all_in(McuState::Active) {
                     self.group = None;
                     self.governor_no_progress = false;
-                    self.no_progress = None;
+                    self.no_progress = [None; AXIS_COUNT];
                     self.phase = Phase::Active {
                         source,
                         entered: now,
@@ -3302,63 +3301,62 @@ impl Supervisor {
         })
     }
 
-    /// ACTIVE かつ `s < 1` の原因軸について、実位置が目標へ `NO_PROGRESS_COUNTS`
-    /// 以上進まない状態が `no_progress_ms` 続いたら coordinated stop。
-    /// 進みは実位置の変位（目標が実位置へ寄っても進んだことにしない）。
+    /// ACTIVE かつ `s < 1` のあいだ、遅れている軸ごとに窓を持つ。
+    /// 実位置が窓の開始から `NO_PROGRESS_COUNTS` 以上動いたらその軸だけやり直す。
+    /// 原因軸が入れ替わっても、目標が実位置を横切っても、速度が 0 になって
+    /// この tick の遅れフラグが落ちても、開いた窓は捨てない。
+    /// `s` が 1 に戻るまで動きが無ければ coordinated stop（センターで目標だけ着いた場合）。
     fn check_governor_no_progress(&mut self, now: Instant) {
-        if !matches!(self.phase, Phase::Active { .. }) {
-            self.no_progress = None;
+        if !matches!(self.phase, Phase::Active { .. }) || !self.governor.status().active {
+            self.no_progress = [None; AXIS_COUNT];
             return;
         }
-        let st = self.governor.status();
-        let Some(id) = st.axis.filter(|_| st.active) else {
-            self.no_progress = None;
-            return;
-        };
-        let i = id.index();
-        if !self.axes[i].connected {
-            self.no_progress = None;
-            return;
-        }
-        let Some(actual) = self.axes[i].status.map(|s| s.actual_count) else {
-            self.no_progress = None;
-            return;
-        };
         if !self.planner.is_initialized() {
-            self.no_progress = None;
+            self.no_progress = [None; AXIS_COUNT];
             return;
         }
-        let target = self.planner.command_counts()[i];
-        let toward = i64::from(target) - i64::from(actual);
-        let dir: i8 = if toward > 0 {
-            1
-        } else if toward < 0 {
-            -1
-        } else {
-            0
+        let lagging = self.governor.lagging_axes();
+        let window = Duration::from_millis(self.governor.config().no_progress_ms);
+        let mut fired: Option<(usize, i32, i32, u64)> = None;
+        for i in 0..AXIS_COUNT {
+            if !self.axes[i].connected {
+                self.no_progress[i] = None;
+                continue;
+            }
+            let Some(actual) = self.axes[i].status.map(|s| s.actual_count) else {
+                self.no_progress[i] = None;
+                continue;
+            };
+            // まだ遅れでない軸の窓は開かない。開いたあとは s<1 のあいだ残す。
+            if self.no_progress[i].is_none() && !lagging[i] {
+                continue;
+            }
+            match self.no_progress[i] {
+                None => {
+                    self.no_progress[i] = Some(NoProgressWatch { since: now, actual0: actual });
+                }
+                Some(w) => {
+                    let moved = (i64::from(actual) - i64::from(w.actual0)).unsigned_abs();
+                    if moved >= NO_PROGRESS_COUNTS as u64 {
+                        self.no_progress[i] = if lagging[i] {
+                            Some(NoProgressWatch { since: now, actual0: actual })
+                        } else {
+                            None
+                        };
+                    } else if now.saturating_duration_since(w.since) >= window {
+                        let target = self.planner.command_counts()[i];
+                        fired = Some((i, actual, target, moved));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((i, actual, target, progress)) = fired else {
+            return;
         };
-        // 目標に着いている。窓を捨てて、止まらない。
-        if dir == 0 {
-            self.no_progress = None;
+        let Some(id) = AxisId::from_index(i) else {
             return;
-        }
-        let same = self.no_progress.as_ref().is_some_and(|w| w.axis == i);
-        if !same {
-            self.no_progress = Some(NoProgressWatch { axis: i, since: now, actual0: actual });
-            return;
-        }
-        let (since, actual0) = {
-            let w = self.no_progress.as_ref().unwrap();
-            (w.since, w.actual0)
         };
-        let progress = (i64::from(actual) - i64::from(actual0)) * i64::from(dir);
-        if progress >= NO_PROGRESS_COUNTS {
-            self.no_progress = Some(NoProgressWatch { axis: i, since: now, actual0: actual });
-            return;
-        }
-        if now.saturating_duration_since(since) < Duration::from_millis(self.governor.config().no_progress_ms) {
-            return;
-        }
         self.event(
             now,
             "governor_no_progress",
@@ -3370,7 +3368,7 @@ impl Supervisor {
             }),
         );
         self.governor_no_progress = true;
-        self.no_progress = None;
+        self.no_progress = [None; AXIS_COUNT];
         self.begin_stop(stop_reason::GOVERNOR_NO_PROGRESS, now);
     }
 
@@ -3855,9 +3853,17 @@ mod governor_wire {
     }
 
     fn push_measured(sup: &mut Supervisor, t: Instant, lag: usize, fe: i32, actual: [i32; 3]) {
+        let mut fes = [0; 3];
+        let mut pwms = [0; 3];
+        fes[lag] = fe;
+        pwms[lag] = 400;
+        push_fe(sup, t, fes, pwms, actual);
+    }
+
+    fn push_fe(sup: &mut Supervisor, t: Instant, fe: [i32; 3], pwm: [i16; 3], actual: [i32; 3]) {
         for i in 0..3 {
             sup.axes[i].connected = true;
-            sup.axes[i].status = Some(referenced_status(if i == lag { fe } else { 0 }, if i == lag { 400 } else { 0 }, actual[i]));
+            sup.axes[i].status = Some(referenced_status(fe[i], pwm[i], actual[i]));
             sup.axes[i].status_at = Some(t);
         }
     }
@@ -4131,5 +4137,119 @@ mod governor_wire {
         assert!(sup.planner.velocities()[1] > 1.0, "planner still lifting");
         assert_eq!(sup.axes[1].mcu_target_sign, -1);
         assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
+    }
+
+    /// 最悪の FE が凍った 2 軸のあいだで入れ替わっても、先に開いた窓は生きる。
+    #[test]
+    fn alternating_culprits_between_two_frozen_axes_stop_within_bound() {
+        let (mut sup, mut t) = sim_governed(200);
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        let actual = [-400, -400, -400];
+        let mut governed_at = None;
+        let mut saw = [false; 3];
+        let mut stopped = false;
+        for step in 0..80 {
+            // 大きい |FE| が軸 2 と軸 3 を毎 tick 入れ替わる。どちらも飽和して遅れ。
+            let (fe1, fe2) = if step % 2 == 0 { (-400, -180) } else { (-180, -400) };
+            push_fe(&mut sup, t, [0, fe1, fe2], [0, 400, 400], actual);
+            sup.tick(t, 0.01, None);
+            if sup.governor.status().scale < 1.0 {
+                governed_at.get_or_insert(t);
+                if let Some(id) = sup.governor.status().axis {
+                    saw[id.index()] = true;
+                }
+            }
+            if sup.state() == RigState::Stopping {
+                let waited = t.saturating_duration_since(governed_at.expect("governed"));
+                assert!(waited >= Duration::from_millis(200), "{waited:?}");
+                assert!(waited <= Duration::from_millis(220), "{waited:?}");
+                stopped = true;
+                break;
+            }
+            assert!(sup.fault.is_none(), "{:?}", sup.fault);
+            t += Duration::from_millis(10);
+        }
+        assert!(stopped, "scale {}", sup.governor.status().scale);
+        assert!(saw[1] && saw[2], "both culprits should lead: {saw:?}");
+        assert_eq!(sup.axes[1].status.unwrap().actual_count, -400);
+        assert_eq!(sup.axes[2].status.unwrap().actual_count, -400);
+        let (events, _) = sup.drain_events();
+        assert!(events.iter().any(|e| e.kind == "governor_no_progress"));
+    }
+
+    /// 目標が凍った実位置をちょうど横切っても、窓をやり直さない。
+    #[test]
+    fn command_crossing_a_frozen_axis_still_stops() {
+        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        cfg.governor.no_progress_ms = 400;
+        // 1 tick あたり 1 count 以下にして、整数の目標が実位置 0 を踏み外さない。
+        cfg.limits.max_vel_count_s = 100;
+        let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
+        let mut t = Instant::now();
+        sup.drive_session = Some(1);
+        sup.phase = Phase::Active { source: ActiveSource::Game, entered: t };
+        // 軸 2 の目標は +側（仮想 512 より上）。軸 1・3 は最初からその目標に置き、
+        // 共有の速度スケールを食わない。max_vel 100 なので軸 2 は 1 tick に
+        // 1 count 以下で、凍った実位置 0 を踏み外さない。
+        let pose = crate::types::Pose { pitch: -0.2, roll: 0.0, yaw: 0.0 };
+        let checked = crate::compat::check_pose(pose, 0.5, 1.0, true).unwrap();
+        let (targets, _, _) = sup.pose_targets(&checked);
+        sup.planner.init([targets[0].round() as i32, -8, targets[2].round() as i32]);
+        let mut governed_at = None;
+        let mut crossed = false;
+        let mut saw_neg = false;
+        let mut saw_pos = false;
+        let mut stopped = false;
+        for _ in 0..120 {
+            let accepted = crate::session::AcceptedPose {
+                pose,
+                requested_gain: 0.5,
+                checked: checked.clone(),
+                fresh_until: t + Duration::from_secs(2),
+                frame_seq: Some(1),
+                seq: 1,
+                received_at: t,
+                produced_at: t,
+                freshness_mode: crate::session::FreshnessMode::FrameSeq,
+                session_gen: 1,
+            };
+            let v = sup.planner.velocities()[1];
+            let fe = if v < 0.0 { 250 } else { -250 };
+            push_measured(&mut sup, t, 1, fe, [0, 0, 0]);
+            sup.tick(t, 0.01, Some(&accepted));
+            let cmd = sup.planner.command_counts()[1];
+            if sup.governor.status().scale < 1.0 {
+                governed_at.get_or_insert(t);
+                if cmd < 0 {
+                    saw_neg = true;
+                }
+                if cmd > 0 {
+                    saw_pos = true;
+                }
+                if cmd == 0 {
+                    crossed = true;
+                }
+            }
+            if sup.state() == RigState::Stopping {
+                let waited = t.saturating_duration_since(governed_at.expect("governed"));
+                assert!(waited >= Duration::from_millis(400), "{waited:?}");
+                assert!(waited <= Duration::from_millis(420), "{waited:?}");
+                stopped = true;
+                break;
+            }
+            assert!(sup.fault.is_none(), "{:?}", sup.fault);
+            t += Duration::from_millis(10);
+        }
+        assert!(stopped, "scale {} cmd {}", sup.governor.status().scale, sup.planner.command_counts()[1]);
+        assert!(
+            saw_neg && saw_pos,
+            "command did not travel across 0 (neg {saw_neg} pos {saw_pos} cmd {})",
+            sup.planner.command_counts()[1]
+        );
+        assert!(crossed, "command never landed on the frozen actual");
+        assert_eq!(sup.axes[1].status.unwrap().actual_count, 0);
+        let (events, _) = sup.drain_events();
+        assert!(events.iter().any(|e| e.kind == "governor_no_progress"));
     }
 }

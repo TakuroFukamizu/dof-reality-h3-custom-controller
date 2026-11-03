@@ -18,7 +18,9 @@
 //!    supervisor detects a reboot from boot_id); a HELLO with another
 //!    device_id ends the link. CLOCK_SYNC_REPLY is dropped (v1 does not use it).
 //!    The writer sends admin messages first (bounded queue, [`ADMIN_QUEUE_LEN`])
-//!    and then the latest SET_POSITION (watch, never queued). Every write is
+//!    and then the latest SET_POSITION (watch, never queued), except
+//!    CONTROLLED_STOP: the pending SET_POSITION is written immediately before
+//!    it so the MCU still applies those limits in ACTIVE. Every write is
 //!    bounded by [`WRITE_TIMEOUT`].
 //! 3. **Axis change** (DESIGN.md §10.1). The link remembers the axis it
 //!    currently claims. When AXIS_SELECT, a HELLO, or a STATUS with a non-zero
@@ -769,7 +771,8 @@ impl Link {
 }
 
 /// Writer of an identified link: admin queue first, then the latest
-/// SET_POSITION. Returns the disconnect reason.
+/// SET_POSITION. CONTROLLED_STOP is the exception — the newest SET_POSITION
+/// is written immediately before it. Returns the disconnect reason.
 async fn write_loop<W>(
     wr: &mut W,
     mut admin_rx: mpsc::Receiver<HostMsg>,
@@ -795,6 +798,18 @@ where
                 Err(_) => return reason::CLOSED_BY_HOST.into(),
             },
         };
+        // ファームは ACTIVE のときだけフレームの加速度を取り込む。
+        // STOPPING では直前の値のまま減速するので、CONTROLLED_STOP より先に
+        // 今の SET_POSITION をこのリンクへ書く（biased の admin 優先を超える）。
+        if let HostMsg::ControlledStop { .. } = msg {
+            // watch::Ref は Send ではないので、await の前に値をコピーして手放す。
+            let prelude = (*setpos_rx.borrow_and_update()).map(HostMsg::SetPosition);
+            if let Some(prelude) = prelude {
+                if let Err(why) = write_frame(wr, &prelude.to_wire()).await {
+                    return why;
+                }
+            }
+        }
         if let Err(why) = write_frame(wr, &msg.to_wire()).await {
             return why;
         }

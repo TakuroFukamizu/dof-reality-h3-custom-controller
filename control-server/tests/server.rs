@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use h3cs::calibration;
 use h3cs::compat;
 use h3cs::config::Config;
+use h3cs::protocol::msg_type;
 use h3cs::server::{self, ServerError, ServerOptions};
 use h3cs::sim_axis::SimHandle;
 use h3cs::types::{AxisId, Counts, FaultCode, McuState, Pose, RigFault, RigState};
@@ -55,7 +56,7 @@ struct Streamer {
 }
 
 impl Streamer {
-    fn start(ws: Ws, session: String, first_seq: u64) -> Self {
+    fn start(ws: Ws, session: String, first_seq: u64, pose: Pose, gain: f64) -> Self {
         let (stop, mut stop_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let (mut tx, mut rx) = ws.split();
@@ -66,7 +67,7 @@ impl Streamer {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = iv.tick() => {
-                        let text = pose_json(&session, seq, seq, POSE.pitch, POSE.roll, POSE.yaw, GAIN);
+                        let text = pose_json(&session, seq, seq, pose.pitch, pose.roll, pose.yaw, gain);
                         seq += 1;
                         if tx.send(Message::Text(text.into())).await.is_err() {
                             break;
@@ -102,7 +103,7 @@ async fn active_rig(cfg: Config) -> (h3cs::server::RunningServer, Streamer) {
     wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
     let id = new_session(srv.local_addr).await;
     let ws = ws_connect(srv.local_addr, &id).await;
-    let streamer = Streamer::start(ws, id, 1);
+    let streamer = Streamer::start(ws, id, 1, POSE, GAIN);
     wait_status(&srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
 
     let r = admin(srv.local_addr, "/v1/arm").await;
@@ -373,7 +374,7 @@ async fn new_session_during_active_stops_and_never_drives_for_the_new_client() {
     // Reconnecting client: new session, first pose right away, then 30 Hz.
     let id = new_session(srv.local_addr).await;
     let ws = ws_connect(srv.local_addr, &id).await;
-    let streamer2 = Streamer::start(ws, id, 1);
+    let streamer2 = Streamer::start(ws, id, 1, POSE, GAIN);
     let deadline = tokio::time::Instant::now() + 3 * S;
     let mut seen = Vec::new();
     loop {
@@ -934,6 +935,96 @@ async fn admin_routes_need_no_token_by_default() {
     assert_eq!(r.status, 200, "fault without token: {}", r.body);
     let st = http(srv.local_addr, "GET", "/v1/status", &[], None).await;
     assert_eq!(st.json()["admin_token_required"], false, "{}", st.body);
+    srv.shutdown().await;
+}
+
+/// After the governor has scaled the live frames, a game STOP must put a
+/// full-limit SET_POSITION on each axis wire before CONTROLLED_STOP. The sim
+/// latches acceleration only in ACTIVE, the same way the firmware does.
+#[tokio::test]
+async fn governed_stop_writes_full_limits_before_controlled_stop_on_each_axis() {
+    let mut cfg = fast_cfg();
+    cfg.governor.no_progress_ms = 10_000;
+    // 軸 2 を仮想端（約 400 count）まで振る。既定の POSE は数十 count しか
+    // 動かさず、止めても追従誤差が fe_hard に届かない。
+    let pose = Pose { pitch: -1.0, roll: 1.0, yaw: 0.0 };
+    let gain = 0.5;
+    let srv = start_sim(cfg).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let id = new_session(srv.local_addr).await;
+    let ws = ws_connect(srv.local_addr, &id).await;
+    let streamer = Streamer::start(ws, id, 1, pose, gain);
+    wait_status(&srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 200, "arm: {r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+    // 追跡が始まる前に止める。追いついてからでは誤差が開かない。
+    sim(&srv, 2).set_stall(true);
+    let r = admin(srv.local_addr, "/v1/start").await;
+    assert_eq!(r.status, 200, "start: {r:?}");
+    let st = wait_status(&srv, 2 * S, "governor engaged", |s| {
+        s.rig_state == RigState::Active && s.governor.active && s.governor.scale < 0.9
+    })
+    .await;
+    assert!(st.governor.scale < 0.9, "{}", st.governor.scale);
+
+    let r = http(srv.local_addr, "POST", "/v1/stop", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let st = wait_state(&srv, RigState::Stopping, S).await;
+    assert!(st.fault.is_none(), "{:?}", st.fault);
+    let full_vel = st.motion_limits.effective.max_vel_count_s;
+    let full_acc = st.motion_limits.effective.max_acc_count_s2;
+    assert!(full_acc > 1000 && full_vel > 100);
+    // 状態が Stopping になっても、リンクの書き出しはまだ終わっていないことがある。
+    // 模擬軸は減速が短いとすぐに HOLDING へ抜けるので、状態ではなく受信で待つ。
+    let deadline = tokio::time::Instant::now() + S;
+    loop {
+        let seen = (1..=3u8).all(|axis| {
+            sim(&srv, axis)
+                .host_rx()
+                .iter()
+                .any(|n| n.msg_type == msg_type::CONTROLLED_STOP)
+        });
+        if seen {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stop frame did not reach every axis: {:?}",
+            (1..=3u8)
+                .map(|axis| {
+                    let handle = sim(&srv, axis);
+                    let rx = handle.host_rx();
+                    (axis, handle.state(), rx.len(), rx.last().map(|n| n.msg_type))
+                })
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for axis in 1..=3u8 {
+        let handle = sim(&srv, axis);
+        let rx = handle.host_rx();
+        let stop_at = rx
+            .iter()
+            .rposition(|n| n.msg_type == msg_type::CONTROLLED_STOP)
+            .unwrap_or_else(|| panic!("axis {axis} never saw CONTROLLED_STOP: {rx:?}"));
+        assert!(stop_at > 0, "axis {axis}: {rx:?}");
+        let prev = rx[stop_at - 1];
+        assert_eq!(prev.msg_type, msg_type::SET_POSITION, "axis {axis}: {rx:?}");
+        assert_eq!(prev.max_vel_count_s, full_vel, "axis {axis} vel");
+        assert_eq!(prev.max_acc_count_s2, full_acc, "axis {axis} acc");
+        assert!(
+            rx[..stop_at].iter().any(|n| {
+                n.msg_type == msg_type::SET_POSITION && n.max_acc_count_s2 + 1 < full_acc
+            }),
+            "axis {axis} had no governed frame before the stop"
+        );
+        let (vel, acc) = handle.frame_limits();
+        assert!((vel - f64::from(full_vel)).abs() < 1.0, "axis {axis} latched vel {vel}");
+        assert!((acc - f64::from(full_acc)).abs() < 1.0, "axis {axis} latched acc {acc}");
+    }
+    let _ = streamer.stop().await;
     srv.shutdown().await;
 }
 
