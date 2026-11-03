@@ -137,7 +137,7 @@ inline bool eq_set_limits(const v1::HostMsg& a, const v1::HostMsg& b) {
   return x.request_id == y.request_id && x.duty_max_percent == y.duty_max_percent &&
          x.duty_min_percent == y.duty_min_percent && x.kp_percent_per_100 == y.kp_percent_per_100 &&
          x.ff_count_s_per_percent == y.ff_count_s_per_percent && x.deadband_count == y.deadband_count &&
-         x.deadband_out_count == y.deadband_out_count;
+         x.deadband_out_count == y.deadband_out_count && x.stop_acc_count_s2 == y.stop_acc_count_s2;
 }
 
 inline bool eq_hello(const v1::McuMsg& a, const v1::McuMsg& b) {
@@ -304,38 +304,39 @@ inline void test_vectors_host() {
     CHECK(v1::decode_host_frame(f, 14, &d) && d.calibrate.request_id == 13 && d.calibrate.mode == 1 &&
           d.calibrate.flags == v1::cal_flags::KEEP_POWER);
   }
-  {  // 7.21 SET_LIMITS（request_id 13、duty_max 40、duty_min 3、kp 2、ff 100、deadband 10、deadband_out 20。
-     // motion-limits 設計 §4.5）。CRC は独立した実装（Python）でも確認した値
+  {  // 7.21 SET_LIMITS（request_id 13、duty_max 40、duty_min 3、kp 2、ff 100、deadband 10、deadband_out 20、
+     // stop_acc 20000。motion-limits 設計 §4.5）。CRC は独立した実装（Python）でも確認した値
     v1::HostMsg m{};
     m.type = v1::msg::SET_LIMITS;
-    m.set_limits = {13, 40, 3, 2, 100, 10, 20};
-    check_host_vector("01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 00 00 40 08",
-                      "04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 01 01 03 40 08 00", m, eq_set_limits);
+    m.set_limits = {13, 40, 3, 2, 100, 10, 20, 20000};
+    check_host_vector("01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 20 4E AC A7",
+                      "04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 05 20 4E AC A7 00", m, eq_set_limits);
     CHECK(v1::host_payload_len(v1::msg::SET_LIMITS) == 16);
-    // 設計 §4.2 のオフセット: 4 duty_max / 5 duty_min / 6 kp / 7 予約 / 8 ff / 10 deadband / 12 deadband_out / 14 予約
+    // オフセット: 4 duty_max / 5 duty_min / 6 kp / 7 予約 / 8 ff / 10 deadband / 12 deadband_out / 14 stop_acc
     uint8_t f[v1::MAX_FRAME_LEN];
     CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 4 + 16 + 2);
     const uint8_t* p = f + 4;
     CHECK(p[4] == 40 && p[5] == 3 && p[6] == 2 && p[7] == 0);
     CHECK(p[8] == 100 && p[9] == 0 && p[10] == 10 && p[11] == 0 && p[12] == 20 && p[13] == 0);
-    CHECK(p[14] == 0 && p[15] == 0);
-    // 予約バイトが 0 でなくても復号は値を変えない（無視する）
+    CHECK(p[14] == 0x20 && p[15] == 0x4E);
+    // byte 7 の予約が 0 でなくても復号は値を変えない。14..15 は stop_acc なので往復する
     uint8_t q[16];
     std::memcpy(q, p, 16);
     q[7] = 0xFF;
-    q[14] = 0xAA;
-    q[15] = 0x55;
     v1::HostMsg d{};
     CHECK(v1::decode_host_payload(v1::msg::SET_LIMITS, q, 16, &d) && eq_set_limits(d, m));
+    q[14] = 0xE8;
+    q[15] = 0x03;  // 1000
+    CHECK(v1::decode_host_payload(v1::msg::SET_LIMITS, q, 16, &d) && d.set_limits.stop_acc_count_s2 == 1000);
     // 長さ違いは捨てる
     CHECK(!v1::decode_host_payload(v1::msg::SET_LIMITS, q, 15, &d));
     uint8_t q17[17] = {0};
     CHECK(!v1::decode_host_payload(v1::msg::SET_LIMITS, q17, 17, &d));
     // u16 の上位バイトも往復する
-    m.set_limits = {0xFFFFFFFFu, 100, 100, 255, 0xFFFF, 0x1234, 0xABCD};
+    m.set_limits = {0xFFFFFFFFu, 100, 100, 255, 0xFFFF, 0x1234, 0xABCD, 0xBEEF};
     CHECK(v1::encode_host_frame(m, f, sizeof(f)) == 22);
     CHECK(f[4 + 8] == 0xFF && f[4 + 9] == 0xFF && f[4 + 10] == 0x34 && f[4 + 11] == 0x12 && f[4 + 12] == 0xCD &&
-          f[4 + 13] == 0xAB);
+          f[4 + 13] == 0xAB && f[4 + 14] == 0xEF && f[4 + 15] == 0xBE);
     CHECK(v1::decode_host_frame(f, 22, &d) && eq_set_limits(d, m));
   }
 }

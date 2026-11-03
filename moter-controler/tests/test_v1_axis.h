@@ -1033,7 +1033,7 @@ inline void test_stop_timeout_faults() {
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::STOP_TIMEOUT);
 }
 
-// 制御された STOPPING の減速度は、最後のフレームではなく CONFIG の max_acc（テストの base は 20000）。
+// stop_acc を置いていないとき、制御された STOPPING の減速度は CONFIG の max_acc（このテストの base は 20000）。
 // 10 ms で 200 count/s。フレーム 1250 なら 12.5 なので、そこでないことを見る。
 // 目標 2600 へ長く走ると制動に入って速度が落ちるので、加速の途中（速度が 10 ms 分の減速より大きい）で止める。
 inline double stopping_dv_over_10ms(uint32_t frame_acc, uint32_t drive_ms, bool disarm) {
@@ -1107,7 +1107,149 @@ inline void test_fault_stop_still_decelerates_at_frame_max_acc() {
   run(1, 4.0, 8.0);       // 下限 500 × 10 ms = 5。フレーム 1 のままでは止まらない
 }
 
-// フレームが max_acc = 0 でも、制御された STOPPING は CONFIG の max_acc で減速する
+// CONFIG は絶対上限（40000）。制御された停止は SET_LIMITS の stop_acc（操作者の max_acc）。
+// 0 は未設定で CONFIG に戻る。天井を超える値は 40000 にクランプする（拒否しない）。
+inline double stopping_dv_with_stop_acc(uint32_t config_acc, uint16_t stop_acc, uint32_t frame_acc, uint32_t drive_ms) {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_acc_count_s2 = config_acc;
+  c.stop_timeout_ms = 5000;
+  Harness::accepted(h.config_with(c));
+  if (stop_acc != 0) {
+    v1::HostMsg lim = h.set_limits_msg(h.next_rid());
+    lim.set_limits.stop_acc_count_s2 = stop_acc;
+    Harness::accepted(h.cmd(lim));
+  }
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  for (uint32_t t = 0; t < drive_ms; t += 10) {
+    v1::HostMsg m = h.set_position_msg(2600);
+    m.set_position.max_vel_count_s = 2000;
+    m.set_position.max_acc_count_s2 = frame_acc;
+    h.send(m);
+    h.idle(10);
+  }
+  CHECK(h.ax.state() == st::ACTIVE);
+  CHECK(h.ax.setpoint_vel() > 400.0);
+  Harness::accepted(h.stop());
+  CHECK(h.ax.state() == st::STOPPING);
+  const double v0 = h.ax.setpoint_vel();
+  h.step(10);
+  return v0 - h.ax.setpoint_vel();
+}
+
+inline void test_controlled_stop_uses_operator_stop_acc() {
+  // 操作者 20000。フレーム 1250（s=0.25 の 20000×s²）でも、フレームが 20000 でも、10 ms で約 200。
+  // 天井 40000 なら約 400、フレーム 1250 なら約 12.5。
+  const double reduced = stopping_dv_with_stop_acc(40000, 20000, 1250, 800);
+  CHECK(reduced > 190.0 && reduced < 210.0);
+  const double same = stopping_dv_with_stop_acc(40000, 20000, 20000, 400);
+  CHECK(same > 190.0 && same < 210.0);
+  // 未設定（0）は CONFIG の天井。10 ms で約 400。
+  const double unset = stopping_dv_with_stop_acc(40000, 0, 20000, 200);
+  CHECK(unset > 380.0 && unset < 420.0);
+  // 65535 は絶対上限 40000 にクランプする（655 にはならない）。
+  const double clamped = stopping_dv_with_stop_acc(40000, 65535, 20000, 200);
+  CHECK(clamped > 380.0 && clamped < 420.0);
+}
+
+// 走行中に stop_acc を 6000 へ下げても、いまの停止は入口の 20000 のまま。次の停止から 6000。
+// 拒否された SET_LIMITS は stop_acc を変えない。
+inline void test_runtime_stop_acc_applies_on_the_next_stop() {
+  Harness h;
+  v1::Config c = base_config();
+  c.max_acc_count_s2 = 40000;
+  c.stop_timeout_ms = 5000;
+  Harness::accepted(h.config_with(c));
+  v1::HostMsg lim = h.set_limits_msg(h.next_rid());
+  lim.set_limits.stop_acc_count_s2 = 20000;
+  Harness::accepted(h.cmd(lim));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  for (int i = 0; i < 80; ++i) {
+    v1::HostMsg m = h.set_position_msg(2600);
+    m.set_position.max_vel_count_s = 2000;
+    m.set_position.max_acc_count_s2 = 1250;
+    h.send(m);
+    h.idle(10);
+  }
+  CHECK(h.ax.setpoint_vel() > 400.0);
+  Harness::accepted(h.stop());
+  const double v0 = h.ax.setpoint_vel();
+  h.step(10);
+  const double first = v0 - h.ax.setpoint_vel();
+  CHECK(first > 190.0 && first < 210.0);
+  lim = h.set_limits_msg(h.next_rid());
+  lim.set_limits.stop_acc_count_s2 = 6000;
+  Harness::accepted(h.cmd(lim));
+  const double v1 = h.ax.setpoint_vel();
+  h.step(10);
+  const double during = v1 - h.ax.setpoint_vel();
+  CHECK(during > 190.0 && during < 210.0);
+  for (int i = 0; i < 200 && h.ax.state() == st::STOPPING; ++i) {
+    h.set_position(2600);
+    h.idle(10);
+  }
+  CHECK(h.ax.state() == st::HOLDING);
+  v1::HostMsg bad = h.set_limits_msg(h.next_rid());
+  bad.set_limits.ff_count_s_per_percent = 0;
+  bad.set_limits.stop_acc_count_s2 = 20000;
+  Harness::rejected(h.cmd(bad), rs::INVALID_PARAM);
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  for (int i = 0; i < 80; ++i) {
+    v1::HostMsg m = h.set_position_msg(2600);
+    m.set_position.max_vel_count_s = 2000;
+    m.set_position.max_acc_count_s2 = 1250;
+    h.send(m);
+    h.idle(10);
+  }
+  CHECK(h.ax.state() == st::ACTIVE);
+  CHECK(h.ax.setpoint_vel() > 100.0);
+  Harness::accepted(h.stop());
+  const double v2 = h.ax.setpoint_vel();
+  h.step(10);
+  const double next = v2 - h.ax.setpoint_vel();
+  CHECK(next > 50.0 && next < 70.0);
+}
+
+// COMMAND_TIMEOUT は stop_acc を見ない。最後のフレーム 1250 のまま（10 ms で約 12.5。20000 ではない）。
+inline void test_fault_stop_ignores_operator_stop_acc() {
+  Harness h;
+  v1::Config c = base_config();
+  c.command_timeout_ms = 40;
+  c.stop_timeout_ms = 5000;
+  Harness::accepted(h.config_with(c));
+  v1::HostMsg lim = h.set_limits_msg(h.next_rid());
+  lim.set_limits.stop_acc_count_s2 = 20000;
+  Harness::accepted(h.cmd(lim));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  for (int i = 0; i < 80; ++i) {
+    v1::HostMsg m = h.set_position_msg(2600, 500);
+    m.set_position.max_vel_count_s = 2000;
+    m.set_position.max_acc_count_s2 = 2000;
+    h.send(m);
+    h.idle(10);
+  }
+  CHECK(h.ax.setpoint_vel() > 400.0);
+  v1::HostMsg last = h.set_position_msg(2600, 500);
+  last.set_position.max_vel_count_s = 2000;
+  last.set_position.max_acc_count_s2 = 1250;
+  h.send(last);
+  h.idle(50);
+  CHECK(h.ax.state() == st::STOPPING && h.ax.fault_code() == fc::COMMAND_TIMEOUT);
+  const double v0 = h.ax.setpoint_vel();
+  CHECK(v0 > 200.0);
+  h.step(10);
+  const double dv = v0 - h.ax.setpoint_vel();
+  CHECK(dv > 10.0 && dv < 16.0);
+}
+
+// フレームが max_acc = 0 でも、stop_acc 未設定の制御された STOPPING は CONFIG の max_acc で減速する
 inline void test_stopping_with_zero_frame_acc_falls_back_to_config() {
   Harness h;
   h.reach_active();
@@ -5083,6 +5225,9 @@ inline void run_all() {
   test_host_fault_during_fault_stop_keeps_pending_code();
   test_stop_timeout_faults();
   test_controlled_stop_decelerates_at_config_max_acc();
+  test_controlled_stop_uses_operator_stop_acc();
+  test_runtime_stop_acc_applies_on_the_next_stop();
+  test_fault_stop_ignores_operator_stop_acc();
   test_fault_stop_still_decelerates_at_frame_max_acc();
   test_stopping_with_zero_frame_acc_falls_back_to_config();
   test_set_limits_accepted_in_disarmed_and_reports_limits();

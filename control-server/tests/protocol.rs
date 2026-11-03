@@ -1103,6 +1103,7 @@ fn round_trip_every_host_message_edge_values() {
                 ff_count_s_per_percent: h,
                 deadband_count: h,
                 deadband_out_count: h,
+                stop_acc_count_s2: h,
             }),
         ];
         for m in msgs {

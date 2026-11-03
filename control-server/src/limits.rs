@@ -490,11 +490,25 @@ pub struct FwTuning {
     pub ff_count_s_per_percent: u16,
     pub deadband_count: u16,
     pub deadband_out_count: u16,
+    /// Controlled-stop deceleration: the operator `max_acc` of the set this
+    /// tuning was built from, clamped to the firmware ceiling. Not a duty
+    /// field — see [`FwTuning::same_duty`].
+    pub stop_acc_count_s2: u16,
+}
+
+/// Operator `max_acc` for the SET_LIMITS `stop_acc` field. The firmware
+/// ceiling fits in the u16 (40000 < 65535). 0 would mean "unset" on the MCU,
+/// so a real limit is never sent as 0 (`max_acc` is at least 1 after clamp).
+fn stop_acc_wire(max_acc: u32) -> u16 {
+    let capped = max_acc.min(fw_absolute::MAX_ACC_COUNT_S2).min(u32::from(u16::MAX));
+    u16::try_from(capped).unwrap_or(u16::MAX)
 }
 
 impl FwTuning {
     /// `effective.duty_max_percent` with the operator-only values from the
     /// config. `duty_min` never exceeds `duty_max` (the MCU would reject it).
+    /// `stop_acc_count_s2` is `effective.max_acc_count_s2` (already ceiling-
+    /// clamped and stop-time-raised).
     pub fn new(cfg: &LimitsConfig, effective: &MotionLimits) -> Self {
         Self {
             duty_max_percent: effective.duty_max_percent,
@@ -503,7 +517,20 @@ impl FwTuning {
             ff_count_s_per_percent: cfg.ff_count_s_per_percent,
             deadband_count: cfg.deadband_count,
             deadband_out_count: cfg.deadband_out_count,
+            stop_acc_count_s2: stop_acc_wire(effective.max_acc_count_s2),
         }
+    }
+
+    /// Duty / Kp / FF / deadband only. Acceleration is not part of the
+    /// planner-pending gate: it still goes out in SET_LIMITS, but the
+    /// planner applies it at once (Issue #15 M3 waits on the duty cap).
+    pub fn same_duty(self, other: Self) -> bool {
+        self.duty_max_percent == other.duty_max_percent
+            && self.duty_min_percent == other.duty_min_percent
+            && self.kp_percent_per_100 == other.kp_percent_per_100
+            && self.ff_count_s_per_percent == other.ff_count_s_per_percent
+            && self.deadband_count == other.deadband_count
+            && self.deadband_out_count == other.deadband_out_count
     }
 
     pub fn to_msg(self, request_id: u32) -> SetLimits {
@@ -515,6 +542,7 @@ impl FwTuning {
             ff_count_s_per_percent: self.ff_count_s_per_percent,
             deadband_count: self.deadband_count,
             deadband_out_count: self.deadband_out_count,
+            stop_acc_count_s2: self.stop_acc_count_s2,
         }
     }
 }
@@ -753,6 +781,14 @@ mod tests {
         let e = MotionLimits { max_gain: 0.5, max_vel_count_s: 3000, max_acc_count_s2: 15000, duty_max_percent: 5 };
         let t = FwTuning::new(&cfg, &e);
         assert_eq!((t.duty_max_percent, t.duty_min_percent), (5, 5));
-        assert_eq!(t.to_msg(9).request_id, 9);
+        assert_eq!(t.stop_acc_count_s2, 15000);
+        let msg = t.to_msg(9);
+        assert_eq!(msg.request_id, 9);
+        assert_eq!(msg.stop_acc_count_s2, 15000);
+        let capped = FwTuning::new(
+            &cfg,
+            &MotionLimits { max_acc_count_s2: 99_999, ..e },
+        );
+        assert_eq!(capped.stop_acc_count_s2, 40000);
     }
 }

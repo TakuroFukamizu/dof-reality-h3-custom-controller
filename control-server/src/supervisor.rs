@@ -1543,15 +1543,20 @@ impl Supervisor {
 
     /// Clamp the request into `target_limits`, then decide what the planner
     /// may use now (Issue #15 M3):
-    /// - the target's SET_LIMITS content equals the one in force → apply at
-    ///   once (velocity / acceleration / gain changes never wait);
-    /// - otherwise wait until every connected axis that speaks SET_LIMITS has
-    ///   ACKed the target tuning (`reconcile_limits` sends it), and meanwhile
-    ///   keep the confirmed set, taking only the *lowered* components of the
-    ///   target (a lowered cap is safe with the old tuning; a raised velocity
-    ///   with an unconfirmed duty cap is the FOLLOWING_ERROR the issue
-    ///   describes). The stop-time rule survives the component-wise minimum:
-    ///   both sets satisfy `acc ≥ vel / deadline`, so their minima do too.
+    /// - the target's duty tuning equals the one in force → apply at once.
+    ///   Velocity, acceleration, and gain never wait. Acceleration still
+    ///   rides out in SET_LIMITS as `stop_acc_count_s2` (the controlled-stop
+    ///   rate), but that field is not part of this comparison, so an
+    ///   acc-only change does not set `pending`;
+    /// - a duty-cap change waits until every connected axis that speaks
+    ///   SET_LIMITS has ACKed that duty tuning (`reconcile_limits` sends the
+    ///   full desired tuning, including the new stop_acc, and confirmation
+    ///   is still the full equality). Meanwhile keep the confirmed duty cap
+    ///   and take only the *lowered* components of the target (a lowered cap
+    ///   is safe with the old tuning; a raised velocity with an unconfirmed
+    ///   duty cap is the FOLLOWING_ERROR the issue describes). The stop-time
+    ///   rule survives the component-wise minimum: both sets satisfy
+    ///   `acc ≥ vel / deadline`, so their minima do too.
     fn recompute_limits(&mut self) {
         let c =
             motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
@@ -1560,12 +1565,12 @@ impl Supervisor {
         self.limit_reasons = c.reasons;
         let want = self.desired_tuning();
         let in_force = FwTuning::new(&self.limits_cfg, &self.effective_limits);
-        let confirmed = want == in_force
+        let confirmed = want.same_duty(in_force)
             || self
                 .axes
                 .iter()
                 .filter(|t| t.connected && t.supports_limits())
-                .all(|t| t.limits_acked == Some(want));
+                .all(|t| t.limits_acked.is_some_and(|acked| acked.same_duty(want)));
         if confirmed {
             self.effective_limits = self.target_limits;
             self.limits_pending = false;

@@ -143,14 +143,14 @@ MCU は PC サーバーの再起動を知らない（USB の再オープンで�
 | `0x03` | ARM_PREPARE | 0: u32 request_id / 4: u32 session_epoch | 8 | ACK、その後 STATUS で ARMING → HOLDING。DISARMED・CONFIGURED・REFERENCED・epoch 一致・実位置が `[soft_min_count, soft_max_count]` 内のときだけ受理。拒否理由はこの順に `BAD_STATE` / `NOT_CONFIGURED` / `NOT_REFERENCED` / `EPOCH_MISMATCH` / `BAD_STATE`（位置が範囲外） |
 | `0x04` | START | 0: u32 request_id / 4: u32 session_epoch | 8 | ACK。HOLDING → ACTIVE。HOLDING・epoch 一致に加え、ARM_PREPARE 受理後に受けた有効期限内（`valid_for_ms`）の SET_POSITION があること。無ければ `REJECTED/BAD_STATE`（受理するとすぐ期限切れで STOPPING に落ちるため）。拒否理由はこの順に `BAD_STATE`（HOLDING でない）/ `EPOCH_MISMATCH` / `BAD_STATE`（期限内の SET_POSITION なし）。受理後も、START の後に受けた最初の SET_POSITION までは保持目標のまま（START 前に受けた目標へ飛ばない） |
 | `0x05` | SET_POSITION | 0: u32 session_epoch / 4: u32 seq / 8: u32 group_frame_id / 12: i32 target_count / 16: u32 max_vel_count_s / 20: u32 max_acc_count_s2 / 24: u16 valid_for_ms / 26: u16 reserved=0 / 28: u64 apply_at_us（0 = 受信後すぐ） | 36 | なし（STATUS で確認） |
-| `0x06` | CONTROLLED_STOP | 0: u32 request_id / 4: u32 session_epoch / 8: u8 reason / 9..11: reserved=0 | 12 | ACK。CONFIG 未受理・epoch 不一致は（どの状態でも）`REJECTED/EPOCH_MISMATCH`。ACTIVE → STOPPING → HOLDING。ACTIVE 以外（DISARMED・ARMING・HOLDING・STOPPING・DISARMING）では何もせず ACCEPTED（PC は HOLDING 中の停止操作でも送る。拒否すると PC は停止失敗として FAULT にする）。`reason` は記録のみ（1 = 管理操作、2 = ゲーム入力の途絶、3 = 中立到達。未知の値も拒否しない）。STOPPING に入ったあとの減速は CONFIG の `max_acc_count_s2`。直前の SET_POSITION が運んだ `max_acc_count_s2`（追従ガバナが下げた値を含む）は使わない。`valid_for_ms` の期限切れと DISARM で入る減速も同じ。異常による減速（COMMAND_TIMEOUT）だけは最後に適用したフレームの `max_acc_count_s2`（0 なら CONFIG、`V1_MIN_DECEL_COUNT_S2` 未満ならその下限） |
+| `0x06` | CONTROLLED_STOP | 0: u32 request_id / 4: u32 session_epoch / 8: u8 reason / 9..11: reserved=0 | 12 | ACK。CONFIG 未受理・epoch 不一致は（どの状態でも）`REJECTED/EPOCH_MISMATCH`。ACTIVE → STOPPING → HOLDING。ACTIVE 以外（DISARMED・ARMING・HOLDING・STOPPING・DISARMING）では何もせず ACCEPTED（PC は HOLDING 中の停止操作でも送る。拒否すると PC は停止失敗として FAULT にする）。`reason` は記録のみ（1 = 管理操作、2 = ゲーム入力の途絶、3 = 中立到達。未知の値も拒否しない）。STOPPING に入ったあとの減速は SET_LIMITS の `stop_acc_count_s2`（0 なら CONFIG の `max_acc_count_s2`）。直前の SET_POSITION が運んだ `max_acc_count_s2`（追従ガバナが下げた値を含む）は使わない。`valid_for_ms` の期限切れと DISARM で入る減速も同じ。異常による減速（COMMAND_TIMEOUT）だけは最後に適用したフレームの `max_acc_count_s2`（0 なら CONFIG、`V1_MIN_DECEL_COUNT_S2` 未満ならその下限） |
 | `0x07` | DISARM | 0: u32 request_id | 4 | ACK。管理命令の共通規則（`request_id` = 0・DUPLICATE・`FAULT_ACTIVE`）で弾かれるとき以外は常に ACCEPTED。ARMING / HOLDING → 直ちに DISARMING。ACTIVE → 減速停止 → DISARMING。STOPPING → 減速を続け、停止後 DISARMING。DISARMED / DISARMING → 何もせず ACCEPTED（PC は ARM 途中の停止でも、まだ DISARMED・ARMING の軸に送る。拒否すると PC は停止失敗として FAULT にする） |
 | `0x08` | FAULT_RESET | 0: u32 request_id | 4 | ACK。FAULT 以外では `REJECTED/BAD_STATE`。原因（エンコーダ異常・電源異常の入力など、続いている異常）が残っていれば `REJECTED/FAULT_CAUSE_PRESENT`。解除後は DISARMED（自動再 ARM しない）。CONFIG と位置基準は残す（ENCODER_FAULT の解除では `POSITION_REFERENCED` を消す）。実位置がソフトリミット外のままでも解除する（下記） |
 | `0x09` | CLOCK_SYNC | 0: u32 request_id / 4: u64 pc_time_us | 12 | CLOCK_SYNC_REPLY |
 | `0x0A` | HOST_FAULT | 0: u32 request_id / 4: u16 fault_code / 6: u16 reserved=0 | 8 | ACK（常に ACCEPTED）。どの状態でも即 FAULT ラッチ（PWM 0・ブレーキ作動）。ラッチされるコードは `HOST_FAULT`（既にラッチ済み・減速中の異常コードがあればそれを保つ）。payload の `fault_code` は記録のみ。ACK の後に送る最初の STATUS から `mcu_state = FAULT`、`fault_code ≠ NONE`（PC はこれを確認してから FAULT_RESET の送り先を決める） |
 | `0x0B` | SET_REFERENCE | 0: u32 request_id / 4: i32 reference_count | 8 | ACK。DISARMED のときだけ。現在の計数値を `reference_count` と定義し `POSITION_REFERENCED` を立てる |
 | `0x0C` | CALIBRATE | 0: u32 request_id / 4: u8 mode（1 = 開始、0 = 中止） / 5: u8 flags（bit0 = `KEEP_POWER`。電源担当軸（CONFIG の `role_flags` bit0）だけが解釈し、他の軸は無視する。bit1〜7 は予約 = 0） / 6: u16 reserved=0 | 8 | ACK。`mode = 1`: DISARMED のときだけ（それ以外 `REJECTED/BAD_STATE`）。受理で CALIBRATING（§1.2）。`KEEP_POWER` が立っていれば、校正（成功・失敗・中止を問わず）の終了手順でブレーキを作動させ PWM 0 にした後も **主電源 ON 指令を保ったまま CALIBRATING（CAL_RESULT の `step = 4` POWER_HOLD）に留まる**。`mode = 0` か `CAL_POWER_HOLD_TIMEOUT_MS`（120000、仮値）で主電源 OFF → DISARMED（このとき CAL_RESULT は送らない。結果は校正終了時に送った 1 回だけ）。`mode = 0`: CALIBRATING（POWER_HOLD を含む）なら中止して終了手順 → DISARMED、それ以外は何もせず ACCEPTED。`mode` が 0・1 以外は `REJECTED/INVALID_PARAM` |
-| `0x0D` | SET_LIMITS | 0: u32 request_id / 4: u8 duty_max_percent / 5: u8 duty_min_percent / 6: u8 kp_percent_per_100 / 7: u8 reserved=0 / 8: u16 ff_count_s_per_percent / 10: u16 deadband_count / 12: u16 deadband_out_count / 14: u16 reserved=0 | 16 | ACK。位置ループの調整値（PC の `[limits]`。[limits.md](limits.md)）。**どの状態でも受理**（管理命令の共通規則だけ）。`duty_max_percent = 0`、`duty_min_percent > duty_max_percent`、`ff_count_s_per_percent = 0`、`deadband_out_count < deadband_count` は `REJECTED/INVALID_PARAM`。受理したら `duty_max`（と `duty_min`）を絶対上限 `V1_ABS_DUTY_MAX`（60）でクランプして置き換え、**ACK の後に LIMITS を 1 回送る**（REJECTED・DUPLICATE では送らない）。受理前は `config.h` の既定（Duty 7〜20 %）。対応するファームは HELLO の `capabilities` bit3 を立てる |
+| `0x0D` | SET_LIMITS | 0: u32 request_id / 4: u8 duty_max_percent / 5: u8 duty_min_percent / 6: u8 kp_percent_per_100 / 7: u8 reserved=0 / 8: u16 ff_count_s_per_percent / 10: u16 deadband_count / 12: u16 deadband_out_count / 14: u16 stop_acc_count_s2（制御された停止の減速度。0 = 未設定で CONFIG の `max_acc`。非 0 は `V1_ABS_MAX_ACC_COUNT_S2` でクランプし拒否しない。byte 7 は予約のまま） | 16 | ACK。位置ループの調整値（PC の `[limits]`。[limits.md](limits.md)）。**どの状態でも受理**（管理命令の共通規則だけ）。`duty_max_percent = 0`、`duty_min_percent > duty_max_percent`、`ff_count_s_per_percent = 0`、`deadband_out_count < deadband_count` は `REJECTED/INVALID_PARAM`。受理したら `duty_max`（と `duty_min`）を絶対上限 `V1_ABS_DUTY_MAX`（60）でクランプして置き換え、`stop_acc_count_s2` を保存し（0 はそのまま。減速中でも保存だけで、いまの停止の減速度は変えない）、**ACK の後に LIMITS を 1 回送る**（REJECTED・DUPLICATE では送らない。LIMITS の offset 14 は予約のまま）。受理前は `config.h` の既定（Duty 7〜20 %、`stop_acc` は 0）。対応するファームは HELLO の `capabilities` bit3 を立てる |
 
 管理命令の共通規則（ACK を返す命令。MCU はこの順に処理する）:
 
@@ -171,7 +171,7 @@ SET_POSITION の規則:
 - `apply_at_us ≠ 0` は v1 では扱わない（`CLOCK_SYNCED` も `capabilities` bit1 も立たない）。そのフレームは破棄して `rx_error_count`++、期限（lease）も延長しない。
 - `valid_for_ms`: MCU 受信時刻からこの時間を過ぎた目標は「期限切れ」。新しい SET_POSITION が来なければ `command_timeout_ms` で `COMMAND_TIMEOUT`。PC は通常 10ms 周期で送る。
 - `target_count` は MCU 側でも `[soft_min_count, soft_max_count]` に制限する（PC の制限を信用しない最終検査）。
-- `max_vel_count_s` / `max_acc_count_s2` はこのフレームの上限。CONFIG の上限より大きい値は CONFIG の値に制限（CONFIG には絶対上限が入っているので、結果として絶対上限）。ACTIVE の追従はこの上限で行う。制御された STOPPING（CONTROLLED_STOP・`valid_for_ms` の期限切れ・DISARM）の減速はフレームの値ではなく **CONFIG の `max_acc_count_s2`**。異常による減速（COMMAND_TIMEOUT）だけが、最後に適用したフレームの `max_acc_count_s2`（0 なら CONFIG、`V1_MIN_DECEL_COUNT_S2` 未満ならその下限）。
+- `max_vel_count_s` / `max_acc_count_s2` はこのフレームの上限。CONFIG の上限より大きい値は CONFIG の値に制限（CONFIG には絶対上限が入っているので、結果として絶対上限）。ACTIVE の追従はこの上限で行う。制御された STOPPING（CONTROLLED_STOP・`valid_for_ms` の期限切れ・DISARM）の減速はフレームの値ではなく **SET_LIMITS の `stop_acc_count_s2`**（0 なら CONFIG の `max_acc_count_s2`）。異常による減速（COMMAND_TIMEOUT）だけが、最後に適用したフレームの `max_acc_count_s2`（0 なら CONFIG、`V1_MIN_DECEL_COUNT_S2` 未満ならその下限）。
 - `HOLDING` / `STOPPING` では `target_count` を使わないが、期限監視（lease）としては有効。
 - `group_frame_id` は 3 軸に同じ値を配る。MCU は適用した値を `last_applied_frame` に返す。同じ値だから同時に適用されたとは見なさない。
 
@@ -441,11 +441,11 @@ wire  (36 byte): 04 01 87 1C 05 EF CD AB 89 02 03 01 03 AF 15 01 03 D7 0A 01 02 
 
 ### 7.21 SET_LIMITS（`0x0D`、PC → MCU）
 
-値: `{"request_id":13,"duty_max_percent":40,"duty_min_percent":3,"kp_percent_per_100":2,"ff_count_s_per_percent":100,"deadband_count":10,"deadband_out_count":20}`
+値: `{"request_id":13,"duty_max_percent":40,"duty_min_percent":3,"kp_percent_per_100":2,"ff_count_s_per_percent":100,"deadband_count":10,"deadband_out_count":20,"stop_acc_count_s2":20000}`
 
 ```text
-frame (22 byte): 01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 00 00 40 08
-wire  (24 byte): 04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 01 01 03 40 08 00
+frame (22 byte): 01 0D 10 00 0D 00 00 00 28 03 02 00 64 00 0A 00 14 00 20 4E AC A7
+wire  (24 byte): 04 01 0D 10 02 0D 01 01 04 28 03 02 02 64 02 0A 02 14 05 20 4E AC A7 00
 ```
 
 ### 7.22 LIMITS（`0x88`、MCU → PC）

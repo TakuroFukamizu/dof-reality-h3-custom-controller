@@ -82,8 +82,10 @@
 //! - `valid_for_ms` expiry in ACTIVE → STOPPING → HOLDING (a new START is needed
 //!   to move again; late frames never resume motion by themselves).
 //! - A controlled STOPPING (CONTROLLED_STOP, `valid_for_ms` expiry, DISARM)
-//!   decelerates at CONFIG `max_acc_count_s2`. A fault stop (COMMAND_TIMEOUT)
-//!   still decelerates at the last applied frame's `max_acc` (0 → CONFIG).
+//!   decelerates at SET_LIMITS `stop_acc_count_s2` (0 → CONFIG `max_acc`).
+//!   A fault stop (COMMAND_TIMEOUT) still decelerates at the last applied
+//!   frame's `max_acc` (0 → CONFIG). A SET_LIMITS during a stop updates the
+//!   stored rate only; the rate already latched at entry stays.
 //! - STOPPING longer than `stop_timeout_ms` → FAULT(STOP_TIMEOUT).
 //!
 //! # Fault checks (while position control is on)
@@ -374,8 +376,12 @@ pub struct SimMcu {
     control_target: f64,
     frame_max_vel: f64,
     frame_max_acc: f64,
+    /// SET_LIMITS `stop_acc`. 0 means unset (controlled stops use CONFIG).
+    /// Not cleared on axis select; a reboot builds a new [`SimMcu`].
+    stop_acc_count_s2: u16,
     /// Deceleration latched on entry to STOPPING [count/s²]. Controlled stops
-    /// use CONFIG `max_acc`; a fault stop uses the last frame's.
+    /// use `stop_acc` when set, else CONFIG `max_acc`. A fault stop uses the
+    /// last frame's.
     stopping_amax: f64,
 
     /// Recently ACCEPTED commands for resend detection (oldest first).
@@ -435,6 +441,7 @@ impl SimMcu {
             control_target: actual,
             frame_max_vel: 0.0,
             frame_max_acc: 0.0,
+            stop_acc_count_s2: 0,
             stopping_amax: 0.0,
             recent_accepted: VecDeque::with_capacity(DEDUPE_DEPTH),
             host_rx: VecDeque::with_capacity(HOST_RX_KEEP),
@@ -575,6 +582,14 @@ impl SimMcu {
     /// End stops in the current count coordinate (min, max).
     pub fn end_counts(&self) -> (Counts, Counts) {
         (to_count(self.end_min), to_count(self.end_max))
+    }
+    /// Profile velocity [count/s]. Positive is increasing counts.
+    pub fn setpoint_vel(&self) -> f64 {
+        self.setpoint_vel
+    }
+    /// Stored controlled-stop acceleration. 0 means unset.
+    pub fn stop_acc_count_s2(&self) -> u16 {
+        self.stop_acc_count_s2
     }
     /// An end-stop calibration is running (state CALIBRATING).
     pub fn is_calibrating(&self) -> bool {
@@ -936,6 +951,13 @@ impl SimMcu {
             ff_count_s_per_percent: l.ff_count_s_per_percent,
             deadband_count: l.deadband_count,
             deadband_out_count: l.deadband_out_count,
+        };
+        // 0 stays unset. A non-zero value is clamped to the absolute ceiling
+        // and does not change a deceleration already latched for this stop.
+        self.stop_acc_count_s2 = if l.stop_acc_count_s2 == 0 {
+            0
+        } else {
+            l.stop_acc_count_s2.min(u16::try_from(fw_absolute::MAX_ACC_COUNT_S2).unwrap_or(u16::MAX))
         };
         self.limits_reply_due = true;
         Ok(())
@@ -1311,9 +1333,10 @@ impl SimMcu {
         self.stop_kind = kind;
         self.stopping_started_us = now;
         // Latch decel at entry. Controlled stops (CONTROLLED_STOP, valid_for
-        // expiry, DISARM) use CONFIG max_acc, never the last frame. A fault
-        // stop keeps the frame value (0 falls back to CONFIG). Converting an
-        // in-progress stop to Fault does not call this, so the entry rate stays.
+        // expiry, DISARM) use SET_LIMITS stop_acc when set, else CONFIG
+        // max_acc — never the last frame. A fault stop keeps the frame value
+        // (0 falls back to CONFIG). Converting an in-progress stop to Fault
+        // does not call this, so the entry rate stays.
         let config_acc = self.config.map(|c| c.max_acc_count_s2 as f64).unwrap_or(0.0);
         self.stopping_amax = match kind {
             StopKind::Fault(_) => {
@@ -1323,7 +1346,13 @@ impl SimMcu {
                     config_acc
                 }
             }
-            _ => config_acc,
+            _ => {
+                if self.stop_acc_count_s2 > 0 {
+                    f64::from(self.stop_acc_count_s2)
+                } else {
+                    config_acc
+                }
+            }
         };
     }
 
@@ -1534,8 +1563,8 @@ impl SimMcu {
                 self.setpoint_vel = v;
             }
             McuState::Stopping => {
-                // Rate latched in begin_stop: CONFIG max_acc for a controlled
-                // stop, the last frame's max_acc for a fault stop.
+                // Rate latched in begin_stop: stop_acc (else CONFIG max_acc) for a
+                // controlled stop, the last frame's max_acc for a fault stop.
                 let amax = self.stopping_amax;
                 let dv = amax * dt;
                 let v = self.setpoint_vel;

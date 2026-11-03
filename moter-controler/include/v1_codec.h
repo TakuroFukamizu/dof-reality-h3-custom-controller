@@ -377,6 +377,7 @@ struct SetLimits {
   uint16_t ff_count_s_per_percent; // > 0
   uint16_t deadband_count;
   uint16_t deadband_out_count;     // ≥ deadband_count
+  uint16_t stop_acc_count_s2;      // 制御された停止の減速度。0 = 未設定（CONFIG の max_acc）
 };
 
 struct Hello {
@@ -576,7 +577,7 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
       put_u16(out + 8, l.ff_count_s_per_percent);
       put_u16(out + 10, l.deadband_count);
       put_u16(out + 12, l.deadband_out_count);
-      // 14: u16 reserved = 0
+      put_u16(out + 14, l.stop_acc_count_s2);
       break;
     }
     default:
@@ -770,7 +771,8 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
       l.ff_count_s_per_percent = get_u16(p + 8);
       l.deadband_count = get_u16(p + 10);
       l.deadband_out_count = get_u16(p + 12);
-      break;  // 7・14 の予約は読まない
+      l.stop_acc_count_s2 = get_u16(p + 14);
+      break;  // 7 の予約は読まない
     }
     default:
       return false;
