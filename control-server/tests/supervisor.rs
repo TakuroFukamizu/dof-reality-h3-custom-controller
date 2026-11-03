@@ -1567,35 +1567,44 @@ fn center_moves_to_neutral_at_reduced_speed_then_holds() {
 
 /// 2026-11-01 on hardware: CENTER reported `center_reached` with axis 2 still
 /// 280 counts below neutral (gravity-loaded, position loop saturated at
-/// duty_min). The setpoint had arrived; the mechanism had not. The move must
-/// be judged on measured position and fault when an axis cannot get there.
+/// duty_min). The setpoint had arrived; the mechanism had not. A stall that
+/// the governor is already slowing for does not wait out `center_reach_timeout`:
+/// the measured position never moves, so the server issues the coordinated
+/// stop (`governor_no_progress`) and, because the axis still is not at rest,
+/// the stop then faults. `center_reached` is not emitted.
 #[test]
 fn center_waits_for_measured_position_and_faults_on_a_stalled_axis() {
     let cfg = sim_cfg();
     let cal = calibration::from_config(&cfg);
-    // 150 counts short: inside following_error_limit (800), so only the new
-    // measured-position check can end the move.
+    // 150 counts short: inside following_error_limit (800), so the MCU does
+    // not FOLLOWING_ERROR. The server ends the move.
     let mut r = Rig::with(cfg.clone(), |i, p| p.initial_count = cal[i].neutral_count() - 150);
     r.holding();
     r.mcus[1].set_stall(true); // axis 2's plant does not move at all
     r.sup.drain_events();
     r.admin(AdminCmd::Center).unwrap();
     r.wait_state(RigState::Active, 500);
-    // 150 counts at max_vel × 0.25 takes about 1.2 s; the planner and the
-    // setpoints are at neutral long before 3 s, but axis 2 is not.
-    r.run_ms(3000);
-    assert_eq!(r.sup.state(), RigState::Active, "centered reported with axis2 at {}", r.mcus[1].actual_count());
-    assert_eq!(r.sup.active_source(), Some(ActiveSource::Center));
+    let t_active = r.now;
+    r.wait_state(RigState::Stopping, 4000);
+    let waited = r.now.saturating_duration_since(t_active);
+    // FE has to reach fe_start and sat_ms before the 1500 ms no-progress window.
+    assert!(waited >= Duration::from_millis(cfg.governor.no_progress_ms), "{waited:?}");
+    assert!(waited <= Duration::from_millis(cfg.governor.no_progress_ms + 1000), "{waited:?}");
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
     let (ev, _) = r.sup.drain_events();
+    assert!(ev.iter().any(|e| e.kind == "governor_no_progress"), "{ev:?}");
     assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
     assert!((r.mcus[0].actual_count() - cal[0].neutral_count()).abs() <= 3);
     assert_eq!(r.mcus[1].actual_count(), cal[1].neutral_count() - 150);
+    assert!(r.sup.snapshot(r.now).limits.contains(&LimitReason::GovernorNoProgress));
+    assert!(r.sup.snapshot(r.now).axes.iter().all(|a| a.referenced));
 
-    r.wait_state(RigState::FaultLatched, cfg.timing.center_reach_timeout_ms + 2000);
+    r.wait_state(RigState::FaultLatched, cfg.timing.stop_settle_timeout_ms + 2000);
     assert_eq!(r.sup.fault(), Some(&RigFault::StopTimeout));
     let rec = r.sup.fault_history().last().unwrap();
     let detail = rec.detail.clone().unwrap_or_default();
-    assert!(detail.starts_with("center: axis2"), "{detail}");
+    assert!(detail.contains("deceleration did not settle"), "{detail}");
+    assert!(detail.contains("axis2"), "{detail}");
     let (ev, _) = r.sup.drain_events();
     assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
 }
@@ -1613,9 +1622,14 @@ fn center_completes_when_measured_position_catches_up() {
     r.sup.drain_events();
     r.admin(AdminCmd::Center).unwrap();
     r.wait_state(RigState::Active, 500);
-    r.run_ms(2000);
-    assert_eq!(r.sup.state(), RigState::Active);
-    r.mcus[1].set_stall(false); // the load lets go before the timeout
+    // Inside the no-progress window: the setpoint can already be home while
+    // axis 2 is still short, and that must not complete the centre.
+    r.run_ms(800);
+    assert_eq!(r.sup.state(), RigState::Active, "{:?}", r.sup.fault());
+    assert_eq!(r.mcus[1].actual_count(), cal[1].neutral_count() - 150);
+    let (ev, _) = r.sup.drain_events();
+    assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
+    r.mcus[1].set_stall(false); // the load lets go before no-progress fires
     r.wait_state(RigState::Holding, cfg.timing.center_reach_timeout_ms);
     assert!(r.sup.fault().is_none());
     let (ev, _) = r.sup.drain_events();

@@ -165,7 +165,8 @@ impl Drop for RunningServer {
 }
 
 /// Validate, bind, start the backend, the control loop and the API.
-pub async fn start(cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
+pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
+    cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
     cfg.validate()?;
     let addr = match opts.bind_override {
         Some(a) => a,

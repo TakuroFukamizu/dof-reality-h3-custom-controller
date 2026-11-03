@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::time::Instant;
 
 use crate::planner::AxisLimits;
@@ -29,10 +29,19 @@ const SAT_MARGIN_PERMILLE: i32 = 5;
 const FE_TREND_WINDOW_MS: u64 = 60;
 /// 速度の符号を決める下限（count/s）。これ未満は「目標は動いていない」。
 const VEL_SIGN_MIN_COUNT_S: f64 = 1.0;
+/// `s` の積分に使う 1 回の dt の上限。遅れた tick が空き時間を速度にしない。
+const MAX_INTEGRATE_DT: Duration = Duration::from_millis(20);
+/// これより長い観測の空きは解放の滞在を捨てる（2 tick ぶん。ちょうど 20 ms は連続）。
+const RELEASE_GAP: Duration = Duration::from_millis(20);
 
-/// `[governor]`。節が無いときは [`GovernorConfig::default`]。
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields, default)]
+/// 工場出荷のしきい値。`following_error_limit_count` が `FACTORY_FE_HARD` 以下で、
+/// 設定がこの 3 つを書いていないときだけ、limit に対する比率へ縮める。
+pub const FACTORY_FE_START: u32 = 120;
+pub const FACTORY_FE_HARD: u32 = 200;
+pub const FACTORY_FE_RELEASE: u32 = 60;
+
+/// `[governor]`。節が無いときは [`GovernorConfig::default`]（有効）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GovernorConfig {
     pub enabled: bool,
     /// 飽和と組で減速を始める |FE|（count）。
@@ -53,65 +62,195 @@ pub struct GovernorConfig {
     pub release_ms: u64,
     /// STATUS がこれより古ければ `s` を上げない（ms）。
     pub stale_ms: u64,
+    /// 原因軸の実位置が目標へこれだけ進まなければサーバが coordinated stop する（ms）。
+    pub no_progress_ms: u64,
+    /// TOML が `fe_start` / `fe_hard` / `fe_release` のいずれかを書いた。
+    /// 書いた値は比率へ縮めない。シリアライズしない。
+    #[serde(skip)]
+    pub thresholds_explicit: bool,
 }
 
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fe_start: 120,
-            fe_hard: 200,
-            fe_release: 60,
+            fe_start: FACTORY_FE_START,
+            fe_hard: FACTORY_FE_HARD,
+            fe_release: FACTORY_FE_RELEASE,
             s_min: 0.25,
             down_rate: 4.0,
             up_rate: 0.5,
             sat_ms: 60,
             release_ms: 300,
             stale_ms: 100,
+            no_progress_ms: 1500,
+            thresholds_explicit: false,
         }
     }
 }
 
+/// `fe_*` の省略と明示を分ける。既定値と同じ数を書いても明示。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct GovernorConfigDe {
+    enabled: Option<bool>,
+    fe_start: Option<u32>,
+    fe_hard: Option<u32>,
+    fe_release: Option<u32>,
+    s_min: Option<f64>,
+    down_rate: Option<f64>,
+    up_rate: Option<f64>,
+    sat_ms: Option<u64>,
+    release_ms: Option<u64>,
+    stale_ms: Option<u64>,
+    no_progress_ms: Option<u64>,
+}
+
+impl Default for GovernorConfigDe {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            fe_start: None,
+            fe_hard: None,
+            fe_release: None,
+            s_min: None,
+            down_rate: None,
+            up_rate: None,
+            sat_ms: None,
+            release_ms: None,
+            stale_ms: None,
+            no_progress_ms: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GovernorConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = GovernorConfigDe::deserialize(deserializer)?;
+        let mut cfg = GovernorConfig::default();
+        if let Some(v) = raw.enabled {
+            cfg.enabled = v;
+        }
+        if let Some(v) = raw.fe_start {
+            cfg.fe_start = v;
+        }
+        if let Some(v) = raw.fe_hard {
+            cfg.fe_hard = v;
+        }
+        if let Some(v) = raw.fe_release {
+            cfg.fe_release = v;
+        }
+        if let Some(v) = raw.s_min {
+            cfg.s_min = v;
+        }
+        if let Some(v) = raw.down_rate {
+            cfg.down_rate = v;
+        }
+        if let Some(v) = raw.up_rate {
+            cfg.up_rate = v;
+        }
+        if let Some(v) = raw.sat_ms {
+            cfg.sat_ms = v;
+        }
+        if let Some(v) = raw.release_ms {
+            cfg.release_ms = v;
+        }
+        if let Some(v) = raw.stale_ms {
+            cfg.stale_ms = v;
+        }
+        if let Some(v) = raw.no_progress_ms {
+            cfg.no_progress_ms = v;
+        }
+        cfg.thresholds_explicit = raw.fe_start.is_some() || raw.fe_hard.is_some() || raw.fe_release.is_some();
+        Ok(cfg)
+    }
+}
+
 impl GovernorConfig {
-    /// `fe_release < fe_start < fe_hard < following_error_limit`、
-    /// `0 < s_min ≤ 1`、両 rate が正。違反の説明を返す（空なら合格）。
-    pub fn validation_errors(&self, following_error_limit_count: u32) -> Vec<String> {
-        let mut errs = Vec::new();
-        if self.fe_release >= self.fe_start {
-            errs.push(format!(
-                "governor.fe_release ({}) must be < governor.fe_start ({})",
-                self.fe_release, self.fe_start
-            ));
+    fn thresholds_are_factory(&self) -> bool {
+        self.fe_start == FACTORY_FE_START
+            && self.fe_hard == FACTORY_FE_HARD
+            && self.fe_release == FACTORY_FE_RELEASE
+    }
+
+    /// 有効、かつしきい値を書いておらず、工場値のまま、かつ
+    /// `limit` が工場の `fe_hard` 以下のときだけ、
+    /// `fe_release = 0.15·limit`、`fe_start = 0.3·limit`、`fe_hard = 0.5·limit`
+    /// （四捨五入）にする。2 回目は工場値でなくなるので何もしない。
+    pub fn apply_scaled_defaults(&mut self, limit: u32) {
+        if !self.enabled || self.thresholds_explicit || !self.thresholds_are_factory() {
+            return;
+        }
+        if limit == 0 || limit > FACTORY_FE_HARD {
+            return;
+        }
+        self.fe_release = pct_half_up(limit, 15);
+        self.fe_start = pct_half_up(limit, 30);
+        self.fe_hard = pct_half_up(limit, 50);
+        if self.fe_hard >= limit {
+            self.fe_hard = limit.saturating_sub(1);
         }
         if self.fe_start >= self.fe_hard {
-            errs.push(format!(
-                "governor.fe_start ({}) must be < governor.fe_hard ({})",
-                self.fe_start, self.fe_hard
-            ));
+            self.fe_start = self.fe_hard.saturating_sub(1);
         }
-        if self.fe_hard >= following_error_limit_count {
-            errs.push(format!(
-                "governor.fe_hard ({}) must be < limits.following_error_limit_count ({})",
-                self.fe_hard, following_error_limit_count
-            ));
+        if self.fe_release >= self.fe_start {
+            self.fe_release = self.fe_start.saturating_sub(1);
         }
-        if !(self.s_min.is_finite() && self.s_min > 0.0 && self.s_min <= 1.0) {
+    }
+
+    /// 有効なときだけ `fe_release < fe_start < fe_hard < following_error_limit`。
+    /// 工場値で limit が `fe_hard` 以下なら、検査は縮めた値で行う（self は変えない）。
+    /// `0 < s_min ≤ 1`、両 rate が正、`no_progress_ms > 0` は無効でも見る。
+    /// 違反の説明を返す（空なら合格）。
+    pub fn validation_errors(&self, following_error_limit_count: u32) -> Vec<String> {
+        let mut cfg = self.clone();
+        cfg.apply_scaled_defaults(following_error_limit_count);
+        let mut errs = Vec::new();
+        if cfg.enabled {
+            if cfg.fe_release >= cfg.fe_start {
+                errs.push(format!(
+                    "governor.fe_release ({}) must be < governor.fe_start ({})",
+                    cfg.fe_release, cfg.fe_start
+                ));
+            }
+            if cfg.fe_start >= cfg.fe_hard {
+                errs.push(format!(
+                    "governor.fe_start ({}) must be < governor.fe_hard ({})",
+                    cfg.fe_start, cfg.fe_hard
+                ));
+            }
+            if cfg.fe_hard >= following_error_limit_count {
+                errs.push(format!(
+                    "governor.fe_hard ({}) must be < limits.following_error_limit_count ({})",
+                    cfg.fe_hard, following_error_limit_count
+                ));
+            }
+        }
+        if !(cfg.s_min.is_finite() && cfg.s_min > 0.0 && cfg.s_min <= 1.0) {
             errs.push(format!(
                 "governor.s_min must be within (0, 1], got {}",
-                self.s_min
+                cfg.s_min
             ));
         }
-        if !(self.down_rate.is_finite() && self.down_rate > 0.0) {
+        if !(cfg.down_rate.is_finite() && cfg.down_rate > 0.0) {
             errs.push(format!(
                 "governor.down_rate must be > 0, got {}",
-                self.down_rate
+                cfg.down_rate
             ));
         }
-        if !(self.up_rate.is_finite() && self.up_rate > 0.0) {
-            errs.push(format!("governor.up_rate must be > 0, got {}", self.up_rate));
+        if !(cfg.up_rate.is_finite() && cfg.up_rate > 0.0) {
+            errs.push(format!("governor.up_rate must be > 0, got {}", cfg.up_rate));
+        }
+        if cfg.no_progress_ms == 0 {
+            errs.push("governor.no_progress_ms must be > 0".into());
         }
         errs
     }
+}
+
+/// `numer` は百分率の分子（15 = 15%）。0.5 は切り上げ。
+fn pct_half_up(limit: u32, numer: u32) -> u32 {
+    ((u64::from(limit) * u64::from(numer) + 50) / 100) as u32
 }
 
 /// なぜ `s` を下げているか。status の `governor.reason`。
@@ -185,7 +324,9 @@ pub struct TrackingGovernor {
 }
 
 impl TrackingGovernor {
-    pub fn new(cfg: GovernorConfig, fe_limit: u32) -> Self {
+    pub fn new(mut cfg: GovernorConfig, fe_limit: u32) -> Self {
+        // 手で組んだ Config でも、工場しきい値が limit を超えないようにする。
+        cfg.apply_scaled_defaults(fe_limit);
         Self {
             cfg,
             fe_limit,
@@ -221,13 +362,20 @@ impl TrackingGovernor {
             return 1.0;
         }
 
-        let dt = match self.last_now {
-            Some(prev) => now.saturating_duration_since(prev).as_secs_f64(),
-            None => 0.0,
+        let gap = match self.last_now {
+            Some(prev) => now.saturating_duration_since(prev),
+            None => Duration::ZERO,
         };
         self.last_now = Some(now);
-        // 時計が戻った・非有限のときは動かさない。
-        let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
+        // 空いたあいだ「解放が続いていた」とは数えない。積分の dt も頭打ち。
+        // 飽和の計時（sat_since）は壁時計のまま（空きではリセットしない）。
+        if gap > RELEASE_GAP || gap > Duration::from_millis(self.cfg.stale_ms) {
+            self.clear_since = None;
+        }
+        let dt = {
+            let secs = gap.min(MAX_INTEGRATE_DT).as_secs_f64();
+            if secs.is_finite() && secs > 0.0 { secs } else { 0.0 }
+        };
 
         let mut any_stale = false;
         let mut all_clear = true;
@@ -501,6 +649,19 @@ mod tests {
         g.update(*now, axes)
     }
 
+    /// 20 ms 刻みで `s_min` まで下げる。1 回の長い step は dt 頭打ちで届かない。
+    fn descend_to_floor(g: &mut TrackingGovernor, now: &mut Instant, axes: &[AxisSample; 3]) -> f64 {
+        g.update(*now, axes);
+        let mut s = 1.0;
+        for _ in 0..40 {
+            s = step(g, now, 20, axes);
+            if (s - g.config().s_min).abs() < 1e-9 {
+                break;
+            }
+        }
+        s
+    }
+
     fn expected_s(fe_abs: u32) -> f64 {
         let raw = 1.0 - (f64::from(fe_abs) - 120.0) / (400.0 - 120.0);
         raw.clamp(0.25, 1.0)
@@ -517,8 +678,13 @@ mod tests {
         assert_eq!(d.s_min, 0.25);
         assert_eq!((d.down_rate, d.up_rate), (4.0, 0.5));
         assert_eq!((d.sat_ms, d.release_ms, d.stale_ms), (60, 300, 100));
+        assert_eq!(d.no_progress_ms, 1500);
+        assert!(!d.thresholds_explicit);
         assert!(d.validation_errors(400).is_empty());
         assert!(d.validation_errors(800).is_empty());
+        // limit が工場の fe_hard 以下でも、検査は縮めた値で通り、self は工場値のまま。
+        assert!(d.validation_errors(200).is_empty());
+        assert_eq!(d.fe_hard, FACTORY_FE_HARD);
     }
 
     #[test]
@@ -546,6 +712,73 @@ mod tests {
         c = GovernorConfig::default();
         c.s_min = 1.0;
         assert!(c.validation_errors(400).is_empty());
+        c = GovernorConfig::default();
+        c.no_progress_ms = 0;
+        assert!(c.validation_errors(400).iter().any(|e| e.contains("no_progress_ms")));
+        // 無効でも no_progress_ms と rate は見る。しきい値の順序は見ない。
+        c.enabled = false;
+        c.fe_hard = 500;
+        assert!(c.validation_errors(200).iter().any(|e| e.contains("no_progress_ms")));
+        assert!(!c.validation_errors(200).iter().any(|e| e.contains("fe_hard")));
+    }
+
+    #[test]
+    fn factory_thresholds_scale_only_when_enabled_and_not_explicit() {
+        let mut c = GovernorConfig::default();
+        c.apply_scaled_defaults(200);
+        assert_eq!((c.fe_release, c.fe_start, c.fe_hard), (30, 60, 100));
+        assert!(c.validation_errors(200).is_empty());
+        // 工場値ではなくなるので 2 回目は上書きしない。
+        c.fe_hard = 90;
+        c.apply_scaled_defaults(200);
+        assert_eq!(c.fe_hard, 90);
+
+        let mut wide = GovernorConfig::default();
+        wide.apply_scaled_defaults(400);
+        assert_eq!((wide.fe_release, wide.fe_start, wide.fe_hard), (60, 120, 200));
+        wide.apply_scaled_defaults(800);
+        assert_eq!(wide.fe_hard, 200);
+
+        // 無効、または TOML が数を書いたときは縮めない。明示の違反は検査が落とす。
+        let mut off = GovernorConfig::default();
+        off.enabled = false;
+        off.fe_hard = 500;
+        off.apply_scaled_defaults(200);
+        assert_eq!(off.fe_hard, 500);
+        assert!(off.validation_errors(200).is_empty());
+
+        let mut explicit = GovernorConfig::default();
+        explicit.thresholds_explicit = true;
+        explicit.apply_scaled_defaults(200);
+        assert_eq!(explicit.fe_hard, FACTORY_FE_HARD);
+        explicit.fe_hard = 500;
+        assert!(explicit.validation_errors(200).iter().any(|e| e.contains("fe_hard")));
+
+        // Rust 側で工場値を壊しただけ（明示フラグなし）は縮めず、順序で落とす。
+        let mut edited = GovernorConfig::default();
+        edited.fe_hard = 400;
+        edited.apply_scaled_defaults(200);
+        assert_eq!(edited.fe_hard, 400);
+        assert!(edited.validation_errors(400).iter().any(|e| e.contains("following_error_limit")));
+    }
+
+    #[test]
+    fn omitted_thresholds_deserialize_as_factory_and_explicit_numbers_stay() {
+        let omitted: GovernorConfig = toml::from_str("enabled = true\n").unwrap();
+        assert!(!omitted.thresholds_explicit);
+        assert_eq!(omitted.fe_hard, FACTORY_FE_HARD);
+        assert_eq!(omitted.no_progress_ms, 1500);
+
+        let explicit: GovernorConfig = toml::from_str(
+            "fe_start = 120\nfe_hard = 200\nfe_release = 60\nno_progress_ms = 800\n",
+        )
+        .unwrap();
+        assert!(explicit.thresholds_explicit);
+        assert_eq!((explicit.fe_release, explicit.fe_start, explicit.fe_hard), (60, 120, 200));
+        assert_eq!(explicit.no_progress_ms, 800);
+        let mut kept = explicit;
+        kept.apply_scaled_defaults(200);
+        assert_eq!(kept.fe_hard, 200);
     }
 
     #[test]
@@ -617,8 +850,14 @@ mod tests {
             idle(),
         ];
         g.update(now, &axes);
-        let s = step(&mut g, &mut now, 200, &axes);
         let want = expected_s(180);
+        let mut s = 1.0;
+        for _ in 0..10 {
+            s = step(&mut g, &mut now, 20, &axes);
+            if (s - want).abs() < 1e-9 {
+                break;
+            }
+        }
         assert!((s - want).abs() < 1e-9, "s {s} want {want}");
         assert_eq!(g.status().axis, AxisId::new(2));
         assert_eq!(g.status().reason, Some(GovernReason::PwmSaturated));
@@ -629,14 +868,18 @@ mod tests {
         let mut g = gov(cfg_fast());
         let mut now = Instant::now();
         let axes = only(lagging(10_000));
+        // 500 ms を 1 回で渡しても積分は 20 ms まで。rate 10 なら 0.2 しか落ちない。
         g.update(now, &axes);
-        let s = step(&mut g, &mut now, 500, &axes);
+        let one = step(&mut g, &mut now, 500, &axes);
+        let capped = 1.0 - 10.0 * Duration::from_millis(20).as_secs_f64();
+        assert!((one - capped).abs() < 1e-6, "capped step s = {one}, want {capped}");
+        let s = descend_to_floor(&mut g, &mut now, &axes);
         assert_eq!(s, 0.25);
         assert!((expected_s(10_000) - 0.25).abs() < 1e-12);
     }
 
     #[test]
-    fn down_rate_bounds_one_step() {
+    fn down_rate_bounds_one_step_and_a_delayed_tick_does_not_integrate_the_gap() {
         let mut cfg = GovernorConfig::default();
         cfg.sat_ms = 0;
         cfg.down_rate = 4.0;
@@ -644,9 +887,25 @@ mod tests {
         let mut now = Instant::now();
         let axes = only(lagging(10_000));
         g.update(now, &axes);
-        // 100 ms × 4.0/s = 0.4。s_min まで落ち切らない。
+        // 100 ms の空きは 20 ms として積分する。4/s × 0.02 = 0.08。0.6 までは落ちない。
         let s = step(&mut g, &mut now, 100, &axes);
-        assert!((s - 0.6).abs() < 1e-9, "s = {s}");
+        let one = 1.0 - 4.0 * Duration::from_millis(20).as_secs_f64();
+        assert!((s - one).abs() < 1e-6, "s = {s}");
+        // 観測した 20 ms を 5 回足すと 100 ms ぶん（0.4）下がる。
+        let mut s = 1.0;
+        let mut g = gov(GovernorConfig { sat_ms: 0, down_rate: 4.0, ..GovernorConfig::default() });
+        let mut now = Instant::now();
+        g.update(now, &axes);
+        for _ in 0..5 {
+            s = step(&mut g, &mut now, 20, &axes);
+        }
+        let mut want = 1.0;
+        let dt = Duration::from_millis(20).as_secs_f64();
+        for _ in 0..5 {
+            want -= 4.0 * dt;
+        }
+        assert!((s - want).abs() < 1e-6, "s = {s} want {want}");
+        assert!((want - 0.6).abs() < 1e-9);
     }
 
     #[test]
@@ -709,18 +968,59 @@ mod tests {
         let mut g = gov(cfg_fast());
         let mut now = Instant::now();
         let hot = only(lagging(10_000));
-        g.update(now, &hot);
-        let low = step(&mut g, &mut now, 200, &hot);
-        assert_eq!(low, 0.25);
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
 
         let clear = only(ax(-10, 0, 1, 0, true));
-        // この tick で計時開始（経過 0）。release_ms = 100。
+        // この tick で計時開始（経過 0）。release_ms = 100。10 ms 刻み。
         step(&mut g, &mut now, 10, &clear);
-        let held = step(&mut g, &mut now, 90, &clear);
-        assert_eq!(held, 0.25);
-        // 計時から 110 ms。dt = 20 ms、up_rate 1/s → +0.02。
-        let s = step(&mut g, &mut now, 20, &clear);
-        assert!((s - 0.27).abs() < 1e-9, "s = {s}");
+        for _ in 0..9 {
+            let held = step(&mut g, &mut now, 10, &clear);
+            assert_eq!(held, 0.25);
+        }
+        // 計時から 100 ms。dt = 10 ms、up_rate 1/s → +0.01。
+        let s = step(&mut g, &mut now, 10, &clear);
+        assert!((s - 0.26).abs() < 1e-9, "s = {s}");
+    }
+
+    #[test]
+    fn release_evidence_resets_across_observation_gaps() {
+        let clear = only(ax(-10, 0, 1, 0, true));
+        let hot = only(lagging(10_000));
+
+        // 21 ms の空きは 2 tick 超。stale_ms が 100 でも解放の計時は捨てる。
+        let mut g = gov(cfg_fast());
+        let mut now = Instant::now();
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
+        step(&mut g, &mut now, 10, &clear);
+        step(&mut g, &mut now, 21, &clear);
+        for _ in 0..9 {
+            assert_eq!(step(&mut g, &mut now, 10, &clear), 0.25);
+        }
+
+        // 16 ms は 20 ms 以下でも stale_ms を超えたら捨てる。
+        let mut cfg = cfg_fast();
+        cfg.stale_ms = 15;
+        let mut g = gov(cfg);
+        let mut now = Instant::now();
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
+        step(&mut g, &mut now, 10, &clear);
+        step(&mut g, &mut now, 16, &clear);
+        for _ in 0..9 {
+            assert_eq!(step(&mut g, &mut now, 10, &clear), 0.25);
+        }
+
+        // ちょうど 20 ms は連続。そのあと 10 ms を足して 100 ms で上がり始める。
+        let mut g = gov(cfg_fast());
+        let mut now = Instant::now();
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
+        step(&mut g, &mut now, 10, &clear); // 計時開始
+        let still = step(&mut g, &mut now, 20, &clear); // 経過 20 ms。空きでは切らない。
+        assert_eq!(still, 0.25);
+        for _ in 0..7 {
+            assert_eq!(step(&mut g, &mut now, 10, &clear), 0.25); // 経過 90 ms
+        }
+        let s = step(&mut g, &mut now, 10, &clear); // 経過 100 ms
+        assert!((s - 0.26).abs() < 1e-9, "s = {s}");
     }
 
     #[test]
@@ -728,18 +1028,19 @@ mod tests {
         let mut g = gov(cfg_fast());
         let mut now = Instant::now();
         let hot = only(lagging(10_000));
-        g.update(now, &hot);
-        step(&mut g, &mut now, 200, &hot);
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
 
-        // |FE| は fe_release 以上。飽和は解けている。
+        // |FE| は fe_release 以上。飽和は解けている。10 ms 刻みで release_ms を超えても上げない。
         let mid = only(ax(-80, 0, 1, 0, true));
-        let s = step(&mut g, &mut now, 500, &mid);
-        assert_eq!(s, 0.25, "fe_release hysteresis");
+        for _ in 0..30 {
+            assert_eq!(step(&mut g, &mut now, 10, &mid), 0.25, "fe_release hysteresis");
+        }
 
         // |FE| は小さいが、まだ飽和。
         let sat = only(ax(-10, 400, 1, 0, true));
-        let s = step(&mut g, &mut now, 500, &sat);
-        assert_eq!(s, 0.25, "still saturated");
+        for _ in 0..30 {
+            assert_eq!(step(&mut g, &mut now, 10, &sat), 0.25, "still saturated");
+        }
     }
 
     #[test]
@@ -749,16 +1050,18 @@ mod tests {
         // 古い巨大 FE では下げない。
         let stale_hot = only(ax(-500, 400, 1, 101, true));
         g.update(now, &stale_hot);
-        assert_eq!(step(&mut g, &mut now, 200, &stale_hot), 1.0);
+        assert_eq!(step(&mut g, &mut now, 20, &stale_hot), 1.0);
 
         let hot = only(lagging(10_000));
-        g.update(now, &hot);
-        let low = step(&mut g, &mut now, 200, &hot);
-        assert_eq!(low, 0.25);
+        assert_eq!(descend_to_floor(&mut g, &mut now, &hot), 0.25);
 
-        // 誤差は解消したように見えるが STATUS が古い。上げない。
+        // 誤差は解消したように見えるが STATUS が古い。10 ms 刻みでも上げない
+        // （空きで計時が切れたから、ではなく古さそのもので上げない）。
         let stale_clear = only(ax(0, 0, 1, 150, true));
-        let s = step(&mut g, &mut now, 500, &stale_clear);
+        let mut s = 0.25;
+        for _ in 0..30 {
+            s = step(&mut g, &mut now, 10, &stale_clear);
+        }
         assert_eq!(s, 0.25);
         assert!(g.status().active);
         // 原因の軸は、s が 1 に戻るまで残す。

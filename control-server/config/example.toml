@@ -89,6 +89,8 @@ up_rate = 0.5
 sat_ms = 60
 release_ms = 300
 stale_ms = 100
+# 原因軸の実位置が目標へ 20 count 以上進まない状態がこれだけ続いたら coordinated stop
+no_progress_ms = 1500
 
 [backend]
 kind = "serial"

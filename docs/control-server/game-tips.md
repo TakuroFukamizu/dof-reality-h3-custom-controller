@@ -111,7 +111,7 @@ val = a + (b - a) * s
 | 見る場所 | 入る理由 | 意味 |
 | --- | --- | --- |
 | pose の ack `limits` | `pose_clamped` / `gain_limited` / `gain_negative` | 受け付け時の検査。姿勢が −1..1 外、gain が `max_gain` 超 |
-| **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` / `tracking_governed` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない**。`tracking_governed` は追従ガバナ（[limits.md](limits.md) §1.3） |
+| **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` / `tracking_governed` / `governor_no_progress` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない**。`tracking_governed` は追従ガバナ（[limits.md](limits.md) §1.3）。`governor_no_progress` はその原因軸が止まって coordinated stop したとき |
 | `limits` メッセージの ack `limits` | `operator_limited` / `ceiling_clamped` / `stop_time_limited` | 要求した制限値がサーバーで変えられた（操作者の値で / ファームの上限で / 停止時間の規則で）。`effective_limits` に結果 |
 
 the server may slow all axes together when one can't keep up; status limits shows tracking_governed

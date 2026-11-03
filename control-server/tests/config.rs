@@ -233,6 +233,45 @@ fn governor_section_defaults_and_rejects_bad_thresholds() {
     let loaded = Config::from_toml_str(&with).unwrap();
     assert_eq!((loaded.governor.fe_release, loaded.governor.fe_start, loaded.governor.fe_hard), (40, 100, 180));
     assert_eq!(loaded.governor.s_min, h3cs::governor::GovernorConfig::default().s_min);
+    assert!(loaded.governor.thresholds_explicit);
+    assert_eq!(loaded.governor.no_progress_ms, 1500);
+}
+
+#[test]
+fn governor_scales_factory_defaults_when_the_following_error_limit_is_small() {
+    let text = std::fs::read_to_string(SIM).unwrap();
+    let low = text.replacen(
+        "following_error_limit_count = 800",
+        "following_error_limit_count = 200",
+        1,
+    );
+    let cfg = Config::from_toml_str(&low).unwrap();
+    assert!(!cfg.governor.thresholds_explicit);
+    assert_eq!(
+        (cfg.governor.fe_release, cfg.governor.fe_start, cfg.governor.fe_hard),
+        (30, 60, 100)
+    );
+    assert_eq!(cfg.governor.no_progress_ms, 1500);
+
+    // 無効なら順序を見ない。明示の fe_hard は縮めない。
+    let off = format!("{low}\n[governor]\nenabled = false\nfe_hard = 500\n");
+    let cfg = Config::from_toml_str(&off).unwrap();
+    assert!(!cfg.governor.enabled);
+    assert!(cfg.governor.thresholds_explicit);
+    assert_eq!(cfg.governor.fe_hard, 500);
+
+    // 工場値と同じ数でも書いたら明示。limit 200 では fe_hard が通らない。
+    let explicit = format!("{low}\n[governor]\nfe_start = 120\nfe_hard = 200\nfe_release = 60\n");
+    match Config::from_toml_str(&explicit) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("governor.fe_hard"), "{m}"),
+        other => panic!("expected invalid fe_hard, got {other:?}"),
+    }
+
+    let stalled = format!("{text}\n[governor]\nno_progress_ms = 0\n");
+    match Config::from_toml_str(&stalled) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("governor.no_progress_ms"), "{m}"),
+        other => panic!("expected invalid no_progress_ms, got {other:?}"),
+    }
 }
 
 #[test]

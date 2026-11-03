@@ -390,7 +390,9 @@ impl Config {
     }
 
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(text)?;
+        let mut cfg: Config = toml::from_str(text)?;
+        // 節が無く工場しきい値のとき、limit が fe_hard 以下なら比率へ縮めてから検査する。
+        cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
         cfg.validate()?;
         Ok(cfg)
     }

@@ -186,7 +186,12 @@ pub mod stop_reason {
     pub const ADMIN: u8 = 1;
     pub const SOURCE_STALE: u8 = 2;
     pub const CENTER_REACHED: u8 = 3;
+    /// ガバナ中に原因軸の実位置が目標へ進まなかった。
+    pub const GOVERNOR_NO_PROGRESS: u8 = 4;
 }
+
+/// 無進捗停止の「目標へ進んだ」と数える実位置の変化（count）。
+const NO_PROGRESS_COUNTS: i64 = 20;
 
 /// `AdminError::error` codes.
 pub mod admin_error {
@@ -608,6 +613,17 @@ struct AxisTrack {
     /// |following_error| inside `timing.rest_*`); `None` once one did not.
     /// `axis_at_rest` needs this to be `rest_dwell_ms` old.
     rest_since: Option<Instant>,
+    /// 直前の STATUS 間隔で MCU の `target_count` が動いた向き。
+    /// 0 は「この間隔では動いていない」で、ガバナはプランナー速度に戻す。
+    mcu_target_sign: i8,
+}
+
+/// ACTIVE でガバナが軸 k を原因に `s < 1` のあいだ、その軸の実位置が進んだか。
+#[derive(Debug, Clone)]
+struct NoProgressWatch {
+    axis: usize,
+    since: Instant,
+    actual0: i32,
 }
 
 impl AxisTrack {
@@ -744,6 +760,10 @@ pub struct Supervisor {
     planner: Planner,
     /// 追跡中の目標が実機に対して逃げないよう、全軸共通の倍率を出す。
     governor: TrackingGovernor,
+    /// ガバナが原因軸を下げているあいだの無進捗ウォッチ。
+    no_progress: Option<NoProgressWatch>,
+    /// 無進捗で coordinated stop した。次に Active へ入るまで status の limits に残す。
+    governor_no_progress: bool,
     planner_settled: bool,
     /// Center: when the planner (and every MCU setpoint) first reached neutral.
     /// `center_reached` additionally needs every MEASURED position within
@@ -840,6 +860,8 @@ impl Supervisor {
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
             governor: TrackingGovernor::new(cfg.governor.clone(), cfg.limits.following_error_limit_count),
+            no_progress: None,
+            governor_no_progress: false,
             planner_settled: false,
             center_commanded_at: None,
             epoch: nonzero(session_epoch),
@@ -1228,6 +1250,8 @@ impl Supervisor {
         self.drive.requested_counts = None;
         // 追跡の倍率。停止（step_stop）には掛けない。
         let gov_s = self.update_governor(now);
+        // 原因軸が止まっていたら、この tick の追跡の前に coordinated stop へ入る。
+        self.check_governor_no_progress(now);
         match self.phase {
             Phase::Active {
                 source: ActiveSource::Game,
@@ -1349,6 +1373,9 @@ impl Supervisor {
         let governor = self.governor.status();
         if governor.active && !limits.contains(&LimitReason::TrackingGoverned) {
             limits.push(LimitReason::TrackingGoverned);
+        }
+        if self.governor_no_progress && !limits.contains(&LimitReason::GovernorNoProgress) {
+            limits.push(LimitReason::GovernorNoProgress);
         }
         let axes = (0..AXIS_COUNT)
             .map(|i| {
@@ -1805,6 +1832,7 @@ impl Supervisor {
             t.cal_pending = false;
             t.cal_ack_ev = None;
             t.calibrate_rejected = None;
+            t.mcu_target_sign = 0;
             // Firmware defaults again: SET_LIMITS must be re-sent (reconcile_limits).
             t.clear_limits();
             if let Some(h) = t.hello {
@@ -1812,6 +1840,20 @@ impl Supervisor {
             }
         }
         let t = &mut self.axes[i];
+        // プランナーは MCU の setpoint より先に反転する。遅れの向きは、
+        // この STATUS 間隔で MCU 自身の target_count が動いた向きを優先する。
+        if !rebooted {
+            if let Some(prev) = t.status {
+                let delta = i64::from(status.target_count) - i64::from(prev.target_count);
+                t.mcu_target_sign = if delta > 0 {
+                    1
+                } else if delta < 0 {
+                    -1
+                } else {
+                    0
+                };
+            }
+        }
         t.boot_id = Some(status.boot_id);
         // A STATUS after the CALIBRATE ACK that is not CALIBRATING: the
         // calibration is over (or never ran); CONFIG may be sent again.
@@ -2707,6 +2749,8 @@ impl Supervisor {
             } => {
                 if all_ok && all_in(McuState::Active) {
                     self.group = None;
+                    self.governor_no_progress = false;
+                    self.no_progress = None;
                     self.phase = Phase::Active {
                         source,
                         entered: now,
@@ -3240,27 +3284,110 @@ impl Supervisor {
                 .status_age(i, now)
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
+            let planner_sign = governor::target_vel_sign(vels[i]);
+            // MCU の目標がこの間隔で動いていればその向き。止まっていればプランナー。
+            let target_vel_sign = if t.mcu_target_sign != 0 {
+                t.mcu_target_sign
+            } else {
+                planner_sign
+            };
             governor::AxisSample {
                 following_error_count: status.map(|s| s.following_error_count).unwrap_or(0),
                 pwm_permille: status.map(|s| s.pwm_permille).unwrap_or(0),
                 duty_max_permille: duty,
-                target_vel_sign: governor::target_vel_sign(vels[i]),
+                target_vel_sign,
                 status_age_ms: age_ms,
                 active: tracking && status.is_some(),
             }
         })
     }
 
+    /// ACTIVE かつ `s < 1` の原因軸について、実位置が目標へ `NO_PROGRESS_COUNTS`
+    /// 以上進まない状態が `no_progress_ms` 続いたら coordinated stop。
+    /// 進みは実位置の変位（目標が実位置へ寄っても進んだことにしない）。
+    fn check_governor_no_progress(&mut self, now: Instant) {
+        if !matches!(self.phase, Phase::Active { .. }) {
+            self.no_progress = None;
+            return;
+        }
+        let st = self.governor.status();
+        let Some(id) = st.axis.filter(|_| st.active) else {
+            self.no_progress = None;
+            return;
+        };
+        let i = id.index();
+        if !self.axes[i].connected {
+            self.no_progress = None;
+            return;
+        }
+        let Some(actual) = self.axes[i].status.map(|s| s.actual_count) else {
+            self.no_progress = None;
+            return;
+        };
+        if !self.planner.is_initialized() {
+            self.no_progress = None;
+            return;
+        }
+        let target = self.planner.command_counts()[i];
+        let toward = i64::from(target) - i64::from(actual);
+        let dir: i8 = if toward > 0 {
+            1
+        } else if toward < 0 {
+            -1
+        } else {
+            0
+        };
+        // 目標に着いている。窓を捨てて、止まらない。
+        if dir == 0 {
+            self.no_progress = None;
+            return;
+        }
+        let same = self.no_progress.as_ref().is_some_and(|w| w.axis == i);
+        if !same {
+            self.no_progress = Some(NoProgressWatch { axis: i, since: now, actual0: actual });
+            return;
+        }
+        let (since, actual0) = {
+            let w = self.no_progress.as_ref().unwrap();
+            (w.since, w.actual0)
+        };
+        let progress = (i64::from(actual) - i64::from(actual0)) * i64::from(dir);
+        if progress >= NO_PROGRESS_COUNTS {
+            self.no_progress = Some(NoProgressWatch { axis: i, since: now, actual0: actual });
+            return;
+        }
+        if now.saturating_duration_since(since) < Duration::from_millis(self.governor.config().no_progress_ms) {
+            return;
+        }
+        self.event(
+            now,
+            "governor_no_progress",
+            serde_json::json!({
+                "axis": id,
+                "actual": actual,
+                "target": target,
+                "progress": progress,
+            }),
+        );
+        self.governor_no_progress = true;
+        self.no_progress = None;
+        self.begin_stop(stop_reason::GOVERNOR_NO_PROGRESS, now);
+    }
+
     fn build_set_position(&mut self, drive_limits: &[LimitReason]) -> [SetPosition; AXIS_COUNT] {
         self.group_frame_id = nonzero(self.group_frame_id.wrapping_add(1));
-        let fraction = match self.phase {
-            Phase::Active {
-                source: ActiveSource::Center,
-                ..
-            } => self.game.center_speed_fraction,
-            _ => 1.0,
+        // ACTIVE / CENTER のフレームはプランナーと同じ s（速度）と s²（加速度）。
+        // ファームの追従補正がこの上限で動くため、ここを素のままだと
+        // ガバナより速く追いつける。停止フレームは全減速度（センター倍率も掛けない）。
+        let scale = self.governor.status().scale;
+        let limits = match self.phase {
+            Phase::Active { source: ActiveSource::Center, .. } => {
+                self.track_limits(self.game.center_speed_fraction, scale)
+            }
+            Phase::Active { source: ActiveSource::Game, .. } => self.track_limits(1.0, scale),
+            Phase::Stopping { .. } => self.axis_limits(1.0),
+            _ => self.axis_limits(1.0),
         };
-        let limits = self.axis_limits(fraction);
         let planned = self
             .planner
             .is_initialized()
@@ -3717,5 +3844,292 @@ mod governor_wire {
             assert!((dv - acc * 0.01).abs() < 1e-4, "axis {i} stop dv {dv}, full {}", acc * 0.01);
             assert!(dv > acc * s * s * 0.01 + 1.0, "stop must not take s²");
         }
+    }
+
+    fn referenced_status(fe: i32, pwm: i16, actual: i32) -> Status {
+        let mut s = stat(fe, pwm);
+        s.actual_count = actual;
+        s.target_count = actual;
+        s.flags = crate::types::status_flags::POSITION_REFERENCED;
+        s
+    }
+
+    fn push_measured(sup: &mut Supervisor, t: Instant, lag: usize, fe: i32, actual: [i32; 3]) {
+        for i in 0..3 {
+            sup.axes[i].connected = true;
+            sup.axes[i].status = Some(referenced_status(if i == lag { fe } else { 0 }, if i == lag { 400 } else { 0 }, actual[i]));
+            sup.axes[i].status_at = Some(t);
+        }
+    }
+
+    /// ガバナ中の SET_POSITION は s / s²。その直後の STOP フレームは全減速度。
+    #[test]
+    fn governed_frames_are_scaled_and_the_following_stop_keeps_full_decel() {
+        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        cfg.governor.no_progress_ms = 1500;
+        let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
+        let mut t = Instant::now();
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        let mut governed = None;
+        for _ in 0..25 {
+            push_measured(&mut sup, t, 1, -250, [-400, -400, -400]);
+            let out = sup.tick(t, 0.01, None);
+            if sup.governor.status().scale < 1.0 {
+                governed = out.set_position;
+            }
+            t += Duration::from_millis(10);
+        }
+        assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
+        let frame = governed.expect("scaled frame");
+        let s = sup.governor.status().scale;
+        assert!(s < 0.95, "s = {s}");
+        let scaled = sup.track_limits(sup.game.center_speed_fraction, s);
+        let bare = sup.axis_limits(sup.game.center_speed_fraction);
+        for i in 0..3 {
+            assert_eq!(frame[i].max_vel_count_s, super::to_u32_limit(scaled[i].max_vel_count_s));
+            assert_eq!(frame[i].max_acc_count_s2, super::to_u32_limit(scaled[i].max_acc_count_s2));
+            assert!(frame[i].max_vel_count_s < super::to_u32_limit(bare[i].max_vel_count_s));
+            assert!(frame[i].max_acc_count_s2 < super::to_u32_limit(bare[i].max_acc_count_s2));
+        }
+
+        push_measured(&mut sup, t, 1, -250, [-400, -400, -400]);
+        sup.begin_stop(super::stop_reason::ADMIN, t);
+        let out = sup.tick(t, 0.01, None);
+        assert_eq!(sup.state(), RigState::Stopping, "{:?}", sup.fault);
+        let stop = out.set_position.expect("stop frame");
+        let full = sup.axis_limits(1.0);
+        for i in 0..3 {
+            assert_eq!(stop[i].max_vel_count_s, super::to_u32_limit(full[i].max_vel_count_s));
+            assert_eq!(stop[i].max_acc_count_s2, super::to_u32_limit(full[i].max_acc_count_s2));
+            assert!(stop[i].max_acc_count_s2 > frame[i].max_acc_count_s2);
+            assert!(sup.axes[i].referenced());
+        }
+        let stops: Vec<u8> = out
+            .admin_msgs
+            .iter()
+            .flatten()
+            .filter_map(|m| match m {
+                crate::protocol::HostMsg::ControlledStop { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec![super::stop_reason::ADMIN; 3]);
+    }
+
+    fn sim_governed(no_progress_ms: u64) -> (Supervisor, Instant) {
+        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        cfg.governor.no_progress_ms = no_progress_ms;
+        let sup = Supervisor::with_initial_ids(&cfg, 1, 1);
+        (sup, Instant::now())
+    }
+
+    #[test]
+    fn stuck_axis_with_a_finite_target_stops_within_no_progress() {
+        let (mut sup, mut t) = sim_governed(200);
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        let mut governed_at = None;
+        let mut stopped_at = None;
+        for _ in 0..80 {
+            push_measured(&mut sup, t, 1, -250, [-400, -400, -400]);
+            let out = sup.tick(t, 0.01, None);
+            if governed_at.is_none() && sup.governor.status().scale < 1.0 {
+                governed_at = Some(t);
+                assert_eq!(sup.state(), RigState::Active);
+            }
+            if sup.state() == RigState::Stopping {
+                stopped_at = Some((t, out));
+                break;
+            }
+            assert!(sup.fault.is_none(), "{:?}", sup.fault);
+            t += Duration::from_millis(10);
+        }
+        let t0 = governed_at.expect("governor");
+        let (t1, out) = stopped_at.expect("stop");
+        let waited = t1.saturating_duration_since(t0);
+        assert!(waited >= Duration::from_millis(200), "stopped too soon: {waited:?}");
+        assert!(waited <= Duration::from_millis(220), "stopped too late: {waited:?}");
+        assert!(sup.fault.is_none(), "{:?}", sup.fault);
+        assert!(sup.axes.iter().all(|a| a.referenced()));
+        let (events, _) = sup.drain_events();
+        assert!(events.iter().any(|e| e.kind == "governor_no_progress"));
+        let snap = sup.snapshot(t1);
+        assert!(snap.limits.contains(&LimitReason::GovernorNoProgress));
+        assert!(snap.axes.iter().all(|a| a.referenced));
+        let json = serde_json::to_value(&snap).unwrap();
+        assert!(json["limits"].as_array().unwrap().iter().any(|x| x == "governor_no_progress"));
+        let reasons: Vec<u8> = out
+            .admin_msgs
+            .iter()
+            .flatten()
+            .filter_map(|m| match m {
+                crate::protocol::HostMsg::ControlledStop { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, vec![super::stop_reason::GOVERNOR_NO_PROGRESS; 3]);
+    }
+
+    #[test]
+    fn oscillating_target_with_a_frozen_axis_still_stops() {
+        let (mut sup, mut t) = sim_governed(400);
+        sup.planner.init([0, 0, 0]);
+        sup.drive_session = Some(1);
+        sup.phase = Phase::Active { source: ActiveSource::Game, entered: t };
+        let mut pitch = 1.0;
+        let mut governed_at = None;
+        let mut min_cmd = i32::MAX;
+        let mut max_cmd = i32::MIN;
+        let mut saw_pos = false;
+        let mut saw_neg = false;
+        let mut stopped = false;
+        for step in 0..120 {
+            if step >= 8 && step % 8 == 0 {
+                pitch = -pitch;
+            }
+            let pose = crate::types::Pose { pitch, roll: 0.0, yaw: 0.0 };
+            let checked = crate::compat::check_pose(pose, 0.5, 1.0, true).unwrap();
+            let accepted = crate::session::AcceptedPose {
+                pose,
+                requested_gain: 0.5,
+                checked,
+                fresh_until: t + Duration::from_secs(2),
+                frame_seq: Some(1),
+                seq: 1,
+                received_at: t,
+                produced_at: t,
+                freshness_mode: crate::session::FreshnessMode::FrameSeq,
+                session_gen: 1,
+            };
+            let v = sup.planner.velocities()[1];
+            let fe = if v < 0.0 { 250 } else { -250 };
+            push_measured(&mut sup, t, 1, fe, [0, 0, 0]);
+            sup.tick(t, 0.01, Some(&accepted));
+            if sup.governor.status().scale < 1.0 {
+                governed_at.get_or_insert(t);
+                let cmd = sup.planner.command_counts()[1];
+                min_cmd = min_cmd.min(cmd);
+                max_cmd = max_cmd.max(cmd);
+                if v > 1.0 {
+                    saw_pos = true;
+                }
+                if v < -1.0 {
+                    saw_neg = true;
+                }
+            }
+            if sup.state() == RigState::Stopping {
+                stopped = true;
+                let waited = t.saturating_duration_since(governed_at.expect("governed"));
+                assert!(waited >= Duration::from_millis(400), "{waited:?}");
+                assert!(waited <= Duration::from_millis(420), "{waited:?}");
+                break;
+            }
+            assert!(sup.fault.is_none(), "{:?}", sup.fault);
+            t += Duration::from_millis(10);
+        }
+        assert!(stopped, "scale {} cmd {min_cmd}..{max_cmd}", sup.governor.status().scale);
+        assert!(max_cmd - min_cmd > 20, "target did not travel: {min_cmd}..{max_cmd}");
+        assert!(saw_pos && saw_neg, "target did not reverse (pos {saw_pos} neg {saw_neg})");
+        assert!(sup.axes.iter().all(|a| a.referenced()));
+        assert_eq!(sup.axes[1].status.unwrap().actual_count, 0);
+        let (events, _) = sup.drain_events();
+        assert!(events.iter().any(|e| e.kind == "governor_no_progress"));
+        assert!(sup.snapshot(t).limits.contains(&LimitReason::GovernorNoProgress));
+    }
+
+    #[test]
+    fn slow_axis_that_keeps_approaching_is_not_stopped() {
+        let (mut sup, mut t) = sim_governed(200);
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        let mut actual = [-400, -400, -400];
+        let mut governed_at = None;
+        for _ in 0..80 {
+            let cmd = sup.planner.command_counts()[1];
+            if cmd > actual[1] {
+                actual[1] = (actual[1] + 3).min(cmd);
+            } else if cmd < actual[1] {
+                actual[1] = (actual[1] - 3).max(cmd);
+            }
+            push_measured(&mut sup, t, 1, -250, actual);
+            sup.tick(t, 0.01, None);
+            if sup.governor.status().scale < 1.0 {
+                governed_at.get_or_insert(t);
+            }
+            assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
+            if governed_at.is_some_and(|t0| t.saturating_duration_since(t0) >= Duration::from_millis(400)) {
+                break;
+            }
+            t += Duration::from_millis(10);
+        }
+        let t0 = governed_at.expect("governor");
+        assert!(t.saturating_duration_since(t0) >= Duration::from_millis(400));
+        assert!(sup.governor.status().scale < 1.0);
+        assert!(actual[1] > -400 + 20);
+        assert!(sup.fault.is_none(), "{:?}", sup.fault);
+        let (events, _) = sup.drain_events();
+        assert!(events.iter().all(|e| e.kind != "governor_no_progress"));
+    }
+
+    #[test]
+    fn reversal_uses_the_mcu_target_direction_when_the_planner_has_already_flipped() {
+        let (mut sup, mut t) = sim_governed(1500);
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        for _ in 0..8 {
+            push_measured(&mut sup, t, 1, 0, [-400, -400, -400]);
+            sup.tick(t, 0.01, None);
+            t += Duration::from_millis(10);
+        }
+        assert!(sup.planner.velocities()[1] > 1.0, "vel {}", sup.planner.velocities()[1]);
+
+        // プランナーはまだ上昇。MCU の目標向きが無い（符号 0）ので正の FE は行き過ぎ。
+        for _ in 0..10 {
+            push_measured(&mut sup, t, 1, 250, [-300, -300, -300]);
+            sup.tick(t, 0.01, None);
+            t += Duration::from_millis(10);
+        }
+        assert_eq!(sup.governor.status().scale, 1.0, "planner-only sign must not govern overshoot");
+        assert_eq!(sup.axes[1].mcu_target_sign, 0);
+        assert!(sup.planner.velocities()[1] > 1.0);
+
+        let mut descending = referenced_status(250, 400, 1100);
+        descending.target_count = 1000;
+        for i in 0..3 {
+            sup.axes[i].connected = true;
+            let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+            sup.on_status(i, sample, t, t);
+        }
+        t += Duration::from_millis(10);
+        descending.target_count = 900;
+        for i in 0..3 {
+            let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+            sup.on_status(i, sample, t, t);
+        }
+        assert_eq!(sup.axes[1].mcu_target_sign, -1);
+
+        let mut target = 900;
+        let mut dropped = false;
+        for _ in 0..12 {
+            target -= 20;
+            descending.target_count = target;
+            descending.actual_count = target + 250;
+            for i in 0..3 {
+                let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+                sup.on_status(i, sample, t, t);
+            }
+            sup.tick(t, 0.01, None);
+            t += Duration::from_millis(10);
+            if sup.governor.status().scale < 1.0 {
+                dropped = true;
+                break;
+            }
+            assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
+        }
+        assert!(dropped, "MCU target descending with positive FE must govern");
+        assert!(sup.planner.velocities()[1] > 1.0, "planner still lifting");
+        assert_eq!(sup.axes[1].mcu_target_sign, -1);
+        assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
     }
 }
