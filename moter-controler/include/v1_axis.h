@@ -37,7 +37,7 @@ struct V1Tuning {
   int duty_max = V1_DUTY_MAX;
   int stall_duty = V1_STALL_DUTY;
   int stall_duty_ratio_percent = V1_STALL_DUTY_RATIO_PERCENT;  // ENCODER_FAULT のしきい値 = max(stall_duty, duty_max × これ / 100)
-  uint32_t stall_ms = STALL_MS;
+  uint32_t stall_ms = V1_STALL_MS;
   uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
   uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
@@ -780,6 +780,8 @@ class V1Axis {
 
   // 無パルス（ENCODER_FAULT）
   bool stall_running_ = false;
+  // 端ガードが参照速度を 0 にしたために回り始めた窓。ガードが解けても、カウントが動くまで捨てない。
+  bool stall_guard_continue_ = false;
   V1DutyState duty_state_{};  // 不感帯と床のヒステリシス（位置制御が止まれば戻す）
   uint64_t settle_dwell_us_ = 0;  // 整定判定（Issue #25 手順 10「S」）: 条件が続いている時間
 
@@ -1287,6 +1289,7 @@ class V1Axis {
     duty_state_ = V1DutyState{};  // 積分（保持バイアス）も捨てる（Issue #25 手順 9「F」）
     reset_v_fast();               // r9: 速い速度推定も取り直す（積分と同じ契機）
     stall_running_ = false;
+    stall_guard_continue_ = false;
     hold_here();
     v1::McuMsg m;
     memset(&m, 0, sizeof(m));
@@ -1442,53 +1445,99 @@ class V1Axis {
 
   // 端ガードが外向きの参照速度を 0 にしている間は、実測速度が落ちるまで「停止済み」にしない。
   // これがないと COMMAND_TIMEOUT が減速（STOPPING）を飛ばして即 FAULT になり、STOPPING 中のガードも 1 tick で終わる。
+  // ガード由来の無パルス窓が、カウントが止まったまま続いているときも完了させない（静かに HOLDING へ行かない）。
   bool end_guard_blocks_stop_finish() const {
-    if (end_guard_side_ == 0) return false;
-    const int32_t speed_i = velocity_ < 0 ? -velocity_ : velocity_;
-    return speed_i >= tuning.end_guard_release_count_s;
+    if (end_guard_side_ != 0) {
+      const int32_t speed_i = velocity_ < 0 ? -velocity_ : velocity_;
+      if (speed_i >= tuning.end_guard_release_count_s) return true;
+    }
+    return stall_guard_continue_ && stall_running_ && raw_ == stall_last_raw_;
   }
 
-  // ACTIVE の最新目標が、ガード側の実測より内側か。等しい・外側は内側ではない。
+  // d_req = |v|·t_lat + v²/(2·a_min) + d_margin。speed は非負。
+  double end_guard_d_req(double speed) const {
+    if (speed < 0.0) speed = -speed;
+    const double a = tuning.end_guard_acc_count_s2;
+    const double t_lat = static_cast<double>(tuning.end_guard_lat_ms) / 1000.0;
+    return speed * t_lat + (speed * speed) / (2.0 * a) + static_cast<double>(tuning.end_guard_margin_count);
+  }
+
+  // ガードが守る線: 凍結した参照と実測のうち、外側でない方。参照が実測より外なら、その参照が線。
+  double end_guard_mark(int side, double x) const {
+    if (side > 0) return x < guard_p_prev_ ? x : guard_p_prev_;
+    return x > guard_p_prev_ ? x : guard_p_prev_;
+  }
+
+  // ACTIVE の最新目標が、守る線より内側か。実測だけより内側（参照が実測の外）は内側ではない。
+  // 例: lo 側で実測 100・凍結参照 150・目標 120 は、参照から見ると外（150→120）。
   // STOPPING は届いた目標で軌道を変えないので、古い control_target_ が内側でも内側要求とは見ない。
   bool end_guard_demand_inward(int side, double x) const {
     if (state_ != v1::state::ACTIVE || side == 0) return false;
-    if (side > 0) return control_target_ < x;
-    return control_target_ > x;
+    const double mark = end_guard_mark(side, x);
+    if (side > 0) return control_target_ < mark;
+    return control_target_ > mark;
+  }
+
+  // 参照を、凍結位置より外へも実測より外へも置かない。外向きの参照速度は 0。
+  void enforce_guard_bound(int side) {
+    const double x = static_cast<double>(actual_count());
+    if (side > 0) {
+      if (setpoint_vel_ > 0.0) setpoint_vel_ = 0.0;
+      const double ceiling = end_guard_mark(side, x);
+      if (setpoint_ > ceiling) setpoint_ = ceiling;
+    } else if (side < 0) {
+      if (setpoint_vel_ < 0.0) setpoint_vel_ = 0.0;
+      const double floor_p = end_guard_mark(side, x);
+      if (setpoint_ < floor_p) setpoint_ = floor_p;
+    }
   }
 
   // 内側の目標なのに、この tick の参照がまだ内側へ動いていない（再生の遅れ・枯渇で速度 0 を含む）なら、
-  // ガード前の参照から今の目標へ profile_step し直す。すでに内側へ向いていれば何もしない。
-  // ガード自身は外向きの出力を作らない。
+  // ガード前の参照から今の目標へ profile_step し直す。フレームの速度・加速度はそのまま（0 を CONFIG で埋めない。
+  // 加速度を下限で引き上げない）。差し替えの結果も、解けるまでは守る線を外へ越えない。
   void follow_inward_now(int side) {
     const bool already_in = side > 0 ? (setpoint_vel_ < 0.0 || setpoint_ < guard_p_prev_)
                                      : (setpoint_vel_ > 0.0 || setpoint_ > guard_p_prev_);
-    if (already_in) return;
-    double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
-    if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
-    double vmax = frame_max_vel_ > 0.0 ? frame_max_vel_ : static_cast<double>(config_.max_vel_count_s);
-    if (vmax < 0.0) vmax = 0.0;
-    double p = guard_p_prev_;
-    double vel = guard_v_prev_;
-    profile_step(control_target_, vmax, amax, guard_dt_ > 0.0 ? guard_dt_ : 0.0, &p, &vel);
-    const double lo = static_cast<double>(config_.soft_min_count);
-    const double hi = static_cast<double>(config_.soft_max_count);
-    if (p < lo) {
-      p = lo;
-      if (vel < 0.0) vel = 0.0;
+    if (!already_in) {
+      const double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : 0.0;
+      const double vmax = frame_max_vel_ > 0.0 ? frame_max_vel_ : 0.0;
+      double p = guard_p_prev_;
+      double vel = guard_v_prev_;
+      profile_step(control_target_, vmax, amax, guard_dt_ > 0.0 ? guard_dt_ : 0.0, &p, &vel);
+      const double lo = static_cast<double>(config_.soft_min_count);
+      const double hi = static_cast<double>(config_.soft_max_count);
+      if (p < lo) {
+        p = lo;
+        if (vel < 0.0) vel = 0.0;
+      }
+      if (p > hi) {
+        p = hi;
+        if (vel > 0.0) vel = 0.0;
+      }
+      setpoint_ = p;
+      setpoint_vel_ = vel;
     }
-    if (p > hi) {
-      p = hi;
-      if (vel > 0.0) vel = 0.0;
-    }
-    setpoint_ = p;
-    setpoint_vel_ = vel;
+    enforce_guard_bound(side);
   }
 
-  // 実測位置 x・実測速度 v（100 ms 窓の velocity_）で、外へ進む側のソフトリミット手前で参照を止める。
-  //   d_req = |v|·t_lat + v²/(2·a_min) + d_margin
-  // 距離が d_req 以下なら END_GUARD。外向きの参照速度は 0、参照位置は実測より外へ置かない。
-  // すでに実測より内側の参照は、その位置から外へ進めない（毎 tick 実測へ寄せると誤差が消えて惰性で抜ける）。
-  // |v| < release、内側への要求、または実測が外向きでなくなったら解く。a_min ≤ 0 なら無効。SOFT_LIMIT の判定は変えない。
+  // 実測速度の絶対値が release 未満のとき、参照速度または ACTIVE の目標が外を向いていれば、その側。
+  // 距離は参照速度を推定の上限にした d_req（遅れ + v²/2a + margin）以下。100 ms 窓が 0 の起動・再始動用。
+  int end_guard_start_inhibit(double x, double d_ref) const {
+    const double hi = static_cast<double>(config_.soft_max_count);
+    const double lo = static_cast<double>(config_.soft_min_count);
+    const bool tgt_hi = state_ == v1::state::ACTIVE && control_target_ > x;
+    const bool tgt_lo = state_ == v1::state::ACTIVE && control_target_ < x;
+    if ((setpoint_vel_ > 0.0 || tgt_hi) && (hi - x) <= d_ref) return 1;
+    if ((setpoint_vel_ < 0.0 || tgt_lo) && (x - lo) <= d_ref) return -1;
+    return 0;
+  }
+
+  // 実測位置 x・実測速度 v（100 ms 窓の velocity_）と参照速度で、外へ進む側のソフトリミット手前で参照を止める。
+  //   d_req = |v|·t_lat + v²/(2·a_min) + d_margin、|v| は max(|v_meas|, |v_ref|)
+  // 距離が d_req 以下なら END_GUARD。外向きの参照速度は 0、参照位置は実測より外へ、凍結位置より外へ置かない。
+  // 解くのは、実測が逆向き、内側への要求（守る線より内側）、または |v| < release かつ起動抑制の外。
+  // |v| < release でも参照や目標が外を向いて端の d_req 以内なら掛けたまま（速度窓が開く前に進ませない）。
+  // a_min ≤ 0 なら無効。SOFT_LIMIT の判定は変えない。ガード自身は外向きの出力を作らない。
   void apply_end_guard() {
     const bool armed = state_ == v1::state::ACTIVE || state_ == v1::state::STOPPING;
     if (!armed || !has_config_ || tuning.end_guard_acc_count_s2 <= 0.0) {
@@ -1496,47 +1545,49 @@ class V1Axis {
       return;
     }
     const double x = static_cast<double>(actual_count());
-    const double v = static_cast<double>(velocity_);
-    const double speed = v < 0.0 ? -v : v;
+    const double v_meas = static_cast<double>(velocity_);
+    const double v_ref = setpoint_vel_;
+    const double speed_meas = v_meas < 0.0 ? -v_meas : v_meas;
+    const double speed_ref = v_ref < 0.0 ? -v_ref : v_ref;
+    const double speed = speed_meas > speed_ref ? speed_meas : speed_ref;
     const int32_t speed_i = velocity_ < 0 ? -velocity_ : velocity_;
-    const double a = tuning.end_guard_acc_count_s2;
-    const double t_lat = static_cast<double>(tuning.end_guard_lat_ms) / 1000.0;
-    const double d_req =
-        speed * t_lat + (speed * speed) / (2.0 * a) + static_cast<double>(tuning.end_guard_margin_count);
+    const double d_req = end_guard_d_req(speed);
+    const double d_ref = end_guard_d_req(speed_ref);
     const double hi = static_cast<double>(config_.soft_max_count);
     const double lo = static_cast<double>(config_.soft_min_count);
     int approach = 0;
-    if (v > 0.0 && (hi - x) <= d_req) approach = 1;
-    else if (v < 0.0 && (x - lo) <= d_req) approach = -1;
+    if (v_meas > 0.0 && (hi - x) <= d_req) approach = 1;
+    else if (v_meas < 0.0 && (x - lo) <= d_req) approach = -1;
+    const int inhibit = speed_i < tuning.end_guard_release_count_s ? end_guard_start_inhibit(x, d_ref) : 0;
 
     if (end_guard_side_ != 0) {
-      // 掛かっている間は d_req が縮んでも維持する。次のどれかで解く:
-      //   |v| が release 未満、要求が内側、実測が外向きでなくなった（0 または逆向き）。
-      // 逆向きでも掴んだままだと、参照が止まった位置の後ろに残り、位置ループが逆走を育てる。
-      const bool still_outward = (end_guard_side_ > 0 && velocity_ > 0) || (end_guard_side_ < 0 && velocity_ < 0);
-      if (!still_outward || speed_i < tuning.end_guard_release_count_s ||
-          end_guard_demand_inward(end_guard_side_, x)) {
+      // 掛かっている間は d_req が縮んでも維持する。逆向きは解く（100 ms 窓が |v| < release を飛ばして
+      // 逆走すると、参照が後ろに残って位置ループが逆走を育てる）。|v| < release は、起動抑制の条件が
+      // まだ成り立つ間は解かない（速度が 0 のまま端で外へ出さない）。
+      const bool reversed =
+          (end_guard_side_ > 0 && velocity_ < 0) || (end_guard_side_ < 0 && velocity_ > 0);
+      const bool slow = speed_i < tuning.end_guard_release_count_s;
+      const bool hold_slow = slow && inhibit == static_cast<int>(end_guard_side_);
+      if (reversed || end_guard_demand_inward(end_guard_side_, x) || (slow && !hold_slow)) {
         const int released = end_guard_side_;
+        const bool inward = end_guard_demand_inward(released, x);
         end_guard_side_ = 0;
-        if (end_guard_demand_inward(released, x)) follow_inward_now(released);
-        return;
+        if (inward) follow_inward_now(released);
       }
-    } else if (approach != 0 && speed_i >= tuning.end_guard_release_count_s &&
-               !end_guard_demand_inward(approach, x)) {
-      end_guard_side_ = static_cast<int8_t>(approach);
-    } else if (approach != 0 && end_guard_demand_inward(approach, x)) {
-      follow_inward_now(approach);
-      return;
     }
-    if (end_guard_side_ > 0) {
-      if (setpoint_vel_ > 0.0) setpoint_vel_ = 0.0;
-      const double ceiling = x < guard_p_prev_ ? x : guard_p_prev_;
-      if (setpoint_ > ceiling) setpoint_ = ceiling;
-    } else if (end_guard_side_ < 0) {
-      if (setpoint_vel_ < 0.0) setpoint_vel_ = 0.0;
-      const double floor_p = x > guard_p_prev_ ? x : guard_p_prev_;
-      if (setpoint_ < floor_p) setpoint_ = floor_p;
+    if (end_guard_side_ == 0) {
+      if (approach != 0 && speed_i >= tuning.end_guard_release_count_s &&
+          !end_guard_demand_inward(approach, x)) {
+        end_guard_side_ = static_cast<int8_t>(approach);
+      } else if (inhibit != 0 && !end_guard_demand_inward(inhibit, x)) {
+        end_guard_side_ = static_cast<int8_t>(inhibit);
+      } else if (approach != 0 && end_guard_demand_inward(approach, x)) {
+        follow_inward_now(approach);
+      } else if (inhibit != 0 && end_guard_demand_inward(inhibit, x)) {
+        follow_inward_now(inhibit);
+      }
     }
+    if (end_guard_side_ != 0) enforce_guard_bound(end_guard_side_);
   }
 
   // 再生バッファの参照が減速に使う加速度 [count/s²]: 最後のフレームの max_acc（CONFIG で頭打ち済み）。0・ごく小さい値でも
@@ -1866,6 +1917,7 @@ class V1Axis {
     if (!position_control_on()) {
       duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
       stall_running_ = false;
+      stall_guard_continue_ = false;
       duty_state_ = V1DutyState{};
       reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
       settle_dwell_us_ = 0;
@@ -1892,15 +1944,20 @@ class V1Axis {
     if (state_ == v1::state::FAULT) return;  // 上乗せの上限・時間切れで ENCODER_FAULT をラッチした（出力は落ちている）
 
     // ENCODER_FAULT: |duty| ≥ しきい値（max(stall_duty, duty_max × 75 %) の permille。Issue #15 M2）が stall_ms 続いてカウントが
-    // 変わらない（manual_guard.h の無パルス判定と同じ窓）。
-    // 窓を回すのは「ブレーキ解除指令中」かつ「軌道が動いている（setpoint_vel ≠ 0）」間だけ（設計 §3）:
+    // 変わらない（manual_guard.h の無パルス判定と同じ窓。v1 の窓は V1_STALL_MS。自動移動の STALL_MS は別）。
+    // 窓を回すのは「ブレーキ解除指令中」かつ「軌道が動いている」間だけ（設計 §3）:
     //  - ブレーキ作動指令中（DISARMING）はカウントが変わらないのが正常。残った追従誤差で窓を回すと DISARM が FAULT になる。
     //  - 目標が止まっているときの静止（荷重とのつり合いで最小 Duty では動かない）は、エンコーダの死と区別できない。
     //    この場合の誤差の上限は FOLLOWING_ERROR が守る（エンコーダが生きている前提。エンコーダが死んだまま目標が
-    //    止まっている間は検出できず、目標が動けば STALL_MS で出る）。
+    //    止まっている間は検出できず、目標が動けば V1_STALL_MS で出る）。
     //  - しきい値を duty_max の 75 % 以上にするのは、kp を上げたとき数百 count の誤差だけで 10 % に届き、荷重で動けない軸が
     //    FOLLOWING_ERROR の前に ENCODER_FAULT になって基準を失うのを避けるため。上限近くまで出しても止まっているときだけ異常。
-    if (mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && setpoint_vel_ != 0.0) {
+    // 端ガードが外向きの参照速度を 0 にしただけは「軌道が止まった」にしない（窓をリセットしない。検出は厳しくしない）。
+    // 実測速度が落ちてガードが解けても、その窓はカウントが動くまで続ける。死んだエンコーダで速度が 0 になり、
+    // STOPPING が HOLDING で静かに終わる経路を、これまでどおりの ENCODER_FAULT に戻す。
+    if (stall_running_ && raw_ != stall_last_raw_ && !end_guard_active()) stall_guard_continue_ = false;
+    const bool ref_moving = setpoint_vel_ != 0.0 || end_guard_active() || stall_guard_continue_;
+    if (mag >= encoder_fault_duty_threshold_permille() && brake_release_cmd_ && ref_moving) {
       if (!stall_running_) {
         stall_running_ = true;
         stall_start_us_ = now;
@@ -1916,10 +1973,13 @@ class V1Axis {
           latch_fault(v1::fault::ENCODER_FAULT, now);
           duty_permille_ = 0;
           stall_running_ = false;
+          stall_guard_continue_ = false;
         }
       }
+      if (stall_running_ && end_guard_active() && setpoint_vel_ == 0.0) stall_guard_continue_ = true;
     } else {
       stall_running_ = false;
+      stall_guard_continue_ = false;
     }
   }
 

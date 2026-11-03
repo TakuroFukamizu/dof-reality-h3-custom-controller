@@ -730,17 +730,33 @@ inline void test_frame_limits_capped_by_config_and_can_be_lower() {
 inline void test_soft_limit_clamps_target() {
   Harness h;
   h.reach_active();
-  h.drive(4000, 5000);  // 端の手前の減速（a_brake 1000 count/s²）は従来の 20000 より緩いので長めに
+  // profile_step は端ガードが、実測速度 0 でも 1 tick 分の参照速度の d_req だけ手前で止まり続ける。
+  // そこへ寄るのに再生バッファの 4 s より長くかかる。
+  h.drive(h.ax.tuning.playout_delay_ms > 0 ? 4000 : 8000, 5000);
   CHECK(h.ax.state() == st::ACTIVE);
-  // 再生バッファの経路（Issue #46）は参照を端の reserve 手前で止める。従来の経路はソフトリミットの値まで行く
-  const int32_t stop_at = h.ax.tuning.playout_delay_ms > 0 ? 2700 - V1_SOFT_RESERVE_COUNT : 2700;
+  // 再生バッファ（Issue #46）は端の reserve 手前。profile_step は端ガードの静止位置
+  // （v = max_acc × 5 ms = 100、d_req = 39.25 → 2700 − 39 = 2661）。
+  int32_t stop_at = 2700 - V1_SOFT_RESERVE_COUNT;
+  if (h.ax.tuning.playout_delay_ms == 0) {
+    const double v_tick = 20000.0 * 0.005;
+    const double d_req = v_tick * 0.08 + (v_tick * v_tick) / (2.0 * 4000.0) + 30.0;
+    stop_at = 2700 - static_cast<int32_t>(std::floor(d_req));
+  }
   CHECK(h.ax.target_count() == stop_at);
   CHECK(h.ax.actual_count() == stop_at);
 }
 
 inline void test_controlled_stop_decelerates_to_holding() {
   Harness h;
-  h.reach_active();
+  v1::Config c = base_config();
+  // d_req(4000) は約 2350。ソフトリミット 2700 のままだと 200 ms の加速で端ガードが参照速度を 0 にし、減速距離が消える。
+  c.soft_min_count = -30000;
+  c.soft_max_count = 30000;
+  Harness::accepted(h.config_with(c));
+  h.reach_holding_from_configured();
+  h.set_position(h.ax.actual_count());
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE);
   h.drive(200, 2500);
   CHECK(h.ax.state() == st::ACTIVE);
   const int32_t at_stop = h.ax.target_count();
@@ -1389,18 +1405,21 @@ inline void test_encoder_fault_on_no_pulses_while_driving() {
   h.ax.tuning.playout_delay_ms = 0;  // 従来の軌道（profile_step。目標へ即座に向かう）の時刻で書いた試験（Issue #45）
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;  // 追従誤差より先に無パルスで止める
+  // 目標 2000 は約 0.6 s で到着して参照速度が 0 になり、600 ms の窓が完了する前にリセットされる。遠くへ置く。
+  c.soft_min_count = -30000;
+  c.soft_max_count = 30000;
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
   h.set_position(0);
   Harness::accepted(h.start());
   h.stall = true;  // カウントが止まる
   // 軌道が動き出してフィードフォワードが |duty| ≥ しきい値 15 %（max(10, duty_max 20 × 75 %)。Issue #15 M2）に届いてから
-  // STALL_MS（200 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
+  // V1_STALL_MS（600 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）。FF が 15 % に届くまで約 75 ms なので、500 ms では未達。
   CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150);
-  h.drive(150, 2000);
+  h.drive(500, 8000);
   CHECK(h.ax.state() == st::ACTIVE);
   CHECK(h.ax.duty_permille() != 0);
-  h.drive(150, 2000);
+  h.drive(300, 8000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   CHECK(h.ax.duty_permille() == 0);
   // FAULT_RESET は通るが POSITION_REFERENCED が消える
@@ -1449,6 +1468,8 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   h.ax.tuning.playout_delay_ms = 0;  // 従来の軌道（profile_step。目標へ即座に向かう）の時刻で書いた試験（Issue #45）
   v1::Config c = base_config();
   c.following_error_limit_count = 100000;  // 後半の無パルス確認で追従誤差より先に止めない
+  c.soft_min_count = -30000;
+  c.soft_max_count = 30000;  // 目標 +2000 だと約 0.6 s で参照が止まり、V1_STALL_MS の窓が閉じる前にリセットされる
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
   h.stall = true;
@@ -1460,9 +1481,9 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   CHECK(h.ax.duty_permille() == 80 || h.ax.duty_permille() == -80);
   CHECK(h.ax.fault_code() == fc::NONE);
   CHECK(h.ax.referenced());
-  // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路）
+  // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路。窓は V1_STALL_MS）
   Harness::accepted(h.start());
-  h.drive(300, h.ax.actual_count() + 2000);
+  h.drive(800, h.ax.actual_count() + 8000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
@@ -3408,7 +3429,7 @@ inline void test_track_assist_requires_trajectory_speed_and_can_be_disabled() {
 }
 
 // 補助は保護を妨げない: 軌道 600 count/s で止まったままなら FOLLOWING_ERROR（400）は従来どおり約 0.7 s で出る。
-// kp 6 で FF + P が 15 %（duty_max 20 の 75 %）に届けば 200 ms の無パルスで ENCODER_FAULT。
+// kp 6 で FF + P が 15 %（duty_max 20 の 75 %）に届けば V1_STALL_MS（600 ms）の無パルスで ENCODER_FAULT。
 inline void test_track_assist_does_not_block_following_error_or_moving_stall_fault() {
   Harness h;
   v1::Config c = base_config();
@@ -3444,8 +3465,9 @@ inline void test_track_assist_does_not_block_following_error_or_moving_stall_fau
   const uint64_t gt0 = g.now;
   g.drive(160, gstart + 5000);
   CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().assist_on && g.ax.duty_permille() <= -90);
-  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
-  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= 900 * MS);  // 誤差 150 まで ≈ 0.25 s ＋ 無パルス 200 ms
+  // 誤差 150 まで ≈ 0.25 s ＋ V1_STALL_MS 600 ms ≈ 0.85 s。窓が 200 ms のときの 70 回では届かない。
+  for (int i = 0; i < 120 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= 1200 * MS);
   CHECK(g.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
@@ -3778,7 +3800,7 @@ inline void test_r6_axis_tracking_outputs_raw_ff_without_floor_or_pulse() {
 }
 
 // 保護は変わらない: 600 count/s で止まったままなら FOLLOWING_ERROR 400 は約 0.7 s。kp 6 / duty_max 20 なら FF 106 + P が 15 %
-// に届いた所から 200 ms の無パルスで ENCODER_FAULT（動き出しパルス 90 は 15 % 未満で判定に入らない）。
+// に届いた所から V1_STALL_MS（600 ms）の無パルスで ENCODER_FAULT（動き出しパルス 90 は 15 % 未満で判定に入らない）。
 inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
   Harness h;
   h.ax.tuning = r6_tuning(2, 40);  // duty_max 40 → 無パルスのしきい値 30 %。FF 106 + P 80 = 186 はそれ未満なので FOLLOWING_ERROR 側
@@ -3812,8 +3834,9 @@ inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
   const uint64_t gt0 = g.now;
   g.drive(60, gstart + 5000);
   CHECK(g.ax.duty_permille() <= -106 && g.ax.state() == st::ACTIVE);  // FF 106 ＋ P
-  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
-  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 600 * MS);
+  // しきい値まで ≈ 0.14 s ＋ V1_STALL_MS 600 ms。窓 200 ms の上限 600 ms では足りない。
+  for (int i = 0; i < 120 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 1100 * MS);
 }
 
 // PR #33 Codex P1: 遅い軌道（25 count/s）に 8 count 遅れて付いていく（100 ms に 2〜3 count）だけでは動き出しパルスを打たない。
@@ -4279,7 +4302,7 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
   stuck_run(V1_VEL_KD_PERMILLE_PER_COUNT_S, &t_r9, &c_r9, &d_r9);
   CHECK(c_r8 == fc::FOLLOWING_ERROR && c_r9 == fc::FOLLOWING_ERROR && t_r8 == t_r9 && t_r9 <= 1000);
   CHECK(d_r8 == 0 && d_r9 == 10);
-  // 走行中の無パルス（kp 6 / duty_max 20 → しきい値 15 %）: r9 は u_d +10 のぶん早くしきい値に届くことがあるが、判定の窓 200 ms は同じ
+  // 走行中の無パルス（kp 6 / duty_max 20 → しきい値 15 %）: r9 は u_d +10 のぶん早くしきい値に届くことがあるが、判定の窓 V1_STALL_MS は同じ
   auto stuck_enc = [](double kd, uint64_t* fault_after_ms, uint16_t* code) {
     Harness g;
     g.ax.tuning = r6_tuning(6);
@@ -4294,13 +4317,13 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
     g.pos_max_vel = 600;
     const int32_t s0 = g.ax.actual_count();
     const uint64_t t0 = g.now;
-    for (int i = 0; i < 100 && g.ax.state() != st::FAULT; ++i) g.drive(10, s0 + 5000);
+    for (int i = 0; i < 160 && g.ax.state() != st::FAULT; ++i) g.drive(10, s0 + 5000);
     *fault_after_ms = (g.now - t0) / MS;
     *code = g.ax.fault_code();
   };
   stuck_enc(0.0, &t_r8, &c_r8);
   stuck_enc(V1_VEL_KD_PERMILLE_PER_COUNT_S, &t_r9, &c_r9);
-  CHECK(c_r8 == fc::ENCODER_FAULT && c_r9 == fc::ENCODER_FAULT && t_r9 <= t_r8 && t_r9 + 100 >= t_r8 && t_r8 <= 600);
+  CHECK(c_r8 == fc::ENCODER_FAULT && c_r9 == fc::ENCODER_FAULT && t_r9 <= t_r8 && t_r9 + 100 >= t_r8 && t_r8 <= 1200);
   // 静止 2 s の監視: 静止目標で誤差 10 のまま進まない → 2 s で ENCODER_FAULT（v_fast 0・軌道 0 なので u_d 0）
   Harness k;
   r9_holding(k);
@@ -4993,7 +5016,8 @@ struct EgSim {
   uint16_t fault = fc::NONE;
 };
 
-inline void eg_prepare(EgSim& s, double speed, double a_plant, int delay_ms, int dir, int32_t lim = 0) {
+inline void eg_prepare(EgSim& s, double speed, double a_plant, int delay_ms, int dir, int32_t lim = 0,
+                       uint32_t command_timeout_ms = 5000, uint32_t stop_timeout_ms = 8000) {
   if (lim <= 0) {
     // 全速に達してから危険域に入る位置。20 s の試験で届くよう、端を必要最小限に置く
     const double accel = speed * speed / (2.0 * a_plant) + 300.0;
@@ -5009,8 +5033,8 @@ inline void eg_prepare(EgSim& s, double speed, double a_plant, int delay_ms, int
   c.max_acc_count_s2 = 40000;
   c.following_error_limit_count = 1000000;
   c.overspeed_count_s = 100000;
-  c.command_timeout_ms = 5000;
-  c.stop_timeout_ms = 8000;
+  c.command_timeout_ms = command_timeout_ms;
+  c.stop_timeout_ms = stop_timeout_ms;
   Harness::accepted(s.h.config_with(c));
   s.h.reach_holding_from_configured();
   s.h.ax.tuning.kp_percent_per_100 = 200;
@@ -5239,6 +5263,329 @@ inline void test_end_guard_midstroke_sine_unchanged() {
   CHECK(same);
 }
 
+// プラントは動かさず、いまの速度のまま惰性で進める（PWM を加速度に戻さない）。期限の試験用。
+inline void eg_coast(EgSim& s) {
+  s.x += s.v * 0.005;
+  s.h.now += 5 * MS;
+  s.h.raw = llround(s.x);
+  s.h.ax.tick(s.h.now, s.h.raw);
+  s.h.drain();
+}
+
+// 実測 100・凍結参照 150・目標 120（lo 側）。目標は実測より内側だが参照より外。参照を外へ動かさない。
+// フレームの max_vel / max_acc が 0 のときは CONFIG の速度・加速度で埋めない。
+inline void test_end_guard_target_between_actual_and_ref_does_not_move_outward() {
+  Harness h;
+  h.ax.tuning.playout_delay_ms = 0;
+  h.ax.tuning.deadband = 0;
+  h.ax.tuning.deadband_out = 0;
+  h.ax.tuning.ki_permille_per_count_s = 0;
+  h.ax.tuning.stall_ms = 60000;
+  h.ax.tuning.stall_boost_ms = 0;
+  h.ax.tuning.assist_ms = 0;
+  h.ax.tuning.soft_brake_acc_count_s2 = 0;
+  v1::Config c = base_config();
+  c.soft_min_count = 0;
+  c.soft_max_count = 5000;
+  c.max_vel_count_s = 6000;
+  c.max_acc_count_s2 = 40000;
+  c.following_error_limit_count = 1000000;
+  c.overspeed_count_s = 100000;
+  c.command_timeout_ms = 2000;
+  c.stop_timeout_ms = 2000;
+  Harness::accepted(h.config_with(c));
+  h.raw = 150;
+  h.step(5);  // 軸の生カウントを 150 にしてから基準を合わせる
+  Harness::accepted(h.set_reference(150));
+  CHECK(h.ax.actual_count() == 150);
+  h.reach_holding_from_configured();
+  h.set_position(150, 200);
+  Harness::accepted(h.start());
+  h.stall = true;
+  h.drive(50, 150);
+  CHECK(fabs(h.ax.setpoint_pos() - 150.0) < 1e-6);
+  h.raw -= 50;  // 実測 100。100 ms 窓が −500 count/s になるまで目標は 150 のまま
+  bool guarded = false;
+  double frozen = 0;
+  for (int i = 0; i < 40 && !guarded; ++i) {
+    h.set_position(150, 200);
+    h.step(5);
+    if (h.ax.end_guard_active() && h.ax.end_guard_side() < 0) {
+      guarded = true;
+      frozen = h.ax.setpoint_pos();
+    }
+  }
+  if (!guarded || h.ax.actual_count() != 100 || frozen < 150.0 - 1e-6) {
+    std::printf("end-guard between setup guard=%d x=%d v=%d sp=%g sv=%g side=%d\n", guarded ? 1 : 0,
+                h.ax.actual_count(), h.ax.velocity_count_s(), h.ax.setpoint_pos(), h.ax.setpoint_vel(),
+                h.ax.end_guard_side());
+  }
+  CHECK(guarded);
+  CHECK(h.ax.actual_count() == 100);
+  CHECK(h.ax.velocity_count_s() <= -400);
+  CHECK(frozen >= 150.0 - 1e-6);
+  h.pos_max_vel = 4000;
+  for (int i = 0; i < 8; ++i) {
+    h.send(h.set_position_msg(120, 200, 20000));
+    h.step(5);
+    if (!h.ax.end_guard_active() || h.ax.setpoint_vel() < -1e-9 || h.ax.setpoint_pos() < frozen - 1e-6) {
+      std::printf("end-guard between retarget i=%d side=%d sp=%g sv=%g x=%d\n", i, h.ax.end_guard_side(),
+                  h.ax.setpoint_pos(), h.ax.setpoint_vel(), h.ax.actual_count());
+    }
+    CHECK(h.ax.end_guard_active());
+    CHECK(h.ax.setpoint_vel() >= -1e-9);
+    CHECK(h.ax.setpoint_pos() >= frozen - 1e-6);
+    CHECK(h.ax.setpoint_pos() >= static_cast<double>(h.ax.actual_count()) - 1e-6);
+  }
+  const double held = h.ax.setpoint_pos();
+  h.pos_max_vel = 0;
+  for (int i = 0; i < 5; ++i) {
+    h.send(h.set_position_msg(400, 200, 0));  // 内側だがフレームの速度・加速度は 0
+    h.step(5);
+    if (fabs(h.ax.setpoint_vel()) >= 1e-6 || fabs(h.ax.setpoint_pos() - held) >= 1e-6) {
+      std::printf("end-guard zero frame i=%d sp=%g sv=%g held=%g\n", i, h.ax.setpoint_pos(), h.ax.setpoint_vel(),
+                  held);
+    }
+    CHECK(fabs(h.ax.setpoint_vel()) < 1e-6);
+    CHECK(fabs(h.ax.setpoint_pos() - held) < 1e-6);
+  }
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.fault_code() == fc::NONE);
+}
+
+// 端ガード中にエンコーダが死ぬと、参照速度 0 のままでも既存の無パルス窓で ENCODER_FAULT。
+// 実測速度が落ちてガードが解け、STOPPING が HOLDING で終わらない。
+inline void test_end_guard_dead_encoder_faults_within_stall_window() {
+  EgSim s;
+  eg_prepare(s, 1200, 6000, 20, +1, 4000);
+  s.h.ax.tuning.stall_ms = V1_STALL_MS;
+  s.h.ax.tuning.duty_max = 20;
+  bool armed = false;
+  for (int ms = 0; ms < 20000 && !armed; ms += 5) {
+    eg_step(s, eg_target(s));
+    if (s.h.ax.end_guard_active() && s.h.ax.state() == st::ACTIVE && s.v > 400 && s.h.ax.velocity_count_s() > 200)
+      armed = true;
+  }
+  if (!armed) {
+    std::printf("end-guard dead-encoder setup x=%d v=%g vm=%d state=%u guard=%d fault=%u\n", s.h.ax.actual_count(),
+                s.v, s.h.ax.velocity_count_s(), s.h.ax.state(), s.h.ax.end_guard_active() ? 1 : 0, s.fault);
+  }
+  CHECK(armed);
+  const int32_t jumped = s.h.ax.actual_count() + 40;
+  CHECK(jumped < s.lim_hi);
+  s.h.raw = jumped;
+  s.x = jumped;
+  s.v = 0;
+  s.h.stall = true;
+  Harness::accepted(s.h.stop());
+  bool holding = false;
+  uint32_t elapsed = 0;
+  for (; elapsed < 1000 && s.h.ax.state() != st::FAULT; elapsed += 5) {
+    s.h.send(s.h.set_position_msg(s.lim_hi, 200, 20000));
+    s.h.step(5);
+    if (s.h.ax.state() == st::HOLDING || s.h.ax.state() == st::DISARMING || s.h.ax.state() == st::DISARMED)
+      holding = true;
+  }
+  if (holding || s.h.ax.fault_code() != fc::ENCODER_FAULT || elapsed > V1_STALL_MS + 80) {
+    std::printf("end-guard dead-encoder holding=%d fault=%u elapsed=%u state=%u duty=%d x=%d sp=%g\n",
+                holding ? 1 : 0, s.h.ax.fault_code(), elapsed, s.h.ax.state(), s.h.ax.duty_permille(),
+                s.h.ax.actual_count(), s.h.ax.setpoint_pos());
+  }
+  CHECK(!holding);
+  CHECK(s.h.ax.state() == st::FAULT && s.h.ax.fault_code() == fc::ENCODER_FAULT);
+  CHECK(elapsed <= V1_STALL_MS + 80);
+  CHECK(elapsed + 5 >= V1_STALL_MS);  // 窓を短くしていない
+  CHECK(s.h.ax.duty_permille() == 0 && s.h.ax.pwm_permille() == 0);
+  CHECK(!s.h.ax.brake_release_cmd());
+}
+
+// 速度窓がまだ 0 の起動で、端の d_req（参照速度を推定の上限）以内なら外へ参照を進めない。
+inline void test_end_guard_start_near_limit_before_velocity_window() {
+  auto run = [](int dir) {
+    Harness h;
+    h.ax.tuning.playout_delay_ms = 0;
+    h.ax.tuning.soft_brake_acc_count_s2 = 0;
+    h.ax.tuning.stall_ms = 60000;
+    h.ax.tuning.deadband = 0;
+    h.ax.tuning.deadband_out = 0;
+    v1::Config c = base_config();
+    c.soft_min_count = -40;
+    c.soft_max_count = 40;
+    c.max_vel_count_s = 6000;
+    c.max_acc_count_s2 = 40000;
+    c.following_error_limit_count = 1000000;
+    c.overspeed_count_s = 100000;
+    c.command_timeout_ms = 1000;
+    c.stop_timeout_ms = 2000;
+    Harness::accepted(h.config_with(c));
+    h.reach_holding_from_configured();
+    h.set_position(0, 200);
+    Harness::accepted(h.start());
+    h.stall = true;
+    h.pos_max_vel = 4000;
+    const int32_t target = dir > 0 ? 40 : -40;
+    double outward = 0;
+    bool flag = false;
+    bool vel_moved = false;
+    for (int ms = 0; ms < 80; ms += 5) {
+      h.send(h.set_position_msg(target, 200, 40000));
+      h.step(5);
+      if (h.ax.velocity_count_s() != 0) vel_moved = true;
+      if (h.ax.end_guard_active()) flag = true;
+      const double sp = h.ax.setpoint_pos();
+      if (dir > 0) {
+        if (sp > outward) outward = sp;
+        CHECK(h.ax.setpoint_vel() <= 1e-9);
+      } else {
+        if (sp < outward) outward = sp;
+        CHECK(h.ax.setpoint_vel() >= -1e-9);
+      }
+    }
+    if (!flag || vel_moved || h.ax.actual_count() != 0 || (dir > 0 ? outward >= 5.0 : outward <= -5.0)) {
+      std::printf("end-guard start dir=%d flag=%d vel_moved=%d x=%d outward=%g sv=%g side=%d state=%u\n", dir,
+                  flag ? 1 : 0, vel_moved ? 1 : 0, h.ax.actual_count(), outward, h.ax.setpoint_vel(),
+                  h.ax.end_guard_side(), h.ax.state());
+    }
+    CHECK(flag);
+    CHECK((h.ax.flags() & fl::END_GUARD) != 0);
+    CHECK(!vel_moved);
+    CHECK(h.ax.actual_count() == 0);
+    CHECK(h.ax.state() == st::ACTIVE && h.ax.fault_code() == fc::NONE);
+    if (dir > 0) CHECK(outward < 5.0);
+    else CHECK(outward > -5.0);
+  };
+  run(+1);
+  run(-1);
+}
+
+// ガードで参照速度が 0 でも、COMMAND_TIMEOUT / DISARM は即ラッチせず stop_timeout_ms の期限で止まる。
+inline void test_end_guard_command_timeout_and_disarm_hit_stop_deadline() {
+  auto reach = [](EgSim& s) {
+    bool reached = false;
+    for (int ms = 0; ms < 20000 && !reached; ms += 5) {
+      eg_step(s, eg_target(s));
+      const int32_t dist = s.lim_hi - s.h.ax.actual_count();
+      if (s.fault != fc::NONE) break;
+      // 掛かり始めは端まで d_req（約 300）。惰性 130 ms × 1200 count/s が収まる余裕だけ残す
+      if (s.h.ax.end_guard_active() && s.h.ax.state() == st::ACTIVE && s.v > 500 && s.h.ax.velocity_count_s() > 200 &&
+          dist > 200)
+        reached = true;
+    }
+    if (!reached) {
+      std::printf("end-guard deadline setup x=%d lim=%d v=%g vm=%d state=%u guard=%d fault=%u\n",
+                  s.h.ax.actual_count(), s.lim_hi, s.v, s.h.ax.velocity_count_s(), s.h.ax.state(),
+                  s.h.ax.end_guard_active() ? 1 : 0, s.fault);
+    }
+    CHECK(reached);
+    return reached;
+  };
+  auto coast_deadline = [](EgSim& s, uint64_t t_stop, uint16_t expect) {
+    bool at70 = false;
+    bool at80 = false;
+    bool early = false;
+    bool holding = false;
+    uint64_t t_fault = 0;
+    while (s.h.now < t_stop + 200 * MS && t_fault == 0) {
+      eg_coast(s);
+      const uint64_t el = s.h.now - t_stop;
+      if (s.h.ax.state() == st::HOLDING || s.h.ax.state() == st::DISARMING || s.h.ax.state() == st::DISARMED)
+        holding = true;
+      if (s.h.ax.state() == st::FAULT) {
+        t_fault = s.h.now;
+        if (el <= 80 * MS) early = true;
+      } else {
+        if (el == 70 * MS) at70 = s.h.ax.state() == st::STOPPING;
+        if (el == 80 * MS) at80 = s.h.ax.state() == st::STOPPING;
+      }
+    }
+    if (!at70 || !at80 || early || holding || t_fault == 0 || s.h.ax.fault_code() != expect ||
+        t_fault > t_stop + 85 * MS) {
+      std::printf(
+          "end-guard deadline expect=%u fault=%u el=%llu at70=%d at80=%d early=%d hold=%d state=%u x=%d v=%g\n",
+          expect, s.h.ax.fault_code(), t_fault ? (unsigned long long)((t_fault - t_stop) / MS) : 0ull, at70 ? 1 : 0,
+          at80 ? 1 : 0, early ? 1 : 0, holding ? 1 : 0, s.h.ax.state(), s.h.ax.actual_count(), s.v);
+    }
+    CHECK(at70);
+    CHECK(at80);
+    CHECK(!early && !holding);
+    CHECK(t_fault > t_stop + 80 * MS && t_fault <= t_stop + 85 * MS);
+    CHECK(s.h.ax.fault_code() == expect);
+    CHECK(s.h.ax.duty_permille() == 0 && s.h.ax.pwm_permille() == 0);
+    CHECK(!s.h.ax.brake_release_cmd());
+  };
+
+  EgSim timeout;
+  eg_prepare(timeout, 1200, 6000, 20, +1, 8000, 40, 80);
+  if (reach(timeout)) {
+    uint64_t t_stop = 0;
+    for (int i = 0; i < 30 && t_stop == 0; ++i) {
+      eg_coast(timeout);
+      if (timeout.h.ax.state() == st::STOPPING) t_stop = timeout.h.now;
+      if (timeout.h.ax.state() == st::FAULT) break;
+    }
+    if (t_stop == 0) {
+      std::printf("end-guard timeout did not enter STOPPING state=%u fault=%u\n", timeout.h.ax.state(),
+                  timeout.h.ax.fault_code());
+    }
+    CHECK(t_stop != 0);
+    if (t_stop != 0) coast_deadline(timeout, t_stop, fc::COMMAND_TIMEOUT);
+  }
+
+  EgSim disarm;
+  eg_prepare(disarm, 1200, 6000, 20, +1, 8000, 5000, 80);
+  if (reach(disarm)) {
+    Harness::accepted(disarm.h.disarm());
+    CHECK(disarm.h.ax.state() == st::STOPPING);
+    coast_deadline(disarm, disarm.h.now, fc::STOP_TIMEOUT);
+  }
+}
+
+// 自重（外向きの一定加速度）と積分を入れたまま、下端へ指令を出し続ける。端の内側で止まるか SOFT_LIMIT。静かに越えない。
+inline void test_end_guard_gravity_bias_stops_or_soft_limit() {
+  EgSim s;
+  eg_prepare(s, 600, 8000, 30, -1, 1800);
+  s.h.ax.tuning.ki_permille_per_count_s = V1_KI_PERMILLE_PER_COUNT_S;
+  s.h.ax.tuning.i_max_permille = V1_I_MAX_PERMILLE;
+  s.h.ax.tuning.i_rate_permille_per_s = V1_I_RATE_PERMILLE_PER_S;
+  s.h.ax.tuning.stall_ms = 60000;
+  CHECK(s.h.ax.tuning.ki_permille_per_count_s > 0.0);
+  const double bias = 2000.0;  // count/s²。カウント減（lo 側）へ
+  bool silent = false;
+  bool guard = false;
+  for (int ms = 0; ms < 6000; ms += 5) {
+    const int applied = s.delay.empty() ? 0 : s.delay.front();
+    if (!s.delay.empty()) s.delay.erase(s.delay.begin());
+    const double dt = 0.005;
+    if (applied > 15) s.v += s.a_plant * dt;
+    else if (applied < -15) s.v -= s.a_plant * dt;
+    s.v -= bias * dt;
+    if (s.v > s.v_cap) s.v = s.v_cap;
+    if (s.v < -s.v_cap) s.v = -s.v_cap;
+    s.x += s.v * dt;
+    s.h.now += 5 * MS;
+    s.h.raw = llround(s.x);
+    s.h.send(s.h.set_position_msg(s.lim_lo, 200, 20000));
+    s.h.ax.tick(s.h.now, s.h.raw);
+    s.h.drain();
+    s.delay.push_back(s.h.ax.pwm_permille());
+    if (s.h.ax.end_guard_active()) guard = true;
+    if (s.h.ax.actual_count() < s.lim_lo && s.h.ax.fault_code() != fc::SOFT_LIMIT) silent = true;
+    if (s.h.ax.state() == st::FAULT) break;
+    const double pv = s.v < 0.0 ? -s.v : s.v;
+    if (guard && pv < 30.0 && s.h.ax.actual_count() >= s.lim_lo && s.h.ax.fault_code() == fc::NONE) break;
+  }
+  const bool inside = s.h.ax.fault_code() == fc::NONE && s.h.ax.actual_count() >= s.lim_lo &&
+                      (s.v < 0.0 ? -s.v : s.v) < 30.0;
+  const bool soft = s.h.ax.fault_code() == fc::SOFT_LIMIT;
+  if (!guard || silent || (!inside && !soft)) {
+    std::printf("end-guard gravity guard=%d silent=%d inside=%d fault=%u x=%d lim=%d v=%g state=%u\n", guard ? 1 : 0,
+                silent ? 1 : 0, inside ? 1 : 0, s.h.ax.fault_code(), s.h.ax.actual_count(), s.lim_lo, s.v,
+                s.h.ax.state());
+  }
+  CHECK(guard);
+  CHECK(!silent);
+  CHECK(inside || soft);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -5403,6 +5750,11 @@ inline void run_all() {
   test_end_guard_outward_clamped_and_inward_immediate();
   test_end_guard_in_stopping();
   test_end_guard_midstroke_sine_unchanged();
+  test_end_guard_target_between_actual_and_ref_does_not_move_outward();
+  test_end_guard_dead_encoder_faults_within_stall_window();
+  test_end_guard_start_near_limit_before_velocity_window();
+  test_end_guard_command_timeout_and_disarm_hit_stop_deadline();
+  test_end_guard_gravity_bias_stops_or_soft_limit();
 }
 
 }  // namespace v1axis_test

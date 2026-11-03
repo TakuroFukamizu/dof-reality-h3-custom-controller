@@ -127,6 +127,8 @@ constexpr int V1_STALL_DUTY = 10;               // ENCODER_FAULT の判定を始
 // 「エンコーダが死んだ」と判定する。それ未満の無パルスは FOLLOWING_ERROR（と下の停止ブースト）に任せる。
 // duty_max < V1_STALL_DUTY の SET_LIMITS は受理するが検出が無効になる（画面に警告。docs/control-server/limits.md）。
 constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
+// v1 の無パルス窓。自動移動・端当ての STALL_MS（200）とは別。運用判断で 600 ms（検出は厳しくしない。窓の長さだけ）。
+constexpr uint32_t V1_STALL_MS = 600;
 // permille 換算（Issue #25 手順 8 b）。位置ループは v1_duty_command から PWM まで permille（0.1 %）で運ぶ。SET_LIMITS / LIMITS の
 // 線上は整数 % のまま（V1Tuning の duty_min / duty_max / stall_duty も %）で、しきい値はここの定数と v1_permille() で換算する。
 constexpr int V1_PERMILLE_PER_PERCENT = PERMILLE_PER_PERCENT;
