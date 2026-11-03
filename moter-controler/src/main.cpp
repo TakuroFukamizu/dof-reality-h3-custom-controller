@@ -82,6 +82,9 @@ void boardBegin() {
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_DIR), DIR_POSITIVE_LEVEL);
   driveOutput(static_cast<gpio_num_t>(PIN_MD13S_PWM), 0);
 
+#if MC_PMIC_LOG
+  pmic_log_preboot();  // M5Unified / M5GFX が REG23（DCDC 低電圧で切る機能）を書き換える前の値を読む（Issue #68）
+#endif
   auto cfg = M5.config();
   cfg.clear_display = true;
 #if MC_USB_POWER
