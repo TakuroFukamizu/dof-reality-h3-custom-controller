@@ -130,6 +130,9 @@ constexpr int V1_STALL_DUTY_RATIO_PERCENT = 75;
 // v1 の無パルス判定の時間。2026-11-03 19:31 / 18:31 に、人が乗った状態で START 直後や動き出しで 200 ms では止まった（#1 / #3）。
 // 操作者の判断で検出を緩める（荷重がかかった機構の動き出しの時間は未測定。PR #64 の測定で見直す）。従来 env の STALL_MS（200）は変えない。
 constexpr uint32_t V1_STALL_MS = 600;
+// 静止 2 s の監視で FAULT にしない |誤差| の上限（2026-11-03 20:11、人の荷重で 14 count 手前から持ち上げられず ENCODER_FAULT）。
+// 既定は deadband_out と同じ 20。0 で従来どおり（どんな小さな誤差でも 2 s で FAULT）
+constexpr int32_t V1_STATIONARY_FAULT_MIN_ERR = 20;
 // permille 換算（Issue #25 手順 8 b）。位置ループは v1_duty_command から PWM まで permille（0.1 %）で運ぶ。SET_LIMITS / LIMITS の
 // 線上は整数 % のまま（V1Tuning の duty_min / duty_max / stall_duty も %）で、しきい値はここの定数と v1_permille() で換算する。
 constexpr int V1_PERMILLE_PER_PERCENT = PERMILLE_PER_PERCENT;

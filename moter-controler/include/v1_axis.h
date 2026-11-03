@@ -78,6 +78,7 @@ struct V1Tuning {
   double ff_b_down_permille_per_count_s = V1_FF_B_DOWN_PERMILLE_PER_COUNT_S;
   int32_t ff_taper_count_s = V1_FF_TAPER_COUNT_S;
   int32_t hold_enter = V1_HOLD_ENTER_COUNT;   // 保持に入る |誤差|（r6）
+  int32_t stationary_fault_min_err = V1_STATIONARY_FAULT_MIN_ERR;  // 静止 2 s の監視で FAULT にしない |誤差| の上限（0 で従来どおり）
   int32_t hold_exit = V1_HOLD_EXIT_COUNT;     // 保持から出る |誤差|（r6）
   int breakaway_up_permille = V1_BREAKAWAY_UP_PERMILLE;
   int breakaway_down_permille = V1_BREAKAWAY_DOWN_PERMILLE;
@@ -790,6 +791,7 @@ class V1Axis {
   bool boost_eligible_ = false;      // 前の tick で対象だった
   bool boost_window_running_ = false;
   int8_t boost_err_sign_ = 0;        // 直近に評価した誤差の符号（反転で 0 に戻す）
+  int64_t boost_err_abs_ = 0;        // 直近に評価した |誤差|（静止 2 s の監視で、小さな誤差なら FAULT にしない。2026-11-03 20:11）
   uint64_t boost_window_start_us_ = 0;
   uint64_t boost_active_since_us_ = 0;  // 対象になってから（動けば取り直す）。stall_boost_max_ms の起点
   int64_t boost_anchor_raw_ = 0;     // 窓の開始時のカウント
@@ -1991,6 +1993,7 @@ class V1Axis {
     const bool in_hold = tuning.ff_directional && duty_state_.in_band;
     const bool eligible = setpoint_vel_ == 0.0 && err_abs > gate && brake_release_cmd_ && !in_hold;
     if (!eligible) { reset_stall_boost(); return; }
+    boost_err_abs_ = err_abs;
     const int8_t err_sign = err > 0 ? 1 : -1;
     if (!boost_eligible_ || err_sign != boost_err_sign_) {
       reset_stall_boost();
@@ -2031,6 +2034,13 @@ class V1Axis {
       // Issue #25 r6: 床が無いので上乗せもしない。静止 2 s の監視（対象のまま stall_boost_min_move 未満しか進まない →
       // ENCODER_FAULT）だけを残す。時計を戻すのは上の「動いた」だけで、動き出しパルス（update_breakaway）は戻さない。
       stall_boost_ = 0;
+      // 2026-11-03 20:11 #2: 人の荷重で、目標の 14 count 手前から最後を持ち上げられず（出力約 10 %）、2 s で ENCODER_FAULT になった。
+      // 操作者の判断で検出を緩める: |誤差| ≤ stationary_fault_min_err（既定 20）のままなら異常にせず、監視の時計だけ取り直す。
+      // 押し続ける出力は小さい誤差ぶん（kp × 20 ＋ 積分）に限られる。誤差がそれを超えたまま動かなければ従来どおり 2 s で FAULT
+      if (timed_out && boost_err_abs_ <= tuning.stationary_fault_min_err) {
+        boost_active_since_us_ = now;
+        return;
+      }
       if (timed_out && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
       return;
     }
