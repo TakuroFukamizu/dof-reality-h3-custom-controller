@@ -148,6 +148,19 @@ pub fn min_acc_for_stop(max_vel_count_s: u32, deadline: Duration) -> u32 {
     }
 }
 
+/// Largest `max_vel_count_s` that stops at `max_acc` within `deadline`
+/// (`floor(acc × deadline)`). Inverse of [`min_acc_for_stop`]; [`clamp`]
+/// uses it when the acceleration ceiling cannot meet the bound, and the
+/// supervisor uses it while a higher `stop_acc` is still unconfirmed.
+pub fn max_vel_for_stop(max_acc_count_s2: u32, deadline: Duration) -> u32 {
+    let v = (f64::from(max_acc_count_s2) * deadline.as_secs_f64()).floor();
+    if v.is_finite() && v >= 0.0 {
+        v.min(f64::from(u32::MAX)) as u32
+    } else {
+        0
+    }
+}
+
 /// Absolute ceilings one MCU reported (LIMITS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FwAbsolute {
@@ -370,8 +383,7 @@ pub fn clamp(requested: &MotionLimits, c: &Ceilings, op: &OperatorCap, stop_dead
                 max_acc_count_s2 = c.max_acc_count_s2;
                 stop.push(LimitedField::MaxAccCountS2);
             }
-            let v = (f64::from(c.max_acc_count_s2) * stop_deadline.as_secs_f64()).floor();
-            let v = if v.is_finite() && v >= 0.0 { v.min(f64::from(u32::MAX)) as u32 } else { 0 };
+            let v = max_vel_for_stop(c.max_acc_count_s2, stop_deadline);
             if v < max_vel_count_s {
                 max_vel_count_s = v;
                 stop.push(LimitedField::MaxVelCountS);
@@ -573,7 +585,9 @@ pub struct MotionLimitsSnapshot {
     /// confirmed duty cap (only lowered gain and velocity are taken at
     /// once). Acceleration may rise only after every axis has echoed that
     /// `stop_acc`; a lower rate applies only while it stays at or below the
-    /// echoed stop deceleration.
+    /// echoed stop deceleration. While the planner's acceleration is still
+    /// below the requested rate, velocity is also held to
+    /// `max_vel_for_stop` of that acceleration.
     pub pending: bool,
 }
 
@@ -656,6 +670,10 @@ mod tests {
         assert_eq!(min_acc_for_stop(6000, DEADLINE), 5000);
         assert_eq!(min_acc_for_stop(0, DEADLINE), 0);
         assert_eq!(min_acc_for_stop(600, Duration::ZERO), u32::MAX);
+        assert_eq!(max_vel_for_stop(500, DEADLINE), 600);
+        assert_eq!(max_vel_for_stop(1000, DEADLINE), 1200);
+        assert_eq!(max_vel_for_stop(0, DEADLINE), 0);
+        assert!(min_acc_for_stop(max_vel_for_stop(500, DEADLINE), DEADLINE) <= 500);
     }
 
     #[test]

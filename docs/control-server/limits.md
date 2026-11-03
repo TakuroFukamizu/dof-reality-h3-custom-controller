@@ -45,7 +45,7 @@ STOP（管理の `/v1/stop`、鮮度切れ、`center_reached`）は planner が�
 
 PC は制限値を 3 段で持つ: `requested`（API が書いた値）→ `target`（§1 の上限と §1.1 で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と毎フレームの SET_POSITION が使う値。status の `motion_limits.effective`）。
 
-- target の Duty 項目が effective と同じなら、速度・gain だけの変更は上げても下げてもその tick で effective になる（SET_LIMITS を送らないので待つ相手がいない）。加速度は制御された停止の減速度で、SET_LIMITS の `stop_acc_count_s2` として送る（操作者の `max_acc`。0 は「未設定」なので送らない）。planner が新しい加速度を使うのは、それが接続中の全軸が LIMITS でエコーした `stop_acc` 以下のときだけ（停止は軌道が仮定する減速度以上で必ず減速できる）。下げはその場で planner に入り、`pending` はエコーが要求と一致するまで true。上げは全軸のエコーが新しい非 0 の `stop_acc` と一致してから planner に入る。エコーが無い軸があるあいだは、いまの加速度を超えない。
+- target の Duty 項目が effective と同じなら、速度・gain だけの変更は上げても下げてもその tick で effective になる（SET_LIMITS を送らないので待つ相手がいない）。加速度は制御された停止の減速度で、SET_LIMITS の `stop_acc_count_s2` として送る（操作者の `max_acc`。0 は「未設定」なので送らない）。planner が新しい加速度を使うのは、それが接続中の全軸が LIMITS でエコーした `stop_acc` 以下のときだけ（停止は軌道が仮定する減速度以上で必ず減速できる）。下げはその場で planner に入り、`pending` はエコーが要求と一致するまで true。上げは全軸のエコーが新しい非 0 の `stop_acc` と一致してから planner に入る。エコーが無い軸があるあいだは、いまの加速度を超えない。そのあいだ planner の加速度が要求より小さいときは、有効な速度を `max_vel_for_stop`（§1.1 の `stop_deadline`。`floor(加速度 × 期限)`）以下に切る。確認が揃うと要求した速度に戻す。確認済み 600/500 のまま 1200/20000 を送り SET_LIMITS が落ちても、有効値は 1200/500 にならない。
 - Duty 上限が変わる要求は、接続中で SET_LIMITS を知る**全軸**がその Duty を ACK するまで effective の Duty にならない（`pending: true`）。待つ間、effective は確定済みの Duty を保ち、target のうち**下がった** gain と速度だけを先に取り込む。加速度は上の停止減速度の規則（確認済みの `stop_acc` 以下なら先に取り、上げは全軸のエコー後）。速度と Duty を同時に上げたとき、前の SET_LIMITS が飛行中の軸に旧 Duty 上限のまま速い目標が届いて FOLLOWING_ERROR になる窓（往復 1 回分、喪失なら 1 s）を閉じるため。成分ごとの最小は §1.1 を保つ（両組が `acc ≥ vel / 期限` なら最小同士も満たす）。
 - 飛行中に要求がまた変わったら、前の ACK が届いた次の tick で新しい内容を送る（`LIMITS_RETRY` の 1 s は待たない）。SET_LIMITS が拒否された軸は `limits_rejected`（§3.3）で見え、`pending` は立ったまま。
 - WS ack の `effective_limits` と `GET/POST /v1/limits` の `effective` は **target**（API スレッドは適用の完了を知らない）。適用済みかは status の `motion_limits.pending` で見る。
@@ -182,6 +182,7 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ## 6. 変更履歴
 
+- 2026-11-03: 加速度が未確認で planner の加速度が要求より小さいあいだ、有効な速度は `max_vel_for_stop(その加速度, stop_deadline)`（§1.1）以下。確認後に要求した速度へ戻る。SET_LIMITS が落ちた 600/500 → 1200/20000 は、速い速度を古い減速度のまま走らない。
 - 2026-11-03: 加速度の上げは、全軸の LIMITS が新しい `stop_acc` をエコーするまで planner に効かない（`pending`）。下げは、確認済みの停止減速度以下ならすぐ効く。未確認の `stop_acc` では、軌道がその減速度を超えない。LIMITS の offset 14 は保存した `stop_acc_count_s2`。0 または不一致は `stop_acc_unconfirmed: axisN` で ARM しない（`[limits] allow_legacy_stop_acc = true` で 0 を許す）。
 - 2026-11-03: 制御された STOPPING の減速度は SET_LIMITS の `stop_acc_count_s2`（操作者の `max_acc`。0 なら CONFIG の `max_acc`。CONFIG はファームの絶対上限のまま）。直前フレームの加速度は使わない。異常停止の COMMAND_TIMEOUT はフレームのまま。サーバは CONTROLLED_STOP の前に全開の SET_POSITION を書かない。加速度だけの変更は planner を待たせず `stop_acc` を送る。
 - 2026-11-03: 追従ガバナ（§1.3）。1 軸が目標方向に遅れて Duty 飽和、または大きな追従誤差が縮まないとき、追跡の `max_vel` を全軸共通の `s`、`max_acc` を `s²` にする。ACTIVE / CENTER の SET_POSITION も同じ倍率。停止のプランナー減速度は全開。MCU の制御された停止は SET_LIMITS の `stop_acc`（未設定なら CONFIG の `max_acc`）で減速する。遅れている軸ごとに `no_progress_ms` の窓を持ち、実位置が 20 count 動かなければ coordinated stop（`governor_no_progress`。原因が入れ替わっても、目標だけ着いても窓はやり直さない）。status の `governor` と `limits` の `tracking_governed`。任意の `[governor]`（省略時は有効・既定値。limit が 200 以下ならしきい値を比率で縮める）。

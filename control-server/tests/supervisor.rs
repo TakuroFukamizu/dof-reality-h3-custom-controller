@@ -3502,6 +3502,100 @@ fn lost_set_limits_keeps_the_old_stop_acc_and_a_raise_waits_for_every_echo() {
     }
 }
 
+/// Confirmed 600/500, then 1200/20000 with SET_LIMITS dropped. The new
+/// velocity must not ride on the old stop rate: effective speed stays within
+/// `max_vel_for_stop(500)`, and the sim finishes the stop inside
+/// `mcu_stop_timeout_ms`.
+#[test]
+fn dropped_acc_raise_caps_velocity_to_the_stop_deadline() {
+    let mut r = Rig::new(sim_cfg());
+    let home = Pose { pitch: 0.0, roll: 0.0, yaw: 0.0 };
+    r.active(home, 0.5);
+    r.sup.set_requested_limits(MotionLimits {
+        max_vel_count_s: 600,
+        max_acc_count_s2: 500,
+        ..r.sup.effective_limits()
+    });
+    assert!(r.run_until(500, |r| {
+        let s = r.sup.snapshot(r.now).motion_limits;
+        !s.pending
+            && s.effective.max_vel_count_s == 600
+            && s.effective.max_acc_count_s2 == 500
+            && r.mcus.iter().all(|m| m.stop_acc_count_s2() == 500)
+    }));
+
+    r.hold_set_limits = [true; 3];
+    let mark = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits {
+        max_vel_count_s: 1200,
+        max_acc_count_s2: 20000,
+        ..r.sup.effective_limits()
+    });
+    r.run_ms(50);
+    let deadline = h3cs::limits::stop_deadline(&r.cfg.timing);
+    let cap = h3cs::limits::max_vel_for_stop(500, deadline);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.requested.max_vel_count_s, 1200);
+    assert_eq!(snap.motion_limits.requested.max_acc_count_s2, 20000);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 500);
+    assert!(
+        snap.motion_limits.effective.max_vel_count_s <= cap,
+        "effective {} cap {cap}",
+        snap.motion_limits.effective.max_vel_count_s
+    );
+    assert!(snap.motion_limits.effective.max_vel_count_s < 1200);
+    assert!(r.setpos.len() > mark);
+    for (_, _, sp) in &r.setpos[mark..] {
+        for k in 0..3 {
+            assert!(sp[k].max_vel_count_s <= cap, "frame vel {}", sp[k].max_vel_count_s);
+            assert_eq!(sp[k].max_acc_count_s2, 500);
+        }
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 500, "SET_LIMITS was dropped");
+    }
+
+    r.set_game(Some((FAR_POSE, 0.5)));
+    let fast = r.run_until(4000, |r| r.mcus[0].setpoint_vel().abs() >= f64::from(cap) * 0.8);
+    assert!(
+        fast,
+        "never reached speed near the cap: {:?}",
+        r.mcus.iter().map(|m| m.setpoint_vel()).collect::<Vec<_>>()
+    );
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+    assert_eq!(r.sup.effective_limits().max_acc_count_s2, 500);
+    assert!(r.sup.effective_limits().max_vel_count_s <= cap);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 500);
+    }
+
+    let t_stop = r.now;
+    r.admin(AdminCmd::Stop).unwrap();
+    let timeout = u64::from(r.cfg.timing.mcu_stop_timeout_ms);
+    let settled = r.run_until(timeout, |r| {
+        r.mcus.iter().all(|m| m.state() != McuState::Stopping && m.state() != McuState::Active)
+    });
+    assert!(
+        settled,
+        "still moving after {timeout} ms: states {:?} fault {:?} vels {:?}",
+        r.mcu_states(),
+        r.sup.fault(),
+        r.mcus.iter().map(|m| m.setpoint_vel()).collect::<Vec<_>>()
+    );
+    assert!(r.now - t_stop <= Duration::from_millis(timeout), "{:?}", r.now - t_stop);
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+    assert!(r.mcus.iter().all(|m| m.state() != McuState::Fault), "{:?}", r.mcu_states());
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(30);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_vel_count_s, 1200);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
+}
+
 /// Old firmware ACKs SET_LIMITS and sends LIMITS with stop_acc 0. That is not
 /// `limits_unconfirmed` (the report arrived) and it blocks ARM.
 #[test]

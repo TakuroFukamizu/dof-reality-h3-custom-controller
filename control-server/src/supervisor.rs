@@ -1524,7 +1524,9 @@ impl Supervisor {
 
     /// The set in effect: what the planner and SET_POSITION use (the clamped
     /// request once its duty tuning is confirmed, and its acceleration only
-    /// up to the stop rate every axis has echoed — see [`Self::limits_pending`]).
+    /// up to the stop rate every axis has echoed). While that acceleration
+    /// is still below the request, velocity is capped by the same
+    /// stop-time rule (`limits::max_vel_for_stop`). See [`Self::limits_pending`].
     pub fn effective_limits(&self) -> MotionLimits {
         self.effective_limits
     }
@@ -1536,7 +1538,8 @@ impl Supervisor {
 
     /// Duty or `stop_acc` is still unconfirmed on a connected axis that
     /// speaks SET_LIMITS. The planner's acceleration never exceeds the
-    /// confirmed stop deceleration while this is true.
+    /// confirmed stop deceleration while this is true, and its velocity
+    /// stays inside that acceleration's stop deadline.
     pub fn limits_pending(&self) -> bool {
         self.limits_pending
     }
@@ -1592,7 +1595,12 @@ impl Supervisor {
     ///   such axis has echoed that new non-zero rate (or, in legacy mode, has
     ///   ACKed it and echoed 0). While any echo is missing, `pending` stays
     ///   set and the planner does not go above the rate already in effect or
-    ///   above the lowest echoed stop rate. `reconcile_limits` keeps retrying.
+    ///   above the lowest echoed stop rate. While that planner acceleration
+    ///   is still below the requested rate, velocity is capped to
+    ///   [`motion_limits::max_vel_for_stop`] of it (the stop-time rule), so a
+    ///   lost SET_LIMITS cannot pair a higher speed with the old stop rate.
+    ///   The requested velocity returns once the new rate is confirmed.
+    ///   `reconcile_limits` keeps retrying.
     fn recompute_limits(&mut self) {
         let c =
             motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
@@ -1636,7 +1644,7 @@ impl Supervisor {
             None => old_acc,
         };
         let (t, e) = (self.target_limits, self.effective_limits);
-        self.effective_limits = if duty_confirmed {
+        let mut effective = if duty_confirmed {
             MotionLimits { max_acc_count_s2: planner_acc, ..t }
         } else {
             MotionLimits {
@@ -1646,6 +1654,13 @@ impl Supervisor {
                 duty_max_percent: e.duty_max_percent,
             }
         };
+        // A higher stop rate is not on the MCUs yet. The new velocity would
+        // take longer to stop than `stop_deadline` at `planner_acc`.
+        if planner_acc < t.max_acc_count_s2 {
+            let cap = motion_limits::max_vel_for_stop(planner_acc, self.stop_deadline());
+            effective.max_vel_count_s = effective.max_vel_count_s.min(cap);
+        }
+        self.effective_limits = effective;
         self.limits_pending = !duty_confirmed || (any && !stop_confirmed);
     }
 
