@@ -50,6 +50,12 @@ PC は制限値を 3 段で持つ: `requested`（API が書いた値）→ `targ
 - 飛行中に要求がまた変わったら、前の ACK が届いた次の tick で新しい内容を送る（`LIMITS_RETRY` の 1 s は待たない）。SET_LIMITS が拒否された軸は `limits_rejected`（§3.3）で見え、`pending` は立ったまま。
 - WS ack の `effective_limits` と `GET/POST /v1/limits` の `effective` は **target**（API スレッドは適用の完了を知らない）。適用済みかは status の `motion_limits.pending` で見る。
 
+### 1.3 追従ガバナ
+
+段 1・段 2 の上限はそのままで、追跡中だけ一時的に倍率を掛ける。負荷で 1 軸が目標の進行方向に遅れ（`following_error = actual − setpoint` の符号が目標速度と逆。行き過ぎは対象外）、かつ Duty が `duty_max` 付近に `sat_ms`（既定 60 ms）以上張り付いて `|FE| ≥ fe_start`（120）、または `|FE| ≥ fe_hard`（200）が約 60 ms 縮まないとき、全軸の `step_track` に渡す `max_vel` を同じ `s`、`max_acc` を `s²` にする。`s` は `1 − (|FE| − fe_start) / (following_error_limit_count − fe_start)` を `[s_min, 1]` に切った値の、遅れている軸の最小。`|FE|` が `following_error_limit_count` のとき `s` は `s_min`（0.25）になる（bring-up の保護は 400）。下げる速さは `down_rate`（4/s）、上げるのは全 active 軸が `|FE| < fe_release`（60）かつ非飽和を `release_ms`（300 ms）続けたあと `up_rate`（0.5/s）だけ。STATUS が `stale_ms`（100 ms）より古い軸があると上げない。
+
+停止（`step_stop`、controlled stop）の減速度には掛けない。`[governor]` は任意で、節が無ければ上の既定値。検査は `fe_release < fe_start < fe_hard < following_error_limit_count`、`0 < s_min ≤ 1`、両 rate が正。`s < 1` のあいだ status（`GET /v1/status` と WS）の `limits` に `tracking_governed` が入り、`governor` は `{scale, active, axis, reason}`（`reason` は `pwm_saturated` か `following_error`）。
+
 ## 2. `[limits]` の項目と根拠
 
 `control-server/config/*.toml` の `[limits]`（`schema_version = 2`）。3 軸共通。下の初期値は `example.toml` / `sim.toml` のもの（上げ切った先の目標）。`bringup.toml` は §4 の低い値で置いてある。
@@ -162,11 +168,13 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 | 追従の始動で 150 ms 止まってから床で動く | ファーム画面 `A1` が点く、`pwm_permille` が小さい FF → ±床 | T の動き出し補助。軌道が 100 count/s 超でカウントが動かない。正常（E の床より先に押し当てる）。頻発するなら `duty_min_percent` が動き出し Duty に足りているか、`ff` が低すぎないか |
 | 動けない軸が ENCODER_FAULT になり基準が消える | FAULT_EVENT の直前の `pwm_permille` が `max(100, duty_max × 7.5)` 以上 | `kp × following_error_limit / 100 < 0.75 × duty_max` にする（§2.2）か、機構を直す |
 | 高速側で頭打ち | `pwm_permille` が `duty_max` に張り付く | `duty_max_percent`（絶対上限 60 まで） |
-| 移動中に FOLLOWING_ERROR | `following_error_count` の増え方 | `max_vel` を下げる → `ff` を小さく → それでも出るなら `following_error_limit_count` |
+| 移動中に FOLLOWING_ERROR | `following_error_count` の増え方 | `max_vel` を下げる → `ff` を小さく → それでも出るなら `following_error_limit_count`。1 軸だけ負荷で遅れ Duty が張り付く場合は追従ガバナ（§1.3）が先に全軸を落とす（`tracking_governed`） |
+| 追従中に 1 軸だけ遅いのに目標が先に走る | `pwm_permille` が Duty 上限、`governor.scale < 1`、`limits` の `tracking_governed` | ガバナの既定で足りなければ `max_vel` を下げる。`[governor]` の `fe_start` / `s_min` は保護（`following_error_limit_count`）の手前で `s` が着くようにする |
 | OVERSPEED | `velocity_count_s` | `overspeed_count_s`（max_vel の 1.5 倍以上を保つ）。暴走なら配線と符号 |
 
 ## 6. 変更履歴
 
+- 2026-11-03: 追従ガバナ（§1.3）。1 軸が目標方向に遅れて Duty 飽和、または大きな追従誤差が縮まないとき、追跡の `max_vel` を全軸共通の `s`、`max_acc` を `s²` にする。停止の減速度は変えない。status の `governor` と `limits` の `tracking_governed`。任意の `[governor]`（省略時は既定値）。
 - 2026-11-02（Issue #15 追加分）: ゲーム経路の上限（§1）。WS `limits` で書いた項目は操作者の `[limits]` の値を超えない（`operator_limited`）。`POST /v1/limits` だけがファームの上限まで上げる。`GET/POST /v1/limits` と status の `motion_limits` に `operator_max` / `game_fields`。試験ページのスライダーの上限もそれに追従。
 - 2026-11-02（Issue #15 H2 / M3）: 停止時間の規則（§1.1。設定の検査と実行時 clamp の下限、`stop_time_limited`、`GET/POST /v1/limits` と status に `reasons`）、要求と適用の分離（§1.2。Duty 上限が変わる要求は全軸の SET_LIMITS ACK まで planner に効かない、status `motion_limits.pending`）。同じ PR で START の姿勢関門 `[game].start_max_offset_count`（M4、DESIGN.md §5）。
 - 2026-11-02（Issue #35 r9、ファーム。未焼き込み・実機未検証）: 方向別の経路に速度誤差の減衰項（`V1_VEL_DAMPING`、既定 1）。`u_d = clamp(0.05 × (軌道速度 − v_fast), ±10)` permille、v_fast は 40 ms 窓の速度推定。SET_LIMITS の項目と意味は変えない（Kd・上限・窓は `config.h` の定数で、変えるにはファームを焼き直す）。r8 と同じく kp 30 前提。protocol.md §5 の r9。

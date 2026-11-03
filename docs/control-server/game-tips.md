@@ -111,8 +111,10 @@ val = a + (b - a) * s
 | 見る場所 | 入る理由 | 意味 |
 | --- | --- | --- |
 | pose の ack `limits` | `pose_clamped` / `gain_limited` / `gain_negative` | 受け付け時の検査。姿勢が −1..1 外、gain が `max_gain` 超 |
-| **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない** |
+| **status の `limits`**（WS の `status`、`GET /v1/status`） | 上に加えて `virtual_saturated` / `soft_limited` / `velocity_limited` / `acceleration_limited` / `tracking_governed` | 直近 tick で混合・校正・プランナーが実際に丸めたもの。**速度・加速度の頭打ちはここにしか出ない**。`tracking_governed` は追従ガバナ（[limits.md](limits.md) §1.3） |
 | `limits` メッセージの ack `limits` | `operator_limited` / `ceiling_clamped` / `stop_time_limited` | 要求した制限値がサーバーで変えられた（操作者の値で / ファームの上限で / 停止時間の規則で）。`effective_limits` に結果 |
+
+the server may slow all axes together when one can't keep up; status limits shows tracking_governed
 
 status は `server.status_period_ms`（bring-up 100 ms）ごとに WS に届く。演出を作るときは `limits` に **`velocity_limited` が出ない**ことを確かめる（出ていれば、その瞬間は意図した速さではなくサーバーの上限 600 count/s で動いている。信頼できる印）。`acceleration_limited` は読み方に注意: 30〜50 Hz で送る姿勢は 100 Hz の tick から見ると階段で、段の縁ごとに目標速度が `max_acc × 送信間隔`（20〜60 count/s）跳ぶのに対し 1 tick の加速度の余地は `max_acc × 0.01` = 20 count/s なので、**制限の内側でもフレームごとに点滅する**。点滅は正常、**連続して立ち続ける**ならランプが急すぎる。`virtual_saturated` / `soft_limited` が出たら姿勢が端に当たっている。
 
