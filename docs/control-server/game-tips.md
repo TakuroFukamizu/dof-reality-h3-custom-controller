@@ -245,6 +245,6 @@ Python なら `clients/python/h3_motion_client.py` の `MotionClient` が sessio
 | ゆっくりの動きがカクつく | 最小 Duty 9 % の段付き（現状の機構・ファーム） | 操作者に伝える（`duty_min_percent`、limits.md §5） |
 | `limits` を送ったのに `effective_limits` が違う | 絶対上限（`ceiling_clamped`）か停止時間の規則（`stop_time_limited`） | ack の `limits`、status の `motion_limits.ceiling` |
 | `limits` を送ったのに効かない | Duty を変えた要求は全軸 ACK まで保留。または再接続で初期値に戻った | status の `motion_limits.pending`、`motion_limits.requested` |
-| 座席が FAULT で止まった | 追従誤差・過速度・USB 無応答・軸の異常。ゲームの入力では直らない | status の `fault`、`fault_history`。操作者が `fault/reset` → ARM → START |
+| 座席が FAULT で止まった | 追従誤差・過速度・USB 無応答・軸の異常。ゲームの入力では直らない | status の `fault`、`fault_history`（最新の FAULT の最初の記録の `prehistory` に直前 2 s の全軸の実測・目標・追従誤差・Duty）。操作者が `fault/reset` → ARM → START |
 
 質問・変更要望は Issue へ。WS の JSON の形・`protocol = 1`・拒否理由の文字列・`frame_seq` の意味は相談なく変えない（[game-integration.md](game-integration.md) §4）。

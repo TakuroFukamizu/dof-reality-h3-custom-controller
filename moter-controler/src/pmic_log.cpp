@@ -4,8 +4,11 @@
 #include <esp_attr.h>
 #include <esp_system.h>
 
+#include <cstring>
+
 // 出力する行（値は整数。電圧は mV、温度は 0.1 ℃）
-//   PMIC up=<s> vbus= vsys= vbat= ts= tdie= s0= s1= i48= i49= i4a= r18= r68= | rst= rtc= on= off=
+//   PMIC up=<s> vbus= vsys= vbat= ts= tdie= s0= s1= i48= i49= i4a= r18= r68= | rst= rtc= on= off= r14= r23=
+//   PMICPRE ok=<n>/<m> t_ms= por= mark= r00= r01= r14= r20= r21= r23= r80= r82= r83= r84= r85= r86= r90= i48= i49= i4a=
 //   PMICBOOT rst= rtc= last_up= last_vbus= last_vsys= last_vbat= last_s0= last_s1= on= off= i48= i49= i4a= reg=<基準レジスタ>
 //
 // 読み方（AXP2101 datasheet）
@@ -18,6 +21,18 @@
 //   i4a = REG4A: b7 watchdog, b6 LDO OC, b5 BATFET OC, b2 die OT level 1
 //   ts  = TS ピンの ADC 生値。CoreS3 では BUS_OUT（M-Bus 5V）の分圧で、おおよそ BUS_OUT の mV になる
 //   rtc = 1 なら前回の最終値が RTC メモリに残っていた（ESP32 だけのリセット）。0 なら電源ごと落ちた
+//   r14/r23 = PMIC 行では毎回読み直した REG14（最小システム電圧）と REG23（DCDC の低電圧・過電圧で切る機能）
+//
+// PMICPRE（Issue #68）: M5.begin() より前、M5Unified / M5GFX が PMIC を設定する前に読んだ値。
+//   ok    = 読めたレジスタ数 / 読もうとした数。0 なら内部 I2C が開けなかった
+//   t_ms  = 読んだときの millis()
+//   mark  = データバッファ REG04〜07 の値。前回の起動でここに目印 "H368"（48333638）を書く。
+//   por   = 1 なら目印が無かった = AXP2101 が POR から起動した（初回の書き込み直後も 1）。
+//           0 なら POR していない（電源キーや VBUS 挿入での OFF→ON、または ESP32 だけのリセット）
+//   r23   = M5Unified が b0〜b4（DCDC1〜5 の低電圧で切る）を切る前の値。POR 直後は既定値が見える
+//   r80   = DCDC の ON/OFF、r82〜r86 = DCDC1〜5 の設定電圧、r90 = LDO の ON/OFF
+//   r14   = SWcharge 版データシートでは b2:0 が最小システム電圧（3.2〜3.9 V、既定 3.7 V）。
+//           linear charger 版とビット配置が違うので、書き換えには使わない
 
 namespace {
 
@@ -59,6 +74,46 @@ uint32_t next_boot_line_ms = 0;
 
 uint8_t reg8(uint8_t reg) { return M5.Power.Axp2101.readRegister8(reg); }
 
+// ---- M5.begin() より前の読み出し（Issue #68） ----
+constexpr uint8_t kAxpAddr = 0x34;
+constexpr uint32_t kPreI2cFreq = 400000;
+constexpr uint8_t kMark[4] = {0x48, 0x33, 0x36, 0x38};  // "H368"
+constexpr uint8_t kPreRegs[] = {0x00, 0x01, 0x14, 0x20, 0x21, 0x23, 0x80, 0x82,
+                                0x83, 0x84, 0x85, 0x86, 0x90, 0x48, 0x49, 0x4A};
+constexpr const char* kPreNames[] = {"r00", "r01", "r14", "r20", "r21", "r23", "r80", "r82",
+                                     "r83", "r84", "r85", "r86", "r90", "i48", "i49", "i4a"};
+static_assert(sizeof(kPreRegs) == sizeof(kPreNames) / sizeof(kPreNames[0]), "names");
+
+struct PreInfo {
+  bool done;
+  uint8_t ok;
+  uint8_t tried;
+  uint32_t t_ms;
+  bool mark_ok;
+  uint8_t mark[4];
+  uint8_t regs[sizeof(kPreRegs)];
+  bool regs_ok[sizeof(kPreRegs)];
+};
+PreInfo pre = {};
+
+void printPreLine() {
+  if (!pre.done) {
+    return;
+  }
+  // 目印を読めなかったときは por を判定しない（-1）
+  const int por = pre.mark_ok ? (memcmp(pre.mark, kMark, sizeof(kMark)) == 0 ? 0 : 1) : -1;
+  Serial.printf("PMICPRE ok=%u/%u t_ms=%lu por=%d mark=%02X%02X%02X%02X", pre.ok, pre.tried,
+                static_cast<unsigned long>(pre.t_ms), por, pre.mark[0], pre.mark[1], pre.mark[2], pre.mark[3]);
+  for (size_t i = 0; i < sizeof(kPreRegs); ++i) {
+    if (pre.regs_ok[i]) {
+      Serial.printf(" %s=%02X", kPreNames[i], pre.regs[i]);
+    } else {
+      Serial.printf(" %s=--", kPreNames[i]);
+    }
+  }
+  Serial.print("\n");
+}
+
 // ADC は 14 ビット。getVBUSVoltage() は VBUS good が落ちると 0 を返すので、生値を自分で読む。
 uint16_t adc14(uint8_t reg) {
   uint8_t buf[2] = {0, 0};
@@ -85,6 +140,32 @@ void printBootLine() {
 }
 
 }  // namespace
+
+void pmic_log_preboot() {
+  pre = {};
+  pre.done = true;
+  pre.t_ms = millis();
+  // CoreS3 の内部 I2C（AXP2101 / AW9523 など）。M5.begin() も同じポート・ピンで開き直す。
+  if (!m5::In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11)) {
+    return;
+  }
+  pre.tried = sizeof(kPreRegs) + 1;
+  pre.mark_ok = m5::In_I2C.readRegister(kAxpAddr, 0x04, pre.mark, sizeof(pre.mark), kPreI2cFreq);
+  if (pre.mark_ok) {
+    ++pre.ok;
+  }
+  for (size_t i = 0; i < sizeof(kPreRegs); ++i) {
+    pre.regs_ok[i] = m5::In_I2C.readRegister(kAxpAddr, kPreRegs[i], &pre.regs[i], 1, kPreI2cFreq);
+    if (pre.regs_ok[i]) {
+      ++pre.ok;
+    }
+  }
+  // 次の起動で「POR したか」を見分ける目印。データバッファは POR でだけ消える。
+  if (pre.mark_ok) {
+    m5::In_I2C.writeRegister(kAxpAddr, 0x04, kMark, sizeof(kMark), kPreI2cFreq);
+  }
+  m5::In_I2C.release();
+}
 
 void pmic_log_boot() {
   boot.reset_reason = static_cast<int>(esp_reset_reason());
@@ -121,6 +202,7 @@ void pmic_log_boot() {
   rtc_magic = kRtcMagic;
   rtc_uptime_s = 0;
   booted = true;
+  printPreLine();
 }
 
 void pmic_log_tick() {
@@ -131,6 +213,7 @@ void pmic_log_tick() {
   if (static_cast<int32_t>(now - next_boot_line_ms) >= 0) {
     next_boot_line_ms = now + 10000;
     printBootLine();
+    printPreLine();
   }
   if (static_cast<int32_t>(now - next_line_ms) < 0) {
     return;
@@ -158,8 +241,11 @@ void pmic_log_tick() {
 
   const uint8_t r18 = reg8(0x18);
   const uint8_t r68 = reg8(0x68);
+  const uint8_t r14 = reg8(0x14);
+  const uint8_t r23 = reg8(0x23);
+  // on / off は起動時に読んだ値の再表示。r14 / r23 は毎回読み直す（後から書き換わっていないかを見る）
   Serial.printf("PMIC up=%lu vbus=%u vsys=%u vbat=%u ts=%u tdie=%d s0=%02X s1=%02X i48=%02X i49=%02X i4a=%02X "
-                "r18=%02X r68=%02X | rst=%d rtc=%d on=%02X off=%02X\n",
+                "r18=%02X r68=%02X | rst=%d rtc=%d on=%02X off=%02X r14=%02X r23=%02X\n",
                 static_cast<unsigned long>(up), vbus, vsys, vbat, ts, tdie, s0, s1, i48, i49, i4a, r18, r68,
-                boot.reset_reason, boot.rtc_ok ? 1 : 0, boot.on, boot.off);
+                boot.reset_reason, boot.rtc_ok ? 1 : 0, boot.on, boot.off, r14, r23);
 }

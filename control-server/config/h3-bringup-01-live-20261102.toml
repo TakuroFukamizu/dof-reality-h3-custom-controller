@@ -1,0 +1,184 @@
+# ===========================================================================
+# 2026-11-02 午後の実機の運用設定（h3-bringup-01）。flight_circus などの繋ぎ込みで同じリグを使うときはこれを使う。
+# - 焼いてあるファーム: 3 台とも hw-r10a-test-20261102（r9 ＋ 校正の修正 ＋ 再生バッファ PR #49 ＋ つなぎの監視 ＋ ARM の電源待ち 2.5 s）。
+#   kp 50（乗員の荷重で戻れない件のつなぎ。Issue #44）
+# - #3（ヨー）は 11-02 夕方にエンコーダ（コードホイール）を仮復旧し、本物の軸に戻した（校正 6205/3102、6206/3103。Issue #9）
+# - このリグは [game].swap_pitch_roll = true（PR #21、操作者が実機で確認）
+# - 仮想位置の端はソフトリミットから 350 count 内側（Issue #34 / PR #38）
+# - ポートは 1C:DB = /dev/cu.usbmodem114501（#1、主電源担当）、68:EE = /dev/cu.usbmodem114101（#2）、30:ED = /dev/cu.usbmodem114301（#3）（11-03 朝。ハブの差し替えで変わる）。ハブの差し替えで変わるので
+#   ioreg の USB Serial Number で確認すること（hardware-bringup.md §1.1）
+# - 校正後はサーバーの再起動が要る（calibration_stale）。校正値はこのファイルの値と毎回ほぼ一致（#1 5555〜5556 / 2777〜2778、#2 5508〜5509 / 2754、#3 6205〜6206 / 3102〜3103）
+# ===========================================================================
+# h3-control-server が校正結果から書き出した設定（POST /v1/calibration/export）。
+# 書き出し: 20261101-132909（UTC）。元の設定: /private/tmp/claude-501/-Users-takuro--superset-worktrees-dof-reality-h3-custom-controller-quilted-pendulum/b547c39a-9972-42f1-a8ff-5d6e28e8b307/scratchpad/bringup-live3.toml
+# calibration_valid は false のまま。値を確認し、hardware-bringup.md §5.5 の手順で true にすること。
+# axis 1: device_id 51311cdbd4ba8d58 / CAL_RESULT n_end_count 5556 neutral_count 2778 sign +1 / mechanical [0, 5556] soft [300, 5256] count_at_virtual [300, 2778, 5256] (decel_zone 300)
+# axis 2: device_id 513168ee8fd842f0 / CAL_RESULT n_end_count 5507 neutral_count 2753 sign +1 / mechanical [0, 5507] soft [300, 5207] count_at_virtual [300, 2753, 5207] (decel_zone 300)
+#   axis 1 calibration_valid: true -> false
+#   axis 1 count_at_virtual_512: 2775 -> 2778
+#   axis 1 count_at_virtual_1023: 5251 -> 5256
+#   axis 1 mechanical_max_count: 5551 -> 5556
+#   axis 1 soft_max_count: 5251 -> 5256
+#   axis 2 calibration_valid: true -> false
+#   axis 2 count_at_virtual_512: 2731 -> 2753
+#   axis 2 count_at_virtual_1023: 5163 -> 5207
+#   axis 2 mechanical_max_count: 5463 -> 5507
+#   axis 2 soft_max_count: 5163 -> 5207
+
+# h3-control-server 実機初回接続（bring-up）用の設定。手順は docs/control-server/hardware-bringup.md。
+# 単位は名前に含める: count, count/s, count/s², ms。
+# 校正・符号・リミットの変更は DISARMED のときだけ（サーバー再起動で反映）。
+#
+# 座標の約束（hardware-bringup.md §5）:
+#   - 各軸とも count は「従来 env の HOME で当てた P 端 = 0、N 端へ向かって増える」座標。
+#     v1 ファームは生の計数に系統の符号を掛けない（protocol.md §1.1）。3 系統とも過去の校正で
+#     sign = +1（速度 − でカウント増）だったので、従来 env の表示と同じ向きになる。
+#     sign = −1 の系統が出たら、その軸だけ count が反対（P 端 0、N 端 −stroke）になるので、
+#     mechanical / soft / count_at_virtual_* を全部負側に書き直す。
+#   - 基準（/v1/reference）は P 端ではなく中立付近で取る（P 端 = 0 はソフトリミット外なので ARM できない）。
+#   - 向き（仮想 0→1023 で座席が上がるか下がるか、ヨーが右か左か）は未確認（architecture.md §6）。
+#     ここでは全軸「count 増 = 仮想位置 増」と仮に置く。逆なら count_at_virtual_0 と
+#     count_at_virtual_1023 の値を入れ替える（count_at_virtual_512 はそのまま。単調減少は許される）。
+#
+# !!! ストロークは過去の記録（従来 env の CAL、無負荷）。#1 5553（2026-10-31、個体 1C:DB）、
+# !!! #2 5462（2026-10-31、個体 68:EE）、#3 6160（2026-10-25、個体 30:ED）。今回の機体で測り直すまで仮値。
+# !!! calibration_valid = false のあいだは ARM できない（check-config が阻害要因として列挙する。意図どおり）。
+
+schema_version = 2
+rig_id = "h3-bringup-01"
+
+# 主電源リレー（DC_STOP1 緑, G2）を操作する唯一の軸。系統 1 を選んだ個体だけが G2 を動かす。
+power_controller_axis = 1
+
+[server]
+bind = "127.0.0.1:8892"
+allow_non_loopback = false
+admin_token_env = "H3CS_ADMIN_TOKEN"     # 起動前に export H3CS_ADMIN_TOKEN=... （未設定なら起動時に生成して標準エラーへ 1 回出す）
+allowed_origins = ["http://localhost:8891", "http://127.0.0.1:8891"]
+max_body_bytes = 4096
+admin_rate_limit_per_s = 20
+status_period_ms = 100
+
+[timing]                                 # protocol.md §6 の既定値（ベンチ用の候補値）。bring-up では変えない
+planner_period_ms = 10
+set_position_valid_for_ms = 250   # 11-02 17:4x 操作者の判断: #2 が USB の詰まりで 100 ms 切れて HOLDING に戻った（17:28）。旧 100。 USB の遅延揺らぎ（実測で数十 ms）に対する余裕。2026-11-01 に 50 で START が BAD_STATE になった
+mcu_command_timeout_ms = 400     # valid_for（250）より長く。旧 200
+mcu_stop_timeout_ms = 1500
+axis_status_timeout_ms = 300
+source_freshness_ms = 3000  # 11-02 15:3x 操作者の判断: 250 ms ではゲームの一瞬の詰まりで停止→自動 ARM でリレーが鳴る。旧 250
+arm_timeout_ms = 5000
+stop_settle_timeout_ms = 3000
+stop_hold_ms = 1000
+max_frame_skew = 25                # USB の遅延揺らぎと模擬軸の混在で 6〜7 フレームずれる（2026-11-01）。bring-up 用
+hello_retry_ms = 200
+hello_timeout_ms = 2000
+
+[game]
+allow_missing_frame_seq = false  # frame_seq の無い Pose は拒否（ゲームの固着を検出するため）
+clamp_out_of_range = true
+virtual_min = 0.0
+virtual_max = 1023.0
+center_speed_fraction = 0.25     # /v1/center は max_vel × 0.25 = 150 count/s で動く
+swap_pitch_roll = true           # 11-02: ジョイスティックの前後で左右に傾いたため（PR #21）
+invert_pitch = false
+invert_roll = false
+invert_yaw = false
+
+[limits]                         # 動きの制限値（docs/control-server/limits.md）。3 軸共通。どの値も実機未検証
+# !!! bring-up 用に低い値（旧 PR と同じ動き: gain 0.15、600 count/s、2000 count/s²、Duty 7〜20 %）。
+# !!! 向きの確認（hardware-bringup.md §7）が通ったら limits.md §4 の順で上げる: duty_min 7 → 5 → 3、
+# !!! max_vel 600 → 1200 → 2000 → 3000、max_acc 2000 → 5000 → 10000 → 15000、duty_max 20 → 30 → 40、
+# !!! gain は 0.5 まで（example.toml / sim.toml の値が上げ切った先の目標）。実行時は試験ページか POST /v1/limits、
+# !!! 決めた値はここに書く。上限はファームの絶対上限（Duty 60 %、6000 count/s、40000 count/s²）と gain 1.0。
+# 実行時に変えられる 4 つ（WS /v1/motion の limits、POST /v1/limits。POST /v1/session で初期値に戻る）
+max_gain = 1.0                  # 11-02: 向きの確認済み。全開でソフトリミット内の端まで（余裕 150 count）
+max_vel_count_s = 1200           # 11-02 15:3x 展示用（無人のステップ試験で FE ≤ 9、端まで SOFT_LIMIT なし）。旧 600。 1.5 回転/s。従来 env の HOME（10 %）より遅い
+max_acc_count_s2 = 20000         # 11-03 17:50 展示用に 6000 → 20000（ヨーの衝撃を強くするため。無人で端寄り 4 Hz 揺れ・±1 ステップとも FAULT なし、端の行き過ぎ ≤ 5 count、FE ≤ 19）。旧 6000、その前 2000
+duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
+# 初期値だけ（SET_LIMITS で配る。実行時には変えない）
+duty_min_percent = 9             # 11-02: 7〜8 % では #2 が動かず、9 % で動き出した実測から
+kp_percent_per_100 = 50          # 11-02 16:0x hw-r10a-test に戻す（kp 50 のつなぎ）。r10 統合版（保持の学習・段階的な力の上げ・駐車）は kp 30 から（Codex）。15:10 のつなぎは: 乗員の荷重で戻れない（誤差 29 で 8.7 % 頭打ち）→ 50（誤差 29 で 14.5 %）。旧 30。 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
+ff_count_s_per_percent = 100     # 軌道速度 [count/s] ÷ これ = Duty [%]（実測 1 % ≈ 100〜130 count/s の下側）
+deadband_count = 10              # 目標が止まっているときの到達帯（入る側）
+deadband_out_count = 20          # 同（出る側）
+# 保護（CONFIG で配る。実行時には変えない）
+following_error_limit_count = 400 # 位置ループは速度フィードフォワード＋比例。追従中の定常誤差は数十 count の想定
+overspeed_count_s = 2000         # ≥ 1.5 × max_vel_count_s（検査される）。max_vel の 2 倍（1200）では過渡で止まった実測。
+                                 # 実行時の max_vel の上限も overspeed / 1.5（= 1333）で頭打ちになるので、速度を上げるときは先にこれを上げる
+
+[backend]
+kind = "serial"
+# 3 台の CoreS3 のポートだけを書く。`h3-control-server list-ports` の一覧をそのまま貼らない
+# （Bluetooth や別の ESP32-S3 のポートが混ざる。サーバーは書かれたポートを全部開いて HELLO_REQ を送るので、
+#   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
+# （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
+# 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
+ports = ["/dev/cu.usbmodem114501", "/dev/cu.usbmodem114101", "/dev/cu.usbmodem114301"]  # 11-03 朝（ioreg で確認）  # 11-02 18:0x 再接続で 145xx/141xx/143xx から変わった（ioreg で確認）  # 11-02 17:0x ハブ上流の差し直しで 115xx/111xx/113xx から変わった（ioreg で確認）  # 1C:DB(#1) / 68:EE(#2) / 30:ED(#3)。11-02 夕方: #3 のエンコーダ（コードホイール）を仮復旧  # 1C:DB(#1) / 68:EE(#2)。#3 は 24V 未接続のため模擬軸
+baud = 115200
+# 実機が足りないときは、その軸を模擬軸で代替できる（例: sim_axes = [3]。その軸の ports は書かない）。
+# 模擬軸は目標に完全に追従するので、その軸の pose を中立に保てば動かない扱いになる。その軸の校正値は
+# 模擬軸用に calibration_valid = true にする（実機の宣言ではない）。実機を戻したら sim_axes を消す。
+
+# ---------------------------------------------------------------------------
+# 軸 1: 右手前リフト (motor #1)。P 端 = 下限（沈み切り）。過去の記録: stroke 5553（1C:DB、2026-10-31）
+# ---------------------------------------------------------------------------
+[[axis]]
+axis_id = 1
+# 照合用の個体 ID（16 桁 hex、0 = 照合しない）。§4 で status の axes[].device_id を見てから転記する。
+# 書くと、別の個体が系統 1 を選んだとき ARM しない（axis_device_mismatch）。
+device_id = "51311cdbd4ba8d58"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+name = "右手前リフト (motor #1)"
+# !!! true にする前に確認すること（hardware-bringup.md §5 の終わり）。true は「この軸でこの値を測った」という
+# !!! 操作者の宣言で、有人運転の可否ではない。bring-up 中は無人・物理非常停止あり・[limits] を低い値にしてあることが前提。
+#   1. この個体・この系統で従来 env の CAL をやり直し（または `?` の ENC 行で保存値を読み）、stroke が
+#      下の mechanical_max_count と ±30 以内で一致する。違えば mechanical_max / soft_max / count_at_virtual_* を測った値から書き直す
+#   2. 従来 env の NEUTRAL で止めた位置で /v1/reference を取った直後、status の actual_count が count_at_virtual_512 と ±30 以内
+#   3. 座席に人がいない。物理非常停止（24V の遮断）を押せる人がいる
+#   向き（仮想 0→1023 が上か下か）は §7 で低ゲインで確認する。逆なら count_at_virtual_0 と 1023 の値を入れ替えて再起動
+calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
+count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
+count_at_virtual_512 = 2778     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
+count_at_virtual_1023 = 5156    # soft_max − 350
+mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
+mechanical_max_count = 5556     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
+soft_min_count = 50             # mechanical_min + decel_zone
+soft_max_count = 5506           # mechanical_max − decel_zone
+decel_zone_count = 50         # ソフトリミットは実測端から 50 count
+
+# ---------------------------------------------------------------------------
+# 軸 2: 左リフト (motor #2)。P 端 = 下限。過去の記録: stroke 5462 / neutral 2731（68:EE、2026-10-31）
+# ---------------------------------------------------------------------------
+[[axis]]
+axis_id = 2
+device_id = "513168ee8fd842f0"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+name = "左リフト (motor #2)"
+# !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
+calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
+count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
+count_at_virtual_512 = 2753     # = stroke / 2
+count_at_virtual_1023 = 5107    # soft_max − 350
+mechanical_min_count = 0
+mechanical_max_count = 5507
+soft_min_count = 50             # mechanical_min + decel_zone
+soft_max_count = 5457           # mechanical_max − decel_zone
+decel_zone_count = 50         # ソフトリミットは実測端から 50 count
+
+# ---------------------------------------------------------------------------
+# 軸 3: 後部ヨー (motor #3)。P 端 = 右端。過去の記録: stroke 6160 / neutral 3080（30:ED、2026-10-25。
+# 2026-10-31 の Base15 での再校正 6138 は同じ個体のスロット #2 に入ってしまった記録があるので、
+# この個体を使うときは従来 env で `?` → ENC motor=3 cal=1 stroke= を見てから信じる）
+# ---------------------------------------------------------------------------
+[[axis]]
+axis_id = 3
+device_id = "513130eda00b2040"   # 2026-11-01 に接続して確認した個体（照合用。別の個体に替えたら書き直すか 0 に）
+name = "後部ヨー (motor #3)"
+# !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
+calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
+count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
+count_at_virtual_512 = 3103  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
+count_at_virtual_1023 = 5806  # soft_max − 350
+mechanical_min_count = 0
+mechanical_max_count = 6206  # 11-02 夕方の CAL
+soft_min_count = 50             # mechanical_min + decel_zone
+soft_max_count = 6156  # mechanical_max − decel_zone
+decel_zone_count = 50         # ソフトリミットは実測端から 50 count

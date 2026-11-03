@@ -13,6 +13,7 @@
 | [limits.md](limits.md) | 動きの制限値。ファームの絶対上限と PC の共有現在値の 2 段、`[limits]` の各値と根拠（実機未検証）、実行時に変える IF（WS `limits`、`/v1/limits`）、実機で上げる手順 |
 | [game-integration.md](game-integration.md) | ゲーム（h3game）実装者向けの入口。実機なしで動かす手順、ゲームがやること・やらないこと、画面に出す状態、変えてはいけないこと |
 | [game-tips.md](game-tips.md) | ゲーム開発者向け Tips。全域を使う（gain）、速さ・加速度を思いどおりにする（補間か `limits` か）、揺れの周波数の上限、START の中立関門、鮮度と停止、ゲーム側に置かないこと、症状 → 原因の表 |
+| [ai-debugging.md](ai-debugging.md) | AI エージェント向け: サーバーを見張りながら実機をデバッグする手順。status・FAULT 直前の記録（prehistory）・イベント・ログの読み方、見張りの仕掛け方、やってはいけないこと（操作中のセッションを取らない、校正前の確認）、復旧手順、2026-11-02 の症状 → 原因 |
 | [`control-server/DESIGN.md`](../../control-server/DESIGN.md) | 実装設計（API・状態機械・JSON の形） |
 | [`clients/python/README.md`](../../clients/python/README.md) | Game API の Python クライアント |
 | [`clients/h3game/README.md`](../../clients/h3game/README.md) | h3game へのパッチと bridge 用バックエンド層 |
@@ -136,7 +137,7 @@ curl -sX POST -H "$AUTH" -d '{"max_vel_count_s":1500,"duty_max_percent":30}' $UR
 - 系統の割当（DESIGN.md §10）は status で見る: 最上位 `axis_conflict`（2 台以上が選んでいる軸の一覧。空なら競合なし）、各軸の `device_id`（接続中の個体）・`expected_device_id`（設定値、0 = 照合なし）・`assignment`（`"selected"`＝MCU の選択 / `"config"`＝`device_id` だけで決まった / null）・`claimants`（この軸を名乗るポートと個体。競合中は 2 つ以上）・`reference_stale`。blockers の code は `axis_conflict` / `axis_device_mismatch` / `reference_stale`。各軸の `decode_errors` は PC 側で復号に失敗したフレーム数（USB の品質。0 が正常）。競合中は arm / start / center が 409 `axis_conflict`、WS の pose / gain も ack `reason: "axis_conflict"` で拒否（鮮度は延びない）。
 - 503 `control_loop_unavailable`: 制御ループが 1 秒以内に答えなかった。arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は**実行されたかもしれない**（ループが追いつけば実行する）。いずれも status で確かめる。`GET /v1/status` は制御ループが終わっている（落ちた）とき 503。終了処理（SIGTERM など）が始まると新しい接続は受け付けず、503 ではなく接続拒否になる（確定: sim で ARM 中に SIGTERM、5 ms ごとの status は全て接続拒否）。終了処理の直前に受け付けた要求に 503 が返ることはありうる（推定、未観測）。
 - 管理 API は rate limit（既定 20 回/秒）。stop / disarm / fault は対象外。
-- FAULT になったら `fault`・`fault_history`（status）に加えて `GET /v1/events` で直前の経過（ARM・START・軸の接続・ACK の拒否や期限切れ・状態遷移）と、その後の状態遷移を見る。リングは 512 件（古いものから上書き、`dropped` に数える）。制御ループが落ちた後も読める。同じイベントは標準エラーにも info で出る。
+- FAULT になったら `fault`・`fault_history`（status）に加えて `GET /v1/events` で直前の経過（ARM・START・軸の接続・ACK の拒否や期限切れ・状態遷移）と、その後の状態遷移を見る。最新のエピソードの最初の記録の `fault_history[].prehistory` に、ラッチ直前 2 s の全軸の STATUS（実測・MCU の目標・サーバーの目標・姿勢から求めた目標・追従誤差・Duty・速度・状態・フラグ、20 Hz）が、FAULT_EVENT で知らされた原因には `fault_event`（`actual_count`・`mcu_state_before`）が付く（Issue #34。DESIGN.md §7.2）。同じものが標準エラーに warn の `fault pre-history` 行（JSON）として 1 回出る。リングは 512 件（古いものから上書き、`dropped` に数える）。制御ループが落ちた後も読める。同じイベントは標準エラーにも info で出る。
 - Python からは `python3 clients/python/h3_motion_client.py status|stop`。
 
 運転の順序: 起動（READY_TO_ARM）→ ゲームが Pose を送る → **人が** ARM → HOLDING → **人が** START → ACTIVE。ゲームが止まる（`frame_seq` が進まない）・画面の再読み込み・bridge の再接続（新しい session）・stop のどれでも STOPPING → 保持 → BRAKED_DISARMED になり、**その場でブレーキ**（中央へ戻さない）。再開は人が ARM ＋ START をやり直す。

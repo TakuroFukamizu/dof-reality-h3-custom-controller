@@ -66,6 +66,13 @@ $PIO device monitor -p /dev/cu.usbmodemXXXX -b 115200   # 従来 env のとき�
 
 ### 1.3 v1 env を書き込む（各台）
 
+> **どのファームを焼くか（2026-11-02 時点）**: 3 台で検証済みの既知の良品はタグ **`fw-v1-r3`**（914cee8、PR #19 の先頭）で、運用設定 `[limits]` の kp 6 / duty_min 9 / ff 100 と組。**main の既定は r8**（`V1_FF_DIRECTIONAL=1`、方向別 FF ＋ PI、床なし）で **kp 30 が前提**（kp 6 のままだと追従が柔らかすぎる。#1 で FE rms 15）。r8 は #1 でしか試しておらず、#2（Issue #23）では未検証。迷ったら `fw-v1-r3` を焼く（Issue #35）。
+>
+> ```sh
+> git worktree add ../fw-r3 fw-v1-r3      # main の作業ツリーを汚さない
+> cd ../fw-r3/moter-controler && $PIO run -e m5stack-cores3-v1 -t upload --upload-port /dev/cu.usbmodemXXXX
+> ```
+
 ```sh
 cd REPO/moter-controler
 $PIO run -e m5stack-cores3-v1-usbpower                                  # ビルドだけ
@@ -366,7 +373,7 @@ HOLDING（ARM 直後、START 前）で `curl -sX POST -H "$AUTH" $URL/v1/center`
 | 観察 | 停止距離（送信停止から静止までの count と秒）、HOLDING の `following_error_count` の幅、ブレーキ作動後の沈み、リレーの音、USB が応答しなくなった個体（§10） |
 | 未解決 | 再現しなかった事象、推定のまま残した値 |
 
-FAULT のたびに `fault_history`（status。最大 32 件）と `GET /v1/events` を取ってから `fault/reset` する。
+FAULT のたびに `fault_history`（status。最大 32 件）と `GET /v1/events` を取ってから `fault/reset` する。最新のエピソードの最初の記録には `prehistory`（ラッチ直前 2 s の全軸の STATUS、20 Hz）と、FAULT_EVENT が知らせた原因なら `fault_event` が付く（Issue #34。次の FAULT で古い記録からは外れるので、その前に status を保存する。`server.log` の `fault pre-history` 行にも残る）。
 
 ## 10. トラブル表
 
@@ -403,7 +410,7 @@ status の `blockers` の code（`:` より前）、`fault.kind` / `code`、HTTP
 | HTTP 401 / 403 | トークン無し・不一致（`require_admin_token = true` のときだけ） / Origin 違反 | `H3CS_ADMIN_TOKEN` が起動時と同じか。curl は Origin を付けないので 403 はブラウザー側 |
 | 3 台とも USB に見えるのに HELLO にも書き込み（esptool）にも答えない | USB-JTAG が固まっている。Base15 の DC を切っても USB ハブの VBUS で CoreS3 は動き続け、再起動しない（`ioreg -p IOUSB -l -w0 \| grep sessionID` が変わらない） | **ハブの上流 USB ケーブルを抜き差し**（または各 USB を抜き差し）して再列挙させる。2026-11-01 に 2 台同時に起きた（[runs/hw_20261101.md](runs/hw_20261101.md)） |
 | HTTP 409 `no_fresh_pose` | START に新鮮な Pose が無い | `bringup_pose.py` が動いているか、`session.fresh`。`frame_seq` の無い Pose は拒否（`allow_missing_frame_seq = false`） |
-| HTTP 409 `pose_not_near_hold` | START 時の Pose が作る目標が、保持位置から `[game].start_max_offset_count`（既定 300 count）を超えて離れた軸がある | `blockers` に軸ごとの距離。送っている Pose を中立（0, 0, 0）か gain 0 に戻してから START（忘れたタブが極端な姿勢を流していないか） |
+| HTTP 409 `pose_not_near_hold` | START 時の Pose が作る目標が、保持位置から `[game].start_max_offset_count`（既定 300 count）を超えて離れた軸がある | `blockers` に軸ごとの距離。送っている Pose を中立（0, 0, 0）か gain 0 に戻してから START（忘れたタブが極端な姿勢を流していないか）。ジョイスティックページ（`/joystick`）はこの拒否と blockers をボタンの下に出す: 自動開始なら一度だけ CENTER を自動で挟む。手動なら速度モードは「中央へ」で指令姿勢を 0 にしてから START、姿勢が 0 でも断られるならページの CENTER ボタンで機構を中立へ |
 | HTTP 409 `not_holding` / `not_disarmed`（`blockers` に `rig_state: <状態>`） | その状態では受けない命令（例: READY_TO_ARM で start、ACTIVE で center、HOLDING 中に reference） | 順序: arm → start。center は HOLDING で、reference は全軸 DISARMED で |
 | HTTP 429 | 管理 API の rate limit（20 回/秒） | status のポーリングは `GET /v1/status`（認証なし・対象外）で |
 | HTTP 503 `control_loop_unavailable` | 制御ループが 1 s 以内に答えない | arm / start / center / reset / reference は **実行されない**。stop / disarm / fault は **実行されたかもしれない**。status で確かめる。`GET /v1/status` 自体が 503 なら制御ループが落ちている → `GET /v1/events` は読めるので保存し、**24V を切ってから** サーバーを再起動（MCU は lease 切れで既に止まっているはず） |

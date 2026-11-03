@@ -3449,3 +3449,174 @@ fn start_is_refused_when_the_pose_is_far_from_the_hold_position() {
     r.wait_state(RigState::Holding, 2000);
     r.admin(AdminCmd::Center).unwrap();
 }
+
+// ------------------------------------------------------------------ fault pre-history (Issue #34)
+
+/// 軸 1 が止まったまま大きく動かされて FOLLOWING_ERROR: 記録に FAULT_EVENT の
+/// 中身と、遅れが育っていく直前 2 s（全軸）が付く。ログ用のイベントは 1 回。
+#[test]
+fn following_error_record_carries_fault_event_and_lagging_prehistory() {
+    let cfg = sim_cfg();
+    let mut r = Rig::new(cfg.clone());
+    r.active(POSE_A, 0.3);
+    r.run_ms(2500);
+    let _ = r.sup.drain_events();
+    // 軸 1 は 180 で止まり、指令は 2000 へ（3000 count/s で離れていく）。
+    let far = Pose { pitch: 1.0, roll: 1.0, yaw: 0.0 };
+    assert_eq!(expected_counts(&cfg, far, 0.5)[0], 2000);
+    r.mcus[0].set_stall(true);
+    r.set_game(Some((far, 0.5)));
+    r.wait_state(RigState::FaultLatched, 2000);
+    assert_eq!(
+        r.sup.fault(),
+        Some(&RigFault::AxisFault { axis: ax(1), code: FaultCode::FollowingError })
+    );
+    let (events, _) = r.sup.drain_events();
+    r.run_ms(200);
+
+    let snap = r.sup.snapshot(r.now);
+    let rec = &snap.fault_history[0];
+    assert_eq!(rec.detail.as_deref(), Some("reported in FAULT_EVENT"));
+    let fe = rec.fault_event.expect("FAULT_EVENT attached");
+    assert_eq!(fe.axis, ax(1));
+    assert_eq!(fe.fault_code, FaultCode::FollowingError);
+    assert_eq!(fe.mcu_state_before, Some(McuState::Active));
+    let stuck = fe.actual_count;
+    assert!((stuck - 180).abs() <= 5, "stalled near the POSE_A target: {stuck}");
+
+    let p = rec.prehistory.as_ref().expect("pre-history on the latching record");
+    assert_eq!((p.window_ms, p.interval_ms), (2000, 50));
+    assert_eq!(p.rig_state_before, RigState::Active);
+    assert_eq!(p.requested_pose, Some(far));
+    assert_eq!(p.axes.len(), 3);
+    for a in &p.axes {
+        assert!(a.len() >= 35 && a.len() <= 41, "axis {} has {} samples", a.axis, a.len());
+        assert!(a.t_ms[0] >= -2000 && *a.t_ms.last().unwrap() <= 0, "{:?}", a.t_ms);
+    }
+    let a1 = &p.axes[0];
+    assert_eq!(a1.axis, ax(1));
+    let n = a1.len();
+    // 2 s 前は追従していた（静止・誤差なし）。
+    assert!(a1.following_error_count[0].abs() <= 50, "{:?}", a1.following_error_count);
+    assert_eq!(a1.server_target_count[0], Some(180));
+    assert_eq!(a1.requested_count[0], Some(180));
+    // 最後は: 実測は止まったまま、誤差が育ち、サーバーの指令は 2000 へ向かっている。
+    let last = n - 1;
+    assert!(a1.following_error_count[last].abs() > 400, "{:?}", a1.following_error_count);
+    assert!((a1.actual_count[last] - stuck).abs() <= 1);
+    assert_eq!(a1.requested_count[last], Some(2000));
+    assert!(a1.server_target_count[last].unwrap() > stuck + 400, "{:?}", a1.server_target_count);
+    // 遅れの区間（誤差 > 50）は単調に育つ。
+    let lag: Vec<i32> = a1
+        .following_error_count
+        .iter()
+        .map(|e| e.abs())
+        .skip_while(|e| *e <= 50)
+        .collect();
+    assert!(lag.len() >= 3, "lagging samples: {:?}", a1.following_error_count);
+    assert!(lag.windows(2).all(|w| w[0] <= w[1]), "{lag:?}");
+    assert!(a1.mcu_state.iter().all(|s| *s == Some(McuState::Active)));
+    assert!(a1.flags.iter().all(|f| f & status_flags::BRAKE_RELEASE_CMD != 0));
+    // 他の軸も同じ時間の記録を持つ。
+    assert_eq!(p.axes[1].axis, ax(2));
+    assert!(p.axes[1].server_target_count.iter().all(Option::is_some));
+
+    // ログに 1 回だけ（"fault_prehistory"）、FAULT_EVENT は別のイベントにも残る。
+    let pre: Vec<_> = events.iter().filter(|e| e.kind == "fault_prehistory").collect();
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].detail["fault"]["code"], "FOLLOWING_ERROR");
+    assert_eq!(pre[0].detail["prehistory"]["axes"][0]["t_ms"].as_array().unwrap().len(), n);
+    assert!(events.iter().any(|e| e.kind == "fault_event" && e.detail["fault_code"] == "FOLLOWING_ERROR"));
+    let fault_ev = events.iter().find(|e| e.kind == "fault").unwrap();
+    assert_eq!(fault_ev.detail["fault_event"]["actual_count"], stuck);
+
+    // status の JSON（追加の項目だけ）。
+    let v = serde_json::to_value(&snap).unwrap();
+    let h = &v["fault_history"][0];
+    assert_eq!(h["fault"]["kind"], "axis_fault");
+    assert_eq!(h["fault_event"]["mcu_state_before"], "ACTIVE");
+    assert_eq!(h["prehistory"]["axes"][0]["following_error_count"].as_array().unwrap().len(), n);
+    assert_eq!(h["prehistory"]["rig_state_before"], "ACTIVE");
+}
+
+/// STATUS が先にラッチしても、後から来た FAULT_EVENT はその記録に付く
+/// （同じ原因の記録を増やさない）。
+#[test]
+fn fault_event_after_status_latch_is_attached_to_the_record() {
+    let mut r = Rig::new(sim_cfg());
+    r.ready();
+    let status = h3cs::protocol::Status {
+        boot_id: 101,
+        mcu_time_us: 5_000_000,
+        mcu_state: McuState::Fault as u8,
+        selected_axis: 2,
+        fault_code: FaultCode::SoftLimit,
+        flags: status_flags::POSITION_REFERENCED | status_flags::CONFIGURED,
+        pwm_permille: 0,
+        actual_count: -410,
+        target_count: -400,
+        velocity_count_s: 0,
+        following_error_count: -10,
+        last_applied_frame: 0,
+        last_applied_seq: 0,
+        last_rx_seq: 0,
+        current_ma: 0,
+        rx_error_count: 0,
+        stale_drop_count: 0,
+    };
+    r.sup.on_link_event(LinkEvent::Status { axis: ax(2), status, received_at: r.now }, r.now);
+    assert_eq!(r.sup.state(), RigState::FaultLatched);
+    let rec = r.sup.fault_history().last().unwrap();
+    assert_eq!(rec.detail.as_deref(), Some("reported in STATUS"));
+    assert!(rec.fault_event.is_none());
+    let p = rec.prehistory.clone().expect("pre-history");
+    assert_eq!(p.rig_state_before, RigState::ReadyToArm);
+    assert_eq!(*p.axes[1].actual_count.last().unwrap(), -410);
+    assert_eq!(*p.axes[1].fault_code.last().unwrap(), FaultCode::SoftLimit);
+    assert!(p.axes[1].server_target_count.iter().all(Option::is_none), "not armed");
+
+    let ev = h3cs::protocol::FaultEvent {
+        boot_id: 101,
+        mcu_time_us: 4_990_000,
+        fault_code: FaultCode::SoftLimit,
+        mcu_state_before: McuState::Stopping as u8,
+        actual_count: -405,
+    };
+    r.sup.on_link_event(LinkEvent::FaultEvent { axis: ax(2), ev }, r.now);
+    assert_eq!(r.sup.fault_history().count(), 1, "no second record for the same cause");
+    let fe = r.sup.fault_history().last().unwrap().fault_event.expect("attached");
+    assert_eq!(fe.actual_count, -405);
+    assert_eq!(fe.mcu_state_before, Some(McuState::Stopping));
+    assert_eq!(fe.mcu_time_us, 4_990_000);
+}
+
+/// 直前の経過は最新のエピソードの最初の記録だけ: 重なった原因と、前の
+/// エピソードの記録は持たない。サーバー側の原因（operator など）にも付く。
+#[test]
+fn only_the_latest_episode_keeps_its_prehistory() {
+    let mut r = Rig::new(sim_cfg());
+    r.ready();
+    r.run_ms(500);
+    r.admin(AdminCmd::Fault { note: "first".into() }).unwrap();
+    r.admin(AdminCmd::Fault { note: "overlap".into() }).unwrap();
+    {
+        let h: Vec<_> = r.sup.fault_history().collect();
+        assert_eq!(h.len(), 2);
+        let p = h[0].prehistory.as_ref().expect("first cause");
+        assert!(p.axes.iter().all(|a| !a.is_empty()), "every axis had STATUS");
+        assert!(h[1].prehistory.is_none(), "overlapping cause");
+    }
+    r.run_ms(50);
+    r.admin(AdminCmd::FaultReset).unwrap();
+    r.wait_state(RigState::ReadyToArm, 500);
+    r.run_ms(300);
+    r.admin(AdminCmd::Fault { note: "second".into() }).unwrap();
+    let h: Vec<_> = r.sup.fault_history().collect();
+    assert_eq!(h.len(), 3);
+    assert!(h[0].prehistory.is_none() && h[1].prehistory.is_none(), "older episode dropped it");
+    let p = h[2].prehistory.as_ref().expect("latest episode");
+    assert_eq!(p.rig_state_before, RigState::ReadyToArm);
+    // 前のエピソードの FAULT 中の STATUS も 2 s の窓に入っている。
+    assert!(p.axes[0].mcu_state.contains(&Some(McuState::Fault)));
+    assert_eq!(*p.axes[0].mcu_state.last().unwrap(), Some(McuState::Disarmed));
+}
