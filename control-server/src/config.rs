@@ -11,6 +11,7 @@
 //! - Axis 2/3 values must be measured on their own; do not copy axis 1.
 
 use crate::calibration::AxisCalibration;
+use crate::governor::GovernorConfig;
 use crate::types::{AxisId, DeviceId, AXIS_COUNT, VIRTUAL_MAX, VIRTUAL_MIN};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -44,6 +45,9 @@ pub struct Config {
     /// values distributed to the MCUs (design 2026-11-01 §2).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// 追従ガバナ。節が無いときは [`GovernorConfig::default`]。
+    #[serde(default)]
+    pub governor: GovernorConfig,
     pub backend: BackendConfig,
     /// The only axis whose MCU drives the shared main-power relay (G2).
     pub power_controller_axis: AxisId,
@@ -672,6 +676,11 @@ impl Config {
                     crate::limits::OVERSPEED_MARGIN
                 ));
             }
+        }
+
+        // 追従ガバナ。FAULT のしきい値より手前で倍率を下げ切る。
+        for e in self.governor.validation_errors(self.limits.following_error_limit_count) {
+            errs.push(e);
         }
 
         // Backend.

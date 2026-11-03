@@ -143,6 +143,7 @@ use tokio::time::Instant;
 use crate::calibration::{self, AxisCalibration};
 use crate::compat;
 use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
+use crate::governor::{self, GovernorStatus, TrackingGovernor};
 use crate::limits::{
     self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest, MotionLimits,
     MotionLimitsSnapshot, OperatorCap,
@@ -471,6 +472,8 @@ pub struct StatusSnapshot {
     pub telemetry: Option<serde_json::Value>,
     /// The shared motion limits (design 2026-11-01 §5.4).
     pub motion_limits: MotionLimitsSnapshot,
+    /// 追従ガバナ。`scale < 1` のとき `limits` に `tracking_governed` が入る。
+    pub governor: GovernorStatus,
 }
 
 // ------------------------------------------------------------------ internals
@@ -739,6 +742,8 @@ pub struct Supervisor {
 
     phase: Phase,
     planner: Planner,
+    /// 追跡中の目標が実機に対して逃げないよう、全軸共通の倍率を出す。
+    governor: TrackingGovernor,
     planner_settled: bool,
     /// Center: when the planner (and every MCU setpoint) first reached neutral.
     /// `center_reached` additionally needs every MEASURED position within
@@ -834,6 +839,7 @@ impl Supervisor {
             cal_keep_power: false,
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
+            governor: TrackingGovernor::new(cfg.governor.clone(), cfg.limits.following_error_limit_count),
             planner_settled: false,
             center_commanded_at: None,
             epoch: nonzero(session_epoch),
@@ -1220,6 +1226,8 @@ impl Supervisor {
 
         let mut drive_limits = Vec::new();
         self.drive.requested_counts = None;
+        // 追跡の倍率。停止（step_stop）には掛けない。
+        let gov_s = self.update_governor(now);
         match self.phase {
             Phase::Active {
                 source: ActiveSource::Game,
@@ -1231,7 +1239,7 @@ impl Supervisor {
                     p.fresh_until > now && Some(p.session_gen) == self.drive_session
                 });
                 match usable {
-                    Some(p) => drive_limits = self.track_game(p, dt),
+                    Some(p) => drive_limits = self.track_game(p, dt, gov_s),
                     None => {
                         if pose.is_some_and(|p| Some(p.session_gen) != self.drive_session) {
                             self.event(now, "session_changed", serde_json::json!({}));
@@ -1247,7 +1255,7 @@ impl Supervisor {
                 let targets = self.cal.each_ref().map(|c| f64::from(c.neutral_count()));
                 let out = self.planner.step_track(
                     targets,
-                    self.axis_limits(self.game.center_speed_fraction),
+                    self.track_limits(self.game.center_speed_fraction, gov_s),
                     dt,
                 );
                 drive_limits = out.limits.clone();
@@ -1305,6 +1313,7 @@ impl Supervisor {
             _ => {}
         }
         if let Phase::Stopping { .. } = self.phase {
+            // 停止の減速度はガバナで下げない（s² を掛けると止まり切れない）。
             let out = self.planner.step_stop(self.axis_limits(1.0), dt);
             self.planner_settled = out.settled;
             drive_limits = out.limits;
@@ -1336,6 +1345,10 @@ impl Supervisor {
             if !limits.contains(l) {
                 limits.push(*l);
             }
+        }
+        let governor = self.governor.status();
+        if governor.active && !limits.contains(&LimitReason::TrackingGoverned) {
+            limits.push(LimitReason::TrackingGoverned);
         }
         let axes = (0..AXIS_COUNT)
             .map(|i| {
@@ -1422,6 +1435,7 @@ impl Supervisor {
             physical_estop: "not_monitored",
             telemetry: None,
             motion_limits: self.motion_limits_snapshot(),
+            governor,
         }
     }
 
@@ -3148,9 +3162,9 @@ impl Supervisor {
     // ------------------------------------------------------------ drive
 
     /// pose → orient → mix → saturate → virtual_to_count → clamp_soft → step_track.
-    fn track_game(&mut self, pose: &AcceptedPose, dt: f64) -> Vec<LimitReason> {
+    fn track_game(&mut self, pose: &AcceptedPose, dt: f64, scale: f64) -> Vec<LimitReason> {
         let (targets, virt, mut limits) = self.pose_targets(&pose.checked);
-        let out = self.planner.step_track(targets, self.axis_limits(1.0), dt);
+        let out = self.planner.step_track(targets, self.track_limits(1.0, scale), dt);
         limits.extend(out.limits);
         self.drive.virtual_targets = virt;
         self.drive.requested_counts = Some(targets);
@@ -3202,6 +3216,39 @@ impl Supervisor {
             max_vel_count_s: f64::from(e.max_vel_count_s) * fraction,
             max_acc_count_s2: f64::from(e.max_acc_count_s2) * fraction,
         }; AXIS_COUNT]
+    }
+
+    /// 追跡だけガバナを掛ける。速度は `s`、加速度は `s²`。3 軸とも同じ `s`。
+    fn track_limits(&self, fraction: f64, scale: f64) -> [AxisLimits; AXIS_COUNT] {
+        governor::scale_track_limits(self.axis_limits(fraction), scale)
+    }
+
+    /// 最新 STATUS とプランナー速度からガバナを 1 ステップ進める。
+    fn update_governor(&mut self, now: Instant) -> f64 {
+        let samples = self.governor_samples(now);
+        self.governor.update(now, &samples)
+    }
+
+    fn governor_samples(&self, now: Instant) -> [governor::AxisSample; AXIS_COUNT] {
+        let tracking = matches!(self.phase, Phase::Active { .. });
+        let duty = i16::from(self.effective_limits.duty_max_percent).saturating_mul(10);
+        let vels = self.planner.velocities();
+        std::array::from_fn(|i| {
+            let t = &self.axes[i];
+            let status = t.status.filter(|_| t.connected);
+            let age_ms = self
+                .status_age(i, now)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            governor::AxisSample {
+                following_error_count: status.map(|s| s.following_error_count).unwrap_or(0),
+                pwm_permille: status.map(|s| s.pwm_permille).unwrap_or(0),
+                duty_max_permille: duty,
+                target_vel_sign: governor::target_vel_sign(vels[i]),
+                status_age_ms: age_ms,
+                active: tracking && status.is_some(),
+            }
+        })
     }
 
     fn build_set_position(&mut self, drive_limits: &[LimitReason]) -> [SetPosition; AXIS_COUNT] {
@@ -3580,4 +3627,95 @@ fn rig_state_name(s: RigState) -> String {
 
 fn state_name(raw: u8) -> String {
     McuState::from_u8(raw).map_or_else(|| format!("raw {raw}"), |s| format!("{s:?}").to_uppercase())
+}
+
+#[cfg(test)]
+mod governor_wire {
+    use super::{ActiveSource, Phase, StopSub, Supervisor};
+    use crate::config::Config;
+    use crate::protocol::Status;
+    use crate::types::{AxisId, FaultCode, LimitReason, McuState, RigState};
+    use std::path::Path;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn stat(fe: i32, pwm: i16) -> Status {
+        Status {
+            boot_id: 1,
+            mcu_time_us: 0,
+            mcu_state: McuState::Active as u8,
+            selected_axis: 1,
+            fault_code: FaultCode::None,
+            flags: 0,
+            pwm_permille: pwm,
+            actual_count: -400,
+            target_count: -400,
+            velocity_count_s: 0,
+            following_error_count: fe,
+            last_applied_frame: 0,
+            last_applied_seq: 0,
+            last_rx_seq: 0,
+            current_ma: 0,
+            rx_error_count: 0,
+            stale_drop_count: 0,
+        }
+    }
+
+    /// 中立へ向かって正方向に動かし、軸 2 だけ Duty 飽和＋遅れ FE を出す。
+    fn run(enabled: bool) -> (Supervisor, Instant) {
+        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        cfg.governor.enabled = enabled;
+        let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
+        let mut t = Instant::now();
+        sup.planner.init([-400, -400, -400]);
+        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        for _ in 0..25 {
+            for i in 0..3 {
+                let (fe, pwm) = if i == 1 { (-250, 400) } else { (0, 0) };
+                sup.axes[i].connected = true;
+                sup.axes[i].status = Some(stat(fe, pwm));
+                sup.axes[i].status_at = Some(t);
+            }
+            sup.tick(t, 0.01, None);
+            t += Duration::from_millis(10);
+        }
+        (sup, t)
+    }
+
+    #[test]
+    fn tracking_slows_all_axes_together_and_stop_keeps_full_decel() {
+        let (mut gov, t) = run(true);
+        let (off, _) = run(false);
+        assert_eq!(gov.state(), RigState::Active, "{:?}", gov.fault);
+        assert!(gov.governor.status().scale < 1.0, "scale {}", gov.governor.status().scale);
+        assert!(off.governor.status().scale == 1.0);
+        // 健全な軸も同じ軌道（同じ s）なので、ガバナ無しより進みが小さい。
+        assert!(gov.planner.positions()[0] < off.planner.positions()[0] - 1.0);
+        let v = gov.planner.velocities();
+        assert!((v[0] - v[1]).abs() < 1e-6 && (v[1] - v[2]).abs() < 1e-6);
+
+        let snap = gov.snapshot(t);
+        assert!(snap.governor.active);
+        assert_eq!(snap.governor.axis, AxisId::new(2));
+        assert!(snap.limits.contains(&LimitReason::TrackingGoverned));
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["governor"]["active"], true);
+        assert!(json["limits"].as_array().unwrap().iter().any(|x| x == "tracking_governed"));
+        assert_eq!(json["governor"]["axis"], 2);
+
+        let acc = f64::from(gov.effective_limits.max_acc_count_s2);
+        let s = gov.governor.status().scale;
+        for i in 0..3 {
+            gov.axes[i].status_at = Some(t);
+        }
+        let v0 = gov.planner.velocities();
+        gov.phase = Phase::Stopping { sub: StopSub::Decel, started: t };
+        gov.tick(t, 0.01, None);
+        let v1 = gov.planner.velocities();
+        for i in 0..3 {
+            let dv = v0[i] - v1[i];
+            assert!((dv - acc * 0.01).abs() < 1e-4, "axis {i} stop dv {dv}, full {}", acc * 0.01);
+            assert!(dv > acc * s * s * 0.01 + 1.0, "stop must not take s²");
+        }
+    }
 }

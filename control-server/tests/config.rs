@@ -212,6 +212,39 @@ fn limits_rules() {
     assert_eq!((d.following_error_limit_count, d.overspeed_count_s), (800, 9000));
 }
 
+#[test]
+fn governor_section_defaults_and_rejects_bad_thresholds() {
+    let cfg = sim();
+    assert_eq!(cfg.governor, h3cs::governor::GovernorConfig::default());
+    let mut bad = cfg.clone();
+    bad.governor.fe_hard = cfg.limits.following_error_limit_count;
+    assert_invalid(&bad, "governor.fe_hard");
+    bad = cfg.clone();
+    bad.governor.fe_release = bad.governor.fe_start;
+    assert_invalid(&bad, "governor.fe_release");
+    bad = cfg.clone();
+    bad.governor.s_min = 0.0;
+    assert_invalid(&bad, "governor.s_min");
+    bad.governor.s_min = 1.0;
+    bad.governor.down_rate = 0.0;
+    assert_invalid(&bad, "governor.down_rate");
+    let text = std::fs::read_to_string(SIM).unwrap();
+    let with = format!("{text}\n[governor]\nfe_start = 100\nfe_hard = 180\nfe_release = 40\n");
+    let loaded = Config::from_toml_str(&with).unwrap();
+    assert_eq!((loaded.governor.fe_release, loaded.governor.fe_start, loaded.governor.fe_hard), (40, 100, 180));
+    assert_eq!(loaded.governor.s_min, h3cs::governor::GovernorConfig::default().s_min);
+}
+
+#[test]
+fn live_bringup_accepts_default_governor() {
+    // 節が無い実機設定。既定の fe_hard が following_error_limit_count 未満であること。
+    let live = concat!(env!("CARGO_MANIFEST_DIR"), "/config/h3-bringup-01-live-20261102.toml");
+    let cfg = Config::load(Path::new(live)).unwrap_or_else(|e| panic!("{live}: {e}"));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.governor, h3cs::governor::GovernorConfig::default());
+    assert!(cfg.limits.following_error_limit_count > cfg.governor.fe_hard);
+}
+
 /// Issue #15 H2: `max_vel / max_acc` must fit in 0.8 x the shorter stop
 /// timeout, for the initial set and for the firmware ceilings.
 #[test]

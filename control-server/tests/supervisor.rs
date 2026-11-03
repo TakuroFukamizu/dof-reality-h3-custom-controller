@@ -1770,11 +1770,16 @@ fn snapshot_json_shape() {
         "physical_estop",
         "telemetry",
         "motion_limits",
+        "governor",
     ];
     let mut got = keys.clone();
     got.sort_unstable();
     want.sort_unstable();
     assert_eq!(got, want);
+    assert_eq!(v["governor"]["scale"], 1.0);
+    assert_eq!(v["governor"]["active"], false);
+    assert!(v["governor"]["axis"].is_null());
+    assert!(v["governor"]["reason"].is_null());
     assert_eq!(v["rig_state"], "ACTIVE");
     assert_eq!(v["active_source"], "game");
     assert_eq!(v["armed"], true);

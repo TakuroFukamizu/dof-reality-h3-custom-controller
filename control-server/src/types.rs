@@ -157,6 +157,9 @@ pub enum LimitReason {
     /// only lower the operator's limits; `POST /v1/limits` (admin) raises
     /// them (Issue #15, `limits::OperatorCap`).
     OperatorLimited,
+    /// 追従ガバナが全軸の速度を `s`、加速度を `s²` に下げている（`s < 1`）。
+    /// 停止の減速度には掛けない。
+    TrackingGoverned,
 }
 
 /// Whole-rig state (server side), architecture §10.
