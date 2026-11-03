@@ -37,7 +37,7 @@ struct V1Tuning {
   int duty_max = V1_DUTY_MAX;
   int stall_duty = V1_STALL_DUTY;
   int stall_duty_ratio_percent = V1_STALL_DUTY_RATIO_PERCENT;  // ENCODER_FAULT のしきい値 = max(stall_duty, duty_max × これ / 100)
-  uint32_t stall_ms = STALL_MS;
+  uint32_t stall_ms = V1_STALL_MS;
   uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
   uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;

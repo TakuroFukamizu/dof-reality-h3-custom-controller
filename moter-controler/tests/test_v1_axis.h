@@ -1395,12 +1395,12 @@ inline void test_encoder_fault_on_no_pulses_while_driving() {
   Harness::accepted(h.start());
   h.stall = true;  // カウントが止まる
   // 軌道が動き出してフィードフォワードが |duty| ≥ しきい値 15 %（max(10, duty_max 20 × 75 %)。Issue #15 M2）に届いてから
-  // STALL_MS（200 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
+  // V1_STALL_MS（600 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
   CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150);
   h.drive(150, 2000);
   CHECK(h.ax.state() == st::ACTIVE);
   CHECK(h.ax.duty_permille() != 0);
-  h.drive(150, 2000);
+  h.drive(550, 2000);  // V1_STALL_MS 600
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   CHECK(h.ax.duty_permille() == 0);
   // FAULT_RESET は通るが POSITION_REFERENCED が消える
@@ -1462,7 +1462,7 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   CHECK(h.ax.referenced());
   // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路）
   Harness::accepted(h.start());
-  h.drive(300, h.ax.actual_count() + 2000);
+  h.drive(700, h.ax.actual_count() + 2000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
