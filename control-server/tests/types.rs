@@ -37,9 +37,18 @@ fn fault_code_wire_values_round_trip_and_local_estop_is_12() {
 
 #[test]
 fn fault_code_json_names_are_screaming_snake_case() {
-    assert_eq!(serde_json::to_value(FaultCode::LocalEstop).unwrap(), "LOCAL_ESTOP");
-    assert_eq!(serde_json::from_value::<FaultCode>("LOCAL_ESTOP".into()).unwrap(), FaultCode::LocalEstop);
-    assert_eq!(serde_json::to_value(FaultCode::HostFault).unwrap(), "HOST_FAULT");
+    assert_eq!(
+        serde_json::to_value(FaultCode::LocalEstop).unwrap(),
+        "LOCAL_ESTOP"
+    );
+    assert_eq!(
+        serde_json::from_value::<FaultCode>("LOCAL_ESTOP".into()).unwrap(),
+        FaultCode::LocalEstop
+    );
+    assert_eq!(
+        serde_json::to_value(FaultCode::HostFault).unwrap(),
+        "HOST_FAULT"
+    );
     assert_eq!(serde_json::to_value(FaultCode::None).unwrap(), "NONE");
 }
 
@@ -52,6 +61,12 @@ fn mcu_state_calibrating_is_8() {
     }
     assert_eq!(McuState::from_u8(8), Some(McuState::Calibrating));
     assert_eq!(McuState::from_u8(9), None);
-    assert_eq!(serde_json::to_value(McuState::Calibrating).unwrap(), "CALIBRATING");
-    assert_eq!(serde_json::from_value::<McuState>("CALIBRATING".into()).unwrap(), McuState::Calibrating);
+    assert_eq!(
+        serde_json::to_value(McuState::Calibrating).unwrap(),
+        "CALIBRATING"
+    );
+    assert_eq!(
+        serde_json::from_value::<McuState>("CALIBRATING".into()).unwrap(),
+        McuState::Calibrating
+    );
 }

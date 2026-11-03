@@ -74,7 +74,11 @@ pub struct PoseMsg {
 
 impl PoseMsg {
     pub fn pose(&self) -> Pose {
-        Pose { pitch: self.pitch, roll: self.roll, yaw: self.yaw }
+        Pose {
+            pitch: self.pitch,
+            roll: self.roll,
+            yaw: self.yaw,
+        }
     }
 }
 
@@ -158,7 +162,12 @@ impl AckMsg {
     }
     /// Ack of an accepted `limits` message: `effective_gain` is the new gain
     /// ceiling (what the next pose's gain is clamped to).
-    pub fn accepted_limits(seq: u64, effective: MotionLimits, limits: Vec<LimitReason>, fresh: bool) -> Self {
+    pub fn accepted_limits(
+        seq: u64,
+        effective: MotionLimits,
+        limits: Vec<LimitReason>,
+        fresh: bool,
+    ) -> Self {
         Self {
             kind: "ack",
             seq: Some(seq),
@@ -272,7 +281,11 @@ impl PoseIntake {
     pub fn new_session(&mut self) -> String {
         let id = format!("{:032x}", rand::random::<u128>());
         let session_gen = self.session_gen.wrapping_add(1);
-        *self = Self { session: Some(id.clone()), session_gen, ..Self::default() };
+        *self = Self {
+            session: Some(id.clone()),
+            session_gen,
+            ..Self::default()
+        };
         id
     }
 
@@ -306,7 +319,9 @@ impl PoseIntake {
         source_freshness_ms: u64,
     ) -> Result<Option<AcceptedPose>, RejectReason> {
         match msg {
-            ClientMsg::Pose(p) => self.accept_pose(p, recv_at, cfg, max_gain, source_freshness_ms).map(Some),
+            ClientMsg::Pose(p) => self
+                .accept_pose(p, recv_at, cfg, max_gain, source_freshness_ms)
+                .map(Some),
             ClientMsg::Gain(g) => self.accept_gain(g, cfg, max_gain).map(|u| u.pose),
             ClientMsg::Limits(l) => self.accept_limits(l, || Ok(())).map(|()| None),
         }
@@ -345,7 +360,8 @@ impl PoseIntake {
         if msg.source_age_ms < 0.0 {
             return Err(RejectReason::InvalidAge);
         }
-        let age = Duration::try_from_secs_f64(msg.source_age_ms / 1000.0).map_err(|_| RejectReason::InvalidAge)?;
+        let age = Duration::try_from_secs_f64(msg.source_age_ms / 1000.0)
+            .map_err(|_| RejectReason::InvalidAge)?;
         let produced_at = recv_at.checked_sub(age).ok_or(RejectReason::InvalidAge)?;
         let window = Duration::from_millis(source_freshness_ms);
         let refreshed = produced_at.checked_add(window).unwrap_or(recv_at);
@@ -391,29 +407,51 @@ impl PoseIntake {
     /// against it so a lowered ceiling takes effect at once, not at the next
     /// pose. Freshness, seq and frame_seq are untouched. `None` when there is
     /// no pose or nothing changed.
-    pub fn reapply_gain_ceiling(&mut self, cfg: &GameConfig, max_gain: f64) -> Option<AcceptedPose> {
+    pub fn reapply_gain_ceiling(
+        &mut self,
+        cfg: &GameConfig,
+        max_gain: f64,
+    ) -> Option<AcceptedPose> {
         let prev = self.latest.as_ref()?;
-        let checked =
-            compat::check_pose(prev.pose, prev.requested_gain, max_gain, cfg.clamp_out_of_range).ok()?;
+        let checked = compat::check_pose(
+            prev.pose,
+            prev.requested_gain,
+            max_gain,
+            cfg.clamp_out_of_range,
+        )
+        .ok()?;
         if checked == prev.checked {
             return None;
         }
-        let p = AcceptedPose { checked, ..prev.clone() };
+        let p = AcceptedPose {
+            checked,
+            ..prev.clone()
+        };
         self.latest = Some(p.clone());
         Some(p)
     }
 
     /// Gain-only update: re-checks the latest pose with the new gain and
     /// never touches its freshness.
-    pub fn accept_gain(&mut self, msg: &GainMsg, cfg: &GameConfig, max_gain: f64) -> Result<GainUpdate, RejectReason> {
+    pub fn accept_gain(
+        &mut self,
+        msg: &GainMsg,
+        cfg: &GameConfig,
+        max_gain: f64,
+    ) -> Result<GainUpdate, RejectReason> {
         self.check_header(msg.protocol, &msg.source_session, msg.seq)?;
         let gain_only = compat::check_pose(Pose::ZERO, msg.gain, max_gain, cfg.clamp_out_of_range)
             .map_err(map_pose_error)?;
         let pose = match &self.latest {
             Some(prev) => {
-                let checked = compat::check_pose(prev.pose, msg.gain, max_gain, cfg.clamp_out_of_range)
-                    .map_err(map_pose_error)?;
-                Some(AcceptedPose { requested_gain: msg.gain, checked, ..prev.clone() })
+                let checked =
+                    compat::check_pose(prev.pose, msg.gain, max_gain, cfg.clamp_out_of_range)
+                        .map_err(map_pose_error)?;
+                Some(AcceptedPose {
+                    requested_gain: msg.gain,
+                    checked,
+                    ..prev.clone()
+                })
             }
             None => None,
         };
@@ -425,7 +463,12 @@ impl PoseIntake {
             Some(p) => (p.checked.effective_gain, p.checked.limits.clone()),
             None => (gain_only.effective_gain, gain_only.limits),
         };
-        Ok(GainUpdate { requested_gain: msg.gain, effective_gain, limits, pose })
+        Ok(GainUpdate {
+            requested_gain: msg.gain,
+            effective_gain,
+            limits,
+            pose,
+        })
     }
 
     pub fn snapshot(&self, now: Instant) -> SessionSnapshot {
@@ -435,7 +478,10 @@ impl PoseIntake {
                 .as_ref()
                 .map(|s| s.chars().take(SESSION_PREFIX_LEN).collect()),
             fresh: self.is_fresh(now),
-            freshness_mode: self.latest.as_ref().map_or(FreshnessMode::FrameSeq, |p| p.freshness_mode),
+            freshness_mode: self
+                .latest
+                .as_ref()
+                .map_or(FreshnessMode::FrameSeq, |p| p.freshness_mode),
             source_age_ms: self
                 .latest
                 .as_ref()

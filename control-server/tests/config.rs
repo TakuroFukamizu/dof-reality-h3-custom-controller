@@ -133,21 +133,48 @@ fn limits_rules() {
     let cases: &[Case] = &[
         (|c| c.limits.max_vel_count_s = 0, "limits.max_vel_count_s"),
         (|c| c.limits.max_acc_count_s2 = 0, "limits.max_acc_count_s2"),
-        (|c| c.limits.following_error_limit_count = 0, "limits.following_error_limit_count"),
-        (|c| c.limits.overspeed_count_s = 0, "limits.overspeed_count_s"),
+        (
+            |c| c.limits.following_error_limit_count = 0,
+            "limits.following_error_limit_count",
+        ),
+        (
+            |c| c.limits.overspeed_count_s = 0,
+            "limits.overspeed_count_s",
+        ),
         (|c| c.limits.duty_max_percent = 0, "limits.duty_max_percent"),
-        (|c| c.limits.duty_max_percent = 101, "limits.duty_max_percent"),
-        (|c| c.limits.duty_min_percent = 50, "limits.duty_min_percent"),
-        (|c| c.limits.ff_count_s_per_percent = 0, "limits.ff_count_s_per_percent"),
-        (|c| c.limits.deadband_out_count = 5, "limits.deadband_out_count"),
+        (
+            |c| c.limits.duty_max_percent = 101,
+            "limits.duty_max_percent",
+        ),
+        (
+            |c| c.limits.duty_min_percent = 50,
+            "limits.duty_min_percent",
+        ),
+        (
+            |c| c.limits.ff_count_s_per_percent = 0,
+            "limits.ff_count_s_per_percent",
+        ),
+        (
+            |c| c.limits.deadband_out_count = 5,
+            "limits.deadband_out_count",
+        ),
         // overspeed must be >= 1.5 x max_vel (3000 -> 4500)
-        (|c| c.limits.overspeed_count_s = 4499, "limits.overspeed_count_s"),
+        (
+            |c| c.limits.overspeed_count_s = 4499,
+            "limits.overspeed_count_s",
+        ),
         // kp = 0 cannot hold position at rest.
-        (|c| c.limits.kp_percent_per_100 = 0, "limits.kp_percent_per_100"),
+        (
+            |c| c.limits.kp_percent_per_100 = 0,
+            "limits.kp_percent_per_100",
+        ),
         // kp x following_error / 100 must reach duty_min, or the loop never
         // exceeds the floor before FOLLOWING_ERROR (2026-11-01: 2 x 400 / 100 = 8 %
         // against a 9 % breakaway). sim: 2 x 800 / 100 = 16 >= 3; make it 2 x 100 = 2 < 3.
-        (|c| c.limits.following_error_limit_count = 100, "limits.kp_percent_per_100"),
+        (
+            |c| c.limits.following_error_limit_count = 100,
+            "limits.kp_percent_per_100",
+        ),
         (
             |c| {
                 c.limits.kp_percent_per_100 = 1;
@@ -156,14 +183,29 @@ fn limits_rules() {
             "limits.kp_percent_per_100",
         ),
         // CENTER's measured tolerance must cover the firmware deadband.
-        (|c| c.game.center_tolerance_count = 0, "game.center_tolerance_count"),
-        (|c| c.game.center_tolerance_count = 19, "game.center_tolerance_count"),
+        (
+            |c| c.game.center_tolerance_count = 0,
+            "game.center_tolerance_count",
+        ),
+        (
+            |c| c.game.center_tolerance_count = 19,
+            "game.center_tolerance_count",
+        ),
         // So must the measured-rest tolerance of STOP (Issue #15 H1), and the
         // rest dwell must fit inside the settle window.
-        (|c| c.timing.rest_error_count = 19, "timing.rest_error_count (19) must be >= limits.deadband_out_count (20)"),
-        (|c| c.timing.rest_dwell_ms = 3000, "timing.rest_dwell_ms (3000) must be < timing.stop_settle_timeout_ms (3000)"),
+        (
+            |c| c.timing.rest_error_count = 19,
+            "timing.rest_error_count (19) must be >= limits.deadband_out_count (20)",
+        ),
+        (
+            |c| c.timing.rest_dwell_ms = 3000,
+            "timing.rest_dwell_ms (3000) must be < timing.stop_settle_timeout_ms (3000)",
+        ),
         // START's pose interlock needs a positive window.
-        (|c| c.game.start_max_offset_count = 0, "game.start_max_offset_count"),
+        (
+            |c| c.game.start_max_offset_count = 0,
+            "game.start_max_offset_count",
+        ),
         // Stop-time rule (Issue #15 H2): 600 count/s at 1 count/s² takes 600 s to stop.
         (
             |c| {
@@ -195,9 +237,16 @@ fn limits_rules() {
     cfg.validate().unwrap();
     assert_eq!(cfg.game.center_tolerance_count, 50);
     assert_eq!(cfg.timing.center_reach_timeout_ms, 5000);
-    assert_eq!(h3cs::config::GameConfig::default().start_max_offset_count, 300);
     assert_eq!(
-        (cfg.timing.rest_velocity_count_s, cfg.timing.rest_error_count, cfg.timing.rest_dwell_ms),
+        h3cs::config::GameConfig::default().start_max_offset_count,
+        300
+    );
+    assert_eq!(
+        (
+            cfg.timing.rest_velocity_count_s,
+            cfg.timing.rest_error_count,
+            cfg.timing.rest_dwell_ms
+        ),
         (50, 50, 200)
     );
     // Exactly at the deadband is accepted.
@@ -206,10 +255,28 @@ fn limits_rules() {
     cfg.validate().unwrap();
     // Defaults are the documented initial values.
     let d = LimitsConfig::default();
-    assert_eq!((d.max_gain, d.max_vel_count_s, d.max_acc_count_s2, d.duty_max_percent), (0.5, 3000, 15000, 40));
-    assert_eq!((d.duty_min_percent, d.kp_percent_per_100, d.ff_count_s_per_percent), (3, 2, 100));
+    assert_eq!(
+        (
+            d.max_gain,
+            d.max_vel_count_s,
+            d.max_acc_count_s2,
+            d.duty_max_percent
+        ),
+        (0.5, 3000, 15000, 40)
+    );
+    assert_eq!(
+        (
+            d.duty_min_percent,
+            d.kp_percent_per_100,
+            d.ff_count_s_per_percent
+        ),
+        (3, 2, 100)
+    );
     assert_eq!((d.deadband_count, d.deadband_out_count), (10, 20));
-    assert_eq!((d.following_error_limit_count, d.overspeed_count_s), (800, 9000));
+    assert_eq!(
+        (d.following_error_limit_count, d.overspeed_count_s),
+        (800, 9000)
+    );
 }
 
 #[test]
@@ -231,8 +298,18 @@ fn governor_section_defaults_and_rejects_bad_thresholds() {
     let text = std::fs::read_to_string(SIM).unwrap();
     let with = format!("{text}\n[governor]\nfe_start = 100\nfe_hard = 180\nfe_release = 40\n");
     let loaded = Config::from_toml_str(&with).unwrap();
-    assert_eq!((loaded.governor.fe_release, loaded.governor.fe_start, loaded.governor.fe_hard), (40, 100, 180));
-    assert_eq!(loaded.governor.s_min, h3cs::governor::GovernorConfig::default().s_min);
+    assert_eq!(
+        (
+            loaded.governor.fe_release,
+            loaded.governor.fe_start,
+            loaded.governor.fe_hard
+        ),
+        (40, 100, 180)
+    );
+    assert_eq!(
+        loaded.governor.s_min,
+        h3cs::governor::GovernorConfig::default().s_min
+    );
     assert!(loaded.governor.thresholds_explicit);
     assert_eq!(loaded.governor.no_progress_ms, 1500);
 }
@@ -248,7 +325,11 @@ fn governor_scales_factory_defaults_when_the_following_error_limit_is_small() {
     let cfg = Config::from_toml_str(&low).unwrap();
     assert!(!cfg.governor.thresholds_explicit);
     assert_eq!(
-        (cfg.governor.fe_release, cfg.governor.fe_start, cfg.governor.fe_hard),
+        (
+            cfg.governor.fe_release,
+            cfg.governor.fe_start,
+            cfg.governor.fe_hard
+        ),
         (30, 60, 100)
     );
     assert_eq!(cfg.governor.no_progress_ms, 1500);
@@ -277,7 +358,10 @@ fn governor_scales_factory_defaults_when_the_following_error_limit_is_small() {
 #[test]
 fn live_bringup_accepts_default_governor() {
     // 節が無い実機設定。既定の fe_hard が following_error_limit_count 未満であること。
-    let live = concat!(env!("CARGO_MANIFEST_DIR"), "/config/h3-bringup-01-live-20261102.toml");
+    let live = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/config/h3-bringup-01-live-20261102.toml"
+    );
     let cfg = Config::load(Path::new(live)).unwrap_or_else(|e| panic!("{live}: {e}"));
     cfg.validate().unwrap();
     assert_eq!(cfg.governor, h3cs::governor::GovernorConfig::default());
@@ -292,7 +376,10 @@ fn stop_time_rule_names_the_numbers() {
     cfg.limits.max_vel_count_s = 600;
     cfg.limits.max_acc_count_s2 = 1;
     let m = invalid(&cfg);
-    assert!(m.contains("limits.max_vel_count_s (600) / limits.max_acc_count_s2 (1) = 600.000 s"), "{m}");
+    assert!(
+        m.contains("limits.max_vel_count_s (600) / limits.max_acc_count_s2 (1) = 600.000 s"),
+        "{m}"
+    );
     assert!(m.contains("<= 1.200 s (0.8 x min(timing.mcu_stop_timeout_ms 1500, timing.stop_settle_timeout_ms 3000))"), "{m}");
     assert!(m.contains("max_acc_count_s2 must be >= 500"), "{m}");
     // Exactly at the bound passes; one below fails.
@@ -309,7 +396,10 @@ fn stop_time_rule_names_the_numbers() {
     let mut cfg = sim();
     cfg.timing.stop_settle_timeout_ms = 100; // 0.08 s
     let m = invalid(&cfg);
-    assert!(m.contains("firmware ceilings: max_vel 6000 / max_acc 40000 = 0.150 s"), "{m}");
+    assert!(
+        m.contains("firmware ceilings: max_vel 6000 / max_acc 40000 = 0.150 s"),
+        "{m}"
+    );
     // The shipped sets pass: sim 3000 / 15000 = 0.2 s, bring-up 600 / 2000 = 0.3 s.
     sim().validate().unwrap();
     let bringup = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml");
@@ -321,11 +411,28 @@ fn schema_1_files_with_per_axis_limits_are_rejected() {
     // An old (schema 1) file: `[game].max_gain` and per-axis limits are unknown fields now.
     let text = std::fs::read_to_string(SIM).unwrap();
     let old = text.replacen("schema_version = 2", "schema_version = 1", 1);
-    assert!(matches!(Config::from_toml_str(&old), Err(ConfigError::Invalid(_))));
-    let with_axis_limit = text.replacen("decel_zone_count = 300", "decel_zone_count = 300\nmax_vel_count_s = 600", 1);
-    assert!(matches!(Config::from_toml_str(&with_axis_limit), Err(ConfigError::Parse(_))));
-    let with_game_gain = text.replacen("clamp_out_of_range = true", "clamp_out_of_range = true\nmax_gain = 0.35", 1);
-    assert!(matches!(Config::from_toml_str(&with_game_gain), Err(ConfigError::Parse(_))));
+    assert!(matches!(
+        Config::from_toml_str(&old),
+        Err(ConfigError::Invalid(_))
+    ));
+    let with_axis_limit = text.replacen(
+        "decel_zone_count = 300",
+        "decel_zone_count = 300\nmax_vel_count_s = 600",
+        1,
+    );
+    assert!(matches!(
+        Config::from_toml_str(&with_axis_limit),
+        Err(ConfigError::Parse(_))
+    ));
+    let with_game_gain = text.replacen(
+        "clamp_out_of_range = true",
+        "clamp_out_of_range = true\nmax_gain = 0.35",
+        1,
+    );
+    assert!(matches!(
+        Config::from_toml_str(&with_game_gain),
+        Err(ConfigError::Parse(_))
+    ));
 }
 
 #[test]
@@ -358,17 +465,41 @@ fn center_speed_fraction_bounds() {
 fn zero_timing_rejected() {
     type Set = fn(&mut Config);
     let cases: [(Set, &str); 15] = [
-        (|c| c.timing.rest_velocity_count_s = 0, "timing.rest_velocity_count_s"),
+        (
+            |c| c.timing.rest_velocity_count_s = 0,
+            "timing.rest_velocity_count_s",
+        ),
         (|c| c.timing.rest_error_count = 0, "timing.rest_error_count"),
         (|c| c.timing.rest_dwell_ms = 0, "timing.rest_dwell_ms"),
-        (|c| c.timing.planner_period_ms = 0, "timing.planner_period_ms"),
-        (|c| c.timing.set_position_valid_for_ms = 0, "timing.set_position_valid_for_ms"),
-        (|c| c.timing.mcu_command_timeout_ms = 0, "timing.mcu_command_timeout_ms"),
-        (|c| c.timing.mcu_stop_timeout_ms = 0, "timing.mcu_stop_timeout_ms"),
-        (|c| c.timing.axis_status_timeout_ms = 0, "timing.axis_status_timeout_ms"),
-        (|c| c.timing.source_freshness_ms = 0, "timing.source_freshness_ms"),
+        (
+            |c| c.timing.planner_period_ms = 0,
+            "timing.planner_period_ms",
+        ),
+        (
+            |c| c.timing.set_position_valid_for_ms = 0,
+            "timing.set_position_valid_for_ms",
+        ),
+        (
+            |c| c.timing.mcu_command_timeout_ms = 0,
+            "timing.mcu_command_timeout_ms",
+        ),
+        (
+            |c| c.timing.mcu_stop_timeout_ms = 0,
+            "timing.mcu_stop_timeout_ms",
+        ),
+        (
+            |c| c.timing.axis_status_timeout_ms = 0,
+            "timing.axis_status_timeout_ms",
+        ),
+        (
+            |c| c.timing.source_freshness_ms = 0,
+            "timing.source_freshness_ms",
+        ),
         (|c| c.timing.arm_timeout_ms = 0, "timing.arm_timeout_ms"),
-        (|c| c.timing.stop_settle_timeout_ms = 0, "timing.stop_settle_timeout_ms"),
+        (
+            |c| c.timing.stop_settle_timeout_ms = 0,
+            "timing.stop_settle_timeout_ms",
+        ),
         (|c| c.timing.stop_hold_ms = 0, "timing.stop_hold_ms"),
         (|c| c.timing.max_frame_skew = 0, "timing.max_frame_skew"),
         (|c| c.timing.hello_retry_ms = 0, "timing.hello_retry_ms"),
@@ -385,7 +516,10 @@ fn zero_timing_rejected() {
 fn command_lifetime_must_exceed_planner_period() {
     let mut cfg = sim();
     cfg.timing.set_position_valid_for_ms = 10;
-    assert_invalid(&cfg, "timing.set_position_valid_for_ms (10) must be > timing.planner_period_ms (10)");
+    assert_invalid(
+        &cfg,
+        "timing.set_position_valid_for_ms (10) must be > timing.planner_period_ms (10)",
+    );
     let mut cfg = sim();
     cfg.timing.mcu_command_timeout_ms = 5;
     assert_invalid(&cfg, "timing.mcu_command_timeout_ms");
@@ -427,13 +561,19 @@ fn soft_limit_outside_mechanical_rejected() {
     let mut cfg = sim();
     cfg.axes[1].soft_max_count = 1200; // mechanical_max_count = 1000
     let m = invalid(&cfg);
-    assert!(m.contains("axis_id = 2") && m.contains("soft_max_count"), "{m}");
+    assert!(
+        m.contains("axis_id = 2") && m.contains("soft_max_count"),
+        "{m}"
+    );
 
     // Inside, but not by decel_zone_count (300).
     let mut cfg = sim();
     cfg.axes[0].soft_min_count = -2500; // mechanical_min_count = -2742
     let m = invalid(&cfg);
-    assert!(m.contains("axis_id = 1") && m.contains("soft_min_count"), "{m}");
+    assert!(
+        m.contains("axis_id = 1") && m.contains("soft_min_count"),
+        "{m}"
+    );
 }
 
 #[test]
@@ -456,17 +596,29 @@ fn multiple_errors_are_all_reported() {
     cfg.limits.max_gain = 2.0;
     cfg.timing.stop_hold_ms = 0;
     let m = invalid(&cfg);
-    assert!(m.contains("limits.max_gain") && m.contains("timing.stop_hold_ms"), "{m}");
+    assert!(
+        m.contains("limits.max_gain") && m.contains("timing.stop_hold_ms"),
+        "{m}"
+    );
 }
 
 #[test]
 fn from_toml_str_runs_validation() {
     let text = std::fs::read_to_string(SIM).unwrap();
     let bad = text.replacen("max_gain = 0.5", "max_gain = 1.5", 1);
-    assert!(matches!(Config::from_toml_str(&bad), Err(ConfigError::Invalid(_))));
+    assert!(matches!(
+        Config::from_toml_str(&bad),
+        Err(ConfigError::Invalid(_))
+    ));
     let bad = text.replacen("bind = \"127.0.0.1:8892\"", "bind = \"0.0.0.0:8892\"", 1);
-    assert!(matches!(Config::from_toml_str(&bad), Err(ConfigError::Invalid(_))));
-    assert!(matches!(Config::from_toml_str("not toml ["), Err(ConfigError::Parse(_))));
+    assert!(matches!(
+        Config::from_toml_str(&bad),
+        Err(ConfigError::Invalid(_))
+    ));
+    assert!(matches!(
+        Config::from_toml_str("not toml ["),
+        Err(ConfigError::Parse(_))
+    ));
 }
 
 #[test]
@@ -487,58 +639,111 @@ fn huge_timing_values_rejected() {
     type Set = fn(&mut Config, u64);
     let cases: [(Set, &str); 10] = [
         (|c, v| c.timing.rest_dwell_ms = v, "timing.rest_dwell_ms"),
-        (|c, v| c.timing.planner_period_ms = v, "timing.planner_period_ms"),
-        (|c, v| c.timing.axis_status_timeout_ms = v, "timing.axis_status_timeout_ms"),
-        (|c, v| c.timing.source_freshness_ms = v, "timing.source_freshness_ms"),
+        (
+            |c, v| c.timing.planner_period_ms = v,
+            "timing.planner_period_ms",
+        ),
+        (
+            |c, v| c.timing.axis_status_timeout_ms = v,
+            "timing.axis_status_timeout_ms",
+        ),
+        (
+            |c, v| c.timing.source_freshness_ms = v,
+            "timing.source_freshness_ms",
+        ),
         (|c, v| c.timing.arm_timeout_ms = v, "timing.arm_timeout_ms"),
-        (|c, v| c.timing.stop_settle_timeout_ms = v, "timing.stop_settle_timeout_ms"),
+        (
+            |c, v| c.timing.stop_settle_timeout_ms = v,
+            "timing.stop_settle_timeout_ms",
+        ),
         (|c, v| c.timing.stop_hold_ms = v, "timing.stop_hold_ms"),
         (|c, v| c.timing.hello_retry_ms = v, "timing.hello_retry_ms"),
-        (|c, v| c.timing.hello_timeout_ms = v, "timing.hello_timeout_ms"),
-        (|c, v| c.server.status_period_ms = v, "server.status_period_ms"),
+        (
+            |c, v| c.timing.hello_timeout_ms = v,
+            "timing.hello_timeout_ms",
+        ),
+        (
+            |c, v| c.server.status_period_ms = v,
+            "server.status_period_ms",
+        ),
     ];
     for (set, needle) in cases {
         let mut cfg = sim();
         set(&mut cfg, MAX_TIMING_MS);
-        assert!(!cfg.validate().is_err_and(|e| e.to_string().contains(&format!("{needle} must be <="))), "{needle} at the max");
+        assert!(
+            !cfg.validate()
+                .is_err_and(|e| e.to_string().contains(&format!("{needle} must be <="))),
+            "{needle} at the max"
+        );
         for v in [MAX_TIMING_MS + 1, u64::MAX] {
             let mut cfg = sim();
             set(&mut cfg, v);
             assert_invalid(&cfg, &format!("{needle} must be <= {MAX_TIMING_MS}"));
         }
     }
-    assert_eq!(h3cs::config::bounded_ms(u64::MAX), std::time::Duration::from_millis(MAX_TIMING_MS));
+    assert_eq!(
+        h3cs::config::bounded_ms(u64::MAX),
+        std::time::Duration::from_millis(MAX_TIMING_MS)
+    );
 }
 
 #[test]
 fn sim_backend_end_stops_default_and_are_ordered() {
-    let BackendConfig::Sim(b) = sim().backend else { panic!("sim backend") };
+    let BackendConfig::Sim(b) = sim().backend else {
+        panic!("sim backend")
+    };
     assert_eq!((b.end_min_count, b.end_max_count), (-3000, 3000));
     let text = std::fs::read_to_string(SIM).unwrap();
-    assert!(text.contains("end_min_count = -3000") && text.contains("end_max_count = 3000"), "sim.toml documents the keys");
-    let omitted = text.replace("end_min_count = -3000", "").replace("end_max_count = 3000", "");
-    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else { panic!("sim backend") };
+    assert!(
+        text.contains("end_min_count = -3000") && text.contains("end_max_count = 3000"),
+        "sim.toml documents the keys"
+    );
+    let omitted = text
+        .replace("end_min_count = -3000", "")
+        .replace("end_max_count = 3000", "");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else {
+        panic!("sim backend")
+    };
     assert_eq!((b.end_min_count, b.end_max_count), (-3000, 3000));
-    let narrow = text.replace("end_min_count = -3000", "end_min_count = -500").replace("end_max_count = 3000", "end_max_count = 500");
-    let BackendConfig::Sim(b) = Config::from_toml_str(&narrow).unwrap().backend else { panic!("sim backend") };
+    let narrow = text
+        .replace("end_min_count = -3000", "end_min_count = -500")
+        .replace("end_max_count = 3000", "end_max_count = 500");
+    let BackendConfig::Sim(b) = Config::from_toml_str(&narrow).unwrap().backend else {
+        panic!("sim backend")
+    };
     assert_eq!((b.end_min_count, b.end_max_count), (-500, 500));
     let inverted = text.replace("end_min_count = -3000", "end_min_count = 3000");
     let err = Config::from_toml_str(&inverted).unwrap_err().to_string();
-    assert!(err.contains("backend.end_min_count (3000) must be < backend.end_max_count (3000)"), "{err}");
+    assert!(
+        err.contains("backend.end_min_count (3000) must be < backend.end_max_count (3000)"),
+        "{err}"
+    );
 }
 
 #[test]
 fn sim_backend_report_selected_axis_defaults_to_true() {
-    let BackendConfig::Sim(b) = sim().backend else { panic!("sim backend") };
+    let BackendConfig::Sim(b) = sim().backend else {
+        panic!("sim backend")
+    };
     assert!(b.report_selected_axis);
     let text = std::fs::read_to_string(SIM).unwrap();
-    assert!(text.contains("report_selected_axis = true"), "sim.toml documents the key");
-    let off = text.replace("report_selected_axis = true", "report_selected_axis = false");
-    let BackendConfig::Sim(b) = Config::from_toml_str(&off).unwrap().backend else { panic!("sim backend") };
+    assert!(
+        text.contains("report_selected_axis = true"),
+        "sim.toml documents the key"
+    );
+    let off = text.replace(
+        "report_selected_axis = true",
+        "report_selected_axis = false",
+    );
+    let BackendConfig::Sim(b) = Config::from_toml_str(&off).unwrap().backend else {
+        panic!("sim backend")
+    };
     assert!(!b.report_selected_axis);
     // Omitted → default true.
     let omitted = text.replace("report_selected_axis = true", "");
-    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else { panic!("sim backend") };
+    let BackendConfig::Sim(b) = Config::from_toml_str(&omitted).unwrap().backend else {
+        panic!("sim backend")
+    };
     assert!(b.report_selected_axis);
 }
 
@@ -554,16 +759,29 @@ fn all_zero_device_ids_mean_no_cross_check_and_validate() {
 
 #[test]
 fn non_loopback_bind_requires_admin_token() {
-    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml")).unwrap();
-    let lan = base.replacen("bind = \"127.0.0.1:8892\"", "bind = \"0.0.0.0:8892\"\nallow_non_loopback = true", 1);
-    assert!(h3cs::config::Config::from_toml_str(&lan).is_err(), "LAN bind without require_admin_token must be rejected");
-    let ok = lan.replacen("allow_non_loopback = true", "allow_non_loopback = true\nrequire_admin_token = true", 1);
+    let base =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml")).unwrap();
+    let lan = base.replacen(
+        "bind = \"127.0.0.1:8892\"",
+        "bind = \"0.0.0.0:8892\"\nallow_non_loopback = true",
+        1,
+    );
+    assert!(
+        h3cs::config::Config::from_toml_str(&lan).is_err(),
+        "LAN bind without require_admin_token must be rejected"
+    );
+    let ok = lan.replacen(
+        "allow_non_loopback = true",
+        "allow_non_loopback = true\nrequire_admin_token = true",
+        1,
+    );
     assert!(h3cs::config::Config::from_toml_str(&ok).is_ok());
 }
 
 #[test]
 fn serial_sim_axes_validation() {
-    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml")).unwrap();
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml"))
+        .unwrap();
     let with = |extra: &str| base.replacen("baud = 115200", &format!("baud = 115200\n{extra}"), 1);
     assert!(h3cs::config::Config::from_toml_str(&with("sim_axes = [3]")).is_ok());
     let dup = h3cs::config::Config::from_toml_str(&with("sim_axes = [3, 3]"));
@@ -573,5 +791,10 @@ fn serial_sim_axes_validation() {
     // No ports at all is fine only when every axis is simulated.
     let no_ports = base.replacen("ports = [", "ports = [] # [", 1);
     assert!(h3cs::config::Config::from_toml_str(&no_ports).is_err());
-    assert!(h3cs::config::Config::from_toml_str(&no_ports.replacen("baud = 115200", "baud = 115200\nsim_axes = [1, 2, 3]", 1)).is_ok());
+    assert!(h3cs::config::Config::from_toml_str(&no_ports.replacen(
+        "baud = 115200",
+        "baud = 115200\nsim_axes = [1, 2, 3]",
+        1
+    ))
+    .is_ok());
 }

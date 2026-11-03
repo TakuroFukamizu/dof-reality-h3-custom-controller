@@ -86,7 +86,10 @@ impl Default for ServerConfig {
             allow_non_loopback: false,
             require_admin_token: false,
             admin_token_env: "H3CS_ADMIN_TOKEN".into(),
-            allowed_origins: vec!["http://localhost:8891".into(), "http://127.0.0.1:8891".into()],
+            allowed_origins: vec![
+                "http://localhost:8891".into(),
+                "http://127.0.0.1:8891".into(),
+            ],
             max_body_bytes: 4096,
             admin_rate_limit_per_s: 20,
             status_period_ms: 100,
@@ -381,7 +384,10 @@ pub struct AxisConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("parse: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("invalid config: {0}")]
@@ -390,15 +396,18 @@ pub enum ConfigError {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|source| ConfigError::Io { path: path.display().to_string(), source })?;
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         Self::from_toml_str(&text)
     }
 
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let mut cfg: Config = toml::from_str(text)?;
         // 節が無く工場しきい値のとき、limit が fe_hard 以下なら比率へ縮めてから検査する。
-        cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
+        cfg.governor
+            .apply_scaled_defaults(cfg.limits.following_error_limit_count);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -419,7 +428,10 @@ impl Config {
         let mut errs: Vec<String> = Vec::new();
 
         if self.schema_version != SCHEMA_VERSION {
-            errs.push(format!("schema_version must be {SCHEMA_VERSION}, got {}", self.schema_version));
+            errs.push(format!(
+                "schema_version must be {SCHEMA_VERSION}, got {}",
+                self.schema_version
+            ));
         }
         if self.rig_id.trim().is_empty() {
             errs.push("rig_id must not be empty".into());
@@ -427,7 +439,10 @@ impl Config {
 
         // Axes: exactly one per AxisId; non-zero device_ids unique.
         if self.axes.len() != AXIS_COUNT {
-            errs.push(format!("expected exactly {AXIS_COUNT} [[axis]] entries, got {}", self.axes.len()));
+            errs.push(format!(
+                "expected exactly {AXIS_COUNT} [[axis]] entries, got {}",
+                self.axes.len()
+            ));
         }
         for id in AxisId::ALL {
             match self.axes.iter().filter(|a| a.axis_id == id).count() {
@@ -463,13 +478,18 @@ impl Config {
                 s.bind
             )),
             Ok(_) => {}
-            Err(_) => errs.push(format!("server.bind must be an IP:port literal (e.g. 127.0.0.1:8892), got {:?}", s.bind)),
+            Err(_) => errs.push(format!(
+                "server.bind must be an IP:port literal (e.g. 127.0.0.1:8892), got {:?}",
+                s.bind
+            )),
         }
         if s.admin_token_env.trim().is_empty() {
             errs.push("server.admin_token_env must not be empty".into());
         }
         if s.allow_non_loopback && !s.require_admin_token {
-            errs.push("server.require_admin_token must be true when allow_non_loopback is set".into());
+            errs.push(
+                "server.require_admin_token must be true when allow_non_loopback is set".into(),
+            );
         }
         if s.max_body_bytes == 0 {
             errs.push("server.max_body_bytes must be > 0".into());
@@ -482,9 +502,18 @@ impl Config {
         let t = &self.timing;
         for (name, v) in [
             ("timing.planner_period_ms", t.planner_period_ms),
-            ("timing.set_position_valid_for_ms", u64::from(t.set_position_valid_for_ms)),
-            ("timing.mcu_command_timeout_ms", u64::from(t.mcu_command_timeout_ms)),
-            ("timing.mcu_stop_timeout_ms", u64::from(t.mcu_stop_timeout_ms)),
+            (
+                "timing.set_position_valid_for_ms",
+                u64::from(t.set_position_valid_for_ms),
+            ),
+            (
+                "timing.mcu_command_timeout_ms",
+                u64::from(t.mcu_command_timeout_ms),
+            ),
+            (
+                "timing.mcu_stop_timeout_ms",
+                u64::from(t.mcu_stop_timeout_ms),
+            ),
             ("timing.axis_status_timeout_ms", t.axis_status_timeout_ms),
             ("timing.source_freshness_ms", t.source_freshness_ms),
             ("timing.arm_timeout_ms", t.arm_timeout_ms),
@@ -492,7 +521,10 @@ impl Config {
             ("timing.stop_hold_ms", t.stop_hold_ms),
             ("timing.max_frame_skew", u64::from(t.max_frame_skew)),
             ("timing.center_reach_timeout_ms", t.center_reach_timeout_ms),
-            ("timing.rest_velocity_count_s", u64::from(t.rest_velocity_count_s)),
+            (
+                "timing.rest_velocity_count_s",
+                u64::from(t.rest_velocity_count_s),
+            ),
             ("timing.rest_error_count", u64::from(t.rest_error_count)),
             ("timing.rest_dwell_ms", t.rest_dwell_ms),
             ("timing.hello_retry_ms", t.hello_retry_ms),
@@ -504,9 +536,18 @@ impl Config {
         }
         for (name, v) in [
             ("timing.planner_period_ms", t.planner_period_ms),
-            ("timing.set_position_valid_for_ms", u64::from(t.set_position_valid_for_ms)),
-            ("timing.mcu_command_timeout_ms", u64::from(t.mcu_command_timeout_ms)),
-            ("timing.mcu_stop_timeout_ms", u64::from(t.mcu_stop_timeout_ms)),
+            (
+                "timing.set_position_valid_for_ms",
+                u64::from(t.set_position_valid_for_ms),
+            ),
+            (
+                "timing.mcu_command_timeout_ms",
+                u64::from(t.mcu_command_timeout_ms),
+            ),
+            (
+                "timing.mcu_stop_timeout_ms",
+                u64::from(t.mcu_stop_timeout_ms),
+            ),
             ("timing.axis_status_timeout_ms", t.axis_status_timeout_ms),
             ("timing.source_freshness_ms", t.source_freshness_ms),
             ("timing.arm_timeout_ms", t.arm_timeout_ms),
@@ -524,7 +565,8 @@ impl Config {
         }
         // A command must outlive one planner period, or every SET_POSITION expires
         // before the next one arrives.
-        if t.planner_period_ms > 0 && u64::from(t.set_position_valid_for_ms) <= t.planner_period_ms {
+        if t.planner_period_ms > 0 && u64::from(t.set_position_valid_for_ms) <= t.planner_period_ms
+        {
             errs.push(format!(
                 "timing.set_position_valid_for_ms ({}) must be > timing.planner_period_ms ({})",
                 t.set_position_valid_for_ms, t.planner_period_ms
@@ -543,7 +585,8 @@ impl Config {
                 t.rest_dwell_ms, t.stop_settle_timeout_ms
             ));
         }
-        if t.rest_error_count > 0 && u32::from(self.limits.deadband_out_count) > t.rest_error_count {
+        if t.rest_error_count > 0 && u32::from(self.limits.deadband_out_count) > t.rest_error_count
+        {
             // The firmware stops correcting inside deadband_out, so a rest
             // tolerance tighter than that could never be met: every STOP would
             // time out.
@@ -557,10 +600,16 @@ impl Config {
         let g = &self.game;
         let vrange = VIRTUAL_MIN..=VIRTUAL_MAX;
         if !vrange.contains(&g.virtual_min) {
-            errs.push(format!("game.virtual_min must be within 0..=1023, got {}", g.virtual_min));
+            errs.push(format!(
+                "game.virtual_min must be within 0..=1023, got {}",
+                g.virtual_min
+            ));
         }
         if !vrange.contains(&g.virtual_max) {
-            errs.push(format!("game.virtual_max must be within 0..=1023, got {}", g.virtual_max));
+            errs.push(format!(
+                "game.virtual_max must be within 0..=1023, got {}",
+                g.virtual_max
+            ));
         }
         if g.virtual_min.partial_cmp(&g.virtual_max) != Some(std::cmp::Ordering::Less) {
             errs.push(format!(
@@ -579,7 +628,10 @@ impl Config {
             ));
         }
         if !(g.center_speed_fraction > 0.0 && g.center_speed_fraction <= 1.0) {
-            errs.push(format!("game.center_speed_fraction must be within (0, 1], got {}", g.center_speed_fraction));
+            errs.push(format!(
+                "game.center_speed_fraction must be within (0, 1], got {}",
+                g.center_speed_fraction
+            ));
         }
         if g.start_max_offset_count == 0 {
             errs.push("game.start_max_offset_count must be > 0".into());
@@ -588,12 +640,18 @@ impl Config {
         // Limits (design 2026-11-01 §2).
         let l = &self.limits;
         if !(l.max_gain.is_finite() && l.max_gain > 0.0 && l.max_gain <= 1.0) {
-            errs.push(format!("limits.max_gain must be within (0, 1], got {}", l.max_gain));
+            errs.push(format!(
+                "limits.max_gain must be within (0, 1], got {}",
+                l.max_gain
+            ));
         }
         for (name, v) in [
             ("limits.max_vel_count_s", l.max_vel_count_s),
             ("limits.max_acc_count_s2", l.max_acc_count_s2),
-            ("limits.following_error_limit_count", l.following_error_limit_count),
+            (
+                "limits.following_error_limit_count",
+                l.following_error_limit_count,
+            ),
             ("limits.overspeed_count_s", l.overspeed_count_s),
         ] {
             if v == 0 {
@@ -601,7 +659,10 @@ impl Config {
             }
         }
         if !(1..=100).contains(&l.duty_max_percent) {
-            errs.push(format!("limits.duty_max_percent must be within 1..=100, got {}", l.duty_max_percent));
+            errs.push(format!(
+                "limits.duty_max_percent must be within 1..=100, got {}",
+                l.duty_max_percent
+            ));
         }
         if l.duty_min_percent > l.duty_max_percent {
             errs.push(format!(
@@ -630,7 +691,8 @@ impl Config {
         // floor cannot move is either stuck (static) or faults (moving target),
         // with no third outcome. kp 2 x 400 / 100 = 8 % vs a measured 9 % breakaway
         // did exactly that. duty_min_percent should be the measured breakaway duty.
-        let authority = f64::from(l.kp_percent_per_100) * f64::from(l.following_error_limit_count) / 100.0;
+        let authority =
+            f64::from(l.kp_percent_per_100) * f64::from(l.following_error_limit_count) / 100.0;
         if authority < f64::from(l.duty_min_percent) {
             errs.push(format!(
                 "limits.kp_percent_per_100 ({}) x limits.following_error_limit_count ({}) / 100 = {authority:.1} % \
@@ -639,7 +701,9 @@ impl Config {
                 l.kp_percent_per_100, l.following_error_limit_count, l.duty_min_percent
             ));
         }
-        if f64::from(l.overspeed_count_s) < crate::limits::OVERSPEED_MARGIN * f64::from(l.max_vel_count_s) {
+        if f64::from(l.overspeed_count_s)
+            < crate::limits::OVERSPEED_MARGIN * f64::from(l.max_vel_count_s)
+        {
             errs.push(format!(
                 "limits.overspeed_count_s ({}) must be >= {} x limits.max_vel_count_s ({})",
                 l.overspeed_count_s,
@@ -653,7 +717,9 @@ impl Config {
         // request may raise max_vel to the ceiling; the clamp then needs an
         // acceleration bound it can actually reach).
         {
-            use crate::limits::{min_acc_for_stop, stop_deadline, stop_time_s, Ceilings, STOP_TIME_FRACTION};
+            use crate::limits::{
+                min_acc_for_stop, stop_deadline, stop_time_s, Ceilings, STOP_TIME_FRACTION,
+            };
             let deadline = stop_deadline(t);
             let deadline_s = deadline.as_secs_f64();
             let budget = format!(
@@ -687,7 +753,10 @@ impl Config {
         }
 
         // 追従ガバナ。FAULT のしきい値より手前で倍率を下げ切る。
-        for e in self.governor.validation_errors(self.limits.following_error_limit_count) {
+        for e in self
+            .governor
+            .validation_errors(self.limits.following_error_limit_count)
+        {
             errs.push(e);
         }
 
@@ -695,7 +764,10 @@ impl Config {
         match &self.backend {
             BackendConfig::Sim(b) => {
                 if !(b.plant_max_vel_count_s.is_finite() && b.plant_max_vel_count_s > 0.0) {
-                    errs.push(format!("backend.plant_max_vel_count_s must be > 0, got {}", b.plant_max_vel_count_s));
+                    errs.push(format!(
+                        "backend.plant_max_vel_count_s must be > 0, got {}",
+                        b.plant_max_vel_count_s
+                    ));
                 }
                 if b.status_period_ms == 0 {
                     errs.push("backend.status_period_ms must be > 0".into());
@@ -706,7 +778,10 @@ impl Config {
                         b.end_min_count, b.end_max_count
                     ));
                 }
-                for (name, v) in [("backend.status_period_ms", b.status_period_ms), ("backend.link_latency_ms", b.link_latency_ms)] {
+                for (name, v) in [
+                    ("backend.status_period_ms", b.status_period_ms),
+                    ("backend.link_latency_ms", b.link_latency_ms),
+                ] {
                     if v > MAX_TIMING_MS {
                         errs.push(format!("{name} must be <= {MAX_TIMING_MS}, got {v}"));
                     }
@@ -725,7 +800,10 @@ impl Config {
                         errs.push(format!("backend.sim_axes lists axis {} twice", a.get()));
                     }
                 }
-                for (name, v) in [("backend.sim.status_period_ms", b.sim.status_period_ms), ("backend.sim.link_latency_ms", b.sim.link_latency_ms)] {
+                for (name, v) in [
+                    ("backend.sim.status_period_ms", b.sim.status_period_ms),
+                    ("backend.sim.link_latency_ms", b.sim.link_latency_ms),
+                ] {
                     if v > MAX_TIMING_MS {
                         errs.push(format!("{name} must be <= {MAX_TIMING_MS}, got {v}"));
                     }

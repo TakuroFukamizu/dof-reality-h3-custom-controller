@@ -533,7 +533,10 @@ class V1Axis {
   }
 
   // 画面の非常停止。ラッチで即 FAULT(LOCAL_ESTOP)（減速中の異常コードがあればそれを保つ）。
-  // ラッチ中は FAULT_RESET が FAULT_CAUSE_PRESENT。解除しても FAULT は FAULT_RESET まで残る。
+  // ラッチ中は FAULT_RESET が FAULT_CAUSE_PRESENT。
+  // 解除したとき、FAULT のコードが LOCAL_ESTOP だけで他の原因が無ければ、ホストの FAULT_RESET と
+  // 同じ出口で DISARMED に戻る（基準は残す。ブレーキ作動・主電源 OFF。FAULT_EVENT は出さず STATUS だけ）。
+  // 他のコード（ENCODER_FAULT、SOFT_LIMIT、FOLLOWING_ERROR、HOST_FAULT、減速中に保った異常）は残す。
   void set_local_estop(bool latched, uint64_t now_us) {
     if (latched == estop_latched_) return;
     now_us_ = now_us;
@@ -543,6 +546,12 @@ class V1Axis {
                                 ? stop_fault_code_
                                 : v1::fault::LOCAL_ESTOP;
       latch_fault(code, now_us);
+      emit_status_if_changed();
+      return;
+    }
+    // ラッチビット自体が fault_cause_present() なので、消してから残る原因を見る。
+    if (state_ == v1::state::FAULT && fault_code_ == v1::fault::LOCAL_ESTOP && !fault_cause_present()) {
+      leave_fault_disarmed();
       emit_status_if_changed();
     }
   }
@@ -1165,12 +1174,18 @@ class V1Axis {
   uint16_t on_fault_reset() {
     if (state_ != v1::state::FAULT) return v1::ack_reason::BAD_STATE;
     if (fault_cause_present()) return v1::ack_reason::FAULT_CAUSE_PRESENT;
+    leave_fault_disarmed();
+    return v1::ack_reason::NONE;
+  }
+
+  // FAULT → DISARMED。ENCODER_FAULT だけ基準を消す。ブレーキはラッチ時に作動済み。
+  // DISARMED は powered_state ではないので主電源指令は落ちる。自動では ARM しない。
+  void leave_fault_disarmed() {
     if (fault_code_ == v1::fault::ENCODER_FAULT) referenced_ = false;
     state_ = v1::state::DISARMED;
     fault_code_ = v1::fault::NONE;
     stop_kind_ = StopKind::Hold;
     hold_here();
-    return v1::ack_reason::NONE;
   }
 
   // HOST_FAULT: 共通規則を飛ばして毎回実行、常に ACCEPTED。記憶しない。

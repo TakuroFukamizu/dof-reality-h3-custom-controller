@@ -133,7 +133,11 @@ impl Planner {
             let a = limits[i].max_acc_count_s2;
             let v_raw = err / dt_s;
             let v_stop = stoppable_speed(err.abs(), a, dt_s);
-            v[i] = if v_raw.abs() > v_stop { v_stop.copysign(err) } else { v_raw };
+            v[i] = if v_raw.abs() > v_stop {
+                v_stop.copysign(err)
+            } else {
+                v_raw
+            };
         }
 
         // Step 3: one scale for all axes.
@@ -188,7 +192,10 @@ impl Planner {
             out_limits.push(LimitReason::AccelerationLimited);
         }
 
-        PlanOutput { limits: out_limits, ..self.output(settled) }
+        PlanOutput {
+            limits: out_limits,
+            ..self.output(settled)
+        }
     }
 
     /// Decelerate every axis at its `a` to zero velocity, without a target.
@@ -202,7 +209,11 @@ impl Planner {
         for i in 0..AXIS_COUNT {
             let dv = limits[i].max_acc_count_s2 * dt_s;
             let v = self.vel[i];
-            let v_new = if v.abs() <= dv { 0.0 } else { v - dv.copysign(v) };
+            let v_new = if v.abs() <= dv {
+                0.0
+            } else {
+                v - dv.copysign(v)
+            };
             let mut new_pos = self.pos[i] + v_new * dt_s;
             let mut v_new = v_new;
             if let Some(t) = self.last_targets.map(|t| t[i]) {
@@ -241,7 +252,11 @@ fn stoppable_speed(dist: f64, a: f64, dt: f64) -> f64 {
     let x = 8.0 * a * dist;
     // = (−u + sqrt(u² + x)) / 2, rewritten to avoid cancellation when u² ≫ x.
     let v = x / (2.0 * (u + (u * u + x).sqrt()));
-    if v.is_finite() { v.max(0.0) } else { 0.0 }
+    if v.is_finite() {
+        v.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// `round()` then saturate into i32 (NaN → 0).

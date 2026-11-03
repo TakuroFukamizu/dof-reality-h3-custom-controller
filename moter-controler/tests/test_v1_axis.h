@@ -2636,11 +2636,14 @@ inline void test_local_estop_latches_and_blocks_reset_until_released() {
   CHECK(h.ax.state() == st::FAULT);
   h.ax.set_local_estop(false, h.now);
   h.drain();
-  CHECK(h.ax.state() == st::FAULT);  // 解除だけでは戻らない
-  Harness::accepted(h.fault_reset());
-  CHECK(h.ax.state() == st::DISARMED);
+  // LOCAL_ESTOP だけの解除はホストの FAULT_RESET と同じ出口。FAULT_EVENT は増えない。
+  CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
+  CHECK(!h.ax.power_on_cmd() && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  CHECK(h.statuses().back().mcu_state == st::DISARMED && h.statuses().back().fault_code == fc::NONE);
+  CHECK((h.statuses().back().flags & (fl::POWER_ON_CMD | fl::BRAKE_RELEASE_CMD)) == 0);
   CHECK(h.ax.configured() && h.ax.referenced());
   CHECK(h.fault_events().size() == 1);
+  Harness::rejected(h.fault_reset(), rs::BAD_STATE);
 }
 
 inline void test_local_estop_in_disarmed_and_during_other_fault() {
@@ -2650,8 +2653,10 @@ inline void test_local_estop_in_disarmed_and_during_other_fault() {
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
   CHECK(h.fault_events().size() == 1 && h.fault_events()[0].mcu_state_before == st::DISARMED);
   h.ax.set_local_estop(false, h.now);
-  Harness::accepted(h.fault_reset());
-  // 既に FAULT（HOST_FAULT）のときの非常停止: コードは保ち、解除まで FAULT_RESET を拒む
+  h.drain();
+  CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE);
+  Harness::rejected(h.fault_reset(), rs::BAD_STATE);
+  // 既に FAULT（HOST_FAULT）のときの非常停止: コードは保ち、画面の解除では戻らない
   h.reach_holding();
   Harness::accepted(h.host_fault());
   h.ax.set_local_estop(true, h.now);
@@ -2659,6 +2664,8 @@ inline void test_local_estop_in_disarmed_and_during_other_fault() {
   CHECK(h.ax.fault_code() == fc::HOST_FAULT);
   Harness::rejected(h.fault_reset(), rs::FAULT_CAUSE_PRESENT);
   h.ax.set_local_estop(false, h.now);
+  h.drain();
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::HOST_FAULT);
   Harness::accepted(h.fault_reset());
   CHECK(h.fault_events().size() == 2);
 }
@@ -3218,8 +3225,9 @@ inline void test_local_estop_and_overrun_during_calibration() {
     CHECK(ev.size() == 1 && ev[0].mcu_state_before == st::CALIBRATING);
     Harness::rejected(h.fault_reset(), rs::FAULT_CAUSE_PRESENT);
     h.ax.set_local_estop(false, h.now);
-    Harness::accepted(h.fault_reset());
-    CHECK(h.ax.state() == st::DISARMED && !h.ax.referenced());
+    h.drain();
+    CHECK(h.ax.state() == st::DISARMED && h.ax.fault_code() == fc::NONE && !h.ax.referenced());
+    Harness::rejected(h.fault_reset(), rs::BAD_STATE);
   }
   {
     Harness h(1, 1, 0, false);

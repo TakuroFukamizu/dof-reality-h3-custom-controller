@@ -103,10 +103,16 @@ fn simulate(govern: bool) -> Outcome {
     let mut planner = Planner::new();
     planner.init([0, 0, 0]);
     let mut gov = TrackingGovernor::new(
-        GovernorConfig { enabled: govern, ..GovernorConfig::default() },
+        GovernorConfig {
+            enabled: govern,
+            ..GovernorConfig::default()
+        },
         FE_LIMIT,
     );
-    let base = [AxisLimits { max_vel_count_s: MAX_VEL, max_acc_count_s2: MAX_ACC }; AXIS_COUNT];
+    let base = [AxisLimits {
+        max_vel_count_s: MAX_VEL,
+        max_acc_count_s2: MAX_ACC,
+    }; AXIS_COUNT];
     let mut plants = [
         AxisPlant::new(0.0, HEALTHY_CAP, HEALTHY_CAP),
         AxisPlant::new(0.0, LIFT_CAP, LOWER_CAP),
@@ -227,10 +233,18 @@ fn reverse_under_lift_cap_faults_without_governor_and_tracks_with_it() {
         "ガバナありの |FE| ピーク {} は 300 未満",
         on.weak_peak_fe
     );
-    assert!(on.healthy_peak_fe < 30, "健全軸の |FE| {}", on.healthy_peak_fe);
+    assert!(
+        on.healthy_peak_fe < 30,
+        "健全軸の |FE| {}",
+        on.healthy_peak_fe
+    );
     for i in 0..AXIS_COUNT {
         let err = (on.final_plant[i] - FINAL_TARGET).abs();
-        assert!(err < 1.0, "軸 {i} の最終位置 {}（目標 {FINAL_TARGET}）", on.final_plant[i]);
+        assert!(
+            err < 1.0,
+            "軸 {i} の最終位置 {}（目標 {FINAL_TARGET}）",
+            on.final_plant[i]
+        );
     }
     assert!(on.min_s < 0.9, "min s {}", on.min_s);
     assert!(on.vels_equal, "3 軸のプランナー速度が揃っていない");
@@ -243,5 +257,8 @@ fn reverse_under_lift_cap_faults_without_governor_and_tracks_with_it() {
     );
     assert!(on.stop_full_decel, "停止が s² の減速度になっている");
     assert!(off.min_s == 1.0);
-    assert!(!off.stop_full_decel, "ガバナ無しでは s<0.9 にならないので停止検査は走らない");
+    assert!(
+        !off.stop_full_decel,
+        "ガバナ無しでは s<0.9 にならないので停止検査は走らない"
+    );
 }

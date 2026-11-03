@@ -29,7 +29,11 @@ impl AxisCalibration {
     pub fn from_config(a: &AxisConfig) -> Self {
         Self {
             axis_id: a.axis_id,
-            count_at: [a.count_at_virtual_0, a.count_at_virtual_512, a.count_at_virtual_1023],
+            count_at: [
+                a.count_at_virtual_0,
+                a.count_at_virtual_512,
+                a.count_at_virtual_1023,
+            ],
             mechanical_min_count: a.mechanical_min_count,
             mechanical_max_count: a.mechanical_max_count,
             soft_min_count: a.soft_min_count,
@@ -46,7 +50,12 @@ impl AxisCalibration {
     ///
     /// Reports the first violated invariant, naming the field.
     pub fn validate(&self) -> Result<(), CalibrationError> {
-        let err = |msg: String| Err(CalibrationError::Invalid { axis: self.axis_id, msg });
+        let err = |msg: String| {
+            Err(CalibrationError::Invalid {
+                axis: self.axis_id,
+                msg,
+            })
+        };
         // i64 so differences of extreme i32 values cannot overflow.
         let [c0, c512, c1023] = self.count_at.map(i64::from);
         let mech_min = i64::from(self.mechanical_min_count);
@@ -59,10 +68,14 @@ impl AxisCalibration {
             return err(format!("decel_zone_count must be >= 0, got {decel}"));
         }
         if mech_min >= mech_max {
-            return err(format!("mechanical_min_count ({mech_min}) must be < mechanical_max_count ({mech_max})"));
+            return err(format!(
+                "mechanical_min_count ({mech_min}) must be < mechanical_max_count ({mech_max})"
+            ));
         }
         if soft_min >= soft_max {
-            return err(format!("soft_min_count ({soft_min}) must be < soft_max_count ({soft_max})"));
+            return err(format!(
+                "soft_min_count ({soft_min}) must be < soft_max_count ({soft_max})"
+            ));
         }
         if soft_min <= mech_min || soft_min - mech_min < decel {
             return err(format!(
@@ -81,9 +94,15 @@ impl AxisCalibration {
                 "count_at_virtual_0/512/1023 ({c0}, {c512}, {c1023}) must be strictly monotonic"
             ));
         }
-        for (name, c) in [("count_at_virtual_0", c0), ("count_at_virtual_512", c512), ("count_at_virtual_1023", c1023)] {
+        for (name, c) in [
+            ("count_at_virtual_0", c0),
+            ("count_at_virtual_512", c512),
+            ("count_at_virtual_1023", c1023),
+        ] {
             if c < soft_min || c > soft_max {
-                return err(format!("{name} ({c}) must lie inside soft limits [{soft_min}, {soft_max}]"));
+                return err(format!(
+                    "{name} ({c}) must lie inside soft limits [{soft_min}, {soft_max}]"
+                ));
             }
         }
         Ok(())
@@ -110,7 +129,9 @@ impl AxisCalibration {
         let [c0, c512, c1023] = self.points();
         // Upper segment iff c lies on the 1023 side of the neutral count.
         if (c - c512) * (c1023 - c512) > 0.0 {
-            VirtualPos(VIRTUAL_CENTER + (VIRTUAL_MAX - VIRTUAL_CENTER) * ((c - c512) / (c1023 - c512)))
+            VirtualPos(
+                VIRTUAL_CENTER + (VIRTUAL_MAX - VIRTUAL_CENTER) * ((c - c512) / (c1023 - c512)),
+            )
         } else {
             VirtualPos(VIRTUAL_CENTER * ((c - c0) / (c512 - c0)))
         }

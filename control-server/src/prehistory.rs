@@ -89,7 +89,11 @@ impl StatusRing {
     /// `capacity` 0 は 1 として扱う。確保はここで 1 回だけ。
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
-        Self { buf: Vec::with_capacity(cap), cap, next: 0 }
+        Self {
+            buf: Vec::with_capacity(cap),
+            cap,
+            next: 0,
+        }
     }
 
     pub fn capacity(&self) -> usize {

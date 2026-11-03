@@ -56,8 +56,8 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use crate::api::{self, lock, AdminRequest, AppState};
 use crate::axis_link::{self, LinkHandle, LinkSendError};
 use crate::config::{BackendConfig, Config, ConfigError, SerialBackendConfig};
-use crate::protocol::HostMsg;
 use crate::limits::{self as motion_limits, MotionLimits, SharedLimits};
+use crate::protocol::HostMsg;
 use crate::session::{AcceptedPose, PoseIntake};
 use crate::sim_axis::{sim_detached, SimHandle, SimParams};
 use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput};
@@ -97,7 +97,10 @@ pub enum ServerError {
     #[error("refusing to bind non-loopback address {0} (set server.allow_non_loopback)")]
     NonLoopback(SocketAddr),
     #[error("bind {addr}: {source}")]
-    Bind { addr: SocketAddr, source: std::io::Error },
+    Bind {
+        addr: SocketAddr,
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ServerError>;
@@ -140,14 +143,20 @@ impl RunningServer {
         let _ = self.shutdown_tx.send(true);
         if let Some(c) = self.control.take() {
             let abort = c.abort_handle();
-            if tokio::time::timeout(SHUTDOWN_DISARM_WAIT + Duration::from_secs(2), c).await.is_err() {
+            if tokio::time::timeout(SHUTDOWN_DISARM_WAIT + Duration::from_secs(2), c)
+                .await
+                .is_err()
+            {
                 tracing::warn!("control loop did not stop in time; aborted");
                 abort.abort();
             }
         }
         if let Some(h) = self.http.take() {
             let abort = h.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(2), h).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .is_err()
+            {
                 abort.abort();
             }
         }
@@ -168,18 +177,27 @@ impl Drop for RunningServer {
 
 /// Validate, bind, start the backend, the control loop and the API.
 pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer> {
-    cfg.governor.apply_scaled_defaults(cfg.limits.following_error_limit_count);
+    cfg.governor
+        .apply_scaled_defaults(cfg.limits.following_error_limit_count);
     cfg.validate()?;
     let addr = match opts.bind_override {
         Some(a) => a,
-        None => cfg.server.bind.parse().map_err(|_| ServerError::BadBind(cfg.server.bind.clone()))?,
+        None => cfg
+            .server
+            .bind
+            .parse()
+            .map_err(|_| ServerError::BadBind(cfg.server.bind.clone()))?,
     };
     if !addr.ip().is_loopback() && !cfg.server.allow_non_loopback {
         return Err(ServerError::NonLoopback(addr));
     }
     let admin_token = resolve_token(&cfg, opts.admin_token);
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|source| ServerError::Bind { addr, source })?;
-    let local_addr = listener.local_addr().map_err(|source| ServerError::Bind { addr, source })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|source| ServerError::Bind { addr, source })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| ServerError::Bind { addr, source })?;
     let cfg = Arc::new(cfg);
 
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_LEN);
@@ -205,31 +223,43 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
     // One simulated unit for axis `a` on `port` (sim backend, or a serial
     // backend's `sim_axes`). The model lives in the port task; `sims` keeps
     // a view of it for inspection / fault injection.
-    let mut spawn_sim = |a: &crate::config::AxisConfig, sim: &crate::config::SimBackendConfig, port: String| {
-        let boot_id = rand::random::<u32>().max(1);
-        let selected_axis = if sim.report_selected_axis { a.axis_id.get() } else { 0 };
-        // A unit always has a device_id; without a configured one the
-        // simulator uses the documented placeholder pattern 5131…0N.
-        let device_id = if a.device_id.is_unassigned() {
-            DeviceId(0x5131_0000_0000_0000 + u64::from(a.axis_id.get()))
-        } else {
-            a.device_id
+    let mut spawn_sim =
+        |a: &crate::config::AxisConfig, sim: &crate::config::SimBackendConfig, port: String| {
+            let boot_id = rand::random::<u32>().max(1);
+            let selected_axis = if sim.report_selected_axis {
+                a.axis_id.get()
+            } else {
+                0
+            };
+            // A unit always has a device_id; without a configured one the
+            // simulator uses the documented placeholder pattern 5131…0N.
+            let device_id = if a.device_id.is_unassigned() {
+                DeviceId(0x5131_0000_0000_0000 + u64::from(a.axis_id.get()))
+            } else {
+                a.device_id
+            };
+            let handle = sim_detached(SimParams::from_backend(
+                sim,
+                device_id,
+                boot_id,
+                selected_axis,
+            ));
+            sims.push((a.axis_id, handle.view()));
+            port_tasks.push(tokio::spawn(sim_port_task(
+                port,
+                handle,
+                cfg.clone(),
+                events_tx.clone(),
+                links_tx.clone(),
+                shutdown_rx.clone(),
+            )));
         };
-        let handle = sim_detached(SimParams::from_backend(sim, device_id, boot_id, selected_axis));
-        sims.push((a.axis_id, handle.view()));
-        port_tasks.push(tokio::spawn(sim_port_task(
-            port,
-            handle,
-            cfg.clone(),
-            events_tx.clone(),
-            links_tx.clone(),
-            shutdown_rx.clone(),
-        )));
-    };
     match &cfg.backend {
         BackendConfig::Sim(sim) => {
             for (k, n) in SIM_PORT_AXES.iter().enumerate() {
-                let Some(a) = AxisId::new(*n).and_then(|id| cfg.axis(id)) else { continue };
+                let Some(a) = AxisId::new(*n).and_then(|id| cfg.axis(id)) else {
+                    continue;
+                };
                 spawn_sim(a, sim, format!("sim:{}", k + 1));
             }
             sims.sort_by_key(|(a, _)| *a);
@@ -305,7 +335,10 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
                 let _ = sd.wait_for(|v| *v).await;
             };
             let app = app.into_make_service_with_connect_info::<SocketAddr>();
-            if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(graceful).await {
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(graceful)
+                .await
+            {
                 tracing::error!("http server: {e}");
             }
             let _ = done_tx.send(true);
@@ -349,7 +382,9 @@ fn resolve_token(cfg: &Config, given: Option<String>) -> String {
         return match std::env::var(var) {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             _ => {
-                tracing::info!("admin token not required (server.require_admin_token = false, loopback only)");
+                tracing::info!(
+                    "admin token not required (server.require_admin_token = false, loopback only)"
+                );
                 String::new()
             }
         };
@@ -358,7 +393,9 @@ fn resolve_token(cfg: &Config, given: Option<String>) -> String {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => {
             let t = format!("{:032x}", rand::random::<u128>());
-            eprintln!("h3-control-server: {var} is not set; generated admin token for this run: {t}");
+            eprintln!(
+                "h3-control-server: {var} is not set; generated admin token for this run: {t}"
+            );
             t
         }
     }
@@ -451,18 +488,27 @@ impl ControlLoop {
         self.drain_admin(now);
 
         let changed = self.pose_rx.has_changed().unwrap_or(false);
-        let pose = if self.shutting_down { None } else { self.pose_rx.borrow_and_update().clone() };
+        let pose = if self.shutting_down {
+            None
+        } else {
+            self.pose_rx.borrow_and_update().clone()
+        };
         if changed {
             if let Some(p) = &pose {
                 if self.last_pose_seq != Some(p.seq) {
                     self.last_pose_seq = Some(p.seq);
-                    self.telemetry.pose_rx_to_tick_ms.record_duration(now.saturating_duration_since(p.received_at));
+                    self.telemetry
+                        .pose_rx_to_tick_ms
+                        .record_duration(now.saturating_duration_since(p.received_at));
                 }
             }
         }
 
-        let dt_s = dt.map_or(self.period, |d| d.min(2 * self.period)).as_secs_f64();
-        self.sup.set_limits_request(motion_limits::read(&self.limits));
+        let dt_s = dt
+            .map_or(self.period, |d| d.min(2 * self.period))
+            .as_secs_f64();
+        self.sup
+            .set_limits_request(motion_limits::read(&self.limits));
         let out = self.sup.tick(now, dt_s, pose.as_ref());
         self.dispatch(out, now);
         self.record_telemetry(now, dt);
@@ -478,7 +524,9 @@ impl ControlLoop {
 
     fn drain_events(&mut self, now: Instant) {
         for _ in 0..MAX_EVENTS_PER_TICK {
-            let Ok((port, ev)) = self.events_rx.try_recv() else { break };
+            let Ok((port, ev)) = self.events_rx.try_recv() else {
+                break;
+            };
             if let Some(ev) = route_event(&self.sup, port, ev) {
                 self.sup.on_link_event(ev, now);
             }
@@ -510,7 +558,10 @@ impl ControlLoop {
     /// SET_POSITION. The firmware decelerates a controlled stop at CONFIG
     /// `max_acc`, so a governed frame left in force does not slow the stop.
     fn dispatch(&mut self, out: TickOutput, now: Instant) {
-        let TickOutput { admin_msgs, set_position } = out;
+        let TickOutput {
+            admin_msgs,
+            set_position,
+        } = out;
         let mut failure: Option<String> = None;
         for (axis, msgs) in AxisId::ALL.into_iter().zip(admin_msgs) {
             let link = self
@@ -527,7 +578,8 @@ impl ControlLoop {
                 let host_fault = matches!(msg, HostMsg::HostFault { .. });
                 if let Err(e) = link.send_admin(msg) {
                     if !host_fault && self.send_error_is_fault(e) {
-                        failure.get_or_insert_with(|| format!("link_send_failed: {axis} admin {e}"));
+                        failure
+                            .get_or_insert_with(|| format!("link_send_failed: {axis} admin {e}"));
                     } else {
                         tracing::debug!(%axis, "admin send failed: {e}");
                     }
@@ -608,10 +660,20 @@ impl ControlLoop {
 
     fn publish(&mut self, now: Instant) {
         let mut snap = self.sup.snapshot(now);
-        if let Some(age) = snap.axes.iter().filter_map(|a| a.status_age_ms).reduce(f64::max) {
+        if let Some(age) = snap
+            .axes
+            .iter()
+            .filter_map(|a| a.status_age_ms)
+            .reduce(f64::max)
+        {
             self.telemetry.status_age_ms.record(age);
         }
-        if self.telemetry_summary.is_none() || self.telemetry.tick_count.is_multiple_of(TELEMETRY_SUMMARY_EVERY) {
+        if self.telemetry_summary.is_none()
+            || self
+                .telemetry
+                .tick_count
+                .is_multiple_of(TELEMETRY_SUMMARY_EVERY)
+        {
             let s: TelemetrySummary = self.telemetry.summary(None);
             self.telemetry_summary = serde_json::to_value(s).ok();
         }
@@ -622,7 +684,10 @@ impl ControlLoop {
 }
 
 fn shutting_down_error() -> AdminError {
-    AdminError { error: "shutting_down".into(), blockers: Vec::new() }
+    AdminError {
+        error: "shutting_down".into(),
+        blockers: Vec::new(),
+    }
 }
 
 /// Forward an event unless it comes from a port that is not the axis's link.
@@ -633,7 +698,9 @@ fn route_event(sup: &Supervisor, port: String, ev: LinkEvent) -> Option<LinkEven
         | LinkEvent::Ack { axis, .. }
         | LinkEvent::FaultEvent { axis, .. }
         | LinkEvent::CalResult { axis, .. } => is_primary(axis).then_some(ev),
-        LinkEvent::Disconnected { axis, .. } if !is_primary(axis) => Some(LinkEvent::PortClosed { port }),
+        LinkEvent::Disconnected { axis, .. } if !is_primary(axis) => {
+            Some(LinkEvent::PortClosed { port })
+        }
         ev => Some(ev),
     }
 }
@@ -749,7 +816,11 @@ async fn serial_port_task(
                     break;
                 }
             }
-            if events.send((port.clone(), LinkEvent::PortClosed { port: port.clone() })).await.is_err() {
+            if events
+                .send((port.clone(), LinkEvent::PortClosed { port: port.clone() }))
+                .await
+                .is_err()
+            {
                 return;
             }
         } else if sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
@@ -790,6 +861,9 @@ mod tests {
         iv.tick().await; // the late tick fires once
         let t = Instant::now();
         iv.tick().await;
-        assert!(t.elapsed() >= Duration::from_millis(4), "missed ticks must not burst");
+        assert!(
+            t.elapsed() >= Duration::from_millis(4),
+            "missed ticks must not burst"
+        );
     }
 }

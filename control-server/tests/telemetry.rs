@@ -20,7 +20,10 @@ fn percentiles_use_nearest_rank() {
     assert_eq!(s.percentile(0.0), Some(1.0));
     assert_eq!(s.percentile(f64::NAN), None);
     let sum = s.summary();
-    assert_eq!((sum.count, sum.p50, sum.p95, sum.p99, sum.max), (100, Some(50.0), Some(95.0), Some(99.0), Some(100.0)));
+    assert_eq!(
+        (sum.count, sum.p50, sum.p95, sum.p99, sum.max),
+        (100, Some(50.0), Some(95.0), Some(99.0), Some(100.0))
+    );
 }
 
 #[test]
@@ -29,14 +32,20 @@ fn single_sample_and_empty() {
     assert_eq!(s.capacity(), LatencyStats::DEFAULT_CAPACITY);
     assert!(s.is_empty());
     let sum = s.summary();
-    assert_eq!((sum.count, sum.p50, sum.max, sum.max_all), (0, None, None, None));
+    assert_eq!(
+        (sum.count, sum.p50, sum.max, sum.max_all),
+        (0, None, None, None)
+    );
     assert_eq!(
         serde_json::to_value(sum).unwrap(),
         json!({"count":0,"p50":null,"p95":null,"p99":null,"max":null,"max_all":null})
     );
     s.record_duration(Duration::from_micros(10_500));
     let sum = s.summary();
-    assert_eq!((sum.p50, sum.p99, sum.max), (Some(10.5), Some(10.5), Some(10.5)));
+    assert_eq!(
+        (sum.p50, sum.p99, sum.max),
+        (Some(10.5), Some(10.5), Some(10.5))
+    );
 }
 
 #[test]
@@ -120,7 +129,11 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("h3cs-telemetry-{tag}-{}-{n}-{}.jsonl", std::process::id(), rand::random::<u64>()))
+    std::env::temp_dir().join(format!(
+        "h3cs-telemetry-{tag}-{}-{n}-{}.jsonl",
+        std::process::id(),
+        rand::random::<u64>()
+    ))
 }
 
 #[tokio::test]

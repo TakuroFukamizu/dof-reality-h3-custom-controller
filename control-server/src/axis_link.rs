@@ -527,9 +527,7 @@ impl Link {
             .iter()
             .find(|a| !a.device_id.is_unassigned() && a.device_id == device_id)
             .map(|a| a.axis_id)
-            .ok_or_else(|| {
-                format!("selected_axis 0 and device_id {device_id} is not in [[axis]]")
-            })
+            .ok_or_else(|| format!("selected_axis 0 and device_id {device_id} is not in [[axis]]"))
     }
 
     /// Reader + STATUS watchdog of an identified link. `claimed` is updated on
@@ -588,7 +586,8 @@ impl Link {
                 let received_at = Instant::now();
                 watchdog.reset(received_at + status_timeout);
                 // (c) the MCU switched and AXIS_SELECT was lost: STATUS says so.
-                if status.selected_axis != 0 && status.selected_axis != claimed.hello.selected_axis {
+                if status.selected_axis != 0 && status.selected_axis != claimed.hello.selected_axis
+                {
                     self.switch_axis(claimed, status.selected_axis).await?;
                 }
                 LinkEvent::Status {
@@ -633,7 +632,10 @@ impl Link {
                         return Err(self.unassign(claimed, why).await);
                     }
                     Err(why) => {
-                        return Err(ReadEnd::Disconnected(format!("{}: {why}", reason::BAD_HELLO)));
+                        return Err(ReadEnd::Disconnected(format!(
+                            "{}: {why}",
+                            reason::BAD_HELLO
+                        )));
                     }
                 };
                 if new != claimed.axis {
@@ -668,7 +670,11 @@ impl Link {
 
     /// Apply a new `selected_axis` seen in AXIS_SELECT or STATUS: resolve it
     /// and, when the axis differs, emit `Disconnected` + `Identified`.
-    async fn switch_axis(&mut self, claimed: &mut Claimed, selected_axis: u8) -> Result<(), ReadEnd> {
+    async fn switch_axis(
+        &mut self,
+        claimed: &mut Claimed,
+        selected_axis: u8,
+    ) -> Result<(), ReadEnd> {
         claimed.hello.selected_axis = selected_axis;
         let new = match self.resolve_axis(selected_axis, claimed.hello.device_id) {
             Ok(axis) => axis,

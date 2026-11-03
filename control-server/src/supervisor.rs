@@ -65,6 +65,13 @@
 //!   latched; an axis (re)identified while latched gets HOST_FAULT, not CONFIG. A cause the MCU reports (`FAULT_CAUSE_PRESENT`) arrives as an ACK
 //!   later: the rig stays latched and the reason is listed in `blockers`; the
 //!   operator may retry (the MCU re-evaluates every FAULT_RESET).
+//! - A latched episode whose every recorded cause is `AxisFault` /
+//!   `LOCAL_ESTOP` clears itself once every axis that reported `LOCAL_ESTOP`
+//!   has left FAULT (the screen released that latch). FAULT_RESET then goes
+//!   only to axes still in FAULT from the coordinated HOST_FAULT, and the rig
+//!   returns through the same gate as an operator FaultReset (references kept,
+//!   never ARM). Event `fault_auto_cleared` with `{cause: local_estop_released}`.
+//!   Any other recorded cause still needs `POST /v1/fault/reset`.
 //! - Start checks freshness of the pose passed to the previous `tick` and binds
 //!   a game drive to that pose's `session_gen`; in ACTIVE(game) a pose of
 //!   another session is treated as stale (→ STOPPING).
@@ -145,14 +152,14 @@ use crate::compat;
 use crate::config::{Config, GameConfig, LimitsConfig, TimingConfig};
 use crate::governor::{self, GovernorStatus, TrackingGovernor};
 use crate::limits::{
-    self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest, MotionLimits,
-    MotionLimitsSnapshot, OperatorCap,
+    self as motion_limits, Ceilings, FieldSet, FwAbsolute, FwTuning, LimitedField, LimitsRequest,
+    MotionLimits, MotionLimitsSnapshot, OperatorCap,
 };
 use crate::planner::{AxisLimits, Planner};
 use crate::prehistory::{self, FaultEventRecord, FaultPrehistory, StatusRing, TraceSample};
 use crate::protocol::{
-    self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult, CalResult,
-    CalResultCode, FaultEvent, Hello, HostMsg, Limits, SetPosition, Status,
+    self, calibrate_flags, calibrate_mode, capabilities, role_flags, Ack, AckReason, AckResult,
+    CalResult, CalResultCode, FaultEvent, Hello, HostMsg, Limits, SetPosition, Status,
 };
 use crate::session::AcceptedPose;
 use crate::types::{
@@ -291,10 +298,17 @@ pub enum AdminCmd {
     Disarm,
     FaultReset,
     Center,
-    Reference { axis: AxisId, count: Counts },
-    Fault { note: String },
+    Reference {
+        axis: AxisId,
+        count: Counts,
+    },
+    Fault {
+        note: String,
+    },
     /// Start the MCU-driven end-stop calibration on `axes` (empty = all three).
-    Calibrate { axes: Vec<AxisId> },
+    Calibrate {
+        axes: Vec<AxisId>,
+    },
     /// CALIBRATE(0) to every calibrating axis.
     CalibrateCancel,
 }
@@ -628,7 +642,8 @@ struct NoProgressWatch {
 impl AxisTrack {
     /// HELLO says the firmware speaks SET_LIMITS / LIMITS.
     fn supports_limits(&self) -> bool {
-        self.hello.is_some_and(|h| h.capabilities & capabilities::LIMITS != 0)
+        self.hello
+            .is_some_and(|h| h.capabilities & capabilities::LIMITS != 0)
     }
     /// `want` is in force on the MCU: SET_LIMITS ACKed *and* LIMITS echoed
     /// that non-zero `stop_acc`. An ACK whose LIMITS was lost is not
@@ -636,7 +651,8 @@ impl AxisTrack {
     /// counts only when `allow_legacy` is set (the MCU then stops at CONFIG
     /// `max_acc`, the absolute ceiling).
     fn limits_confirmed(&self, want: FwTuning, allow_legacy: bool) -> bool {
-        self.limits_acked == Some(want) && self.stop_acc_echo_ok(want.stop_acc_count_s2, allow_legacy)
+        self.limits_acked == Some(want)
+            && self.stop_acc_echo_ok(want.stop_acc_count_s2, allow_legacy)
     }
     /// LIMITS `stop_acc` equals the requested non-zero rate. Zero matches
     /// only in legacy mode.
@@ -682,8 +698,7 @@ impl AxisTrack {
     /// No HOST_FAULT outstanding, or a STATUS arrived after its ACK (so the
     /// cached STATUS shows the state the HOST_FAULT left the MCU in).
     fn host_fault_confirmed(&self) -> bool {
-        self.host_fault_req.is_none()
-            || self.host_fault_ack_ev.is_some_and(|a| self.status_ev > a)
+        self.host_fault_req.is_none() || self.host_fault_ack_ev.is_some_and(|a| self.status_ev > a)
     }
     /// Frames this axis was behind the last sent frame when its STATUS came in.
     fn frame_lag(&self) -> Option<i64> {
@@ -816,6 +831,9 @@ pub struct Supervisor {
     ev: u64,
     /// `ev` when the current FaultReset was accepted.
     reset_ev: u64,
+    /// The in-flight FaultReset was started because every LOCAL_ESTOP latch
+    /// was released on the screen, not because of `POST /v1/fault/reset`.
+    fault_reset_auto: bool,
     /// Session generation the game drive is bound to (set by Start).
     drive_session: Option<u64>,
 
@@ -883,7 +901,10 @@ impl Supervisor {
             cal_keep_power: false,
             phase: Phase::Idle(RigState::Offline),
             planner: Planner::new(),
-            governor: TrackingGovernor::new(cfg.governor.clone(), cfg.limits.following_error_limit_count),
+            governor: TrackingGovernor::new(
+                cfg.governor.clone(),
+                cfg.limits.following_error_limit_count,
+            ),
             no_progress: [None; AXIS_COUNT],
             governor_no_progress: false,
             planner_settled: false,
@@ -903,6 +924,7 @@ impl Supervisor {
             t0: None,
             ev: 0,
             reset_ev: 0,
+            fault_reset_auto: false,
             drive_session: None,
             last_pose: None,
             requested: RequestView::default(),
@@ -1047,7 +1069,10 @@ impl Supervisor {
                     .iter()
                     .map(|c| format!("{}({})", c.port, c.hello.device_id))
                     .collect();
-                b.push(format!("axis_conflict: axis{n} claimed by {}", who.join(", ")));
+                b.push(format!(
+                    "axis_conflict: axis{n} claimed by {}",
+                    who.join(", ")
+                ));
             }
             // Cross-check against the configured device_id, both directions.
             let expected = self.device_ids[i];
@@ -1089,7 +1114,9 @@ impl Supervisor {
                 b.push(format!("fault_reset_rejected: axis{n} {r:?}"));
             }
             if let Some(r) = t.calibrate_rejected {
-                b.push(format!("calibrate_rejected: axis{n} CALIBRATE rejected ({r:?})"));
+                b.push(format!(
+                    "calibrate_rejected: axis{n} CALIBRATE rejected ({r:?})"
+                ));
             }
             if !t.connected {
                 continue;
@@ -1111,7 +1138,9 @@ impl Supervisor {
                 }
             }
             if let Some(r) = t.limits_rejected {
-                b.push(format!("limits_rejected: axis{n} SET_LIMITS rejected ({r:?})"));
+                b.push(format!(
+                    "limits_rejected: axis{n} SET_LIMITS rejected ({r:?})"
+                ));
             } else if t.supports_limits() && !t.limits_confirmed(want_tuning, allow_legacy) {
                 // Never arm on the firmware's default tuning (or a previous
                 // connection's): the duty cap must be the configured one,
@@ -1293,9 +1322,8 @@ impl Supervisor {
             } => {
                 // Bound to the session that was current at START: a pose of a
                 // newer session stops the rig like a stale one.
-                let usable = pose.filter(|p| {
-                    p.fresh_until > now && Some(p.session_gen) == self.drive_session
-                });
+                let usable = pose
+                    .filter(|p| p.fresh_until > now && Some(p.session_gen) == self.drive_session);
                 match usable {
                     Some(p) => drive_limits = self.track_game(p, dt, gov_s),
                     None => {
@@ -1519,7 +1547,10 @@ impl Supervisor {
 
     /// The cap the clamp applies to the game-written fields.
     fn operator_cap(&self) -> OperatorCap {
-        OperatorCap { max: MotionLimits::from_config(&self.limits_cfg), fields: self.game_fields }
+        OperatorCap {
+            max: MotionLimits::from_config(&self.limits_cfg),
+            fields: self.game_fields,
+        }
     }
 
     /// The set in effect: what the planner and SET_POSITION use (the clamped
@@ -1602,8 +1633,12 @@ impl Supervisor {
     ///   The requested velocity returns once the new rate is confirmed.
     ///   `reconcile_limits` keeps retrying.
     fn recompute_limits(&mut self) {
-        let c =
-            motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
+        let c = motion_limits::clamp(
+            &self.requested_limits,
+            &self.ceilings(),
+            &self.operator_cap(),
+            self.stop_deadline(),
+        );
         self.target_limits = c.effective;
         self.limited = c.limited;
         self.limit_reasons = c.reasons;
@@ -1619,7 +1654,11 @@ impl Supervisor {
         let mut any = false;
         let mut stop_confirmed = true;
         let mut floor: Option<u32> = Some(u32::MAX);
-        for t in self.axes.iter().filter(|t| t.connected && t.supports_limits()) {
+        for t in self
+            .axes
+            .iter()
+            .filter(|t| t.connected && t.supports_limits())
+        {
             any = true;
             if !t.limits_confirmed(want, legacy) {
                 stop_confirmed = false;
@@ -1645,7 +1684,10 @@ impl Supervisor {
         };
         let (t, e) = (self.target_limits, self.effective_limits);
         let mut effective = if duty_confirmed {
-            MotionLimits { max_acc_count_s2: planner_acc, ..t }
+            MotionLimits {
+                max_acc_count_s2: planner_acc,
+                ..t
+            }
         } else {
             MotionLimits {
                 max_gain: e.max_gain.min(t.max_gain),
@@ -1699,7 +1741,12 @@ impl Supervisor {
                 let id = self.take_request_id();
                 self.axes[i].limits_inflight = Some(want);
                 self.axes[i].limits_retry_at = None;
-                self.push_msg(i, HostMsg::SetLimits(want.to_msg(id)), Purpose::SetLimits, now);
+                self.push_msg(
+                    i,
+                    HostMsg::SetLimits(want.to_msg(id)),
+                    Purpose::SetLimits,
+                    now,
+                );
             }
         }
     }
@@ -1726,7 +1773,11 @@ impl Supervisor {
         } else {
             t.limits_retry_at = None;
         }
-        self.event(now, "limits", serde_json::json!({"axis": axis, "limits": limits}));
+        self.event(
+            now,
+            "limits",
+            serde_json::json!({"axis": axis, "limits": limits}),
+        );
         self.recompute_limits();
     }
 
@@ -1833,7 +1884,11 @@ impl Supervisor {
         self.axes
             .iter()
             .flat_map(|t| t.claimants.iter().map(|c| c.hello.device_id))
-            .chain(self.axes.iter().filter_map(|t| t.hello.as_ref().map(|h| h.device_id)))
+            .chain(
+                self.axes
+                    .iter()
+                    .filter_map(|t| t.hello.as_ref().map(|h| h.device_id)),
+            )
             .collect()
     }
 
@@ -1979,7 +2034,12 @@ impl Supervisor {
         // FAULT 直前の経過（Issue #34）: 固定リングへ上書きするだけ。
         let server_target = self.is_armed().then(|| self.drive.target_counts[i]);
         let requested = self.drive.requested_counts.map(|c| c[i].round() as Counts);
-        self.traces[i].push(TraceSample::new(received_at, &status, server_target, requested));
+        self.traces[i].push(TraceSample::new(
+            received_at,
+            &status,
+            server_target,
+            requested,
+        ));
         if rebooted {
             self.event(
                 now,
@@ -2099,7 +2159,7 @@ impl Supervisor {
             };
             self.latch(fault, Some(reason), now);
         } else if let Phase::Fault { reset: Some(_) } = self.phase {
-            self.phase = Phase::Fault { reset: None };
+            self.abandon_fault_reset();
         }
     }
 
@@ -2155,7 +2215,8 @@ impl Supervisor {
                 // the deferral is bounded by one ACK_TIMEOUT).
                 let host_fault_outstanding = matches!(self.phase, Phase::Fault { .. })
                     && t.host_fault_ack_ev.is_none()
-                    && t.host_fault_req.is_some_and(|id| self.pending.contains_key(&id));
+                    && t.host_fault_req
+                        .is_some_and(|id| self.pending.contains_key(&id));
                 if host_fault_outstanding {
                     continue;
                 }
@@ -2167,7 +2228,7 @@ impl Supervisor {
                 self.drop_primary(i);
                 // Like a disconnect: a FAULT_RESET in flight cannot complete.
                 if let Phase::Fault { reset: Some(_) } = self.phase {
-                    self.phase = Phase::Fault { reset: None };
+                    self.abandon_fault_reset();
                 }
             } else if t.claimants.len() == 1 && !t.connected {
                 let c = t.claimants[0].clone();
@@ -2234,7 +2295,8 @@ impl Supervisor {
                         // LIMITS should follow at once; if it is lost, resend after
                         // this. A tuning that changed while this one was in flight
                         // goes out at the next tick instead (Issue #15 M3).
-                        t.limits_retry_at = (t.limits_acked == Some(want)).then_some(now + LIMITS_RETRY);
+                        t.limits_retry_at =
+                            (t.limits_acked == Some(want)).then_some(now + LIMITS_RETRY);
                     }
                     _ => {}
                 }
@@ -2296,7 +2358,7 @@ impl Supervisor {
             Purpose::FaultReset => {
                 self.axes[i].reset_rejected = Some(reason);
                 if let Phase::Fault { reset: Some(_) } = self.phase {
-                    self.phase = Phase::Fault { reset: None };
+                    self.abandon_fault_reset();
                 }
             }
             Purpose::Calibrate => {
@@ -2355,7 +2417,11 @@ impl Supervisor {
         }
     }
 
-    fn cmd_calibrate(&mut self, axes: &[AxisId], now: Instant) -> Result<Option<String>, AdminError> {
+    fn cmd_calibrate(
+        &mut self,
+        axes: &[AxisId],
+        now: Instant,
+    ) -> Result<Option<String>, AdminError> {
         if !self.axis_conflict().is_empty() {
             return Err(AdminError::new(
                 admin_error::AXIS_CONFLICT,
@@ -2365,7 +2431,10 @@ impl Supervisor {
         match self.phase {
             Phase::Idle(_) => {}
             Phase::Fault { .. } => {
-                return Err(AdminError::new(admin_error::FAULT_LATCHED, self.blockers(now)))
+                return Err(AdminError::new(
+                    admin_error::FAULT_LATCHED,
+                    self.blockers(now),
+                ))
             }
             _ => {
                 return Err(AdminError::new(
@@ -2397,7 +2466,10 @@ impl Supervisor {
             .map(|a| format!("not_connected: {a}"))
             .collect();
         if !disconnected.is_empty() {
-            return Err(AdminError::new(admin_error::AXIS_DISCONNECTED, disconnected));
+            return Err(AdminError::new(
+                admin_error::AXIS_DISCONNECTED,
+                disconnected,
+            ));
         }
         let not_disarmed: Vec<String> = targets
             .iter()
@@ -2405,7 +2477,9 @@ impl Supervisor {
                 let t = &self.axes[a.index()];
                 match (t.status, t.status_fault(), t.mcu_state()) {
                     (None, _, _) => Some(format!("no_status: {a}")),
-                    (Some(_), Some(code), _) => Some(format!("axis_fault: {a} fault_code {code:?}")),
+                    (Some(_), Some(code), _) => {
+                        Some(format!("axis_fault: {a} fault_code {code:?}"))
+                    }
                     (Some(_), None, Some(McuState::Disarmed)) if !t.cal_pending => None,
                     (Some(s), None, _) => Some(format!(
                         "mcu_not_disarmed: {a} state {}",
@@ -2455,7 +2529,11 @@ impl Supervisor {
         if cancelled.is_empty() {
             Some("no axis calibrating".into())
         } else {
-            self.event(now, "calibrate_cancelled", serde_json::json!({"axes": cancelled}));
+            self.event(
+                now,
+                "calibrate_cancelled",
+                serde_json::json!({"axes": cancelled}),
+            );
             None
         }
     }
@@ -2484,7 +2562,11 @@ impl Supervisor {
             Purpose::CalibrateCancel,
             now,
         );
-        self.event(now, "calibrate_power_release", serde_json::json!({"axis": self.power_axis}));
+        self.event(
+            now,
+            "calibrate_power_release",
+            serde_json::json!({"axis": self.power_axis}),
+        );
     }
 
     fn send_calibrate_cancel(&mut self, now: Instant) -> Vec<AxisId> {
@@ -2655,7 +2737,11 @@ impl Supervisor {
                 if cancelled.is_empty() {
                     Some("not driving".into())
                 } else {
-                    self.event(now, "calibrate_cancelled", serde_json::json!({"axes": cancelled, "because": "stop"}));
+                    self.event(
+                        now,
+                        "calibrate_cancelled",
+                        serde_json::json!({"axes": cancelled, "because": "stop"}),
+                    );
                     let names: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
                     Some(format!("calibration cancelled: {}", names.join(", ")))
                 }
@@ -2737,6 +2823,15 @@ impl Supervisor {
         if !unsettled.is_empty() {
             return Err(AdminError::new(admin_error::AXIS_NOT_SETTLED, unsettled));
         }
+        self.fault_reset_auto = false;
+        self.start_fault_reset(now);
+        Ok(None)
+    }
+
+    /// FAULT_RESET to every axis still in FAULT. Callers have already checked
+    /// the settlement gates. Axes that already left FAULT are not targets
+    /// (`begin_group` marks them done).
+    fn start_fault_reset(&mut self, now: Instant) {
         let targets: [bool; AXIS_COUNT] =
             std::array::from_fn(|i| self.axes[i].mcu_state() == Some(McuState::Fault));
         for t in &mut self.axes {
@@ -2754,7 +2849,13 @@ impl Supervisor {
             );
         }
         self.phase = Phase::Fault { reset: Some(now) };
-        Ok(None)
+    }
+
+    /// A FaultReset in flight cannot finish (disconnect, conflict, rejection,
+    /// timeout). A screen-release clear does not stay tagged as automatic.
+    fn abandon_fault_reset(&mut self) {
+        self.fault_reset_auto = false;
+        self.phase = Phase::Fault { reset: None };
     }
 
     fn cmd_reference(
@@ -2855,7 +2956,11 @@ impl Supervisor {
                     // Name the real cause: an axis not ACTIVE, else one whose
                     // START ACK never came (normally caught earlier by
                     // `expire_pending`; this is the backstop).
-                    let (axis, detail) = match self.axes.iter().position(|t| t.mcu_state() != Some(McuState::Active)) {
+                    let (axis, detail) = match self
+                        .axes
+                        .iter()
+                        .position(|t| t.mcu_state() != Some(McuState::Active))
+                    {
                         Some(i) => (
                             AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
                             format!(
@@ -2869,7 +2974,10 @@ impl Supervisor {
                             let i = self.axes.iter().position(|t| !t.group_ok).unwrap_or(0);
                             (
                                 AxisId::from_index(i).unwrap_or(AxisId::ALL[0]),
-                                format!("ack_timeout: START on axis{} not ACKed (MCU reports ACTIVE)", i + 1),
+                                format!(
+                                    "ack_timeout: START on axis{} not ACKed (MCU reports ACTIVE)",
+                                    i + 1
+                                ),
                             )
                         }
                     };
@@ -2898,13 +3006,18 @@ impl Supervisor {
                 StopSub::Decel => {
                     // Planner settled, every MCU HOLDING (its trajectory at
                     // velocity 0) AND every axis measured at rest.
-                    if self.planner_settled && all_ok && all_in(McuState::Holding) && self.all_at_rest(now) {
+                    if self.planner_settled
+                        && all_ok
+                        && all_in(McuState::Holding)
+                        && self.all_at_rest(now)
+                    {
                         self.phase = Phase::Stopping {
                             sub: StopSub::Hold { since: now },
                             started,
                         };
                     } else if elapsed(now, started) > ms(self.timing.stop_settle_timeout_ms) {
-                        let detail = format!("deceleration did not settle: {}", self.rest_detail(now));
+                        let detail =
+                            format!("deceleration did not settle: {}", self.rest_detail(now));
                         self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
@@ -2919,8 +3032,13 @@ impl Supervisor {
                             sub: StopSub::Disarming { since: now },
                             started,
                         };
-                    } else if held > ms(self.timing.stop_hold_ms) + ms(self.timing.stop_settle_timeout_ms) {
-                        let detail = format!("hold did not come to rest before the brake: {}", self.rest_detail(now));
+                    } else if held
+                        > ms(self.timing.stop_hold_ms) + ms(self.timing.stop_settle_timeout_ms)
+                    {
+                        let detail = format!(
+                            "hold did not come to rest before the brake: {}",
+                            self.rest_detail(now)
+                        );
                         self.latch(RigFault::StopTimeout, Some(detail), now);
                     }
                 }
@@ -2950,6 +3068,14 @@ impl Supervisor {
                             && t.status.is_some_and(|s| s.fault_code == FaultCode::None)
                     });
                 if clear {
+                    if self.fault_reset_auto {
+                        self.event(
+                            now,
+                            "fault_auto_cleared",
+                            serde_json::json!({"cause": "local_estop_released"}),
+                        );
+                        self.fault_reset_auto = false;
+                    }
                     self.event(
                         now,
                         "fault_cleared",
@@ -2965,10 +3091,10 @@ impl Supervisor {
                     self.phase = Phase::Idle(RigState::Offline);
                 } else if elapsed(now, since) > FAULT_RESET_TIMEOUT {
                     self.event(now, "fault_reset_timeout", serde_json::json!({}));
-                    self.phase = Phase::Fault { reset: None };
+                    self.abandon_fault_reset();
                 }
             }
-            Phase::Fault { reset: None } => {}
+            Phase::Fault { reset: None } => self.maybe_auto_clear_local_estop(now),
         }
         if matches!(self.phase, Phase::Idle(_) | Phase::Fault { .. }) {
             self.reconcile_claimants(now);
@@ -2976,6 +3102,66 @@ impl Supervisor {
         }
         self.classify(now);
         self.note_state(now);
+    }
+
+    /// Screen release of every LOCAL_ESTOP in this episode. HOST_FAULT on the
+    /// other axes is the server's own coordinated latch, not another cause, so
+    /// it is not in `fault_history`. Wait for the same settlement gates as
+    /// [`Self::cmd_fault_reset`] instead of failing the operator's next tick.
+    /// A rejected FAULT_RESET stays latched until `POST /v1/fault/reset`.
+    fn maybe_auto_clear_local_estop(&mut self, now: Instant) {
+        if self.axes.iter().any(|t| t.reset_rejected.is_some()) {
+            return;
+        }
+        let episode = self.episode_at_ms;
+        let mut any = false;
+        let mut all_local = true;
+        let mut reporters = [false; AXIS_COUNT];
+        for rec in self.fault_history.iter().filter(|r| r.at_ms >= episode) {
+            any = true;
+            match rec.fault {
+                RigFault::AxisFault {
+                    axis,
+                    code: FaultCode::LocalEstop,
+                } => reporters[axis.index()] = true,
+                _ => all_local = false,
+            }
+        }
+        if !any || !all_local || !reporters.iter().any(|r| *r) {
+            return;
+        }
+        let released = reporters.iter().enumerate().all(|(i, reported)| {
+            if !*reported {
+                return true;
+            }
+            let t = &self.axes[i];
+            t.connected
+                && t.mcu_state().is_some_and(|s| s != McuState::Fault)
+                && t.status.is_some_and(|s| s.fault_code == FaultCode::None)
+        });
+        if !released {
+            return;
+        }
+        if self
+            .axes
+            .iter()
+            .any(|t| !t.connected || !t.host_fault_confirmed())
+        {
+            return;
+        }
+        for t in &self.axes {
+            match (t.status, t.mcu_state()) {
+                (Some(s), Some(McuState::Fault | McuState::Disarmed)) => {
+                    if s.fault_code != FaultCode::None && t.mcu_state() == Some(McuState::Disarmed)
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+        self.fault_reset_auto = true;
+        self.start_fault_reset(now);
     }
 
     /// Idle sub-state from the blockers. Never arms.
@@ -3074,7 +3260,12 @@ impl Supervisor {
         let fault = RigFault::AxisFault { axis, code };
         if latched {
             let episode_ms = self.episode_at_ms;
-            if let Some(rec) = self.fault_history.iter_mut().rev().find(|r| r.fault == fault) {
+            if let Some(rec) = self
+                .fault_history
+                .iter_mut()
+                .rev()
+                .find(|r| r.fault == fault)
+            {
                 // STATUS が先にラッチした記録へ、後から来た FAULT_EVENT を付ける
                 // （今のエピソードの記録だけ。重複の判定そのものは従来どおり履歴全体）。
                 if rec.fault_event.is_none() && rec.at_ms >= episode_ms {
@@ -3083,7 +3274,12 @@ impl Supervisor {
                 return;
             }
         }
-        self.latch_record(fault, Some(format!("reported in {source}")), fault_event, now);
+        self.latch_record(
+            fault,
+            Some(format!("reported in {source}")),
+            fault_event,
+            now,
+        );
     }
 
     /// Latch FAULT_LATCHED. The first latch of an episode sends HOST_FAULT to
@@ -3277,7 +3473,8 @@ impl Supervisor {
         if lags.len() < AXIS_COUNT {
             return;
         }
-        let spread = lags.iter().max().copied().unwrap_or(0) - lags.iter().min().copied().unwrap_or(0);
+        let spread =
+            lags.iter().max().copied().unwrap_or(0) - lags.iter().min().copied().unwrap_or(0);
         let spread = u32::try_from(spread).unwrap_or(u32::MAX);
         if elapsed(now, entered) <= FRAME_SKEW_GRACE {
             return;
@@ -3304,7 +3501,9 @@ impl Supervisor {
     /// pose → orient → mix → saturate → virtual_to_count → clamp_soft → step_track.
     fn track_game(&mut self, pose: &AcceptedPose, dt: f64, scale: f64) -> Vec<LimitReason> {
         let (targets, virt, mut limits) = self.pose_targets(&pose.checked);
-        let out = self.planner.step_track(targets, self.track_limits(1.0, scale), dt);
+        let out = self
+            .planner
+            .step_track(targets, self.track_limits(1.0, scale), dt);
         limits.extend(out.limits);
         self.drive.virtual_targets = virt;
         self.drive.requested_counts = Some(targets);
@@ -3321,7 +3520,8 @@ impl Supervisor {
     ) -> ([f64; AXIS_COUNT], [f64; AXIS_COUNT], Vec<LimitReason>) {
         let oriented = compat::orient(checked.pose, self.game.orientation());
         let mixed = compat::mix(oriented, checked.effective_gain);
-        let (virt, saturated) = compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
+        let (virt, saturated) =
+            compat::saturate(mixed, self.game.virtual_min, self.game.virtual_max);
         let mut limits = Vec::new();
         if saturated {
             limits.push(LimitReason::VirtualSaturated);
@@ -3430,13 +3630,19 @@ impl Supervisor {
             }
             match self.no_progress[i] {
                 None => {
-                    self.no_progress[i] = Some(NoProgressWatch { since: now, actual0: actual });
+                    self.no_progress[i] = Some(NoProgressWatch {
+                        since: now,
+                        actual0: actual,
+                    });
                 }
                 Some(w) => {
                     let moved = (i64::from(actual) - i64::from(w.actual0)).unsigned_abs();
                     if moved >= NO_PROGRESS_COUNTS as u64 {
                         self.no_progress[i] = if lagging[i] {
-                            Some(NoProgressWatch { since: now, actual0: actual })
+                            Some(NoProgressWatch {
+                                since: now,
+                                actual0: actual,
+                            })
                         } else {
                             None
                         };
@@ -3476,10 +3682,14 @@ impl Supervisor {
         // ガバナより速く追いつける。停止フレームは全減速度（センター倍率も掛けない）。
         let scale = self.governor.status().scale;
         let limits = match self.phase {
-            Phase::Active { source: ActiveSource::Center, .. } => {
-                self.track_limits(self.game.center_speed_fraction, scale)
-            }
-            Phase::Active { source: ActiveSource::Game, .. } => self.track_limits(1.0, scale),
+            Phase::Active {
+                source: ActiveSource::Center,
+                ..
+            } => self.track_limits(self.game.center_speed_fraction, scale),
+            Phase::Active {
+                source: ActiveSource::Game,
+                ..
+            } => self.track_limits(1.0, scale),
             Phase::Stopping { .. } => self.axis_limits(1.0),
             _ => self.axis_limits(1.0),
         };
@@ -3645,7 +3855,9 @@ impl Supervisor {
                     && matches!(self.phase, Phase::Holding { start: Some(_), .. })
                 {
                     if let Some(axis) = AxisId::from_index(p.axis) {
-                        let reports = self.axes[p.axis].mcu_state().map_or("no STATUS".to_string(), |s| format!("{s:?}"));
+                        let reports = self.axes[p.axis]
+                            .mcu_state()
+                            .map_or("no STATUS".to_string(), |s| format!("{s:?}"));
                         let detail = format!(
                             "ack_timeout: START on axis{} not ACKed within {} ms (MCU reports {reports})",
                             axis.get(),
@@ -3694,8 +3906,7 @@ impl Supervisor {
         let t = &self.axes[i];
         t.connected
             && t.status.is_some()
-            && t
-                .rest_since
+            && t.rest_since
                 .is_some_and(|since| elapsed(now, since) >= ms(self.timing.rest_dwell_ms))
     }
 
@@ -3885,12 +4096,19 @@ mod governor_wire {
 
     /// 中立へ向かって正方向に動かし、軸 2 だけ Duty 飽和＋遅れ FE を出す。
     fn run(enabled: bool) -> (Supervisor, Instant) {
-        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        let mut cfg = Config::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/sim.toml"
+        )))
+        .unwrap();
         cfg.governor.enabled = enabled;
         let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
         let mut t = Instant::now();
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         for _ in 0..25 {
             for i in 0..3 {
                 let (fe, pwm) = if i == 1 { (-250, 400) } else { (0, 0) };
@@ -3909,7 +4127,11 @@ mod governor_wire {
         let (mut gov, t) = run(true);
         let (off, _) = run(false);
         assert_eq!(gov.state(), RigState::Active, "{:?}", gov.fault);
-        assert!(gov.governor.status().scale < 1.0, "scale {}", gov.governor.status().scale);
+        assert!(
+            gov.governor.status().scale < 1.0,
+            "scale {}",
+            gov.governor.status().scale
+        );
         assert!(off.governor.status().scale == 1.0);
         // 健全な軸も同じ軌道（同じ s）なので、ガバナ無しより進みが小さい。
         assert!(gov.planner.positions()[0] < off.planner.positions()[0] - 1.0);
@@ -3922,7 +4144,11 @@ mod governor_wire {
         assert!(snap.limits.contains(&LimitReason::TrackingGoverned));
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["governor"]["active"], true);
-        assert!(json["limits"].as_array().unwrap().iter().any(|x| x == "tracking_governed"));
+        assert!(json["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "tracking_governed"));
         assert_eq!(json["governor"]["axis"], 2);
 
         let acc = f64::from(gov.effective_limits.max_acc_count_s2);
@@ -3931,12 +4157,19 @@ mod governor_wire {
             gov.axes[i].status_at = Some(t);
         }
         let v0 = gov.planner.velocities();
-        gov.phase = Phase::Stopping { sub: StopSub::Decel, started: t };
+        gov.phase = Phase::Stopping {
+            sub: StopSub::Decel,
+            started: t,
+        };
         gov.tick(t, 0.01, None);
         let v1 = gov.planner.velocities();
         for i in 0..3 {
             let dv = v0[i] - v1[i];
-            assert!((dv - acc * 0.01).abs() < 1e-4, "axis {i} stop dv {dv}, full {}", acc * 0.01);
+            assert!(
+                (dv - acc * 0.01).abs() < 1e-4,
+                "axis {i} stop dv {dv}, full {}",
+                acc * 0.01
+            );
             assert!(dv > acc * s * s * 0.01 + 1.0, "stop must not take s²");
         }
     }
@@ -3968,12 +4201,19 @@ mod governor_wire {
     /// ガバナ中の SET_POSITION は s / s²。その直後の STOP フレームは全減速度。
     #[test]
     fn governed_frames_are_scaled_and_the_following_stop_keeps_full_decel() {
-        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        let mut cfg = Config::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/sim.toml"
+        )))
+        .unwrap();
         cfg.governor.no_progress_ms = 1500;
         let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
         let mut t = Instant::now();
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         let mut governed = None;
         for _ in 0..25 {
             push_measured(&mut sup, t, 1, -250, [-400, -400, -400]);
@@ -3990,8 +4230,14 @@ mod governor_wire {
         let scaled = sup.track_limits(sup.game.center_speed_fraction, s);
         let bare = sup.axis_limits(sup.game.center_speed_fraction);
         for i in 0..3 {
-            assert_eq!(frame[i].max_vel_count_s, super::to_u32_limit(scaled[i].max_vel_count_s));
-            assert_eq!(frame[i].max_acc_count_s2, super::to_u32_limit(scaled[i].max_acc_count_s2));
+            assert_eq!(
+                frame[i].max_vel_count_s,
+                super::to_u32_limit(scaled[i].max_vel_count_s)
+            );
+            assert_eq!(
+                frame[i].max_acc_count_s2,
+                super::to_u32_limit(scaled[i].max_acc_count_s2)
+            );
             assert!(frame[i].max_vel_count_s < super::to_u32_limit(bare[i].max_vel_count_s));
             assert!(frame[i].max_acc_count_s2 < super::to_u32_limit(bare[i].max_acc_count_s2));
         }
@@ -4003,8 +4249,14 @@ mod governor_wire {
         let stop = out.set_position.expect("stop frame");
         let full = sup.axis_limits(1.0);
         for i in 0..3 {
-            assert_eq!(stop[i].max_vel_count_s, super::to_u32_limit(full[i].max_vel_count_s));
-            assert_eq!(stop[i].max_acc_count_s2, super::to_u32_limit(full[i].max_acc_count_s2));
+            assert_eq!(
+                stop[i].max_vel_count_s,
+                super::to_u32_limit(full[i].max_vel_count_s)
+            );
+            assert_eq!(
+                stop[i].max_acc_count_s2,
+                super::to_u32_limit(full[i].max_acc_count_s2)
+            );
             assert!(stop[i].max_acc_count_s2 > frame[i].max_acc_count_s2);
             assert!(sup.axes[i].referenced());
         }
@@ -4021,7 +4273,11 @@ mod governor_wire {
     }
 
     fn sim_governed(no_progress_ms: u64) -> (Supervisor, Instant) {
-        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        let mut cfg = Config::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/sim.toml"
+        )))
+        .unwrap();
         cfg.governor.no_progress_ms = no_progress_ms;
         let sup = Supervisor::with_initial_ids(&cfg, 1, 1);
         (sup, Instant::now())
@@ -4031,7 +4287,10 @@ mod governor_wire {
     fn stuck_axis_with_a_finite_target_stops_within_no_progress() {
         let (mut sup, mut t) = sim_governed(200);
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         let mut governed_at = None;
         let mut stopped_at = None;
         for _ in 0..80 {
@@ -4051,8 +4310,14 @@ mod governor_wire {
         let t0 = governed_at.expect("governor");
         let (t1, out) = stopped_at.expect("stop");
         let waited = t1.saturating_duration_since(t0);
-        assert!(waited >= Duration::from_millis(200), "stopped too soon: {waited:?}");
-        assert!(waited <= Duration::from_millis(220), "stopped too late: {waited:?}");
+        assert!(
+            waited >= Duration::from_millis(200),
+            "stopped too soon: {waited:?}"
+        );
+        assert!(
+            waited <= Duration::from_millis(220),
+            "stopped too late: {waited:?}"
+        );
         assert!(sup.fault.is_none(), "{:?}", sup.fault);
         assert!(sup.axes.iter().all(|a| a.referenced()));
         let (events, _) = sup.drain_events();
@@ -4061,7 +4326,11 @@ mod governor_wire {
         assert!(snap.limits.contains(&LimitReason::GovernorNoProgress));
         assert!(snap.axes.iter().all(|a| a.referenced));
         let json = serde_json::to_value(&snap).unwrap();
-        assert!(json["limits"].as_array().unwrap().iter().any(|x| x == "governor_no_progress"));
+        assert!(json["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "governor_no_progress"));
         let reasons: Vec<u8> = out
             .admin_msgs
             .iter()
@@ -4079,7 +4348,10 @@ mod governor_wire {
         let (mut sup, mut t) = sim_governed(400);
         sup.planner.init([0, 0, 0]);
         sup.drive_session = Some(1);
-        sup.phase = Phase::Active { source: ActiveSource::Game, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Game,
+            entered: t,
+        };
         let mut pitch = 1.0;
         let mut governed_at = None;
         let mut min_cmd = i32::MAX;
@@ -4091,7 +4363,11 @@ mod governor_wire {
             if step >= 8 && step % 8 == 0 {
                 pitch = -pitch;
             }
-            let pose = crate::types::Pose { pitch, roll: 0.0, yaw: 0.0 };
+            let pose = crate::types::Pose {
+                pitch,
+                roll: 0.0,
+                yaw: 0.0,
+            };
             let checked = crate::compat::check_pose(pose, 0.5, 1.0, true).unwrap();
             let accepted = crate::session::AcceptedPose {
                 pose,
@@ -4131,21 +4407,37 @@ mod governor_wire {
             assert!(sup.fault.is_none(), "{:?}", sup.fault);
             t += Duration::from_millis(10);
         }
-        assert!(stopped, "scale {} cmd {min_cmd}..{max_cmd}", sup.governor.status().scale);
-        assert!(max_cmd - min_cmd > 20, "target did not travel: {min_cmd}..{max_cmd}");
-        assert!(saw_pos && saw_neg, "target did not reverse (pos {saw_pos} neg {saw_neg})");
+        assert!(
+            stopped,
+            "scale {} cmd {min_cmd}..{max_cmd}",
+            sup.governor.status().scale
+        );
+        assert!(
+            max_cmd - min_cmd > 20,
+            "target did not travel: {min_cmd}..{max_cmd}"
+        );
+        assert!(
+            saw_pos && saw_neg,
+            "target did not reverse (pos {saw_pos} neg {saw_neg})"
+        );
         assert!(sup.axes.iter().all(|a| a.referenced()));
         assert_eq!(sup.axes[1].status.unwrap().actual_count, 0);
         let (events, _) = sup.drain_events();
         assert!(events.iter().any(|e| e.kind == "governor_no_progress"));
-        assert!(sup.snapshot(t).limits.contains(&LimitReason::GovernorNoProgress));
+        assert!(sup
+            .snapshot(t)
+            .limits
+            .contains(&LimitReason::GovernorNoProgress));
     }
 
     #[test]
     fn slow_axis_that_keeps_approaching_is_not_stopped() {
         let (mut sup, mut t) = sim_governed(200);
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         let mut actual = [-400, -400, -400];
         let mut governed_at = None;
         for _ in 0..80 {
@@ -4161,7 +4453,9 @@ mod governor_wire {
                 governed_at.get_or_insert(t);
             }
             assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
-            if governed_at.is_some_and(|t0| t.saturating_duration_since(t0) >= Duration::from_millis(400)) {
+            if governed_at
+                .is_some_and(|t0| t.saturating_duration_since(t0) >= Duration::from_millis(400))
+            {
                 break;
             }
             t += Duration::from_millis(10);
@@ -4179,13 +4473,20 @@ mod governor_wire {
     fn reversal_uses_the_mcu_target_direction_when_the_planner_has_already_flipped() {
         let (mut sup, mut t) = sim_governed(1500);
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         for _ in 0..8 {
             push_measured(&mut sup, t, 1, 0, [-400, -400, -400]);
             sup.tick(t, 0.01, None);
             t += Duration::from_millis(10);
         }
-        assert!(sup.planner.velocities()[1] > 1.0, "vel {}", sup.planner.velocities()[1]);
+        assert!(
+            sup.planner.velocities()[1] > 1.0,
+            "vel {}",
+            sup.planner.velocities()[1]
+        );
 
         // プランナーはまだ上昇。MCU の目標向きが無い（符号 0）ので正の FE は行き過ぎ。
         for _ in 0..10 {
@@ -4193,7 +4494,11 @@ mod governor_wire {
             sup.tick(t, 0.01, None);
             t += Duration::from_millis(10);
         }
-        assert_eq!(sup.governor.status().scale, 1.0, "planner-only sign must not govern overshoot");
+        assert_eq!(
+            sup.governor.status().scale,
+            1.0,
+            "planner-only sign must not govern overshoot"
+        );
         assert_eq!(sup.axes[1].mcu_target_sign, 0);
         assert!(sup.planner.velocities()[1] > 1.0);
 
@@ -4201,13 +4506,21 @@ mod governor_wire {
         descending.target_count = 1000;
         for i in 0..3 {
             sup.axes[i].connected = true;
-            let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+            let sample = if i == 1 {
+                descending
+            } else {
+                referenced_status(0, 0, -400)
+            };
             sup.on_status(i, sample, t, t);
         }
         t += Duration::from_millis(10);
         descending.target_count = 900;
         for i in 0..3 {
-            let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+            let sample = if i == 1 {
+                descending
+            } else {
+                referenced_status(0, 0, -400)
+            };
             sup.on_status(i, sample, t, t);
         }
         assert_eq!(sup.axes[1].mcu_target_sign, -1);
@@ -4219,7 +4532,11 @@ mod governor_wire {
             descending.target_count = target;
             descending.actual_count = target + 250;
             for i in 0..3 {
-                let sample = if i == 1 { descending } else { referenced_status(0, 0, -400) };
+                let sample = if i == 1 {
+                    descending
+                } else {
+                    referenced_status(0, 0, -400)
+                };
                 sup.on_status(i, sample, t, t);
             }
             sup.tick(t, 0.01, None);
@@ -4230,7 +4547,10 @@ mod governor_wire {
             }
             assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
         }
-        assert!(dropped, "MCU target descending with positive FE must govern");
+        assert!(
+            dropped,
+            "MCU target descending with positive FE must govern"
+        );
         assert!(sup.planner.velocities()[1] > 1.0, "planner still lifting");
         assert_eq!(sup.axes[1].mcu_target_sign, -1);
         assert_eq!(sup.state(), RigState::Active, "{:?}", sup.fault);
@@ -4241,14 +4561,21 @@ mod governor_wire {
     fn alternating_culprits_between_two_frozen_axes_stop_within_bound() {
         let (mut sup, mut t) = sim_governed(200);
         sup.planner.init([-400, -400, -400]);
-        sup.phase = Phase::Active { source: ActiveSource::Center, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Center,
+            entered: t,
+        };
         let actual = [-400, -400, -400];
         let mut governed_at = None;
         let mut saw = [false; 3];
         let mut stopped = false;
         for step in 0..80 {
             // 大きい |FE| が軸 2 と軸 3 を毎 tick 入れ替わる。どちらも飽和して遅れ。
-            let (fe1, fe2) = if step % 2 == 0 { (-400, -180) } else { (-180, -400) };
+            let (fe1, fe2) = if step % 2 == 0 {
+                (-400, -180)
+            } else {
+                (-180, -400)
+            };
             push_fe(&mut sup, t, [0, fe1, fe2], [0, 400, 400], actual);
             sup.tick(t, 0.01, None);
             if sup.governor.status().scale < 1.0 {
@@ -4278,21 +4605,33 @@ mod governor_wire {
     /// 目標が凍った実位置をちょうど横切っても、窓をやり直さない。
     #[test]
     fn command_crossing_a_frozen_axis_still_stops() {
-        let mut cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config/sim.toml"))).unwrap();
+        let mut cfg = Config::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/sim.toml"
+        )))
+        .unwrap();
         cfg.governor.no_progress_ms = 400;
         // 1 tick あたり 1 count 以下にして、整数の目標が実位置 0 を踏み外さない。
         cfg.limits.max_vel_count_s = 100;
         let mut sup = Supervisor::with_initial_ids(&cfg, 1, 1);
         let mut t = Instant::now();
         sup.drive_session = Some(1);
-        sup.phase = Phase::Active { source: ActiveSource::Game, entered: t };
+        sup.phase = Phase::Active {
+            source: ActiveSource::Game,
+            entered: t,
+        };
         // 軸 2 の目標は +側（仮想 512 より上）。軸 1・3 は最初からその目標に置き、
         // 共有の速度スケールを食わない。max_vel 100 なので軸 2 は 1 tick に
         // 1 count 以下で、凍った実位置 0 を踏み外さない。
-        let pose = crate::types::Pose { pitch: -0.2, roll: 0.0, yaw: 0.0 };
+        let pose = crate::types::Pose {
+            pitch: -0.2,
+            roll: 0.0,
+            yaw: 0.0,
+        };
         let checked = crate::compat::check_pose(pose, 0.5, 1.0, true).unwrap();
         let (targets, _, _) = sup.pose_targets(&checked);
-        sup.planner.init([targets[0].round() as i32, -8, targets[2].round() as i32]);
+        sup.planner
+            .init([targets[0].round() as i32, -8, targets[2].round() as i32]);
         let mut governed_at = None;
         let mut crossed = false;
         let mut saw_neg = false;
@@ -4338,7 +4677,12 @@ mod governor_wire {
             assert!(sup.fault.is_none(), "{:?}", sup.fault);
             t += Duration::from_millis(10);
         }
-        assert!(stopped, "scale {} cmd {}", sup.governor.status().scale, sup.planner.command_counts()[1]);
+        assert!(
+            stopped,
+            "scale {} cmd {}",
+            sup.governor.status().scale,
+            sup.planner.command_counts()[1]
+        );
         assert!(
             saw_neg && saw_pos,
             "command did not travel across 0 (neg {saw_neg} pos {saw_pos} cmd {})",

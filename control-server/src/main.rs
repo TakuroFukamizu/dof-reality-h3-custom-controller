@@ -15,7 +15,11 @@ use h3cs::config::{BackendConfig, Config};
 use h3cs::server::{self, ServerOptions};
 
 #[derive(Parser)]
-#[command(name = "h3-control-server", version, about = "DOF Reality H3 control server")]
+#[command(
+    name = "h3-control-server",
+    version,
+    about = "DOF Reality H3 control server"
+)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -71,7 +75,12 @@ fn check_config(path: &Path) -> ExitCode {
             }
         }
     };
-    println!("{}: OK (rig_id {}, bind {}, backend {backend})", path.display(), cfg.rig_id, cfg.server.bind);
+    println!(
+        "{}: OK (rig_id {}, bind {}, backend {backend})",
+        path.display(),
+        cfg.rig_id,
+        cfg.server.bind
+    );
     let mut blockers = Vec::new();
     let mut axes: Vec<_> = cfg.axes.iter().collect();
     axes.sort_by_key(|a| a.axis_id);
@@ -82,12 +91,19 @@ fn check_config(path: &Path) -> ExitCode {
             a.axis_id.get(),
             a.name,
             a.device_id,
-            if a.device_id.is_unassigned() { " (no cross-check; assigned by the MCU's selected_axis)" } else { "" },
+            if a.device_id.is_unassigned() {
+                " (no cross-check; assigned by the MCU's selected_axis)"
+            } else {
+                ""
+            },
             calibration_hash(&cfg.rig_id, &cal),
             a.calibration_valid
         );
         if !a.calibration_valid {
-            blockers.push(format!("calibration_invalid: axis{} calibration_valid = false", a.axis_id.get()));
+            blockers.push(format!(
+                "calibration_invalid: axis{} calibration_valid = false",
+                a.axis_id.get()
+            ));
         }
         if let Err(e) = cal.validate() {
             blockers.push(format!("calibration_invalid: axis{} {e}", a.axis_id.get()));
@@ -118,7 +134,10 @@ fn list_ports() -> ExitCode {
 fn run(path: &Path, bind: Option<SocketAddr>) -> ExitCode {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     let cfg = match Config::load(path) {
         Ok(c) => c,
@@ -135,7 +154,11 @@ fn run(path: &Path, bind: Option<SocketAddr>) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()) };
+        let opts = ServerOptions {
+            admin_token: None,
+            bind_override: bind,
+            config_path: Some(path.to_path_buf()),
+        };
         let srv = match server::start(cfg, opts).await {
             Ok(s) => s,
             Err(e) => {

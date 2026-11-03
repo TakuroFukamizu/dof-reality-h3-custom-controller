@@ -688,7 +688,10 @@ async fn controlled_stop_is_written_without_waiting_for_set_position() {
             .filter(|m| !matches!(m, HostMsg::HelloReq { .. }))
             .collect();
         assert!(
-            matches!(msgs.as_slice(), [HostMsg::ControlledStop { request_id: 9, .. }]),
+            matches!(
+                msgs.as_slice(),
+                [HostMsg::ControlledStop { request_id: 9, .. }]
+            ),
             "{msgs:?}"
         );
     }
@@ -1168,10 +1171,18 @@ async fn collect_until_reidentified(rx: &mut Events, port: &str) -> Vec<LinkEven
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let (p, ev) = next(rx, left).await;
-        if p != port || matches!(ev, LinkEvent::Status { .. } | LinkEvent::DecodeErrors { .. }) {
+        if p != port
+            || matches!(
+                ev,
+                LinkEvent::Status { .. } | LinkEvent::DecodeErrors { .. }
+            )
+        {
             continue;
         }
-        let done = matches!(ev, LinkEvent::Identified { .. } | LinkEvent::UnknownDevice { .. });
+        let done = matches!(
+            ev,
+            LinkEvent::Identified { .. } | LinkEvent::UnknownDevice { .. }
+        );
         out.push(ev);
         if done {
             return out;
@@ -1219,7 +1230,10 @@ async fn selected_axis_out_of_range_is_unknown_device() {
         tx,
     );
     let (_, ev) = next(&mut rx, Duration::from_secs(1)).await;
-    assert!(matches!(ev, LinkEvent::UnknownDevice { device_id, .. } if device_id == dev(1)), "{ev:?}");
+    assert!(
+        matches!(ev, LinkEvent::UnknownDevice { device_id, .. } if device_id == dev(1)),
+        "{ev:?}"
+    );
     sleep(Duration::from_millis(300)).await;
     assert!(only_hello_reqs(&peer.log()));
     assert!(link.is_finished());
@@ -1253,7 +1267,11 @@ async fn axis_select_reidentifies_on_the_same_port() {
         }
     );
     match &evs[1] {
-        LinkEvent::Identified { axis, hello: h, port } => {
+        LinkEvent::Identified {
+            axis,
+            hello: h,
+            port,
+        } => {
             assert_eq!((*axis, port.as_str()), (ax(2), "p"));
             assert_eq!((h.device_id, h.boot_id, h.selected_axis), (dev(1), 5, 2));
         }
@@ -1270,7 +1288,10 @@ async fn axis_select_reidentifies_on_the_same_port() {
     assert!(matches!(ev, LinkEvent::Status { axis, .. } if axis == ax(2)));
     link.send_admin(HostMsg::Disarm { request_id: 9 }).unwrap();
     sleep(Duration::from_millis(20)).await;
-    assert!(peer.log().iter().any(|m| matches!(m, HostMsg::Disarm { request_id: 9 })));
+    assert!(peer
+        .log()
+        .iter()
+        .any(|m| matches!(m, HostMsg::Disarm { request_id: 9 })));
 
     // The same value again: ignored (no Disconnected / Identified).
     peer.send_raw(axis_select(5, 2, 2)).await;
@@ -1300,7 +1321,10 @@ async fn status_or_hello_with_another_selected_axis_switches_too() {
     sleep(Duration::from_millis(50)).await;
     // The peer's periodic STATUS says 0 (old firmware): never a switch.
     while let Ok((_, ev)) = rx.try_recv() {
-        assert!(matches!(ev, LinkEvent::Status { axis, .. } if axis == ax(1)), "{ev:?}");
+        assert!(
+            matches!(ev, LinkEvent::Status { axis, .. } if axis == ax(1)),
+            "{ev:?}"
+        );
     }
     peer.send_raw(
         McuMsg::Status(Status {
@@ -1312,11 +1336,18 @@ async fn status_or_hello_with_another_selected_axis_switches_too() {
     .await;
     let evs = collect_until_reidentified(&mut rx, "p").await;
     assert_eq!(evs.len(), 2, "{evs:?}");
-    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"));
-    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3));
+    assert!(
+        matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3")
+    );
+    assert!(
+        matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3)
+    );
     // That STATUS itself is forwarded for the new axis.
     let (_, ev) = next(&mut rx, Duration::from_millis(50)).await;
-    assert!(matches!(ev, LinkEvent::Status { axis, status, .. } if axis == ax(3) && status.selected_axis == 3), "{ev:?}");
+    assert!(
+        matches!(ev, LinkEvent::Status { axis, status, .. } if axis == ax(3) && status.selected_axis == 3),
+        "{ev:?}"
+    );
     assert_eq!(link.axis(), Some(ax(3)));
 
     // (b) HELLO naming another axis.
@@ -1330,8 +1361,12 @@ async fn status_or_hello_with_another_selected_axis_switches_too() {
     .await;
     let evs = collect_until_reidentified(&mut rx, "p").await;
     assert_eq!(evs.len(), 2, "{evs:?}");
-    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(3) && reason == "axis_changed: 3->2"));
-    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(2) && h.selected_axis == 2 && h.boot_id == 5));
+    assert!(
+        matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(3) && reason == "axis_changed: 3->2")
+    );
+    assert!(
+        matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(2) && h.selected_axis == 2 && h.boot_id == 5)
+    );
     assert_eq!(link.axis(), Some(ax(2)));
     assert!(!link.is_finished());
 }
@@ -1373,7 +1408,10 @@ async fn axis_select_to_zero_without_config_fallback_ends_as_unknown_device() {
     assert!(link.is_finished());
     assert!(peer.saw_eof(), "port closed");
     assert_eq!(link.axis(), None);
-    assert_eq!(link.send_admin(HostMsg::Disarm { request_id: 1 }), Err(LinkSendError::Closed));
+    assert_eq!(
+        link.send_admin(HostMsg::Disarm { request_id: 1 }),
+        Err(LinkSendError::Closed)
+    );
     // Exactly one Disconnected, no PortClosed, nothing after UnknownDevice.
     assert!(rx.try_recv().is_err());
 }
@@ -1397,8 +1435,12 @@ async fn axis_select_to_zero_falls_back_to_the_configured_device_id() {
     peer.send_raw(axis_select(5, 0, 1)).await;
     let evs = collect_until_reidentified(&mut rx, "p").await;
     assert_eq!(evs.len(), 2, "{evs:?}");
-    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"));
-    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 0));
+    assert!(
+        matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3")
+    );
+    assert!(
+        matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 0)
+    );
     assert_eq!(link.axis(), Some(ax(3)));
     assert!(!peer.saw_eof());
 }
@@ -1415,8 +1457,14 @@ async fn sim_select_axis_switches_the_link() {
     sleep(Duration::from_millis(30)).await;
     sim.select_axis(3);
     let evs = collect_until_reidentified(&mut rx, "sim:p").await;
-    assert!(matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"), "{evs:?}");
-    assert!(matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3), "{evs:?}");
+    assert!(
+        matches!(&evs[0], LinkEvent::Disconnected { axis, reason } if *axis == ax(1) && reason == "axis_changed: 1->3"),
+        "{evs:?}"
+    );
+    assert!(
+        matches!(&evs[1], LinkEvent::Identified { axis, hello: h, .. } if *axis == ax(3) && h.selected_axis == 3),
+        "{evs:?}"
+    );
     assert_eq!(link.axis(), Some(ax(3)));
     assert_eq!(sim.snapshot().selected_axis, 3);
 }
@@ -1447,7 +1495,10 @@ impl std::io::Write for ModemLog {
 }
 
 fn unsupported<T>() -> tokio_serial::Result<T> {
-    Err(tokio_serial::Error::new(tokio_serial::ErrorKind::Unknown, "not a port"))
+    Err(tokio_serial::Error::new(
+        tokio_serial::ErrorKind::Unknown,
+        "not a port",
+    ))
 }
 
 impl tokio_serial::SerialPort for ModemLog {
@@ -1496,7 +1547,10 @@ impl tokio_serial::SerialPort for ModemLog {
     }
     fn write_data_terminal_ready(&mut self, level: bool) -> tokio_serial::Result<()> {
         if self.fail_dtr {
-            return Err(tokio_serial::Error::new(tokio_serial::ErrorKind::Io(std::io::ErrorKind::Unsupported), "ENOTTY"));
+            return Err(tokio_serial::Error::new(
+                tokio_serial::ErrorKind::Io(std::io::ErrorKind::Unsupported),
+                "ENOTTY",
+            ));
         }
         self.dtr.push(level);
         Ok(())
@@ -1545,7 +1599,10 @@ fn open_asserts_dtr_once_and_never_writes_rts() {
 
 #[test]
 fn dtr_failure_is_reported_not_panicked() {
-    let mut log = ModemLog { fail_dtr: true, ..Default::default() };
+    let mut log = ModemLog {
+        fail_dtr: true,
+        ..Default::default()
+    };
     let err = h3cs::axis_link::assert_cdc_dtr(&mut log).expect_err("driver without the ioctl");
     assert!(err.to_string().contains("ENOTTY"), "{err}");
     assert!(log.rts.is_empty());

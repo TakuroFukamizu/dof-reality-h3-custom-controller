@@ -40,7 +40,10 @@ impl AxisId {
     }
     /// Inverse of [`AxisId::index`]; `None` for any index ≥ 3 (no truncation).
     pub fn from_index(i: usize) -> Option<Self> {
-        u8::try_from(i).ok().and_then(|v| v.checked_add(1)).and_then(Self::new)
+        u8::try_from(i)
+            .ok()
+            .and_then(|v| v.checked_add(1))
+            .and_then(Self::new)
     }
 }
 
@@ -112,7 +115,11 @@ pub struct Pose {
 }
 
 impl Pose {
-    pub const ZERO: Pose = Pose { pitch: 0.0, roll: 0.0, yaw: 0.0 };
+    pub const ZERO: Pose = Pose {
+        pitch: 0.0,
+        roll: 0.0,
+        yaw: 0.0,
+    };
 }
 
 /// Legacy virtual target position on one axis, 0..=1023 with 512 neutral.
@@ -306,7 +313,11 @@ pub enum RigFault {
     /// (`selected_axis` changed; protocol §1.1, DESIGN §10.2).
     AxisChanged { axis: AxisId },
     /// An axis left the state the supervisor commanded (e.g. dropped to DISARMED while ACTIVE).
-    AxisStateMismatch { axis: AxisId, expected: McuState, actual: McuState },
+    AxisStateMismatch {
+        axis: AxisId,
+        expected: McuState,
+        actual: McuState,
+    },
     /// ARMING did not reach HOLDING on all axes in time.
     ArmTimeout,
     /// START was not confirmed on this axis: its ACK did not arrive within

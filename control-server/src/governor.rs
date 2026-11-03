@@ -161,7 +161,8 @@ impl<'de> Deserialize<'de> for GovernorConfig {
         if let Some(v) = raw.no_progress_ms {
             cfg.no_progress_ms = v;
         }
-        cfg.thresholds_explicit = raw.fe_start.is_some() || raw.fe_hard.is_some() || raw.fe_release.is_some();
+        cfg.thresholds_explicit =
+            raw.fe_start.is_some() || raw.fe_hard.is_some() || raw.fe_release.is_some();
         Ok(cfg)
     }
 }
@@ -276,7 +277,12 @@ pub struct GovernorStatus {
 
 impl Default for GovernorStatus {
     fn default() -> Self {
-        Self { scale: 1.0, active: false, axis: None, reason: None }
+        Self {
+            scale: 1.0,
+            active: false,
+            axis: None,
+            reason: None,
+        }
     }
 }
 
@@ -304,7 +310,10 @@ struct AxisMem {
 
 impl Default for AxisMem {
     fn default() -> Self {
-        Self { sat_since: None, fe_hist: VecDeque::with_capacity(16) }
+        Self {
+            sat_since: None,
+            fe_hist: VecDeque::with_capacity(16),
+        }
     }
 }
 
@@ -383,7 +392,11 @@ impl TrackingGovernor {
         }
         let dt = {
             let secs = gap.min(MAX_INTEGRATE_DT).as_secs_f64();
-            if secs.is_finite() && secs > 0.0 { secs } else { 0.0 }
+            if secs.is_finite() && secs > 0.0 {
+                secs
+            } else {
+                0.0
+            }
         };
 
         let mut any_stale = false;
@@ -473,7 +486,11 @@ impl TrackingGovernor {
         if goal > self.scale && !allow_rise {
             goal = self.scale;
         }
-        let rate = if goal < self.scale { self.cfg.down_rate } else { self.cfg.up_rate };
+        let rate = if goal < self.scale {
+            self.cfg.down_rate
+        } else {
+            self.cfg.up_rate
+        };
         let step = rate * dt;
         if (goal - self.scale).abs() <= step {
             self.scale = goal;
@@ -542,8 +559,15 @@ impl TrackingGovernor {
 }
 
 /// 追跡用の制限。速度は `s`、加速度は `s²`。停止には使わない。
-pub fn scale_track_limits(limits: [AxisLimits; AXIS_COUNT], scale: f64) -> [AxisLimits; AXIS_COUNT] {
-    let s = if scale.is_finite() { scale.clamp(0.0, 1.0) } else { 1.0 };
+pub fn scale_track_limits(
+    limits: [AxisLimits; AXIS_COUNT],
+    scale: f64,
+) -> [AxisLimits; AXIS_COUNT] {
+    let s = if scale.is_finite() {
+        scale.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     // s = 0 だと max_acc が 0 になりプランナーがステップを拒否する。
     // ガバナは s_min > 0 しか返さないが、ここでも加速度だけは正に保つ。
     let s_acc = s.max(1e-6);
@@ -662,7 +686,11 @@ mod tests {
     }
 
     /// 20 ms 刻みで `s_min` まで下げる。1 回の長い step は dt 頭打ちで届かない。
-    fn descend_to_floor(g: &mut TrackingGovernor, now: &mut Instant, axes: &[AxisSample; 3]) -> f64 {
+    fn descend_to_floor(
+        g: &mut TrackingGovernor,
+        now: &mut Instant,
+        axes: &[AxisSample; 3],
+    ) -> f64 {
         g.update(*now, axes);
         let mut s = 1.0;
         for _ in 0..40 {
@@ -683,10 +711,7 @@ mod tests {
     fn defaults_match_the_incident_tuning() {
         let d = GovernorConfig::default();
         assert!(d.enabled);
-        assert_eq!(
-            (d.fe_start, d.fe_hard, d.fe_release),
-            (120, 200, 60)
-        );
+        assert_eq!((d.fe_start, d.fe_hard, d.fe_release), (120, 200, 60));
         assert_eq!(d.s_min, 0.25);
         assert_eq!((d.down_rate, d.up_rate), (4.0, 0.5));
         assert_eq!((d.sat_ms, d.release_ms, d.stale_ms), (60, 300, 100));
@@ -703,13 +728,22 @@ mod tests {
     fn validation_rejects_inverted_thresholds_and_bad_rates() {
         let mut c = GovernorConfig::default();
         c.fe_release = 120;
-        assert!(c.validation_errors(400).iter().any(|e| e.contains("fe_release")));
+        assert!(c
+            .validation_errors(400)
+            .iter()
+            .any(|e| e.contains("fe_release")));
         c = GovernorConfig::default();
         c.fe_hard = 100;
-        assert!(c.validation_errors(400).iter().any(|e| e.contains("fe_start")));
+        assert!(c
+            .validation_errors(400)
+            .iter()
+            .any(|e| e.contains("fe_start")));
         c = GovernorConfig::default();
         c.fe_hard = 400;
-        assert!(c.validation_errors(400).iter().any(|e| e.contains("following_error_limit")));
+        assert!(c
+            .validation_errors(400)
+            .iter()
+            .any(|e| e.contains("following_error_limit")));
         c = GovernorConfig::default();
         c.s_min = 0.0;
         assert!(c.validation_errors(400).iter().any(|e| e.contains("s_min")));
@@ -726,12 +760,21 @@ mod tests {
         assert!(c.validation_errors(400).is_empty());
         c = GovernorConfig::default();
         c.no_progress_ms = 0;
-        assert!(c.validation_errors(400).iter().any(|e| e.contains("no_progress_ms")));
+        assert!(c
+            .validation_errors(400)
+            .iter()
+            .any(|e| e.contains("no_progress_ms")));
         // 無効でも no_progress_ms と rate は見る。しきい値の順序は見ない。
         c.enabled = false;
         c.fe_hard = 500;
-        assert!(c.validation_errors(200).iter().any(|e| e.contains("no_progress_ms")));
-        assert!(!c.validation_errors(200).iter().any(|e| e.contains("fe_hard")));
+        assert!(c
+            .validation_errors(200)
+            .iter()
+            .any(|e| e.contains("no_progress_ms")));
+        assert!(!c
+            .validation_errors(200)
+            .iter()
+            .any(|e| e.contains("fe_hard")));
     }
 
     #[test]
@@ -747,7 +790,10 @@ mod tests {
 
         let mut wide = GovernorConfig::default();
         wide.apply_scaled_defaults(400);
-        assert_eq!((wide.fe_release, wide.fe_start, wide.fe_hard), (60, 120, 200));
+        assert_eq!(
+            (wide.fe_release, wide.fe_start, wide.fe_hard),
+            (60, 120, 200)
+        );
         wide.apply_scaled_defaults(800);
         assert_eq!(wide.fe_hard, 200);
 
@@ -764,14 +810,20 @@ mod tests {
         explicit.apply_scaled_defaults(200);
         assert_eq!(explicit.fe_hard, FACTORY_FE_HARD);
         explicit.fe_hard = 500;
-        assert!(explicit.validation_errors(200).iter().any(|e| e.contains("fe_hard")));
+        assert!(explicit
+            .validation_errors(200)
+            .iter()
+            .any(|e| e.contains("fe_hard")));
 
         // Rust 側で工場値を壊しただけ（明示フラグなし）は縮めず、順序で落とす。
         let mut edited = GovernorConfig::default();
         edited.fe_hard = 400;
         edited.apply_scaled_defaults(200);
         assert_eq!(edited.fe_hard, 400);
-        assert!(edited.validation_errors(400).iter().any(|e| e.contains("following_error_limit")));
+        assert!(edited
+            .validation_errors(400)
+            .iter()
+            .any(|e| e.contains("following_error_limit")));
     }
 
     #[test]
@@ -786,7 +838,10 @@ mod tests {
         )
         .unwrap();
         assert!(explicit.thresholds_explicit);
-        assert_eq!((explicit.fe_release, explicit.fe_start, explicit.fe_hard), (60, 120, 200));
+        assert_eq!(
+            (explicit.fe_release, explicit.fe_start, explicit.fe_hard),
+            (60, 120, 200)
+        );
         assert_eq!(explicit.no_progress_ms, 800);
         let mut kept = explicit;
         kept.apply_scaled_defaults(200);
@@ -856,11 +911,7 @@ mod tests {
         let mut g = gov(cfg_fast());
         let mut now = Instant::now();
         // 軸 1 の |FE| 150、軸 2 の |FE| 180（fe_hard 未満なので飽和経路）。軸 2 が律速。
-        let axes = [
-            lagging(150),
-            ax(-180, 400, 1, 0, true),
-            idle(),
-        ];
+        let axes = [lagging(150), ax(-180, 400, 1, 0, true), idle()];
         g.update(now, &axes);
         let want = expected_s(180);
         let mut s = 1.0;
@@ -884,7 +935,10 @@ mod tests {
         g.update(now, &axes);
         let one = step(&mut g, &mut now, 500, &axes);
         let capped = 1.0 - 10.0 * Duration::from_millis(20).as_secs_f64();
-        assert!((one - capped).abs() < 1e-6, "capped step s = {one}, want {capped}");
+        assert!(
+            (one - capped).abs() < 1e-6,
+            "capped step s = {one}, want {capped}"
+        );
         let s = descend_to_floor(&mut g, &mut now, &axes);
         assert_eq!(s, 0.25);
         assert!((expected_s(10_000) - 0.25).abs() < 1e-12);
@@ -905,7 +959,11 @@ mod tests {
         assert!((s - one).abs() < 1e-6, "s = {s}");
         // 観測した 20 ms を 5 回足すと 100 ms ぶん（0.4）下がる。
         let mut s = 1.0;
-        let mut g = gov(GovernorConfig { sat_ms: 0, down_rate: 4.0, ..GovernorConfig::default() });
+        let mut g = gov(GovernorConfig {
+            sat_ms: 0,
+            down_rate: 4.0,
+            ..GovernorConfig::default()
+        });
         let mut now = Instant::now();
         g.update(now, &axes);
         for _ in 0..5 {
@@ -1045,7 +1103,11 @@ mod tests {
         // |FE| は fe_release 以上。飽和は解けている。10 ms 刻みで release_ms を超えても上げない。
         let mid = only(ax(-80, 0, 1, 0, true));
         for _ in 0..30 {
-            assert_eq!(step(&mut g, &mut now, 10, &mid), 0.25, "fe_release hysteresis");
+            assert_eq!(
+                step(&mut g, &mut now, 10, &mid),
+                0.25,
+                "fe_release hysteresis"
+            );
         }
 
         // |FE| は小さいが、まだ飽和。
@@ -1108,7 +1170,10 @@ mod tests {
 
     #[test]
     fn scale_track_limits_uses_s_and_s_squared() {
-        let base = [AxisLimits { max_vel_count_s: 1200.0, max_acc_count_s2: 20_000.0 }; AXIS_COUNT];
+        let base = [AxisLimits {
+            max_vel_count_s: 1200.0,
+            max_acc_count_s2: 20_000.0,
+        }; AXIS_COUNT];
         let out = scale_track_limits(base, 0.5);
         assert_eq!(out[0].max_vel_count_s, 600.0);
         assert_eq!(out[0].max_acc_count_s2, 5_000.0);

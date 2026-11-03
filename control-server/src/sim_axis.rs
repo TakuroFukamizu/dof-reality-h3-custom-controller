@@ -17,6 +17,7 @@
 //! HOLDING / ARMING --DISARM--> DISARMING --disarming_delay--> DISARMED
 //! ACTIVE / STOPPING --DISARM--> STOPPING(disarm) --(velocity 0)--> DISARMING → DISARMED
 //! any --HOST_FAULT / fault check / force_fault--> FAULT --FAULT_RESET(no cause)--> DISARMED
+//! FAULT(LOCAL_ESTOP) --screen release, no other cause--> DISARMED   (same exit as FAULT_RESET; other codes stay)
 //! ```
 //!
 //! # Command gating and ACK reasons (protocol.md §3.3, §4)
@@ -396,6 +397,10 @@ pub struct SimMcu {
     stall: bool,
     drop_rx: bool,
     freeze_tx: bool,
+    /// Screen e-stop latch. While set, FAULT_RESET is FAULT_CAUSE_PRESENT.
+    /// Releasing it leaves FAULT only when the code is LOCAL_ESTOP and
+    /// `fault_cause_present` is clear (firmware `set_local_estop`).
+    estop_latched: bool,
     fault_cause_present: bool,
     /// The next calibration fails at its first move with this reason.
     cal_failure: Option<[u8; CAL_REASON_LEN]>,
@@ -452,6 +457,7 @@ impl SimMcu {
             stall: false,
             drop_rx: false,
             freeze_tx: false,
+            estop_latched: false,
             fault_cause_present: false,
             cal_failure: None,
             cal: None,
@@ -647,6 +653,30 @@ impl SimMcu {
     pub fn set_calibration_failure(&mut self, reason: Option<&str>) {
         self.cal_failure = reason.map(CalResult::reason_bytes);
     }
+    /// Screen e-stop latch (firmware `set_local_estop`). Release leaves FAULT
+    /// by itself only for LOCAL_ESTOP with no other cause: reference kept,
+    /// brake engaged, power off, DISARMED. STATUS goes out; no FAULT_EVENT.
+    pub fn set_local_estop(&mut self, latched: bool) {
+        if latched == self.estop_latched {
+            return;
+        }
+        let now = self.now_us.unwrap_or(0);
+        self.estop_latched = latched;
+        if latched {
+            let code = match (self.state, self.stop_kind) {
+                (McuState::Stopping, StopKind::Fault(pending)) => pending,
+                _ => FaultCode::LocalEstop,
+            };
+            self.latch_fault(code, now);
+            self.emit_status_if_changed();
+        } else if self.state == McuState::Fault
+            && self.fault_code == FaultCode::LocalEstop
+            && !self.fault_cause_present
+        {
+            self.leave_fault_disarmed();
+            self.emit_status_if_changed();
+        }
+    }
     /// Latch `code` now (FAULT_EVENT goes out with the next handle/tick).
     pub fn force_fault(&mut self, code: FaultCode) {
         let code = if code == FaultCode::None {
@@ -823,17 +853,19 @@ impl SimMcu {
                 s.on_set_reference(reference_count)
             }),
             HostMsg::SetLimits(l) => {
-                self.command(msg, l.request_id, msg_type::SET_LIMITS, now, |s, _| s.on_set_limits(&l));
+                self.command(msg, l.request_id, msg_type::SET_LIMITS, now, |s, _| {
+                    s.on_set_limits(&l)
+                });
                 // After the ACK (protocol: ACK first, then one LIMITS).
                 if std::mem::take(&mut self.limits_reply_due) {
                     self.push_limits();
                 }
             }
-            HostMsg::Calibrate { request_id, mode, .. } => {
-                self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
-                    s.on_calibrate(mode, now)
-                })
-            }
+            HostMsg::Calibrate {
+                request_id, mode, ..
+            } => self.command(msg, request_id, msg_type::CALIBRATE, now, |s, now| {
+                s.on_calibrate(mode, now)
+            }),
         }
     }
 
@@ -965,7 +997,8 @@ impl SimMcu {
         self.stop_acc_count_s2 = if l.stop_acc_count_s2 == 0 {
             0
         } else {
-            l.stop_acc_count_s2.min(u16::try_from(fw_absolute::MAX_ACC_COUNT_S2).unwrap_or(u16::MAX))
+            l.stop_acc_count_s2
+                .min(u16::try_from(fw_absolute::MAX_ACC_COUNT_S2).unwrap_or(u16::MAX))
         };
         self.limits_reply_due = true;
         Ok(())
@@ -982,7 +1015,11 @@ impl SimMcu {
             ff_count_s_per_percent: t.ff_count_s_per_percent,
             deadband_count: t.deadband_count,
             deadband_out_count: t.deadband_out_count,
-            stop_acc_count_s2: if self.echo_stop_acc { self.stop_acc_count_s2 } else { 0 },
+            stop_acc_count_s2: if self.echo_stop_acc {
+                self.stop_acc_count_s2
+            } else {
+                0
+            },
             abs_max_vel_count_s: fw_absolute::MAX_VEL_COUNT_S,
             abs_max_acc_count_s2: fw_absolute::MAX_ACC_COUNT_S2,
         }));
@@ -1100,9 +1137,16 @@ impl SimMcu {
         if self.state != McuState::Fault {
             return Err(AckReason::BadState);
         }
-        if self.fault_cause_present {
+        if self.fault_cause_present || self.estop_latched {
             return Err(AckReason::FaultCausePresent);
         }
+        self.leave_fault_disarmed();
+        Ok(())
+    }
+
+    /// FAULT → DISARMED. ENCODER_FAULT drops the reference. Brake stays
+    /// applied (latched off); DISARMED is not a powered state.
+    fn leave_fault_disarmed(&mut self) {
         if self.fault_code == FaultCode::EncoderFault {
             self.referenced = false;
         }
@@ -1110,7 +1154,6 @@ impl SimMcu {
         self.fault_code = FaultCode::None;
         self.stop_kind = StopKind::Hold;
         self.hold_here();
-        Ok(())
     }
 
     /// HOST_FAULT: latch FAULT immediately in any state and ACK ACCEPTED. No
@@ -1346,7 +1389,10 @@ impl SimMcu {
         // max_acc — never the last frame. A fault stop keeps the frame value
         // (0 falls back to CONFIG). Converting an in-progress stop to Fault
         // does not call this, so the entry rate stays.
-        let config_acc = self.config.map(|c| c.max_acc_count_s2 as f64).unwrap_or(0.0);
+        let config_acc = self
+            .config
+            .map(|c| c.max_acc_count_s2 as f64)
+            .unwrap_or(0.0);
         self.stopping_amax = match kind {
             StopKind::Fault(_) => {
                 if self.frame_max_acc > 0.0 {
@@ -1693,7 +1739,12 @@ impl SimMcu {
     }
 
     fn status_key(&self) -> (McuState, FaultCode, u16, u8) {
-        (self.state, self.fault_code(), self.flags(), self.selected_axis)
+        (
+            self.state,
+            self.fault_code(),
+            self.flags(),
+            self.selected_axis,
+        )
     }
 
     /// Immediate STATUS when state, fault code, flags or selected_axis changed.
@@ -1723,7 +1774,11 @@ impl SimMcu {
 
 /// `reason` bytes as text (up to the first NUL).
 fn reason_text(r: &[u8; CAL_REASON_LEN]) -> String {
-    CalResult { reason: *r, ..CalResult::EMPTY }.reason_str()
+    CalResult {
+        reason: *r,
+        ..CalResult::EMPTY
+    }
+    .reason_str()
 }
 
 /// Encoder count from an f64 position (saturating, NaN → 0).
@@ -1873,6 +1928,10 @@ impl SimHandle {
     pub fn force_fault(&self, code: FaultCode) {
         self.shared.lock().force_fault(code);
     }
+    /// Screen e-stop latch. See [`SimMcu::set_local_estop`].
+    pub fn set_local_estop(&self, latched: bool) {
+        self.shared.lock().set_local_estop(latched);
+    }
     pub fn set_drop_rx(&self, drop: bool) {
         self.shared.lock().set_drop_rx(drop);
     }
@@ -1931,7 +1990,11 @@ impl SimHandle {
     /// dropping it stops nothing. For code that only watches the simulator
     /// while another owner (the server's sim port task) runs it.
     pub fn view(&self) -> SimHandle {
-        SimHandle { shared: self.shared.clone(), shutdown: None, task: None }
+        SimHandle {
+            shared: self.shared.clone(),
+            shutdown: None,
+            task: None,
+        }
     }
     /// (Re)attach the model to a fresh byte stream and return the host end:
     /// the previous runner, if any, is stopped and a new one started on the
@@ -1948,7 +2011,12 @@ impl SimHandle {
         let (host, mcu) = tokio::io::duplex(DUPLEX_BUF);
         let (stop_tx, stop_rx) = oneshot::channel();
         let latency = Duration::from_millis(self.shared.lock().params().link_latency_ms);
-        self.task = Some(tokio::spawn(run_sim_axis(mcu, self.shared.clone(), latency, stop_rx)));
+        self.task = Some(tokio::spawn(run_sim_axis(
+            mcu,
+            self.shared.clone(),
+            latency,
+            stop_rx,
+        )));
         self.shutdown = Some(stop_tx);
         host
     }
@@ -1971,7 +2039,11 @@ pub fn sim_detached(params: SimParams) -> SimHandle {
         tx_dropped: AtomicU64::new(0),
         origin: Instant::now(),
     });
-    SimHandle { shared, shutdown: None, task: None }
+    SimHandle {
+        shared,
+        shutdown: None,
+        task: None,
+    }
 }
 
 /// Run a [`SimMcu`] on one side of a duplex stream: COBS frames in, model
@@ -1980,7 +2052,12 @@ pub fn spawn_sim_axis(io: DuplexStream, params: SimParams) -> SimHandle {
     let mut h = sim_detached(params);
     let latency = Duration::from_millis(h.shared.lock().params().link_latency_ms);
     let (stop_tx, stop_rx) = oneshot::channel();
-    h.task = Some(tokio::spawn(run_sim_axis(io, h.shared.clone(), latency, stop_rx)));
+    h.task = Some(tokio::spawn(run_sim_axis(
+        io,
+        h.shared.clone(),
+        latency,
+        stop_rx,
+    )));
     h.shutdown = Some(stop_tx);
     h
 }

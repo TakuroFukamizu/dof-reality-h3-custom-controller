@@ -184,7 +184,11 @@ const ALL_REASONS: [AckReason; 8] = [
     AckReason::FaultCausePresent,
 ];
 
-const ALL_CAL_RESULTS: [CalResultCode; 3] = [CalResultCode::Ok, CalResultCode::Failed, CalResultCode::Cancelled];
+const ALL_CAL_RESULTS: [CalResultCode; 3] = [
+    CalResultCode::Ok,
+    CalResultCode::Failed,
+    CalResultCode::Cancelled,
+];
 
 fn rand_mcu(r: &mut Rng) -> McuMsg {
     match r.below(7) {
@@ -918,7 +922,11 @@ fn reserved_fields_written_zero_and_ignored_on_decode() {
     });
     // STATUS offset 13 is `selected_axis` since protocol §1.1 (no longer reserved).
     let mcu_cases: [(McuMsg, &[usize]); 3] = [(hello, &[7, 23]), (fe, &[15]), (sel, &[7])];
-    assert_eq!(st.encode_payload()[13], 2, "STATUS byte 13 carries selected_axis");
+    assert_eq!(
+        st.encode_payload()[13],
+        2,
+        "STATUS byte 13 carries selected_axis"
+    );
     for (m, reserved) in mcu_cases {
         let mut p = m.encode_payload();
         for &i in reserved {
@@ -945,7 +953,11 @@ fn axis_select_layout_and_length() {
     // Wrong length is rejected, never panics.
     assert!(matches!(
         McuMsg::decode_payload(msg_type::AXIS_SELECT, &[0u8; 7]),
-        Err(DecodeError::BadPayloadLen { msg_type: 0x86, expected: 8, got: 7 })
+        Err(DecodeError::BadPayloadLen {
+            msg_type: 0x86,
+            expected: 8,
+            got: 7
+        })
     ));
     assert!(McuMsg::decode_payload(msg_type::AXIS_SELECT, &[]).is_err());
 }
@@ -954,20 +966,44 @@ fn axis_select_layout_and_length() {
 fn calibrate_layout_and_length() {
     // protocol §4: 0x0C, 8 bytes: u32 request_id / u8 mode / u8 reserved / u16 reserved.
     assert_eq!(host_payload_len(msg_type::CALIBRATE), Some(8));
-    let m = HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::START, flags: 0 };
+    let m = HostMsg::Calibrate {
+        request_id: 7,
+        mode: calibrate_mode::START,
+        flags: 0,
+    };
     assert_eq!(m.msg_type(), 0x0C);
     assert_eq!(m.encode_payload(), [7, 0, 0, 0, 1, 0, 0, 0]);
     host_rt(m);
-    host_rt(HostMsg::Calibrate { request_id: 7, mode: calibrate_mode::CANCEL, flags: 0 });
+    host_rt(HostMsg::Calibrate {
+        request_id: 7,
+        mode: calibrate_mode::CANCEL,
+        flags: 0,
+    });
     // flags (KEEP_POWER) is byte 5; the two reserved bytes are ignored on decode; wrong length is rejected.
-    assert_eq!(HostMsg::Calibrate { request_id: 7, mode: 1, flags: 1 }.encode_payload(), [7, 0, 0, 0, 1, 1, 0, 0]);
+    assert_eq!(
+        HostMsg::Calibrate {
+            request_id: 7,
+            mode: 1,
+            flags: 1
+        }
+        .encode_payload(),
+        [7, 0, 0, 0, 1, 1, 0, 0]
+    );
     assert_eq!(
         HostMsg::decode_payload(msg_type::CALIBRATE, &[7, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC]),
-        Ok(HostMsg::Calibrate { request_id: 7, mode: 0, flags: 0xAA })
+        Ok(HostMsg::Calibrate {
+            request_id: 7,
+            mode: 0,
+            flags: 0xAA
+        })
     );
     assert!(matches!(
         HostMsg::decode_payload(msg_type::CALIBRATE, &[0u8; 4]),
-        Err(DecodeError::BadPayloadLen { msg_type: 0x0C, expected: 8, got: 4 })
+        Err(DecodeError::BadPayloadLen {
+            msg_type: 0x0C,
+            expected: 8,
+            got: 4
+        })
     ));
 }
 
@@ -994,11 +1030,20 @@ fn cal_result_layout_reason_padding_and_unknown_result() {
     assert_eq!(&p[16..20], &[0xFF, 0, 0, 0]);
     assert_eq!(&p[20..], b"stall\0\0\0");
     mcu_rt(m);
-    let McuMsg::CalResult(c) = m else { unreachable!() };
+    let McuMsg::CalResult(c) = m else {
+        unreachable!()
+    };
     assert_eq!(c.reason_str(), "stall");
     // reason_bytes truncates to 8 and never pads with anything but NUL.
     assert_eq!(&CalResult::reason_bytes("timeout_long"), b"timeout_");
-    assert_eq!(CalResult { reason: [b'o', b'k', 0, 0, 0, 0, 0, 0], ..CalResult::EMPTY }.reason_str(), "ok");
+    assert_eq!(
+        CalResult {
+            reason: [b'o', b'k', 0, 0, 0, 0, 0, 0],
+            ..CalResult::EMPTY
+        }
+        .reason_str(),
+        "ok"
+    );
     // An unknown result code is a decode error (the frame is discarded).
     let mut bad = p.clone();
     bad[4] = 3;
@@ -1013,21 +1058,33 @@ fn cal_result_layout_reason_padding_and_unknown_result() {
     assert_eq!(McuMsg::decode_payload(msg_type::CAL_RESULT, &res), Ok(m));
     assert!(matches!(
         McuMsg::decode_payload(msg_type::CAL_RESULT, &[0u8; 27]),
-        Err(DecodeError::BadPayloadLen { msg_type: 0x87, expected: 28, got: 27 })
+        Err(DecodeError::BadPayloadLen {
+            msg_type: 0x87,
+            expected: 28,
+            got: 27
+        })
     ));
 }
 
 #[test]
 fn status_selected_axis_is_byte_13_and_old_frames_decode_as_zero() {
-    let McuMsg::Status(s) = sample_status() else { unreachable!() };
-    let m = McuMsg::Status(Status { selected_axis: 3, ..s });
+    let McuMsg::Status(s) = sample_status() else {
+        unreachable!()
+    };
+    let m = McuMsg::Status(Status {
+        selected_axis: 3,
+        ..s
+    });
     let mut p = m.encode_payload();
     assert_eq!(p[13], 3);
     // A frame from firmware that still writes reserved = 0 decodes with selected_axis 0.
     p[13] = 0;
     assert_eq!(
         McuMsg::decode_payload(msg_type::STATUS, &p),
-        Ok(McuMsg::Status(Status { selected_axis: 0, ..s }))
+        Ok(McuMsg::Status(Status {
+            selected_axis: 0,
+            ..s
+        }))
     );
 }
 
