@@ -250,6 +250,11 @@ pub struct LimitsConfig {
     /// Must be ≥ 1.5 × `max_vel_count_s`; also caps runtime velocity
     /// requests at `overspeed / 1.5`.
     pub overspeed_count_s: u32,
+    /// Old firmware ACKs SET_LIMITS but reports `stop_acc` 0 (LIMITS offset
+    /// 14 was reserved) and still stops at CONFIG `max_acc`. When false, ARM
+    /// stays blocked until every axis echoes the requested non-zero
+    /// `stop_acc`. When true, a 0 echo is accepted.
+    pub allow_legacy_stop_acc: bool,
 }
 
 impl Default for LimitsConfig {
@@ -266,6 +271,7 @@ impl Default for LimitsConfig {
             deadband_out_count: 20,
             following_error_limit_count: 800,
             overspeed_count_s: 9000,
+            allow_legacy_stop_acc: false,
         }
     }
 }

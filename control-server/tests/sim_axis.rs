@@ -2246,6 +2246,7 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     assert_eq!((l[0].duty_max_percent, l[0].duty_min_percent, l[0].kp_percent_per_100), (60, 60, 2));
     assert_eq!((l[0].ff_count_s_per_percent, l[0].deadband_count, l[0].deadband_out_count), (100, 10, 20));
     assert_eq!((l[0].abs_duty_max_percent, l[0].abs_max_vel_count_s, l[0].abs_max_acc_count_s2), (60, 6000, 40000));
+    assert_eq!(l[0].stop_acc_count_s2, 0, "unset stop_acc is echoed as 0");
     assert_eq!(l[0].boot_id, h.sim.status().boot_id);
     assert_eq!(h.sim.tuning().duty_max_percent, 60);
     // ACTIVE: still accepted.
@@ -2259,6 +2260,14 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     let out = h.send(set_limits(12, 40, 3));
     assert_eq!(acks(&out)[0].result, AckResult::Duplicate);
     assert!(limits_of(&out).is_empty());
+    // 65535 is stored and echoed as the absolute ceiling, not the request.
+    let mut msg = set_limits(13, 40, 3);
+    let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+    limits.stop_acc_count_s2 = 65535;
+    let out = h.send(msg);
+    accepted(acks(&out)[0]);
+    assert_eq!(limits_of(&out)[0].stop_acc_count_s2, 40000);
+    assert_eq!(h.sim.stop_acc_count_s2(), 40000);
 }
 
 #[test]
@@ -2376,7 +2385,10 @@ fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
         let mut msg = set_limits(1, 40, 3);
         let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
         limits.stop_acc_count_s2 = stop_acc;
-        assert_eq!(h.send(msg)[0].msg_type(), msg_type::ACK);
+        let out = h.send(msg);
+        assert_eq!(out[0].msg_type(), msg_type::ACK);
+        let expect = if stop_acc == 0 { 0 } else { stop_acc.min(40_000) };
+        assert_eq!(limits_of(&out).last().map(|l| l.stop_acc_count_s2), Some(expect));
         assert_eq!(h.arm().result, AckResult::Accepted);
         let here = h.sim.actual_count();
         h.drive(60, here);
@@ -2418,7 +2430,9 @@ fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
     let mut msg = set_limits(2, 40, 3);
     let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
     limits.stop_acc_count_s2 = 6000;
-    assert_eq!(h.cmd(msg).result, AckResult::Accepted);
+    let out = h.send(msg);
+    assert_eq!(acks(&out)[0].result, AckResult::Accepted);
+    assert_eq!(limits_of(&out)[0].stop_acc_count_s2, 6000);
     assert_eq!(h.sim.stop_acc_count_s2(), 6000);
     let v0 = h.sim.setpoint_vel();
     h.now += 10 * MS;

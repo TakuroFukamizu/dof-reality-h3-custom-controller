@@ -377,6 +377,20 @@ impl Rig {
         }
     }
 
+    /// Deliver only sim `i`'s captured SET_LIMITS. The others stay held.
+    fn release_held_axis(&mut self, i: usize) {
+        let us = self.us();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.held).into_iter().partition(|(j, _)| *j == i);
+        self.held = rest;
+        for (j, m) in mine {
+            if self.linked[j] {
+                let r = self.mcus[j].handle(&m, us);
+                self.feed(j, r);
+            }
+        }
+    }
+
     fn run_until(&mut self, max_ms: u64, pred: impl Fn(&Rig) -> bool) -> bool {
         for _ in 0..max_ms / 10 {
             if pred(self) {
@@ -3093,8 +3107,9 @@ fn limits_are_distributed_once_and_follow_runtime_changes() {
     r.run_ms(500);
     assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
     // Velocity does not touch the firmware tuning, so it sends nothing.
-    // Gain is the same. Acceleration is stop_acc and does send SET_LIMITS,
-    // but the planner does not wait on that ACK.
+    // Gain is the same. An acceleration-only lower is at or below the echoed
+    // stop rate, so the planner may use it at once. SET_LIMITS still goes
+    // out, and pending stays until every LIMITS echoes that stop_acc.
     r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 2000, ..r.sup.effective_limits() });
     r.run_ms(200);
     assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
@@ -3114,6 +3129,9 @@ fn limits_are_distributed_once_and_follow_runtime_changes() {
     let snap = r.sup.snapshot(r.now);
     assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
     assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 8000);
+    for a in &snap.axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 8000);
+    }
     for m in r.mcus.iter() {
         assert_eq!(m.stop_acc_count_s2(), 8000);
     }
@@ -3350,6 +3368,7 @@ fn arm_is_blocked_until_set_limits_is_acked() {
         }
     }
     assert!(!has(&sup.blockers(now), "limits_unconfirmed"), "{:?}", sup.blockers(now));
+    assert!(!has(&sup.blockers(now), "stop_acc_unconfirmed"), "{:?}", sup.blockers(now));
     // An unanswered SET_LIMITS is re-sent after the ACK timeout; the blocker stays meanwhile.
     let later = now + ACK_TIMEOUT + LIMITS_RETRY + Duration::from_millis(50);
     sup.set_requested_limits(MotionLimits { duty_max_percent: 30, ..sup.effective_limits() });
@@ -3399,7 +3418,197 @@ fn set_limits_acked_but_limits_report_lost_is_resent_with_a_new_request_id() {
         }
     }
     assert!(!has(&sup.blockers(t2), "limits_unconfirmed"), "{:?}", sup.blockers(t2));
+    assert!(!has(&sup.blockers(t2), "stop_acc_unconfirmed"), "{:?}", sup.blockers(t2));
     assert!(sup.snapshot(t2).axes[0].fw_limits.is_some());
+}
+
+/// A lost SET_LIMITS must not let the planner assume a stop the MCU has not
+/// confirmed. A lower rate applies at once (the MCU is still at least that
+/// hard). A raise applies only after every axis echoes it.
+#[test]
+fn lost_set_limits_keeps_the_old_stop_acc_and_a_raise_waits_for_every_echo() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    assert!(!has(&r.blockers(), "stop_acc_unconfirmed"), "{:?}", r.blockers());
+    assert_eq!(r.sup.effective_limits().max_acc_count_s2, 15000);
+    for a in &r.sup.snapshot(r.now).axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 15000);
+    }
+
+    r.hold_set_limits = [true; 3];
+    let mark_sp = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 6000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    assert!(r.setpos.len() > mark_sp);
+    for (_, _, sp) in &r.setpos[mark_sp..] {
+        for k in 0..3 {
+            assert_eq!(sp[k].max_acc_count_s2, 6000);
+        }
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 15000, "the SET_LIMITS never arrived");
+    }
+    for a in &snap.axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 15000);
+    }
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 6000);
+    }
+
+    r.hold_set_limits = [true; 3];
+    let mark_sp = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 20000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000, "a raise waits");
+    for (_, _, sp) in &r.setpos[mark_sp..] {
+        assert_eq!(sp[0].max_acc_count_s2, 6000);
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 6000);
+    }
+
+    r.release_held_axis(0);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "one axis is not enough");
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    assert_eq!(r.mcus[0].stop_acc_count_s2(), 20000);
+    assert_eq!(r.mcus[1].stop_acc_count_s2(), 6000);
+    assert_eq!(r.mcus[2].stop_acc_count_s2(), 6000);
+    assert_eq!(snap.axes[0].fw_limits.unwrap().stop_acc_count_s2, 20000);
+    assert_eq!(snap.axes[1].fw_limits.unwrap().stop_acc_count_s2, 6000);
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!(sp[0].max_acc_count_s2, 20000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 20000);
+    }
+}
+
+/// Old firmware ACKs SET_LIMITS and sends LIMITS with stop_acc 0. That is not
+/// `limits_unconfirmed` (the report arrived) and it blocks ARM.
+#[test]
+fn old_firmware_without_a_stop_acc_echo_blocks_arm() {
+    let mut r = Rig::new(sim_cfg());
+    for m in r.mcus.iter_mut() {
+        m.set_echo_stop_acc(false);
+    }
+    r.connect_all();
+    r.run_ms(200);
+    let b = r.blockers();
+    for n in 1..=3 {
+        assert!(has(&b, &format!("stop_acc_unconfirmed: axis{n}")), "{b:?}");
+        assert!(!has(&b, &format!("limits_unconfirmed: axis{n}")), "{b:?}");
+    }
+    assert_ne!(r.sup.state(), RigState::ReadyToArm);
+    let err = r.admin(AdminCmd::Arm).unwrap_err();
+    assert_eq!(err.error, admin_error::NOT_READY);
+    assert!(has(&err.blockers, "stop_acc_unconfirmed: axis1"), "{:?}", err.blockers);
+    assert_eq!(r.count(0, msg_type::SET_LIMITS), [1, 1, 1], "retry waits LIMITS_RETRY");
+}
+
+/// ACK plus a LIMITS whose stop_acc is 0, or some other value, is
+/// `stop_acc_unconfirmed` and not the "not received yet" blocker.
+#[test]
+fn stop_acc_echo_zero_or_mismatch_is_its_own_blocker() {
+    fn blockers_for(mutate: impl Fn(&mut h3cs::protocol::Limits)) -> Vec<String> {
+        let cfg = sim_cfg();
+        let mut sup = Supervisor::new(&cfg);
+        let mut mcu = SimMcu::new(SimParams { device_id: cfg.axes[0].device_id, ..SimParams::default() });
+        let now = Instant::now();
+        let Some(McuMsg::Hello(hello)) = mcu.handle(&HostMsg::HelloReq { request_id: 1 }, 1).into_iter().next() else {
+            panic!("no hello");
+        };
+        sup.on_link_event(LinkEvent::Identified { axis: ax(1), hello, port: "sim:1".into() }, now);
+        sup.on_link_event(LinkEvent::Status { axis: ax(1), status: mcu.status(), received_at: now }, now);
+        let out = sup.tick(now, 0.01, None);
+        let [HostMsg::Config(c), HostMsg::SetLimits(l)] = out.admin_msgs[0].as_slice() else {
+            panic!("{:?}", out.admin_msgs);
+        };
+        let ack = Ack {
+            request_id: c.request_id,
+            acked_type: msg_type::CONFIG,
+            result: AckResult::Accepted,
+            reason: AckReason::None,
+        };
+        sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now);
+        let configured = mcu.handle(&HostMsg::Config(*c), 2);
+        let status = configured
+            .iter()
+            .find_map(|m| match m { McuMsg::Status(s) => Some(*s), _ => None })
+            .unwrap_or(mcu.status());
+        sup.on_link_event(LinkEvent::Status { axis: ax(1), status, received_at: now }, now);
+        for m in mcu.handle(&HostMsg::SetLimits(*l), 3) {
+            match m {
+                McuMsg::Ack(ack) => sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now),
+                McuMsg::Limits(mut limits) => {
+                    mutate(&mut limits);
+                    sup.on_link_event(LinkEvent::Limits { axis: ax(1), limits }, now);
+                }
+                _ => {}
+            }
+        }
+        sup.blockers(now)
+    }
+
+    let cases: [fn(&mut h3cs::protocol::Limits); 2] = [
+        |l| l.stop_acc_count_s2 = 0,
+        |l| l.stop_acc_count_s2 = 1,
+    ];
+    for mutate in cases {
+        let b = blockers_for(mutate);
+        assert!(has(&b, "stop_acc_unconfirmed: axis1"), "{b:?}");
+        assert!(!has(&b, "limits_unconfirmed: axis1"), "{b:?}");
+    }
+}
+
+/// `[limits] allow_legacy_stop_acc` accepts a 0 echo. A raise still waits
+/// until every axis has ACKed the new rate (the 0 echo then counts).
+#[test]
+fn legacy_stop_acc_echo_allows_arm_and_a_raise_only_after_every_ack() {
+    let mut cfg = sim_cfg();
+    cfg.limits.allow_legacy_stop_acc = true;
+    let mut r = Rig::new(cfg);
+    for m in r.mcus.iter_mut() {
+        m.set_echo_stop_acc(false);
+    }
+    r.ready();
+    assert!(!has(&r.blockers(), "stop_acc_unconfirmed"), "{:?}", r.blockers());
+    assert!(!has(&r.blockers(), "limits_unconfirmed"), "{:?}", r.blockers());
+    for a in &r.sup.snapshot(r.now).axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 0);
+    }
+    r.admin(AdminCmd::Arm).unwrap();
+
+    r.hold_set_limits = [true; 3];
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 20000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 15000);
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
 }
 
 // ------------------------------------------------------------------ Issue #15 H2 / M3 / M4

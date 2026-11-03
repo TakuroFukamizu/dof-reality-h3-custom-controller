@@ -196,6 +196,7 @@ inline bool eq_limits(const v1::McuMsg& a, const v1::McuMsg& b) {
          x.duty_min_percent == y.duty_min_percent && x.kp_percent_per_100 == y.kp_percent_per_100 &&
          x.abs_duty_max_percent == y.abs_duty_max_percent && x.ff_count_s_per_percent == y.ff_count_s_per_percent &&
          x.deadband_count == y.deadband_count && x.deadband_out_count == y.deadband_out_count &&
+         x.stop_acc_count_s2 == y.stop_acc_count_s2 &&
          x.abs_max_vel_count_s == y.abs_max_vel_count_s && x.abs_max_acc_count_s2 == y.abs_max_acc_count_s2;
 }
 
@@ -440,39 +441,40 @@ inline void test_vectors_mcu() {
     CHECK(v1::decode_host_payload(v1::msg::CALIBRATE, p, 8, &h) && h.calibrate.mode == 0);
   }
   {  // 7.22 LIMITS（boot_id 0x89ABCDEF、duty_max 40、duty_min 3、kp 2、abs_duty_max 60、ff 100、deadband 10、
-     // deadband_out 20、abs_max_vel 6000、abs_max_acc 40000。motion-limits 設計 §4.5）。CRC は Python でも確認した値
+     // deadband_out 20、stop_acc 20000、abs_max_vel 6000、abs_max_acc 40000）。CRC は Python でも確認した値
     v1::McuMsg m{};
     m.type = v1::msg::LIMITS;
-    m.limits = {2309737967u, 40, 3, 2, 60, 100, 10, 20, 6000, 40000};
+    m.limits = {2309737967u, 40, 3, 2, 60, 100, 10, 20, 20000, 6000, 40000};
     check_mcu_vector(
-        "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 00 00 70 17 00 00 40 9C 00 00 BF DB",
-        "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 01 01 03 70 17 01 03 40 9C 01 03 BF DB 00", m,
+        "01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 20 4E 70 17 00 00 40 9C 00 00 1C CE",
+        "04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 05 20 4E 70 17 01 03 40 9C 01 03 1C CE 00", m,
         eq_limits);
     CHECK(v1::mcu_payload_len(v1::msg::LIMITS) == 24);
-    // 設計 §4.3 のオフセット: 4 duty_max / 5 duty_min / 6 kp / 7 abs_duty_max / 8 ff / 10 deadband / 12 deadband_out /
-    // 14 予約 / 16 abs_max_vel / 20 abs_max_acc
+    // オフセット: 4 duty_max / 5 duty_min / 6 kp / 7 abs_duty_max / 8 ff / 10 deadband / 12 deadband_out /
+    // 14 stop_acc / 16 abs_max_vel / 20 abs_max_acc
     uint8_t f[v1::MAX_FRAME_LEN];
     CHECK(v1::encode_mcu_frame(m, f, sizeof(f)) == 4 + 24 + 2);
     const uint8_t* p = f + 4;
     CHECK(p[0] == 0xEF && p[1] == 0xCD && p[2] == 0xAB && p[3] == 0x89);
     CHECK(p[4] == 40 && p[5] == 3 && p[6] == 2 && p[7] == 60);
     CHECK(p[8] == 100 && p[9] == 0 && p[10] == 10 && p[11] == 0 && p[12] == 20 && p[13] == 0);
-    CHECK(p[14] == 0 && p[15] == 0);
+    CHECK(p[14] == 0x20 && p[15] == 0x4E);  // stop_acc 20000
     CHECK(p[16] == 0x70 && p[17] == 0x17 && p[18] == 0 && p[19] == 0);   // 6000
     CHECK(p[20] == 0x40 && p[21] == 0x9C && p[22] == 0 && p[23] == 0);   // 40000
-    // 予約が 0 でなくても復号は値を変えない
+    // offset 14 は stop_acc として往復する（0x55AA）
     uint8_t q[24];
     std::memcpy(q, p, 24);
     q[14] = 0xAA;
     q[15] = 0x55;
     v1::McuMsg d{};
-    CHECK(v1::decode_mcu_payload(v1::msg::LIMITS, q, 24, &d) && eq_limits(d, m));
+    CHECK(v1::decode_mcu_payload(v1::msg::LIMITS, q, 24, &d) && d.limits.stop_acc_count_s2 == 0x55AA);
+    CHECK(!eq_limits(d, m));
     // 長さ違いは捨てる
     CHECK(!v1::decode_mcu_payload(v1::msg::LIMITS, q, 23, &d));
     uint8_t q25[25] = {0};
     CHECK(!v1::decode_mcu_payload(v1::msg::LIMITS, q25, 25, &d));
     // 大きな値も往復する
-    m.limits = {0xFFFFFFFFu, 255, 255, 255, 255, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFFFFFFu, 0x12345678u};
+    m.limits = {0xFFFFFFFFu, 255, 255, 255, 255, 0xFFFF, 0xFFFF, 0xFFFF, 0xBEEF, 0xFFFFFFFFu, 0x12345678u};
     uint8_t w[v1::MAX_WIRE_LEN];
     const size_t n = v1::encode_mcu_wire(m, w, sizeof(w));
     CHECK(n > 0);

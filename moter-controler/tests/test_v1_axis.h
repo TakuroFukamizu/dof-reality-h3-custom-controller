@@ -1119,6 +1119,13 @@ inline double stopping_dv_with_stop_acc(uint32_t config_acc, uint16_t stop_acc, 
     v1::HostMsg lim = h.set_limits_msg(h.next_rid());
     lim.set_limits.stop_acc_count_s2 = stop_acc;
     Harness::accepted(h.cmd(lim));
+    const auto ls = h.limits();
+    CHECK(!ls.empty());
+    // 65535 は絶対上限 40000 をエコーする。要求そのものは返さない。
+    const uint16_t echoed = stop_acc > V1_ABS_MAX_ACC_COUNT_S2
+                                ? static_cast<uint16_t>(V1_ABS_MAX_ACC_COUNT_S2)
+                                : stop_acc;
+    CHECK(ls.back().stop_acc_count_s2 == echoed);
   }
   h.reach_holding_from_configured();
   h.set_position(h.ax.actual_count());
@@ -1165,6 +1172,7 @@ inline void test_runtime_stop_acc_applies_on_the_next_stop() {
   v1::HostMsg lim = h.set_limits_msg(h.next_rid());
   lim.set_limits.stop_acc_count_s2 = 20000;
   Harness::accepted(h.cmd(lim));
+  CHECK(h.limits().back().stop_acc_count_s2 == 20000);
   h.reach_holding_from_configured();
   h.set_position(h.ax.actual_count());
   Harness::accepted(h.start());
@@ -1184,6 +1192,7 @@ inline void test_runtime_stop_acc_applies_on_the_next_stop() {
   lim = h.set_limits_msg(h.next_rid());
   lim.set_limits.stop_acc_count_s2 = 6000;
   Harness::accepted(h.cmd(lim));
+  CHECK(h.limits().back().stop_acc_count_s2 == 6000);
   const double v1 = h.ax.setpoint_vel();
   h.step(10);
   const double during = v1 - h.ax.setpoint_vel();
@@ -1197,6 +1206,7 @@ inline void test_runtime_stop_acc_applies_on_the_next_stop() {
   bad.set_limits.ff_count_s_per_percent = 0;
   bad.set_limits.stop_acc_count_s2 = 20000;
   Harness::rejected(h.cmd(bad), rs::INVALID_PARAM);
+  CHECK(h.limits().back().stop_acc_count_s2 == 6000);
   h.set_position(h.ax.actual_count());
   Harness::accepted(h.start());
   for (int i = 0; i < 80; ++i) {
@@ -1225,6 +1235,7 @@ inline void test_fault_stop_ignores_operator_stop_acc() {
   v1::HostMsg lim = h.set_limits_msg(h.next_rid());
   lim.set_limits.stop_acc_count_s2 = 20000;
   Harness::accepted(h.cmd(lim));
+  CHECK(h.limits().back().stop_acc_count_s2 == 20000);
   h.reach_holding_from_configured();
   h.set_position(h.ax.actual_count());
   Harness::accepted(h.start());
@@ -1273,7 +1284,8 @@ inline bool limits_match(const v1::Limits& l, uint8_t duty_max, uint8_t duty_min
                          uint16_t deadband, uint16_t deadband_out) {
   return l.boot_id == 2309737967u && l.duty_max_percent == duty_max && l.duty_min_percent == duty_min &&
          l.kp_percent_per_100 == kp && l.ff_count_s_per_percent == ff && l.deadband_count == deadband &&
-         l.deadband_out_count == deadband_out && l.abs_duty_max_percent == V1_ABS_DUTY_MAX &&
+         l.deadband_out_count == deadband_out && l.stop_acc_count_s2 == 0 &&
+         l.abs_duty_max_percent == V1_ABS_DUTY_MAX &&
          l.abs_max_vel_count_s == V1_ABS_MAX_VEL_COUNT_S && l.abs_max_acc_count_s2 == V1_ABS_MAX_ACC_COUNT_S2 &&
          l.abs_duty_max_percent == 60 && l.abs_max_vel_count_s == 6000 && l.abs_max_acc_count_s2 == 40000;
 }

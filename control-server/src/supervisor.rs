@@ -630,10 +630,35 @@ impl AxisTrack {
     fn supports_limits(&self) -> bool {
         self.hello.is_some_and(|h| h.capabilities & capabilities::LIMITS != 0)
     }
-    /// `want` is in force on the MCU: SET_LIMITS ACKed *and* its LIMITS
-    /// report received (an ACK whose LIMITS was lost is not confirmation).
-    fn limits_confirmed(&self, want: FwTuning) -> bool {
-        self.limits_acked == Some(want) && self.fw_limits.is_some()
+    /// `want` is in force on the MCU: SET_LIMITS ACKed *and* LIMITS echoed
+    /// that non-zero `stop_acc`. An ACK whose LIMITS was lost is not
+    /// confirmation. A zero echo is old firmware that ignored offset 14; it
+    /// counts only when `allow_legacy` is set (the MCU then stops at CONFIG
+    /// `max_acc`, the absolute ceiling).
+    fn limits_confirmed(&self, want: FwTuning, allow_legacy: bool) -> bool {
+        self.limits_acked == Some(want) && self.stop_acc_echo_ok(want.stop_acc_count_s2, allow_legacy)
+    }
+    /// LIMITS `stop_acc` equals the requested non-zero rate. Zero matches
+    /// only in legacy mode.
+    fn stop_acc_echo_ok(&self, want_stop: u16, allow_legacy: bool) -> bool {
+        match self.fw_limits.map(|l| l.stop_acc_count_s2) {
+            Some(echo) if echo == want_stop && want_stop != 0 => true,
+            Some(0) if allow_legacy => true,
+            _ => false,
+        }
+    }
+    /// Stop deceleration this axis has reported [count/s²]. A non-zero echo
+    /// is that rate. A zero echo is the firmware ceiling only when legacy
+    /// mode accepts it. Otherwise the stop rate is unknown.
+    fn confirmed_stop_acc(&self, allow_legacy: bool) -> Option<u32> {
+        let echo = self.fw_limits?.stop_acc_count_s2;
+        if echo != 0 {
+            Some(u32::from(echo))
+        } else if allow_legacy {
+            Some(protocol::fw_absolute::MAX_ACC_COUNT_S2)
+        } else {
+            None
+        }
     }
     fn clear_limits(&mut self) {
         self.fw_limits = None;
@@ -1009,6 +1034,8 @@ impl Supervisor {
     /// Why ARM is (or would be) refused right now. Empty = ready.
     pub fn blockers(&self, now: Instant) -> Vec<String> {
         let mut b = Vec::new();
+        let want_tuning = self.desired_tuning();
+        let allow_legacy = self.limits_cfg.allow_legacy_stop_acc;
         for (i, t) in self.axes.iter().enumerate() {
             let n = i + 1;
             if !t.connected {
@@ -1085,11 +1112,19 @@ impl Supervisor {
             }
             if let Some(r) = t.limits_rejected {
                 b.push(format!("limits_rejected: axis{n} SET_LIMITS rejected ({r:?})"));
-            } else if t.supports_limits() && !t.limits_confirmed(self.desired_tuning()) {
+            } else if t.supports_limits() && !t.limits_confirmed(want_tuning, allow_legacy) {
                 // Never arm on the firmware's default tuning (or a previous
                 // connection's): the duty cap must be the configured one,
-                // ACKed and reported back (LIMITS).
-                b.push(format!("limits_unconfirmed: axis{n} SET_LIMITS not ACKed / LIMITS not received yet"));
+                // ACKed and reported back (LIMITS). An ACK plus a LIMITS
+                // whose stop_acc is 0 or not the request is a different
+                // blocker: the MCU did not confirm the stop rate.
+                if t.limits_acked == Some(want_tuning) && t.fw_limits.is_some() {
+                    b.push(format!("stop_acc_unconfirmed: axis{n}"));
+                } else {
+                    b.push(format!(
+                        "limits_unconfirmed: axis{n} SET_LIMITS not ACKed / LIMITS not received yet"
+                    ));
+                }
             }
             let Some(s) = t.status else {
                 b.push(format!("no_status: axis{n}"));
@@ -1488,8 +1523,8 @@ impl Supervisor {
     }
 
     /// The set in effect: what the planner and SET_POSITION use (the clamped
-    /// request once its duty tuning is confirmed on every axis, see
-    /// [`Self::limits_pending`]).
+    /// request once its duty tuning is confirmed, and its acceleration only
+    /// up to the stop rate every axis has echoed — see [`Self::limits_pending`]).
     pub fn effective_limits(&self) -> MotionLimits {
         self.effective_limits
     }
@@ -1499,8 +1534,9 @@ impl Supervisor {
         self.target_limits
     }
 
-    /// The clamped request changes the firmware tuning and not every
-    /// connected axis has ACKed that SET_LIMITS yet.
+    /// Duty or `stop_acc` is still unconfirmed on a connected axis that
+    /// speaks SET_LIMITS. The planner's acceleration never exceeds the
+    /// confirmed stop deceleration while this is true.
     pub fn limits_pending(&self) -> bool {
         self.limits_pending
     }
@@ -1543,20 +1579,20 @@ impl Supervisor {
 
     /// Clamp the request into `target_limits`, then decide what the planner
     /// may use now (Issue #15 M3):
-    /// - the target's duty tuning equals the one in force → apply at once.
-    ///   Velocity, acceleration, and gain never wait. Acceleration still
-    ///   rides out in SET_LIMITS as `stop_acc_count_s2` (the controlled-stop
-    ///   rate), but that field is not part of this comparison, so an
-    ///   acc-only change does not set `pending`;
-    /// - a duty-cap change waits until every connected axis that speaks
-    ///   SET_LIMITS has ACKed that duty tuning (`reconcile_limits` sends the
-    ///   full desired tuning, including the new stop_acc, and confirmation
-    ///   is still the full equality). Meanwhile keep the confirmed duty cap
-    ///   and take only the *lowered* components of the target (a lowered cap
-    ///   is safe with the old tuning; a raised velocity with an unconfirmed
-    ///   duty cap is the FOLLOWING_ERROR the issue describes). The stop-time
-    ///   rule survives the component-wise minimum: both sets satisfy
-    ///   `acc ≥ vel / deadline`, so their minima do too.
+    /// - velocity and gain apply at once when the duty tuning already matches
+    ///   (they do not ride in SET_LIMITS). A duty-cap change waits until every
+    ///   connected axis that speaks SET_LIMITS has ACKed that duty tuning.
+    ///   Meanwhile keep the confirmed duty cap and take only the *lowered*
+    ///   velocity and gain (a raised velocity with an unconfirmed duty cap is
+    ///   the FOLLOWING_ERROR the issue describes);
+    /// - acceleration is the controlled-stop rate (`stop_acc`). The planner
+    ///   may use the new value only when it is ≤ the stop deceleration every
+    ///   connected axis has echoed, so a stop can always decelerate at least
+    ///   as hard as the trajectory assumes. A raise applies only after every
+    ///   such axis has echoed that new non-zero rate (or, in legacy mode, has
+    ///   ACKed it and echoed 0). While any echo is missing, `pending` stays
+    ///   set and the planner does not go above the rate already in effect or
+    ///   above the lowest echoed stop rate. `reconcile_limits` keeps retrying.
     fn recompute_limits(&mut self) {
         let c =
             motion_limits::clamp(&self.requested_limits, &self.ceilings(), &self.operator_cap(), self.stop_deadline());
@@ -1564,26 +1600,53 @@ impl Supervisor {
         self.limited = c.limited;
         self.limit_reasons = c.reasons;
         let want = self.desired_tuning();
+        let legacy = self.limits_cfg.allow_legacy_stop_acc;
         let in_force = FwTuning::new(&self.limits_cfg, &self.effective_limits);
-        let confirmed = want.same_duty(in_force)
+        let duty_confirmed = want.same_duty(in_force)
             || self
                 .axes
                 .iter()
                 .filter(|t| t.connected && t.supports_limits())
                 .all(|t| t.limits_acked.is_some_and(|acked| acked.same_duty(want)));
-        if confirmed {
-            self.effective_limits = self.target_limits;
-            self.limits_pending = false;
+        let mut any = false;
+        let mut stop_confirmed = true;
+        let mut floor: Option<u32> = Some(u32::MAX);
+        for t in self.axes.iter().filter(|t| t.connected && t.supports_limits()) {
+            any = true;
+            if !t.limits_confirmed(want, legacy) {
+                stop_confirmed = false;
+            }
+            match t.confirmed_stop_acc(legacy) {
+                Some(stop) => {
+                    if let Some(f) = floor.as_mut() {
+                        *f = (*f).min(stop);
+                    }
+                }
+                None => floor = None,
+            }
+        }
+        let target_acc = self.target_limits.max_acc_count_s2;
+        let old_acc = self.effective_limits.max_acc_count_s2;
+        // No echo yet: keep the rate already in effect. With echoes, a new
+        // rate at or below every confirmed stop may apply at once; anything
+        // higher waits, and an unconfirmed change cannot climb past `old_acc`.
+        let planner_acc = match floor {
+            Some(f) if stop_confirmed => target_acc.min(f),
+            Some(f) => target_acc.min(f).min(old_acc),
+            None => old_acc,
+        };
+        let (t, e) = (self.target_limits, self.effective_limits);
+        self.effective_limits = if duty_confirmed {
+            MotionLimits { max_acc_count_s2: planner_acc, ..t }
         } else {
-            let (t, e) = (&self.target_limits, &self.effective_limits);
-            self.effective_limits = MotionLimits {
+            MotionLimits {
                 max_gain: e.max_gain.min(t.max_gain),
                 max_vel_count_s: e.max_vel_count_s.min(t.max_vel_count_s),
-                max_acc_count_s2: e.max_acc_count_s2.min(t.max_acc_count_s2),
+                max_acc_count_s2: planner_acc,
                 duty_max_percent: e.duty_max_percent,
-            };
-            self.limits_pending = true;
-        }
+            }
+        };
+        self.limits_pending = !duty_confirmed || (any && !stop_confirmed);
     }
 
     /// The SET_LIMITS content for the clamped request (`target_limits`).
@@ -1592,18 +1655,21 @@ impl Supervisor {
     }
 
     /// Send SET_LIMITS to every connected axis on which the desired tuning is
-    /// not confirmed (ACK + LIMITS): once per change, one outstanding per
-    /// axis, not to a faulted MCU (it would answer FAULT_ACTIVE), not while
-    /// the rig is latched (HOST_FAULT first). An ACK whose LIMITS never
-    /// arrives is re-sent after `LIMITS_RETRY` with a new request_id (a
-    /// resend of the same request would only be DUPLICATE, without LIMITS).
-    /// A tuning that changed while the previous SET_LIMITS was in flight goes
-    /// out as soon as that one is ACKed (the ACK handler sets no retry wait).
+    /// not confirmed (ACK + a LIMITS echo of that `stop_acc`): once per
+    /// change, one outstanding per axis, not to a faulted MCU (it would
+    /// answer FAULT_ACTIVE), not while the rig is latched (HOST_FAULT first).
+    /// An ACK whose LIMITS never arrives, or a LIMITS that does not echo the
+    /// requested `stop_acc`, is re-sent after `LIMITS_RETRY` with a new
+    /// request_id (a resend of the same request would only be DUPLICATE,
+    /// without LIMITS). A tuning that changed while the previous SET_LIMITS
+    /// was in flight goes out as soon as that one is ACKed (the ACK handler
+    /// sets no retry wait).
     fn reconcile_limits(&mut self, now: Instant) {
         if matches!(self.phase, Phase::Fault { .. }) {
             return;
         }
         let want = self.desired_tuning();
+        let legacy = self.limits_cfg.allow_legacy_stop_acc;
         for i in 0..AXIS_COUNT {
             let t = &self.axes[i];
             let due = t.connected
@@ -1612,7 +1678,7 @@ impl Supervisor {
                 && t.status_fault().is_none()
                 && t.host_fault_confirmed()
                 && t.limits_inflight.is_none()
-                && !t.limits_confirmed(want)
+                && !t.limits_confirmed(want, legacy)
                 && t.limits_retry_at.is_none_or(|at| now >= at);
             if due {
                 let id = self.take_request_id();
@@ -1630,10 +1696,21 @@ impl Supervisor {
         if !self.axes[i].connected {
             return;
         }
+        let want = self.desired_tuning();
+        let legacy = self.limits_cfg.allow_legacy_stop_acc;
         let t = &mut self.axes[i];
         t.fw_limits = Some(limits);
-        // The exchange completed: no resend pending for a lost report.
-        t.limits_retry_at = None;
+        // A matching echo completes the exchange. A report that does not echo
+        // the requested stop_acc (old firmware leaves offset 14 at 0) retries
+        // on the same cadence as a lost LIMITS. A tuning that changed while
+        // this report was in flight goes out at the next tick.
+        if t.limits_confirmed(want, legacy) {
+            t.limits_retry_at = None;
+        } else if t.limits_acked == Some(want) {
+            t.limits_retry_at = Some(now + LIMITS_RETRY);
+        } else {
+            t.limits_retry_at = None;
+        }
         self.event(now, "limits", serde_json::json!({"axis": axis, "limits": limits}));
         self.recompute_limits();
     }

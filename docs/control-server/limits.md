@@ -25,7 +25,7 @@
 - 段 2 で段 1 を超える要求を受けても拒否はしない。段 1 でクランプして、有効値と理由（`ceiling_clamped`）を返す。gain の `gain_limited` と同じ流儀。
 - **ゲーム経路は操作者の値を下げるだけ**（Issue #15）。WS `/v1/motion` の `limits`（トークン不要）で書いた項目は、`[limits]` の初期値（＝操作者が許した上限。status の `motion_limits.operator_max`）を超えない。超える要求は操作者の値でクランプして理由 `operator_limited` を返す（ファームの上限のほうが低い個体では `ceiling_clamped`）。操作者の `POST /v1/limits`（Bearer）だけがそれを超えて段 1 まで上げられる。項目ごとに「最後に書いたのがゲームか」を覚えていて（status の `motion_limits.game_fields`）、管理者が書いた項目はこの上限から外れ、ゲームが書き直せばまた入る。`POST /v1/session` で値とともに消える。
 - クランプにはもう 1 つ、**停止時間の規則**（§1.1）がある。上限とは逆向き（下限）で、`max_acc_count_s2` を上げる（場合により `max_vel_count_s` を下げる）。理由は `stop_time_limited`。
-- クランプした要求（target）がすぐ有効値になるとは限らない。Duty 上限が変わる要求は、全軸が新しい SET_LIMITS を ACK するまで planner に効かない（§1.2、status の `pending`）。
+- クランプした要求（target）がすぐ有効値になるとは限らない。Duty 上限が変わる要求は、全軸が新しい SET_LIMITS を ACK するまで planner に効かない。加速度の上げも、全軸が新しい `stop_acc` を LIMITS でエコーするまで planner に効かない（§1.2、status の `pending`）。
 - CONFIG（ARM 時に MCU へ送る）の速度・加速度には段 1 の値を入れる。実際の上限は毎フレームの SET_POSITION が運ぶ有効値で決まる。CONFIG は「もう 1 つの上限」ではない。
 - ソフトリミット（`soft_min/max_count`、`decel_zone_count`）と校正 3 点は幾何で、制限値ではない。`[[axis]]` に置いたままで、実行時には変えない。
 - `POST /v1/session`（新しいゲームの接続）で現在値は `[limits]` の初期値に戻る。ゲームが上げた値は、別のゲームや再接続に引き継がれない。
@@ -45,8 +45,8 @@ STOP（管理の `/v1/stop`、鮮度切れ、`center_reached`）は planner が�
 
 PC は制限値を 3 段で持つ: `requested`（API が書いた値）→ `target`（§1 の上限と §1.1 で clamp した値。SET_LIMITS はこれを運ぶ）→ `effective`（planner と毎フレームの SET_POSITION が使う値。status の `motion_limits.effective`）。
 
-- target の Duty 項目が effective と同じなら、target はその tick で effective になる。速度・gain だけの変更は上げても下げても待たない（SET_LIMITS を送らないので待つ相手がいない）。加速度だけの変更も planner は待たない（`pending` は立たない）が、制御された停止の減速度として SET_LIMITS の `stop_acc_count_s2` を送る（操作者の `max_acc`。0 は「未設定」なので送らない）。
-- Duty 上限が変わる要求は、接続中で SET_LIMITS を知る**全軸**がその内容を ACK するまで effective にならない（`pending: true`）。待つ間、effective は確定済みの組を保ち、target のうち**下がった**成分（gain・速度・加速度）だけを先に取り込む。速度と Duty を同時に上げたとき、前の SET_LIMITS が飛行中の軸に旧 Duty 上限のまま速い目標が届いて FOLLOWING_ERROR になる窓（往復 1 回分、喪失なら 1 s）を閉じるため。成分ごとの最小は §1.1 を保つ（両組が `acc ≥ vel / 期限` なら最小同士も満たす）。
+- target の Duty 項目が effective と同じなら、速度・gain だけの変更は上げても下げてもその tick で effective になる（SET_LIMITS を送らないので待つ相手がいない）。加速度は制御された停止の減速度で、SET_LIMITS の `stop_acc_count_s2` として送る（操作者の `max_acc`。0 は「未設定」なので送らない）。planner が新しい加速度を使うのは、それが接続中の全軸が LIMITS でエコーした `stop_acc` 以下のときだけ（停止は軌道が仮定する減速度以上で必ず減速できる）。下げはその場で planner に入り、`pending` はエコーが要求と一致するまで true。上げは全軸のエコーが新しい非 0 の `stop_acc` と一致してから planner に入る。エコーが無い軸があるあいだは、いまの加速度を超えない。
+- Duty 上限が変わる要求は、接続中で SET_LIMITS を知る**全軸**がその Duty を ACK するまで effective の Duty にならない（`pending: true`）。待つ間、effective は確定済みの Duty を保ち、target のうち**下がった** gain と速度だけを先に取り込む。加速度は上の停止減速度の規則（確認済みの `stop_acc` 以下なら先に取り、上げは全軸のエコー後）。速度と Duty を同時に上げたとき、前の SET_LIMITS が飛行中の軸に旧 Duty 上限のまま速い目標が届いて FOLLOWING_ERROR になる窓（往復 1 回分、喪失なら 1 s）を閉じるため。成分ごとの最小は §1.1 を保つ（両組が `acc ≥ vel / 期限` なら最小同士も満たす）。
 - 飛行中に要求がまた変わったら、前の ACK が届いた次の tick で新しい内容を送る（`LIMITS_RETRY` の 1 s は待たない）。SET_LIMITS が拒否された軸は `limits_rejected`（§3.3）で見え、`pending` は立ったまま。
 - WS ack の `effective_limits` と `GET/POST /v1/limits` の `effective` は **target**（API スレッドは適用の完了を知らない）。適用済みかは status の `motion_limits.pending` で見る。
 
@@ -65,6 +65,8 @@ ACTIVE（ゲーム）と CENTER の SET_POSITION が運ぶ `max_vel` / `max_acc`
 ## 2. `[limits]` の項目と根拠
 
 `control-server/config/*.toml` の `[limits]`（`schema_version = 2`）。3 軸共通。下の初期値は `example.toml` / `sim.toml` のもの（上げ切った先の目標）。`bringup.toml` は §4 の低い値で置いてある。
+
+`allow_legacy_stop_acc`（bool、既定 false。TOML に無ければ false）。旧ファームは SET_LIMITS の offset 14 を無視して ACK し、LIMITS の offset 14 を 0 で返す（停止は CONFIG の `max_acc`）。false のとき、その軸は `stop_acc_unconfirmed: axisN` で ARM しない。true のとき 0 のエコーを受け入れ、planner はその軸の停止減速度をファーム絶対上限（40000）として扱う。
 
 ### 2.1 実行時に変えられる 4 つ
 
@@ -140,9 +142,9 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ### 3.3 status で見る
 
-- `motion_limits`: 上の GET と同じ 8 つ（`effective` / `requested` / `ceiling` / `defaults` / `operator_max` / `game_fields` / `limited` / `reasons`）に `pending`（bool。Duty 上限が変わる要求の SET_LIMITS を全軸が ACK するまで true。その間 `effective` は確定済みの組＋下がった成分、§1.2）。
-- `axes[].fw_limits`: その個体が LIMITS で返した有効値（`duty_max_percent` …）と絶対上限（`abs_duty_max_percent`、`abs_max_vel_count_s`、`abs_max_acc_count_s2`）。SET_LIMITS を受ける前は `null`。
-- blockers: `firmware_limits_unsupported: axisN`（SET_LIMITS を知らない旧ファーム。焼き直すまで ARM しない）、`limits_rejected: axisN`（SET_LIMITS が拒否された。1 秒後に再送）、`limits_unconfirmed: axisN`（いまの調整値の SET_LIMITS が ACK され、かつ LIMITS が届くまで。ファーム既定の 7〜20 % や前の接続の値で ARM しないための阻害。ACK が来なければ 1 秒の期限切れの後に、ACK は来たが LIMITS が落ちたなら 1 秒後に、新しい request_id で送り直す）。
+- `motion_limits`: 上の GET と同じ 8 つ（`effective` / `requested` / `ceiling` / `defaults` / `operator_max` / `game_fields` / `limited` / `reasons`）に `pending`（bool。Duty 上限の SET_LIMITS を全軸が ACK するまで、または `stop_acc` のエコーが要求と一致するまで true。その間 Duty は確定済み、加速度は確認済みの停止減速度を超えない、§1.2）。
+- `axes[].fw_limits`: その個体が LIMITS で返した有効値（`duty_max_percent` …、offset 14 の `stop_acc_count_s2`。0 は未設定か旧ファーム）と絶対上限（`abs_duty_max_percent`、`abs_max_vel_count_s`、`abs_max_acc_count_s2`）。SET_LIMITS を受ける前は `null`。
+- blockers: `firmware_limits_unsupported: axisN`（SET_LIMITS を知らない旧ファーム。焼き直すまで ARM しない）、`limits_rejected: axisN`（SET_LIMITS が拒否された。1 秒後に再送）、`limits_unconfirmed: axisN`（いまの調整値の SET_LIMITS が ACK され、かつ LIMITS が届くまで。ファーム既定の 7〜20 % や前の接続の値で ARM しないための阻害。ACK が来なければ 1 秒の期限切れの後に、ACK は来たが LIMITS が落ちたなら 1 秒後に、新しい request_id で送り直す）、`stop_acc_unconfirmed: axisN`（ACK と LIMITS は届いたが `stop_acc` が 0 か要求と違う。旧ファームは offset 14 を 0 のまま返す。`[limits] allow_legacy_stop_acc = true` のときだけ 0 を受け入れて ARM する。既定は false。0 のエコーも 1 秒後に SET_LIMITS を送り直す）。
 - events: `limits`（LIMITS の受信）、`ack_rejected`（SET_LIMITS の拒否）。
 
 ### 3.4 試験ページ（`GET /`）
@@ -180,6 +182,7 @@ curl -sX POST -H "$AUTH" -d '{"duty_max_percent":30}' $URL/v1/limits   # 書い�
 
 ## 6. 変更履歴
 
+- 2026-11-03: 加速度の上げは、全軸の LIMITS が新しい `stop_acc` をエコーするまで planner に効かない（`pending`）。下げは、確認済みの停止減速度以下ならすぐ効く。未確認の `stop_acc` では、軌道がその減速度を超えない。LIMITS の offset 14 は保存した `stop_acc_count_s2`。0 または不一致は `stop_acc_unconfirmed: axisN` で ARM しない（`[limits] allow_legacy_stop_acc = true` で 0 を許す）。
 - 2026-11-03: 制御された STOPPING の減速度は SET_LIMITS の `stop_acc_count_s2`（操作者の `max_acc`。0 なら CONFIG の `max_acc`。CONFIG はファームの絶対上限のまま）。直前フレームの加速度は使わない。異常停止の COMMAND_TIMEOUT はフレームのまま。サーバは CONTROLLED_STOP の前に全開の SET_POSITION を書かない。加速度だけの変更は planner を待たせず `stop_acc` を送る。
 - 2026-11-03: 追従ガバナ（§1.3）。1 軸が目標方向に遅れて Duty 飽和、または大きな追従誤差が縮まないとき、追跡の `max_vel` を全軸共通の `s`、`max_acc` を `s²` にする。ACTIVE / CENTER の SET_POSITION も同じ倍率。停止のプランナー減速度は全開。MCU の制御された停止は SET_LIMITS の `stop_acc`（未設定なら CONFIG の `max_acc`）で減速する。遅れている軸ごとに `no_progress_ms` の窓を持ち、実位置が 20 count 動かなければ coordinated stop（`governor_no_progress`。原因が入れ替わっても、目標だけ着いても窓はやり直さない）。status の `governor` と `limits` の `tracking_governed`。任意の `[governor]`（省略時は有効・既定値。limit が 200 以下ならしきい値を比率で縮める）。
 - 2026-11-02（Issue #15 追加分）: ゲーム経路の上限（§1）。WS `limits` で書いた項目は操作者の `[limits]` の値を超えない（`operator_limited`）。`POST /v1/limits` だけがファームの上限まで上げる。`GET/POST /v1/limits` と status の `motion_limits` に `operator_max` / `game_fields`。試験ページのスライダーの上限もそれに追従。

@@ -521,9 +521,9 @@ impl FwTuning {
         }
     }
 
-    /// Duty / Kp / FF / deadband only. Acceleration is not part of the
-    /// planner-pending gate: it still goes out in SET_LIMITS, but the
-    /// planner applies it at once (Issue #15 M3 waits on the duty cap).
+    /// Duty / Kp / FF / deadband only. Acceleration is the controlled-stop
+    /// rate and has its own confirmation (`LIMITS.stop_acc`), not this
+    /// comparison. Issue #15 M3 still waits on the duty cap.
     pub fn same_duty(self, other: Self) -> bool {
         self.duty_max_percent == other.duty_max_percent
             && self.duty_min_percent == other.duty_min_percent
@@ -568,9 +568,12 @@ pub struct MotionLimitsSnapshot {
     pub limited: Vec<LimitedField>,
     /// Why (`ceiling_clamped` / `operator_limited` / `stop_time_limited`).
     pub reasons: Vec<LimitReason>,
-    /// The clamped request changes the firmware tuning (duty cap) and not
-    /// every connected axis has ACKed that SET_LIMITS yet: `effective` keeps
-    /// the confirmed set (only lowered components are taken at once).
+    /// The clamped request changes the duty cap or the stop rate, and not
+    /// every connected axis has confirmed it yet. `effective` keeps the
+    /// confirmed duty cap (only lowered gain and velocity are taken at
+    /// once). Acceleration may rise only after every axis has echoed that
+    /// `stop_acc`; a lower rate applies only while it stays at or below the
+    /// echoed stop deceleration.
     pub pending: bool,
 }
 

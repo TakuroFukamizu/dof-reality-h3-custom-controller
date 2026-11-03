@@ -379,6 +379,9 @@ pub struct SimMcu {
     /// SET_LIMITS `stop_acc`. 0 means unset (controlled stops use CONFIG).
     /// Not cleared on axis select; a reboot builds a new [`SimMcu`].
     stop_acc_count_s2: u16,
+    /// LIMITS echoes `stop_acc_count_s2`. False imitates firmware that ACKs
+    /// SET_LIMITS but leaves offset 14 at 0.
+    echo_stop_acc: bool,
     /// Deceleration latched on entry to STOPPING [count/s²]. Controlled stops
     /// use `stop_acc` when set, else CONFIG `max_acc`. A fault stop uses the
     /// last frame's.
@@ -442,6 +445,7 @@ impl SimMcu {
             frame_max_vel: 0.0,
             frame_max_acc: 0.0,
             stop_acc_count_s2: 0,
+            echo_stop_acc: true,
             stopping_amax: 0.0,
             recent_accepted: VecDeque::with_capacity(DEDUPE_DEPTH),
             host_rx: VecDeque::with_capacity(HOST_RX_KEEP),
@@ -590,6 +594,10 @@ impl SimMcu {
     /// Stored controlled-stop acceleration. 0 means unset.
     pub fn stop_acc_count_s2(&self) -> u16 {
         self.stop_acc_count_s2
+    }
+    /// When false, LIMITS reports `stop_acc` 0 (firmware that ignores offset 14).
+    pub fn set_echo_stop_acc(&mut self, echo: bool) {
+        self.echo_stop_acc = echo;
     }
     /// An end-stop calibration is running (state CALIBRATING).
     pub fn is_calibrating(&self) -> bool {
@@ -974,6 +982,7 @@ impl SimMcu {
             ff_count_s_per_percent: t.ff_count_s_per_percent,
             deadband_count: t.deadband_count,
             deadband_out_count: t.deadband_out_count,
+            stop_acc_count_s2: if self.echo_stop_acc { self.stop_acc_count_s2 } else { 0 },
             abs_max_vel_count_s: fw_absolute::MAX_VEL_COUNT_S,
             abs_max_acc_count_s2: fw_absolute::MAX_ACC_COUNT_S2,
         }));

@@ -2146,6 +2146,7 @@ class V1Axis {
     m.limits.ff_count_s_per_percent = static_cast<uint16_t>(tuning.ff_count_s_per_percent);
     m.limits.deadband_count = static_cast<uint16_t>(tuning.deadband);
     m.limits.deadband_out_count = static_cast<uint16_t>(tuning.deadband_out);
+    m.limits.stop_acc_count_s2 = stop_acc_count_s2_;  // 0 は未設定のまま返す
     m.limits.abs_max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
     m.limits.abs_max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     push(m);
