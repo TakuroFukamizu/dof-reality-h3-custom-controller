@@ -69,6 +69,11 @@ struct V1Tuning {
   // Issue #46: ソフトリミットに向かう参照速度の上限（再生バッファの経路だけ）。soft_brake_acc ≤ 0 で無効
   double soft_brake_acc_count_s2 = V1_SOFT_BRAKE_ACC_COUNT_S2;
   int32_t soft_reserve_count = V1_SOFT_RESERVE_COUNT;
+  // 端ガード（実測位置・速度）。end_guard_acc ≤ 0 で無効。減速度は仮（PR #64 の実測に置き換える）
+  uint32_t end_guard_lat_ms = V1_END_GUARD_LAT_MS;
+  double end_guard_acc_count_s2 = V1_END_GUARD_ACC_COUNT_S2;
+  int32_t end_guard_margin_count = V1_END_GUARD_MARGIN_COUNT;
+  int32_t end_guard_release_count_s = V1_END_GUARD_RELEASE_COUNT_S;
   // Issue #25 r6（config.h V1_FF_DIRECTIONAL）: 方向別 FF ＋ PI、走行中の床なし、保持 2/4、動き出しパルス。
   // directional = false なら r5 までの経路（上の床 E・補助 T・不感帯 deadband/deadband_out・Ki 0.1）。
   bool ff_directional = V1_FF_DIRECTIONAL != 0;
@@ -478,7 +483,7 @@ class V1Axis {
     emit_status_if_changed();
   }
 
-  // 5 ms ごと。タイマー → 軌道 → 異常検出 → Duty → STATUS。
+  // 5 ms ごと。タイマー → 軌道 → 異常検出 → 端ガード → Duty → STATUS。
   void tick(uint64_t now_us, int64_t raw) {
     if (!began_) return;
     const uint64_t dt_us = now_us > last_tick_us_ ? now_us - last_tick_us_ : 0;
@@ -496,11 +501,14 @@ class V1Axis {
     check_timers(now_us);
     if (position_control_on()) {
       update_setpoint(static_cast<double>(dt_us) / 1e6);
-      check_motion_faults(now_us);
+      check_motion_faults(now_us);  // SOFT_LIMIT はクランプ前の実位置のまま（判定は変えない）
     }
-    if (state_ == v1::state::STOPPING && setpoint_vel_ == 0.0) {
+    // 減速プロファイルがすでに速度 0 なら、端ガードより先に止める。
+    // ガードが外向き速度を 0 にしただけで実測がまだ速いときは、惰性のまま完了させない（下の end_guard_blocks_stop_finish）
+    if (state_ == v1::state::STOPPING && setpoint_vel_ == 0.0 && !end_guard_blocks_stop_finish()) {
       finish_stop(now_us);
     }
+    apply_end_guard();  // ACTIVE / STOPPING だけ。参照を実測より外へ進めない
     update_duty(now_us, dt_us);
     tick_calibration(now_us);  // CALIBRATING のときだけ Duty を書く（update_duty の後）
     emit_status_if_changed();
@@ -592,6 +600,11 @@ class V1Axis {
   // 参照（軌道）の速度 [count/s]。FF・r9 の減衰・保持／整定の判定・動き出しパルスが使う値そのもの（丸めない）
   double setpoint_vel() const { return setpoint_vel_; }
   double setpoint_pos() const { return setpoint_; }
+  // 端ガードが外向き側を止めている（+1 = hi 側、−1 = lo 側、0 = していない）
+  bool end_guard_active() const {
+    return (state_ == v1::state::ACTIVE || state_ == v1::state::STOPPING) && end_guard_side_ != 0;
+  }
+  int end_guard_side() const { return end_guard_active() ? static_cast<int>(end_guard_side_) : 0; }
   // Issue #45: 直近の tick の再生バッファの推定（has / starved / pos / vel / 点の数）と時刻の付け直しの周期 [us]（0 = 未確定）
   const V1PlayoutFit& playout_fit() const { return playout_fit_; }
   double playout_period_us() const { return playout_clock_.valid() ? playout_clock_.period_us() : 0.0; }
@@ -649,6 +662,7 @@ class V1Axis {
     if (brake_release_cmd_) f |= v1::flags::BRAKE_RELEASE_CMD;
     if (referenced_) f |= v1::flags::POSITION_REFERENCED;
     if (has_config_) f |= v1::flags::CONFIGURED;
+    if (end_guard_active()) f |= v1::flags::END_GUARD;  // ガード中だけ。HOLDING / FAULT では end_guard_active が偽
     return f;
   }
 
@@ -734,6 +748,11 @@ class V1Axis {
   double setpoint_ = 0.0;
   double setpoint_vel_ = 0.0;
   double control_target_ = 0.0;
+  // 端ガード。+1 = hi 側、−1 = lo 側、0 = していない。update_setpoint の直前の参照は、内側目標への差し替えに使う
+  int8_t end_guard_side_ = 0;
+  double guard_p_prev_ = 0.0;
+  double guard_v_prev_ = 0.0;
+  double guard_dt_ = 0.0;
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
   V1PlayoutBuffer playout_{};  // Issue #45: ACTIVE で受けた目標（受信時刻つき）。START・hold_here で空にする
@@ -1218,8 +1237,9 @@ class V1Axis {
   }
 
   // 減速してからラッチする異常（COMMAND_TIMEOUT）。止まっていれば即ラッチ。
+  // 端ガードが参照速度だけ 0 で、実測がまだ release 以上のときは止まっていない（STOPPING に入って実測が落ちてからラッチ）。
   void begin_fault_stop(uint16_t code, uint64_t now) {
-    if (setpoint_vel_ == 0.0) {
+    if (setpoint_vel_ == 0.0 && !end_guard_blocks_stop_finish()) {
       latch_fault(code, now);
     } else if (state_ == v1::state::STOPPING) {
       stop_kind_ = StopKind::Fault;  // 減速の開始時刻はそのまま（stop_timeout の起点を保つ）
@@ -1262,6 +1282,7 @@ class V1Axis {
     stop_kind_ = StopKind::Hold;
     brake_release_cmd_ = false;
     duty_permille_ = 0;  // 次の tick を待たず PWM 0
+    end_guard_side_ = 0;  // 端ガードは ACTIVE / STOPPING だけ。FAULT では出さない
     terms_ = V1DutyTerms{};
     duty_state_ = V1DutyState{};  // 積分（保持バイアス）も捨てる（Issue #25 手順 9「F」）
     reset_v_fast();               // r9: 速い速度推定も取り直す（積分と同じ契機）
@@ -1382,6 +1403,9 @@ class V1Axis {
   // 速度・加速度制限つきの setpoint（sim_axis.rs の update_setpoint / profile_step と同じ。ただし Issue #45 の再生バッファ（既定）では
   // ACTIVE の参照を playout_step で作るので、PC 側の参照モデルとは ACTIVE の軌道の時刻・形が違う（STOPPING 以降は同じ）
   void update_setpoint(double dt) {
+    guard_p_prev_ = setpoint_;
+    guard_v_prev_ = setpoint_vel_;
+    guard_dt_ = dt;
     if (!has_config_) return;
     playout_clock_.refit_if_dirty();  // Issue #45: 時刻の付け直しの当てはめは 1 tick に 1 回まで（push は O(1)）
     const double lo = static_cast<double>(config_.soft_min_count);
@@ -1413,6 +1437,105 @@ class V1Axis {
       setpoint_ = p < lo ? lo : (p > hi ? hi : p);
     } else {
       setpoint_vel_ = 0.0;  // ARMING / HOLDING / DISARMING は保持
+    }
+  }
+
+  // 端ガードが外向きの参照速度を 0 にしている間は、実測速度が落ちるまで「停止済み」にしない。
+  // これがないと COMMAND_TIMEOUT が減速（STOPPING）を飛ばして即 FAULT になり、STOPPING 中のガードも 1 tick で終わる。
+  bool end_guard_blocks_stop_finish() const {
+    if (end_guard_side_ == 0) return false;
+    const int32_t speed_i = velocity_ < 0 ? -velocity_ : velocity_;
+    return speed_i >= tuning.end_guard_release_count_s;
+  }
+
+  // ACTIVE の最新目標が、ガード側の実測より内側か。等しい・外側は内側ではない。
+  // STOPPING は届いた目標で軌道を変えないので、古い control_target_ が内側でも内側要求とは見ない。
+  bool end_guard_demand_inward(int side, double x) const {
+    if (state_ != v1::state::ACTIVE || side == 0) return false;
+    if (side > 0) return control_target_ < x;
+    return control_target_ > x;
+  }
+
+  // 内側の目標なのに、この tick の参照がまだ内側へ動いていない（再生の遅れ・枯渇で速度 0 を含む）なら、
+  // ガード前の参照から今の目標へ profile_step し直す。すでに内側へ向いていれば何もしない。
+  // ガード自身は外向きの出力を作らない。
+  void follow_inward_now(int side) {
+    const bool already_in = side > 0 ? (setpoint_vel_ < 0.0 || setpoint_ < guard_p_prev_)
+                                     : (setpoint_vel_ > 0.0 || setpoint_ > guard_p_prev_);
+    if (already_in) return;
+    double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+    if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
+    double vmax = frame_max_vel_ > 0.0 ? frame_max_vel_ : static_cast<double>(config_.max_vel_count_s);
+    if (vmax < 0.0) vmax = 0.0;
+    double p = guard_p_prev_;
+    double vel = guard_v_prev_;
+    profile_step(control_target_, vmax, amax, guard_dt_ > 0.0 ? guard_dt_ : 0.0, &p, &vel);
+    const double lo = static_cast<double>(config_.soft_min_count);
+    const double hi = static_cast<double>(config_.soft_max_count);
+    if (p < lo) {
+      p = lo;
+      if (vel < 0.0) vel = 0.0;
+    }
+    if (p > hi) {
+      p = hi;
+      if (vel > 0.0) vel = 0.0;
+    }
+    setpoint_ = p;
+    setpoint_vel_ = vel;
+  }
+
+  // 実測位置 x・実測速度 v（100 ms 窓の velocity_）で、外へ進む側のソフトリミット手前で参照を止める。
+  //   d_req = |v|·t_lat + v²/(2·a_min) + d_margin
+  // 距離が d_req 以下なら END_GUARD。外向きの参照速度は 0、参照位置は実測より外へ置かない。
+  // すでに実測より内側の参照は、その位置から外へ進めない（毎 tick 実測へ寄せると誤差が消えて惰性で抜ける）。
+  // |v| < release、内側への要求、または実測が外向きでなくなったら解く。a_min ≤ 0 なら無効。SOFT_LIMIT の判定は変えない。
+  void apply_end_guard() {
+    const bool armed = state_ == v1::state::ACTIVE || state_ == v1::state::STOPPING;
+    if (!armed || !has_config_ || tuning.end_guard_acc_count_s2 <= 0.0) {
+      end_guard_side_ = 0;
+      return;
+    }
+    const double x = static_cast<double>(actual_count());
+    const double v = static_cast<double>(velocity_);
+    const double speed = v < 0.0 ? -v : v;
+    const int32_t speed_i = velocity_ < 0 ? -velocity_ : velocity_;
+    const double a = tuning.end_guard_acc_count_s2;
+    const double t_lat = static_cast<double>(tuning.end_guard_lat_ms) / 1000.0;
+    const double d_req =
+        speed * t_lat + (speed * speed) / (2.0 * a) + static_cast<double>(tuning.end_guard_margin_count);
+    const double hi = static_cast<double>(config_.soft_max_count);
+    const double lo = static_cast<double>(config_.soft_min_count);
+    int approach = 0;
+    if (v > 0.0 && (hi - x) <= d_req) approach = 1;
+    else if (v < 0.0 && (x - lo) <= d_req) approach = -1;
+
+    if (end_guard_side_ != 0) {
+      // 掛かっている間は d_req が縮んでも維持する。次のどれかで解く:
+      //   |v| が release 未満、要求が内側、実測が外向きでなくなった（0 または逆向き）。
+      // 逆向きでも掴んだままだと、参照が止まった位置の後ろに残り、位置ループが逆走を育てる。
+      const bool still_outward = (end_guard_side_ > 0 && velocity_ > 0) || (end_guard_side_ < 0 && velocity_ < 0);
+      if (!still_outward || speed_i < tuning.end_guard_release_count_s ||
+          end_guard_demand_inward(end_guard_side_, x)) {
+        const int released = end_guard_side_;
+        end_guard_side_ = 0;
+        if (end_guard_demand_inward(released, x)) follow_inward_now(released);
+        return;
+      }
+    } else if (approach != 0 && speed_i >= tuning.end_guard_release_count_s &&
+               !end_guard_demand_inward(approach, x)) {
+      end_guard_side_ = static_cast<int8_t>(approach);
+    } else if (approach != 0 && end_guard_demand_inward(approach, x)) {
+      follow_inward_now(approach);
+      return;
+    }
+    if (end_guard_side_ > 0) {
+      if (setpoint_vel_ > 0.0) setpoint_vel_ = 0.0;
+      const double ceiling = x < guard_p_prev_ ? x : guard_p_prev_;
+      if (setpoint_ > ceiling) setpoint_ = ceiling;
+    } else if (end_guard_side_ < 0) {
+      if (setpoint_vel_ < 0.0) setpoint_vel_ = 0.0;
+      const double floor_p = x > guard_p_prev_ ? x : guard_p_prev_;
+      if (setpoint_ < floor_p) setpoint_ = floor_p;
     }
   }
 

@@ -124,6 +124,7 @@ MCU が記憶するのは受理（ACCEPTED）した命令だけ。拒否した�
 | 4 | `POWER_CONTROLLER`（主電源担当軸として設定されている） |
 | 5 | `CURRENT_VALID`（`current_ma` が校正済み実測値。0 のとき `current_ma` は無意味） |
 | 6 | `CLOCK_SYNCED`（予約。apply_at 対応時） |
+| 7 | `END_GUARD`（実測位置・速度の端ガードが、外へ進む側の参照を止めている。ACTIVE / STOPPING の間だけ立つ。内側への要求は止めない。実位置がソフトリミットを越えたら、これまでどおり `SOFT_LIMIT`） |
 
 ## 4. メッセージ
 

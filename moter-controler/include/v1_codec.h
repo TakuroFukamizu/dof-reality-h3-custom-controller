@@ -104,6 +104,7 @@ constexpr uint16_t CONFIGURED = 1u << 3;
 constexpr uint16_t POWER_CONTROLLER = 1u << 4;
 constexpr uint16_t CURRENT_VALID = 1u << 5;
 constexpr uint16_t CLOCK_SYNCED = 1u << 6;
+constexpr uint16_t END_GUARD = 1u << 7;  // 実測の端ガードが外向きの参照を止めている（ACTIVE / STOPPING の間だけ）
 }  // namespace flags
 
 namespace role_flags {

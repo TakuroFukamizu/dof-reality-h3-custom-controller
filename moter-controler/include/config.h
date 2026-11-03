@@ -279,6 +279,15 @@ constexpr double V1_PLAYOUT_SNAP_COUNT = 0.5;             // 目標が止まっ�
 // !!! A_BRAKE・RESERVE は仮値。実機が実際に止まれる減速度と、全速（600 count/s）から止めたときの行き過ぎを計測して決めること。
 constexpr double V1_SOFT_BRAKE_ACC_COUNT_S2 = 1000.0;     // 端に向かうときの想定減速度 [count/s²]（CONFIG の max_acc より小さく）
 constexpr int32_t V1_SOFT_RESERVE_COUNT = 100;            // ソフトリミットの手前に残す距離 [count]
+// 端ガード: 実測位置 x と実測速度 v（100 ms 窓の velocity_）から、外へ進む向きの停止距離
+//   d_req = |v|·t_lat + v²/(2·a_min) + d_margin
+// がソフトリミットまでの距離以下なら、参照を実測位置より外へ進めない（ACTIVE / STOPPING）。
+// Issue #46（参照位置 p0 と soft_brake）とは別。無パルス（ENCODER_FAULT）と SOFT_LIMIT の判定は変えない。
+// a_min は仮。PR #64 の実測制動データに置き換えること（いまの 4000 は測った減速度ではない）。
+constexpr uint32_t V1_END_GUARD_LAT_MS = 80;              // 検知から出力が効くまでの遅れ [ms]
+constexpr double V1_END_GUARD_ACC_COUNT_S2 = 4000.0;      // 止まれるとみなす最小減速度 [count/s²]（仮。PR #64 の実測に置き換える）
+constexpr int32_t V1_END_GUARD_MARGIN_COUNT = 30;         // 停止距離に足す余裕 [count]
+constexpr int32_t V1_END_GUARD_RELEASE_COUNT_S = 30;      // |実測速度| がこれ未満ならガードを解く [count/s]
 // Issue #15 M7: USB 送信をブロックさせない（include/v1_tx_pump.h）。書く前に TX リングの空きを見て、入らなければ次の poll へ。
 constexpr uint32_t V1_TX_STATUS_STALE_MS = 100;  // 積まれてからこれ以上経った STATUS は送らない（20 ms ごとに新しいものが来る。PC の途絶判定 200 ms の半分）
 constexpr uint32_t V1_TX_HOLD_WRITE_THROUGH_MS = 100;  // STATUS 以外（ACK など。捨てない）を空き不足で保留してこれだけ経ったら、空きを見ずに書く（HWCDC の待ちは tx timeout 1 ms × 20 = 20 ms で有界。availableForWrite が 0 を返し続ける状態での退路）
