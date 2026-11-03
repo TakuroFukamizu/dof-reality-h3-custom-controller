@@ -4971,6 +4971,274 @@ inline void test_playout_expiry_stop_fault_epoch_unchanged() {
   }
 }
 
+// ---- 端ガード（実測位置・速度） ----------------------------------------------
+// 既存の追従プラントは参照に張り付くので、遅れと減速度の上限を持つプラントで端に寄せる。
+// PWM は pwm_permille（正がカウント増）。出力は delay_ms 遅れて効く。外向き PWM は approach 速度まで加速し、
+// 内向き PWM は a_plant で減速する。Issue #46 は切る（指定速度のまま端に入れるため）。
+
+struct EgSim {
+  Harness h;
+  double x = 0;
+  double v = 0;
+  double a_plant = 6000;
+  double v_cap = 1200;
+  int dir = 1;
+  std::vector<int> delay;
+  int32_t lim_hi = 30000;
+  int32_t lim_lo = -30000;
+  bool guard_seen = false;
+  bool stopping_guard = false;
+  bool outward_pwm = false;  // ガード中に外向き PWM を出した
+  int32_t outward_most = 0;
+  uint16_t fault = fc::NONE;
+};
+
+inline void eg_prepare(EgSim& s, double speed, double a_plant, int delay_ms, int dir, int32_t lim = 0) {
+  if (lim <= 0) {
+    // 全速に達してから危険域に入る位置。20 s の試験で届くよう、端を必要最小限に置く
+    const double accel = speed * speed / (2.0 * a_plant) + 300.0;
+    const double d_req = speed * 0.08 + speed * speed / (2.0 * 4000.0) + 30.0;
+    lim = static_cast<int32_t>(ceil(accel + speed * 0.8 + d_req + 500.0));
+  }
+  s.lim_hi = lim;
+  s.lim_lo = -lim;
+  v1::Config c = base_config();
+  c.soft_min_count = s.lim_lo;
+  c.soft_max_count = s.lim_hi;
+  c.max_vel_count_s = 6000;
+  c.max_acc_count_s2 = 40000;
+  c.following_error_limit_count = 1000000;
+  c.overspeed_count_s = 100000;
+  c.command_timeout_ms = 5000;
+  c.stop_timeout_ms = 8000;
+  Harness::accepted(s.h.config_with(c));
+  s.h.reach_holding_from_configured();
+  s.h.ax.tuning.kp_percent_per_100 = 200;
+  s.h.ax.tuning.deadband = 0;
+  s.h.ax.tuning.deadband_out = 0;
+  s.h.ax.tuning.duty_min = 0;
+  s.h.ax.tuning.duty_max = 100;
+  s.h.ax.tuning.ki_permille_per_count_s = 0;
+  s.h.ax.tuning.stall_boost_ms = 0;
+  s.h.ax.tuning.assist_ms = 0;
+  s.h.ax.tuning.stall_ms = 60000;
+  s.h.ax.tuning.settled_ms = 0;
+  s.h.ax.tuning.soft_brake_acc_count_s2 = 0;
+  s.h.ax.tuning.playout_delay_ms = 0;
+  s.h.pos_max_vel = static_cast<uint32_t>(speed);
+  s.h.set_position(0, 200);
+  Harness::accepted(s.h.start());
+  s.a_plant = a_plant;
+  s.v_cap = speed;
+  s.dir = dir;
+  s.x = 0;
+  s.v = 0;
+  s.outward_most = 0;
+  s.delay.assign(static_cast<size_t>(delay_ms / 5), 0);
+}
+
+inline int32_t eg_target(const EgSim& s) { return s.dir > 0 ? s.lim_hi : s.lim_lo; }
+
+inline void eg_step(EgSim& s, int32_t target, uint32_t max_acc = 20000) {
+  const int applied = s.delay.empty() ? 0 : s.delay.front();
+  if (!s.delay.empty()) s.delay.erase(s.delay.begin());
+  const double dt = 0.005;
+  // 正の PWM はカウント増。|PWM| がしきい値を超えたら ±a_plant で加減速（遅れの分だけ古い指令）。
+  // 外向きの速さだけ approach 速度で頭打ち。内向きは制動が通り抜ける
+  if (applied > 15) s.v += s.a_plant * dt;
+  else if (applied < -15) s.v -= s.a_plant * dt;
+  if (s.dir > 0 && s.v > s.v_cap) s.v = s.v_cap;
+  if (s.dir < 0 && s.v < -s.v_cap) s.v = -s.v_cap;
+  s.x += s.v * dt;
+  s.h.now += 5 * MS;
+  s.h.raw = llround(s.x);
+  if (s.dir > 0 && s.h.raw > s.outward_most) s.outward_most = static_cast<int32_t>(s.h.raw);
+  if (s.dir < 0 && s.h.raw < s.outward_most) s.outward_most = static_cast<int32_t>(s.h.raw);
+  s.h.send(s.h.set_position_msg(target, 200, max_acc));
+  s.h.ax.tick(s.h.now, s.h.raw);
+  s.h.drain();
+  s.delay.push_back(s.h.ax.pwm_permille());
+  if (s.h.ax.end_guard_active()) {
+    s.guard_seen = true;
+    if (s.h.ax.state() == st::STOPPING) s.stopping_guard = true;
+    const int pwm = s.h.ax.pwm_permille();
+    if ((s.dir > 0 && pwm > 0) || (s.dir < 0 && pwm < 0)) s.outward_pwm = true;
+  }
+  if (s.h.ax.state() == st::FAULT) s.fault = s.h.ax.fault_code();
+}
+
+inline bool eg_inside(const EgSim& s) {
+  const int32_t a = s.h.ax.actual_count();
+  return a >= s.lim_lo && a <= s.lim_hi;
+}
+
+// 物理的に止まれる組み合わせは端の内側で END_GUARD が立ち、止まれない組み合わせは SOFT_LIMIT のまま。
+inline void test_end_guard_approach_matrix() {
+  const double speeds[] = {1200, 2500, 4000};
+  const double accels[] = {6000, 3000};
+  const int delays[] = {20, 40};
+  CHECK(v1::flags::END_GUARD == (1u << 7));
+  for (double speed : speeds) {
+    for (double a_plant : accels) {
+      for (int delay_ms : delays) {
+        const double d_req = speed * 0.08 + speed * speed / (2.0 * 4000.0) + 30.0;
+        const double d_stop = speed * (delay_ms / 1000.0 + 0.005) + speed * speed / (2.0 * a_plant);
+        const bool can_stop = d_stop < d_req;
+        for (int dir : {+1, -1}) {
+          EgSim s;
+          eg_prepare(s, speed, a_plant, delay_ms, dir);
+          CHECK(s.h.ax.tuning.end_guard_lat_ms == V1_END_GUARD_LAT_MS);
+          CHECK(s.h.ax.tuning.end_guard_acc_count_s2 == V1_END_GUARD_ACC_COUNT_S2);
+          CHECK(s.h.ax.tuning.end_guard_margin_count == V1_END_GUARD_MARGIN_COUNT);
+          bool stopped = false;
+          bool flag_while_guard = false;
+          for (int ms = 0; ms < 20000; ms += 5) {
+            eg_step(s, eg_target(s));
+            if (s.h.ax.end_guard_active()) {
+              if ((s.h.ax.flags() & fl::END_GUARD) != 0) flag_while_guard = true;
+              if (dir > 0) {
+                CHECK(s.h.ax.setpoint_pos() <= static_cast<double>(s.h.ax.actual_count()) + 1e-6);
+                CHECK(s.h.ax.setpoint_vel() <= 0.0);
+              } else {
+                CHECK(s.h.ax.setpoint_pos() >= static_cast<double>(s.h.ax.actual_count()) - 1e-6);
+                CHECK(s.h.ax.setpoint_vel() >= 0.0);
+              }
+            }
+            if (s.fault != fc::NONE) break;
+            // 100 ms 窓の velocity_ は止まった直後も高いままなので、プラントの速さで「止まった」を見る
+            const double pv = s.v < 0 ? -s.v : s.v;
+            if (s.guard_seen && pv < 30.0 && eg_inside(s)) {
+              stopped = true;
+              break;
+            }
+          }
+          if (!can_stop) {
+            if (s.fault != fc::SOFT_LIMIT || !s.guard_seen) {
+              std::printf("end-guard expected SOFT_LIMIT dir=%d v=%g a=%g delay=%d fault=%u guard=%d x=%d lim=%d\n",
+                          dir, speed, a_plant, delay_ms, s.fault, s.guard_seen ? 1 : 0, s.h.ax.actual_count(),
+                          s.lim_hi);
+            }
+            CHECK(s.fault == fc::SOFT_LIMIT);
+            CHECK(s.guard_seen);  // ガードが先に掛かっても、越えたら SOFT_LIMIT は残る
+            CHECK(!eg_inside(s));
+          } else {
+            if (!stopped || !flag_while_guard || s.outward_pwm || s.fault != fc::NONE) {
+              std::printf(
+                  "end-guard expected stop dir=%d v=%g a=%g delay=%d stopped=%d flag=%d pwm_out=%d fault=%u x=%d lim=%d pv=%g\n",
+                  dir, speed, a_plant, delay_ms, stopped ? 1 : 0, flag_while_guard ? 1 : 0, s.outward_pwm ? 1 : 0, s.fault,
+                  s.h.ax.actual_count(), s.lim_hi, s.v);
+            }
+            CHECK(stopped);
+            CHECK(flag_while_guard);
+            CHECK(!s.outward_pwm);
+            CHECK(s.fault == fc::NONE);
+            CHECK(eg_inside(s));
+          }
+        }
+      }
+    }
+  }
+}
+
+// ガード中の外向きフレームは参照を進めない。内側フレームは再生遅れ 40 ms を待たず、その tick で内側の速度になる。
+inline void test_end_guard_outward_clamped_and_inward_immediate() {
+  EgSim s;
+  eg_prepare(s, 1200, 6000, 20, +1);
+  bool armed = false;
+  for (int ms = 0; ms < 20000 && !armed; ms += 5) {
+    eg_step(s, eg_target(s));
+    if (s.h.ax.end_guard_active() && s.h.ax.state() == st::ACTIVE) armed = true;
+  }
+  CHECK(armed);
+  CHECK((s.h.ax.flags() & fl::END_GUARD) != 0);
+  const double sp = s.h.ax.setpoint_pos();
+  const int32_t x = s.h.ax.actual_count();
+  CHECK(sp <= static_cast<double>(x) + 1e-6);
+  CHECK(s.h.ax.setpoint_vel() <= 0.0);
+  eg_step(s, s.lim_hi);  // さらに外（ソフトリミット）を要求
+  CHECK(s.h.ax.end_guard_active());
+  CHECK(s.h.ax.setpoint_pos() <= sp + 1e-6);
+  CHECK(s.h.ax.setpoint_vel() <= 0.0);
+  CHECK(s.h.ax.pwm_permille() <= 0);
+  // 再生バッファに切り替えても、内側の目標はその tick で追従する（遅れ 40 ms を待たない）
+  s.h.ax.tuning.playout_delay_ms = 40;
+  eg_step(s, 0, 20000);
+  CHECK(!s.h.ax.end_guard_active());
+  CHECK((s.h.ax.flags() & fl::END_GUARD) == 0);
+  CHECK(s.h.ax.setpoint_vel() < 0.0);
+  CHECK(s.h.ax.state() == st::ACTIVE);
+}
+
+// STOPPING でも掛かる。減速をフレームの 500 count/s² にすると、ガードが無ければ端を越える距離で止める。
+inline void test_end_guard_in_stopping() {
+  EgSim s;
+  eg_prepare(s, 1200, 6000, 40, +1, 8000);
+  bool stopped_cmd = false;
+  for (int ms = 0; ms < 20000; ms += 5) {
+    const int32_t x = static_cast<int32_t>(llround(s.x));
+    const int32_t dist = s.lim_hi - x;
+    const int32_t vm = s.h.ax.velocity_count_s();
+    if (!stopped_cmd && s.h.ax.state() == st::ACTIVE && !s.h.ax.end_guard_active() && vm > 800 && dist < 1000 &&
+        dist > 500) {
+      Harness::accepted(s.h.stop());
+      stopped_cmd = true;
+    }
+    eg_step(s, s.lim_hi, 500);
+    if (s.fault != fc::NONE) break;
+    if (stopped_cmd && s.h.ax.state() == st::HOLDING) break;
+  }
+  if (!stopped_cmd || !s.stopping_guard || s.fault != fc::NONE) {
+    std::printf("end-guard stopping cmd=%d guard=%d fault=%u x=%d state=%u\n", stopped_cmd ? 1 : 0,
+                s.stopping_guard ? 1 : 0, s.fault, s.h.ax.actual_count(), s.h.ax.state());
+  }
+  CHECK(stopped_cmd);
+  CHECK(s.stopping_guard);
+  CHECK(s.fault == fc::NONE);
+  CHECK(eg_inside(s));
+  CHECK(s.h.ax.actual_count() < s.lim_hi);
+}
+
+// ストローク中央の正弦は端に届かない。ビットは立たず、ガード無効の軸と参照・実位置・Duty が一致する。
+inline void test_end_guard_midstroke_sine_unchanged() {
+  auto run = [](bool enable, std::vector<int32_t>* act, std::vector<int32_t>* tgt, std::vector<int>* duty,
+                std::vector<double>* sv, bool* bit) {
+    Harness h;
+    h.reach_active();
+    if (!enable) h.ax.tuning.end_guard_acc_count_s2 = 0;
+    *bit = false;
+    for (int ms = 0; ms < 2000; ms += 5) {
+      if (ms % 10 == 0) {
+        const double ang = 6.283185307179586 * static_cast<double>(ms) / 2000.0;
+        h.set_position(static_cast<int32_t>(llround(400.0 * sin(ang))), 50);
+      }
+      h.step(5);
+      if (h.ax.end_guard_active() || (h.ax.flags() & fl::END_GUARD) != 0) *bit = true;
+      act->push_back(h.ax.actual_count());
+      tgt->push_back(h.ax.target_count());
+      duty->push_back(h.ax.duty_permille());
+      sv->push_back(h.ax.setpoint_vel());
+    }
+  };
+  std::vector<int32_t> act_a, act_b, tgt_a, tgt_b;
+  std::vector<int> duty_a, duty_b;
+  std::vector<double> sv_a, sv_b;
+  bool bit_a = false, bit_b = false;
+  run(true, &act_a, &tgt_a, &duty_a, &sv_a, &bit_a);
+  run(false, &act_b, &tgt_b, &duty_b, &sv_b, &bit_b);
+  CHECK(!bit_a);
+  CHECK(!bit_b);
+  CHECK(act_a.size() == act_b.size());
+  bool same = act_a.size() == act_b.size();
+  for (size_t i = 0; same && i < act_a.size(); ++i) {
+    if (act_a[i] != act_b[i] || tgt_a[i] != tgt_b[i] || duty_a[i] != duty_b[i] || fabs(sv_a[i] - sv_b[i]) > 1e-9) {
+      same = false;
+      std::printf("end-guard midstroke differs at %zu act %d/%d tgt %d/%d duty %d/%d\n", i, act_a[i], act_b[i],
+                  tgt_a[i], tgt_b[i], duty_a[i], duty_b[i]);
+    }
+  }
+  CHECK(same);
+}
+
 inline void run_all() {
   test_boots_disarmed_with_safe_outputs();
   test_hello_answers_in_every_state();
@@ -5131,6 +5399,10 @@ inline void run_all() {
   test_host_fault_during_calibration();
   test_local_estop_and_overrun_during_calibration();
   test_fault_during_calibration_shutdown_keeps_final_result();
+  test_end_guard_approach_matrix();
+  test_end_guard_outward_clamped_and_inward_immediate();
+  test_end_guard_in_stopping();
+  test_end_guard_midstroke_sine_unchanged();
 }
 
 }  // namespace v1axis_test
