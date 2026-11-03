@@ -3333,31 +3333,41 @@ inline void test_settled_on_keeps_stationary_stall_fault() {
   Harness::accepted(h.config_with(c));
   h.reach_holding_from_configured();
   h.stall = true;
-  h.raw -= 25;
+  h.raw -= 30;  // stationary_fault_min_err（25）を超える
   h.step();
-  h.drive(1990, h.ax.actual_count() + 25);
+  h.drive(1990, h.ax.actual_count() + 30);
   CHECK(h.ax.state() == st::HOLDING);
-  h.drive(20, h.ax.actual_count() + 25);
+  h.drive(20, h.ax.actual_count() + 30);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   CHECK(h.ax.integral_permille() == 0 && h.ax.duty_permille() == 0);
 }
 
 
-// 2026-11-03 20:11: 人の荷重で目標の 14 count 手前から動けなくても、|誤差| ≤ stationary_fault_min_err（20）なら静止 2 s の監視で FAULT にしない。
-// 25 count 手前なら従来どおり ENCODER_FAULT（上の test_settled_on_keeps_stationary_stall_fault）
+// 2026-11-03 20:11: 人の荷重で目標の手前から動けなくても、|誤差| ≤ stationary_fault_min_err（25）なら静止 2 s の監視で FAULT にしない。
+// flight_circus 側の記録の最大 −21 も含める。26 以上なら従来どおり ENCODER_FAULT
+inline void r9_holding(Harness& h);  // 下で定義
 inline void test_stationary_small_error_under_load_is_not_encoder_fault() {
+  // 実機の既定（方向別 FF ＋ PI、r9）。試験のビルドは V1_FF_DIRECTIONAL=0 なので r9_holding で方向別にする
   Harness h;
-  v1::Config c = base_config();
-  c.following_error_limit_count = 100000;
-  Harness::accepted(h.config_with(c));
-  h.reach_holding_from_configured();
+  r9_holding(h);
+  h.ax.tuning.overrun_ms = V1_OVERRUN_MS;
+  CHECK(h.ax.tuning.stationary_fault_min_err == 25);
   h.stall = true;
-  h.raw -= 14;
+  h.raw -= 21;  // flight_circus 側の記録の最大
   h.step();
-  h.drive(6000, h.ax.actual_count() + 14);
+  h.drive(6000, h.ax.target_count());
   CHECK(h.ax.state() == st::HOLDING);
   CHECK(h.ax.fault_code() == fc::NONE);
   CHECK(h.ax.referenced());
+  // 26 count なら従来どおり 2 s で ENCODER_FAULT
+  Harness k;
+  r9_holding(k);
+  k.ax.tuning.overrun_ms = V1_OVERRUN_MS;
+  k.stall = true;
+  k.raw -= 26;
+  k.step();
+  k.drive(2200, k.ax.target_count());
+  CHECK(k.ax.state() == st::FAULT && k.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
 // ---- Issue #25 手順 9「T」: 追従中の動き出し補助 ----------------------------------------------------------------
