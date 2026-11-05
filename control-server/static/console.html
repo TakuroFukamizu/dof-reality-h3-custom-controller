@@ -190,7 +190,7 @@ td.num{text-align:right}
   </section>
 
   <section class="sec">
-    <header><span class="num">02</span><h2>校正</h2><span class="lbl">CALIBRATION</span></header>
+    <header><span class="num">02</span><h2>校正と反映</h2><span class="lbl">CALIBRATE / APPLY / DECLARE</span></header>
     <label class="check"><input type="checkbox" id="seat-empty"> 座席に人がいない・手が離れている・まわりに物がない（校正では各軸が端から端まで動きます）</label>
     <div class="row" style="margin-top:10px;align-items:center">
       <span class="small">対象:</span>
@@ -205,20 +205,18 @@ td.num{text-align:right}
     </div>
     <div class="result" id="cal-result"></div>
     <div class="cards3" id="cal-cards" style="margin-top:12px"></div>
-  </section>
-
-  <section class="sec">
-    <header><span class="num">03</span><h2>反映と宣言</h2><span class="lbl">APPLY / DECLARE</span></header>
-    <div id="apply-new" class="hide">
-      <div class="note">校正の結果を設定に保存して、その場で使います（再起動は不要）。全軸が止まっているときだけ押せます。行程が前回と ±30 を超えていても止めずに知らせます。確かめてから反映してください。</div>
-      <div class="cards3" id="apply-cards" style="margin-top:10px"></div>
+    <div id="apply-new" class="hide" style="margin-top:10px">
+      <div class="note">校正の結果は、各軸のカードの「反映する」で設定に保存してその場で使います（再起動は不要）。全軸が止まっているときだけ押せます。行程が前回と ±30 を超えていても止めずに知らせるので、確かめてから反映してください。同じ個体で ±30 以内なら「宣言」は引き継がれます。</div>
+      <div class="row" style="margin-top:8px"><button class="btn-go" id="apply-all">結果が OK の軸をまとめて反映</button></div>
     </div>
-    <div id="apply-old">
+    <div id="apply-old" style="margin-top:10px">
       <div class="note">このサーバーは、まだその場での反映に対応していません。校正のあとは「設定に書き出す」→ 書き出したファイルを確認して <code>calibration_valid = true</code> にする → そのファイルでサーバーを再起動、の順で進めます（hardware-bringup.md §5.0）。</div>
       <div class="row" style="margin-top:10px"><button id="cal-export">校正結果を設定に書き出す</button></div>
     </div>
     <div class="result" id="apply-result"></div>
   </section>
+
+
 
   <section class="sec" id="tok-sec">
     <header><span class="num">··</span><h2>管理トークン</h2><span class="lbl">ADMIN TOKEN</span></header>
@@ -558,14 +556,14 @@ function renderSetup() {
 
   // 02 校正
   $('cal-run').disabled = !$('seat-empty').checked || lost();
-  $('cal-cards').innerHTML = [1, 2, 3].map(n => calCard(axes.find(x => x.axis_id === n) || {}, n, false)).join('');
-  // 03 反映
+  // 結果カードに反映・宣言のボタンを入れる（新しい API があるとき）
+  $('cal-cards').innerHTML = [1, 2, 3].map(n => calCard(axes.find(x => x.axis_id === n) || {}, n, hasNewApi())).join('');
   $('apply-new').classList.toggle('hide', !hasNewApi());
   $('apply-old').classList.toggle('hide', hasNewApi());
   if (hasNewApi()) {
-    $('apply-cards').innerHTML = [1, 2, 3].map(n => calCard(axes.find(x => x.axis_id === n) || {}, n, true)).join('');
     document.querySelectorAll('[data-apply]').forEach(b => b.onclick = () => applyCal(Number(b.dataset.apply)));
     document.querySelectorAll('[data-declare]').forEach(b => b.onclick = () => declare(Number(b.dataset.declare)));
+    $('apply-all').disabled = !axes.some(a => a.calibration_stale && a.calibration && a.calibration.result === 'OK');
   }
 }
 
@@ -620,6 +618,17 @@ async function applyCal(n) {
   const j = r.json || {};
   show($('apply-result'), r, `#${n} を反映しました。行程 ${j.stroke}（前回 ${j.prev_stroke}）${j.within_tolerance ? '' : ' ±30 超'} / 宣言 ${j.calibration_valid ? '引き継ぎ' : 'やり直しが必要'}\n保存: ${j.path || ''}（元のファイル: ${j.backup || ''}）`);
 }
+$('apply-all').addEventListener('click', async () => {
+  const axes = ((S && S.axes) || []).filter(a => a.calibration_stale && a.calibration && a.calibration.result === 'OK').map(a => a.axis_id);
+  const lines = [];
+  for (const n of axes) {
+    const r = await api('POST', '/v1/calibration/apply', {axis: n});
+    const j = r.json || {};
+    lines.push(r.ok ? `#${n} 反映: 行程 ${j.stroke}（前回 ${j.prev_stroke}）${j.within_tolerance ? '' : ' ±30 超'} / 宣言 ${j.calibration_valid ? '引き継ぎ' : 'やり直しが必要'}`
+                    : `#${n} 失敗 (${r.status}) ${humanErr((r.json || {}).error || '')}`);
+  }
+  const el = $('apply-result'); el.classList.toggle('err', lines.some(l => l.includes('失敗'))); el.textContent = lines.join('\n') || '反映するものがありません';
+});
 async function declare(n) {
   const ok = window.confirm(`#${n} の値は、この軸・この個体で測ったものですか？\n・行程が過去の値と大きく違わない\n・中立で止めた位置が正しい\n・座席に人がいない\n・物理の非常停止を押せる人がいる`);
   if (!ok) return;
