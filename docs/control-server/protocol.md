@@ -457,3 +457,11 @@ frame (30 byte): 01 88 18 00 EF CD AB 89 28 03 02 3C 64 00 0A 00 14 00 20 4E 70 
 wire  (32 byte): 04 01 88 18 0A EF CD AB 89 28 03 02 3C 64 02 0A 02 14 05 20 4E 70 17 01 03 40 9C 01 03 1C CE 00
 ```
 <!-- VECTORS:END -->
+
+## 付録 A. 計測専用の種別（量産のファーム・サーバーには無い）
+
+`env:m5stack-cores3-v1-diag`（`-DV1_DIAG_BRAKE_TEST=1`）だけが答える。ブレーキの効き始めと沈みの計測用で、サーバーは送らない・受けても知らない。
+種別 `0x40` DIAG_START（ACK あり）/ `0x41` DIAG_READ（ACK なし）/ `0xC0` DIAG_RESULT / `0xC1` DIAG_DATA、状態 `9` = DIAG、capabilities bit 8 = DIAG_BRAKE。
+DIAG_DATA の 13〜15 byte は区間の状態（session_flags・session_ms）、DIAG_RESULT の 62〜63 byte は解除時の区間の経過 ms（2026-11-02 夜、PR #64 の修正）。
+量産のファームは `0x40` / `0x41` を未知の種別として rx_error に数えるだけ。レイアウトは `moter-controler/include/v1_codec.h`、
+手順は `moter-controler/docs/brake_sag_measurement.md`。

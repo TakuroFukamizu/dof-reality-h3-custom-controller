@@ -379,7 +379,13 @@ inline void test_hello_answers_in_every_state() {
         CHECK(m.hello.device_id == 0x5131000000000001ull);
         CHECK(m.hello.boot_id == 2309737967u);
         CHECK(m.hello.fw_major == 0 && m.hello.fw_minor == 1 && m.hello.fw_patch == 0);
+#if V1_DIAG_BRAKE_TEST
+        // 計測専用の組み立ては DIAG_BRAKE を足して名乗る（test_v1_diag.h）
+        CHECK(m.hello.capabilities ==
+              (v1::capabilities::POSITION_MODE | v1::capabilities::LIMITS | v1::capabilities::DIAG_BRAKE));
+#else
         CHECK(m.hello.capabilities == (v1::capabilities::POSITION_MODE | v1::capabilities::LIMITS));
+#endif
         CHECK((m.hello.capabilities & v1::capabilities::LIMITS) != 0);  // SET_LIMITS / LIMITS 対応（設計 §4.1）
         CHECK(m.hello.calibration_hash == expect_hash);
       }

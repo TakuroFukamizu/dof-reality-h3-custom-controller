@@ -274,6 +274,13 @@ void write_outputs(bool power_on, bool brake_release, int duty_permille) {
   motor_output_write_permille(duty_permille);
 }
 
+#if V1_DIAG_BRAKE_TEST
+// 計測専用: VIOUT（保護基板の電流出力 → Base15 内の分圧 → G10 / ADC1_CH9）の生値。換算はしない（記録に残すだけ）。
+// 計測の記録中（1 ms ごと）だけ読む。analogRead は 1 回数十 us
+uint16_t diag_read_viout() { return static_cast<uint16_t>(analogRead(PIN_VIOUT)); }
+static_assert(configTICK_RATE_HZ == 1000, "計測の 1 ms 刻みは FreeRTOS の tick 1 kHz が前提");
+#endif
+
 void v1_task_main(void*) {
   V1Identity id;
   id.device_id = v1_link_device_id();
@@ -343,7 +350,16 @@ void v1_task_main(void*) {
       }
     }
 
+#if V1_DIAG_BRAKE_TEST
+    {
+      // 計測専用: tick の後に計測の段階を進める（tick_calibration と同じ位置。DIAG の間 tick は Duty 0 を書くので、ここで上書きする）
+      const int64_t raw_now = encoder_count();
+      g_axis.tick(now, raw_now);
+      g_axis.diag_step(now, raw_now, g_axis.diag_fast() ? diag_read_viout() : 0);
+    }
+#else
     g_axis.tick(now, encoder_count());
+#endif
     write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille());
 
     // 校正に成功した系統の符号を、次の系統切り替え（set_sign）に反映する。NVS への保存は loop() が行う
@@ -433,7 +449,25 @@ void v1_task_main(void*) {
     g_v1_snap = snap;
     portEXIT_CRITICAL(&g_mux);
 
+#if V1_DIAG_BRAKE_TEST
+    // 計測専用: 記録中（ブレーキ解除から作動後の記録の終わりまで、最長約 1 s）だけ、次の 5 ms の tick までの間を 1 ms ごとに刻み、
+    // エンコーダ・VIOUT を読んで計測の段階を進め、出力を書く（FreeRTOS の tick は 1 kHz）。受信・tick・異常の監視・スナップショットは
+    // 5 ms のまま（画面の非常停止の反映も従来どおり最長 5 ms）。記録中でなければ従来と同じ 5 ms 周期。
+    {
+      const TickType_t period = pdMS_TO_TICKS(kPeriodMs);
+      TickType_t waited = 0;
+      while (g_axis.diag_fast() && waited + 1 < period) {
+        vTaskDelayUntil(&last_wake, 1);
+        waited += 1;
+        const uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
+        g_axis.diag_step(t, encoder_count(), diag_read_viout());
+        write_outputs(g_axis.power_on_cmd(), g_axis.brake_release_cmd(), g_axis.duty_permille());
+      }
+      vTaskDelayUntil(&last_wake, period - waited);
+    }
+#else
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(kPeriodMs));
+#endif
   }
 }
 
@@ -447,6 +481,10 @@ void control_v1_begin(const MotorProfile profiles[4], uint8_t selected_axis) {
   g_selected = (selected_axis >= 1 && selected_axis <= 3) ? selected_axis : 1;
   g_v1_snap.selected_axis = g_selected;
   g_v1_snap.state = 0;  // BOOT（タスクが begin するまで）
+#if V1_DIAG_BRAKE_TEST
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_VIOUT, ADC_11db);  // 0〜約 3.1 V。分圧後の電圧が範囲に入るかは未確認（記録は生値）
+#endif
   xTaskCreatePinnedToCore(v1_task_main, "control_v1", 8192, nullptr, 5, nullptr, 1);
 }
 
