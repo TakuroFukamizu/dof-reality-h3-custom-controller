@@ -514,8 +514,7 @@ function renderMonitor() {
   const fh = S && S.fault_history && S.fault_history.length ? S.fault_history[S.fault_history.length - 1] : null;
   if (!lost() && fh && S.rig_state !== 'FAULT_LATCHED' && nowMs !== null && nowMs - fh.at_ms < 10 * 60 * 1000) {
     const f = faultText(fh.fault);
-    const ago = Math.round((nowMs - fh.at_ms) / 1000);
-    rec.innerHTML = `直近の異常 ${ago} 秒前: <b>${esc(f.what)}</b> <span class="mono">${esc(f.code)}</span>（解除済み）`;
+    rec.innerHTML = `直近の異常 ${fmtDur(nowMs - fh.at_ms)}前: <b>${esc(f.what)}</b> <span class="mono">${esc(f.code)}</span>（解除済み）`;
     rec.classList.remove('hide');
   } else rec.classList.add('hide');
 
@@ -719,7 +718,7 @@ function renderSession() {
   const rows = [
     ['セッション ID（先頭 8 桁）', s?.source_session_prefix || 'なし'],
     ['姿勢の鮮度', !s || !s.source_session_prefix ? 'ゲーム未接続' : (s.fresh ? '<span class="sev-ok">新しい</span>' : '<span class="sev-warn">途切れている</span>')],
-    ['最後の姿勢からの時間', s?.source_age_ms != null ? s.source_age_ms + ' ms' : '—'],
+    ['最後の姿勢からの時間', fmtDur(s?.source_age_ms)],
     ['最後の seq / frame_seq', s ? `${s.last_seq ?? '—'} / ${s.last_frame_seq ?? '—'}` : '—'],
     ['要求の姿勢 (pitch, roll, yaw)', S?.requested_pose ? ['pitch', 'roll', 'yaw'].map(k => (+S.requested_pose[k]).toFixed(2)).join(', ') : '—'],
     ['ゲイン（要求 → 有効）', S ? `${S.requested_gain ?? '—'} → ${S.effective_gain ?? '—'}` : '—'],
@@ -779,6 +778,18 @@ function evSummary(e) {
     }
     default: { const j = JSON.stringify(d); return j.length > 160 ? j.slice(0, 160) + '…' : j; }
   }
+}
+// 経過時間を人が読める形に: 850 ms / 3.2 秒 / 5 分 27 秒 / 1 時間 3 分
+function fmtDur(ms) {
+  if (ms == null || !isFinite(ms)) return '—';
+  ms = Math.max(0, ms);
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 10) return `${s.toFixed(1)} 秒`;
+  if (s < 60) return `${Math.floor(s)} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分 ${Math.floor(s % 60)} 秒`;
+  return `${Math.floor(m / 60)} 時間 ${m % 60} 分`;
 }
 function fmtT(ms) { if (ms == null) return '—'; const s = ms / 1000; const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = Math.floor(s % 60); return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}`; }
 function renderLog() {
