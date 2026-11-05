@@ -51,6 +51,10 @@ struct Harness {
   bool stall = false;             // プラントが動かない
   uint32_t pos_max_vel = 4000;    // set_position の max_vel_count_s（T のテストで遅い軌道にする）
   double plant_vel = 4000.0;      // count/s
+  uint32_t release_freeze_ms = 0; // ブレーキ解除指令（立ち上がり）の後、機構がこの間動かない（ブレーキが物理的に外れるまでの模擬）
+  uint64_t frozen_until = 0;
+  int32_t bite_count = 0;         // ブレーキ作動指令の直後に機構が受ける食い込み（#2 の実測 6〜34 count）
+  bool prev_brake = false;
   // 校正（CALIBRATING）の模擬機構: Duty（MD13S の符号付き %）に比例した速度で raw が動き、端 [end_lo, end_hi] で止まる
   // （止まる＝無パルス。AutoMachine の端検出がこれを拾う）。plant_sign = +1 は「Duty + でカウント減」（#1 の実測。
   // P 端 = raw の下限側）。既定の端は stroke 5551 / neutral 2775（CAL_RESULT のテストベクタと同じ値）。
@@ -67,6 +71,7 @@ struct Harness {
     id.boot_id = 2309737967u;
     raw = raw0;
     ax.begin(id, axis, sign, now, raw);
+    ax.tuning.hold_brake = false;  // HOLDING のブレーキ保持（test_hold_brake_*）は個別に有効にする。他の試験はブレーキ解除のまま
     ax.tick(now, raw);
     drain();
     if (reference) accepted(set_reference(0));
@@ -196,7 +201,10 @@ struct Harness {
   // 1 tick（既定 5 ms）。プラントは位置制御中だけ setpoint に追従する。校正中は Duty に応じて端まで動く。
   void step(uint32_t dt_ms = 5) {
     now += dt_ms * MS;
-    if (!stall && ax.brake_release_cmd()) {
+    if (ax.brake_release_cmd() && !prev_brake) frozen_until = now + static_cast<uint64_t>(release_freeze_ms) * MS;
+    if (!ax.brake_release_cmd() && prev_brake) raw += bite_count;  // 作動指令の立ち上がり（解除 → 作動）
+    prev_brake = ax.brake_release_cmd();
+    if (!stall && ax.brake_release_cmd() && now >= frozen_until) {
       if (ax.state() == st::CALIBRATING) {
         const double v = -static_cast<double>(plant_sign) * ax.duty_permille() / 10.0 * cal_count_s_per_percent;  // count/s（Duty は permille）
         raw += llround(v * static_cast<double>(dt_ms) / 1000.0);
@@ -3709,6 +3717,7 @@ inline void test_integral_does_not_flip_floor_direction_when_stationary() {
 
 inline V1Tuning r6_tuning(int kp = 6, int duty_max = 20) {
   V1Tuning t(true);
+  t.hold_brake = false;  // ブレーキ保持は test_hold_brake_* だけで見る
   t.kp_percent_per_100 = kp;
   t.duty_min = 9;
   t.duty_max = duty_max;
@@ -4715,6 +4724,7 @@ inline PlayoutResult run_playout_scenario(const PlayoutScenario& s) {
   PlayoutResult r;
   Harness h;
   h.ax.tuning = V1Tuning(true);
+  h.ax.tuning.hold_brake = false;
   h.ax.tuning.vel_kd_permille_per_count_s = 0.0;  // FF の落ちをそのまま見る（r9 の減衰も同じ参照速度を使う）
   h.ax.tuning.playout_delay_ms = s.delay_ms;
   h.pos_max_vel = s.max_vel;
@@ -5017,6 +5027,7 @@ inline void test_playout_zero_max_acc_still_decelerates() {
   {
     Harness h;
     h.ax.tuning = V1Tuning(true);
+    h.ax.tuning.hold_brake = false;
     h.pos_max_vel = 600;
     h.reach_active();
     const int32_t from = h.ax.actual_count();
@@ -5037,6 +5048,7 @@ inline void test_playout_zero_max_acc_still_decelerates() {
   {
     Harness h;
     h.ax.tuning = V1Tuning(true);
+    h.ax.tuning.hold_brake = false;
     h.pos_max_vel = 600;
     h.reach_active();
     const int32_t from = h.ax.actual_count();
@@ -5055,6 +5067,7 @@ inline void test_playout_zero_max_acc_still_decelerates() {
   {
     Harness h;
     h.ax.tuning = V1Tuning(true);
+    h.ax.tuning.hold_brake = false;
     h.pos_max_vel = 600;
     h.reach_active();
     const int32_t from = h.ax.actual_count();
@@ -5103,6 +5116,7 @@ inline void test_playout_cadence_change_reseeds_clock() {
 inline void test_playout_expiry_stop_fault_epoch_unchanged() {
   auto make = [](Harness& h) {
     h.ax.tuning = V1Tuning(true);
+    h.ax.tuning.hold_brake = false;
     h.pos_max_vel = 600;
     CHECK(h.ax.tuning.playout_delay_ms == V1_PLAYOUT_DELAY_MS || V1_PLAYOUT == 0);
     h.ax.tuning.playout_delay_ms = 40;
@@ -5204,6 +5218,416 @@ inline void test_playout_expiry_stop_fault_epoch_unchanged() {
     CHECK(h.ax.stale_drop_count() == stale0 + 20);
     CHECK(h.ax.state() == st::ACTIVE && h.ax.target_count() == here && h.ax.setpoint_vel() == 0.0);
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// HOLDING 中のブレーキ保持（V1Tuning::hold_brake）。座った荷重での位置ループの微振動を避ける。
+// プラントはブレーキ作動中は動かない（Harness::step）。荷重のずれは h.raw を直接動かして模擬する。
+// ---------------------------------------------------------------------------
+
+// ARM して HOLDING に入った tick で止める（ブレーキ保持は有効にして）。入った時刻を返す
+inline uint64_t hb_arm_to_holding(Harness& h, bool hold_brake = true) {
+  h.ax.tuning = r6_tuning(6);
+  h.ax.tuning.hold_brake = hold_brake;
+  Harness::accepted(h.config());
+  Harness::accepted(h.arm());
+  const int32_t here = h.ax.actual_count();
+  for (int i = 0; i < 400 && h.ax.state() != st::HOLDING; ++i) {
+    if (i % 2 == 0) h.set_position(here);
+    h.step(5);
+  }
+  CHECK(h.ax.state() == st::HOLDING);
+  return h.now;
+}
+
+inline void hb_run(Harness& h, uint32_t ms, int32_t target) { h.drive(ms, target); }
+
+// 作動指令が出るまで 5 ms ずつ進める（静止待ち）。出た tick の時刻を返す（出なければ 0）
+inline uint64_t hb_wait_brake_cmd(Harness& h, uint32_t max_ms = 3000) {
+  for (uint32_t t = 0; t < max_ms; t += 5) {
+    if (!h.ax.brake_release_cmd()) return h.now;
+    hb_run(h, 5, 0);
+  }
+  return !h.ax.brake_release_cmd() ? h.now : 0;
+}
+
+// ARM → HOLDING → 静止待ち → 作動指令 → 支えの時間の後（作動中）まで
+inline void hb_arm_to_braked(Harness& h) {
+  hb_arm_to_holding(h);
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 120, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 3);
+}
+
+inline void test_hold_brake_engages_after_rest_and_idles_after_support() {
+  Harness h;
+  const uint64_t t0 = hb_arm_to_holding(h);
+  CHECK(h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 1);  // 入った tick はまだ解除のまま（静止待ち）
+  const uint64_t t_cmd = hb_wait_brake_cmd(h);
+  CHECK(t_cmd != 0 && t_cmd - t0 >= 190 * MS && t_cmd - t0 <= 260 * MS);  // 静止が settled_ms（200 ms）続いてから
+  CHECK(h.ax.hold_brake_phase() == 2);
+  CHECK((h.status().flags & fl::BRAKE_RELEASE_CMD) == 0 && (h.status().flags & fl::POWER_ON_CMD) != 0);
+  h.raw += 15;  // 荷重で沈んだ（保持位置との差 15。作動しきるまでは位置ループが支える）
+  hb_run(h, 70, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd());
+  CHECK(h.ax.duty_permille() != 0 && h.ax.duty_terms().p_permille != 0);  // 支えの間は通常どおり Duty を出す
+  hb_run(h, 50, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 3);
+  CHECK(h.ax.duty_permille() == 0 && h.ax.integral_permille() == 0);  // 作動中は Duty 0・I もない
+  CHECK(h.ax.duty_terms().p_permille == 0 && h.ax.duty_terms().i_permille == 0);
+  CHECK(h.fault_events().empty());
+}
+
+// 支えの時間のちょうど境目: 作動指令の tick から 95 ms はまだ位置ループ、100 ms で Duty 0
+inline void test_hold_brake_support_boundary_is_exact() {
+  Harness h;
+  hb_arm_to_holding(h);
+  const uint64_t t_cmd = hb_wait_brake_cmd(h);
+  CHECK(t_cmd != 0);
+  h.raw += 15;
+  hb_run(h, 90, 0);
+  hb_run(h, 5, 0);
+  CHECK(h.now - t_cmd == 95 * MS && h.ax.hold_brake_phase() == 2 && h.ax.duty_permille() != 0);
+  hb_run(h, 5, 0);
+  CHECK(h.now - t_cmd == 100 * MS && h.ax.hold_brake_phase() == 3 && h.ax.duty_permille() == 0);
+}
+
+// まだ動いている・遅れているうちに HOLDING に入っても作動させない。静止が続いてから作動
+inline void test_hold_brake_waits_for_rest_when_lagging() {
+  Harness h;
+  const uint64_t t0 = hb_arm_to_holding(h);
+  h.plant_vel = 200.0;  // 1 count / tick で追従（遅れている機構）
+  h.raw += 100;
+  bool applied = false;
+  uint64_t t_cmd = 0;
+  for (int i = 0; i < 400 && !applied; ++i) {
+    hb_run(h, 5, 0);
+    if (!h.ax.brake_release_cmd()) { applied = true; t_cmd = h.now; }
+  }
+  CHECK(applied && h.ax.state() == st::HOLDING);
+  CHECK(t_cmd - t0 >= 600 * MS);  // 誤差が 20 以内に入り、速度が止まり、さらに 200 ms
+  const int32_t v = h.ax.velocity_count_s();
+  CHECK((v < 0 ? -v : v) <= h.ax.tuning.settled_meas_vel);
+  const int32_t e = h.ax.target_count() - h.ax.actual_count();
+  CHECK((e < 0 ? -e : e) <= h.ax.tuning.hold_brake_slip_count);
+  CHECK(h.fault_events().empty());
+}
+
+// 静止の条件が途中で崩れたら 0 から数え直す
+inline void test_hold_brake_rest_break_resets_dwell() {
+  Harness h;
+  const uint64_t t0 = hb_arm_to_holding(h);
+  hb_run(h, 120, 0);
+  CHECK(h.ax.brake_release_cmd());
+  h.raw += 60;  // 誤差 > 20（プラントが 3 tick で戻す）
+  hb_run(h, 150, 0);
+  CHECK(h.ax.brake_release_cmd());  // 崩れなければ 200 ms で作動していた時刻を過ぎても、まだ解除のまま
+  const uint64_t t_cmd = hb_wait_brake_cmd(h);
+  CHECK(t_cmd != 0 && t_cmd - t0 >= 320 * MS);  // 崩さなければ約 195 ms。崩れた後から 200 ms 数え直す
+}
+
+// START の解除の直後は動き出しパルスを出さない（機構が物理的に外れるまで）。その後は出せる
+inline void test_hold_brake_release_grace_inhibits_breakaway() {
+  Harness h;
+  hb_arm_to_braked(h);
+  h.raw += 10;  // 保持位置との差 10（目標は止まったまま）
+  hb_run(h, 100, 0);
+  CHECK(h.ax.hold_brake_phase() == 3);
+  h.release_freeze_ms = 600;  // 解除しても 600 ms 動かないブレーキ（長めに固着）
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.brake_release_cmd());
+  const uint64_t t_start = h.now;
+  h.step(5);
+  CHECK(h.ax.duty_permille() != 0);  // 通常の位置ループはすぐ動く
+  bool pulse_in_grace = false;
+  while (h.now - t_start < 150 * MS) {
+    hb_run(h, 5, 0);
+    if (h.now - t_start < 150 * MS && (h.ax.breakaway_active() || h.ax.breakaway_pulses() != 0)) pulse_in_grace = true;
+  }
+  CHECK(!pulse_in_grace);
+  bool pulse_after = false;
+  while (h.now - t_start < 500 * MS) {
+    hb_run(h, 5, 0);
+    if (h.ax.breakaway_active() || h.ax.breakaway_pulses() != 0) pulse_after = true;
+  }
+  CHECK(pulse_after);
+  CHECK(h.ax.state() == st::ACTIVE && h.fault_events().empty());
+}
+
+// 非常停止・HOST_FAULT: 作動中でも FAULT、ブレーキ作動、状態は消え、FAULT_RESET → ARM → HOLDING → ブレーキ保持 → START が通る
+inline void hb_fault_and_recover(Harness& h, bool estop) {
+  hb_arm_to_braked(h);
+  if (estop) {
+    h.ax.set_local_estop(true, h.now);
+    h.step(5);
+    CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::LOCAL_ESTOP);
+  } else {
+    Harness::accepted(h.host_fault());
+    CHECK(h.ax.state() == st::FAULT);
+  }
+  CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0 && h.ax.hold_brake_phase() == 0);
+  h.idle(100);
+  CHECK(h.ax.state() == st::FAULT && !h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 0);
+  if (estop) h.ax.set_local_estop(false, h.now);
+  Harness::accepted(h.fault_reset());
+  CHECK(h.ax.state() == st::DISARMED);
+  Harness::accepted(h.arm());
+  const int32_t here = h.ax.actual_count();
+  for (int i = 0; i < 400 && h.ax.state() != st::HOLDING; ++i) {
+    if (i % 2 == 0) h.set_position(here);
+    h.step(5);
+  }
+  CHECK(h.ax.state() == st::HOLDING && h.ax.hold_brake_phase() == 1 && h.ax.brake_release_cmd());
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 120, here);
+  CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd());
+  h.set_position(here);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());
+}
+
+inline void test_hold_brake_estop_in_braked_holding_recovers() {
+  Harness h;
+  hb_fault_and_recover(h, true);
+}
+
+inline void test_hold_brake_host_fault_in_braked_holding_recovers() {
+  Harness h;
+  hb_fault_and_recover(h, false);
+}
+
+inline void test_hold_brake_start_releases_in_same_call() {
+  Harness h;
+  hb_arm_to_braked(h);
+  h.raw += 15;
+  hb_run(h, 100, 0);  // 作動中（15 は slip 以内）
+  CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  h.plant_vel = 500.0;  // 解除直後の 1 tick で誤差が消えないよう遅いプラント
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());  // tick を待たずに解除
+  h.step(5);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd() && h.ax.duty_permille() != 0);  // 位置制御がすぐ再開
+  hb_run(h, 300, 0);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd() && h.fault_events().empty());
+  CHECK(h.ax.actual_count() == 0);  // 解除後は目標へ戻る
+}
+
+inline void test_hold_brake_start_during_support_releases() {
+  Harness h;
+  hb_arm_to_holding(h);
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  h.raw += 15;
+  hb_run(h, 50, 0);  // まだ支えの間
+  CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() != 0);
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());
+  hb_run(h, 600, 0);
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd() && h.fault_events().empty());
+}
+
+// 静止待ちの間（ブレーキ未作動）の START: 猶予は要らない（外す必要がない）
+inline void test_hold_brake_start_while_waiting_for_rest() {
+  Harness h;
+  hb_arm_to_holding(h);
+  CHECK(h.ax.hold_brake_phase() == 1 && h.ax.brake_release_cmd());
+  h.release_freeze_ms = 600;
+  h.raw += 10;
+  hb_run(h, 20, 0);
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 0);
+  hb_run(h, 600, 0);
+  CHECK(h.ax.state() == st::ACTIVE && h.fault_events().empty());
+}
+
+inline void test_hold_brake_reengages_after_stop_to_holding() {
+  Harness h;
+  hb_arm_to_braked(h);
+  h.set_position(0);
+  Harness::accepted(h.start());
+  hb_run(h, 200, 300);  // 動かす
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());
+  Harness::accepted(h.stop());
+  bool seen = false;
+  for (int i = 0; i < 600 && !seen; ++i) {
+    if (i % 2 == 0) h.set_position(h.ax.actual_count());
+    h.step(5);
+    if (h.ax.state() == st::HOLDING) seen = true;
+  }
+  CHECK(seen);
+  CHECK(h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 1);  // STOPPING(Hold) → HOLDING も静止待ちから
+  const int32_t here = h.ax.target_count();
+  hb_run(h, 800, here);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  CHECK(h.fault_events().empty());
+}
+
+inline void test_hold_brake_slip_over_limit_releases_and_resumes() {
+  Harness h;
+  hb_arm_to_braked(h);
+  CHECK(!h.ax.brake_release_cmd());
+  h.raw += 25;  // > 20
+  h.set_position(0);
+  h.step(5);
+  CHECK(h.ax.state() == st::HOLDING && h.ax.brake_release_cmd());  // 解除して位置制御へ
+  hb_run(h, 300, 0);
+  CHECK(h.ax.actual_count() == 0 && h.ax.state() == st::HOLDING && h.ax.brake_release_cmd());  // 戻した
+  hb_run(h, 1000, 0);
+  h.raw += 30;
+  hb_run(h, 500, 0);
+  CHECK(h.ax.brake_release_cmd() && h.ax.state() == st::HOLDING);  // この HOLDING の間は作動に戻らない
+  CHECK(h.fault_events().empty());
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());
+}
+
+// 作動の食い込み（#2 の実測 6〜34 count）: 支えの間に起きるので、作動中に入った時点の位置が基準になり、スリップとは見ない。
+// その基準から 20 を超えてずれたら解除
+inline void test_hold_brake_bite_is_absorbed_by_anchor() {
+  Harness h;
+  h.bite_count = 34;
+  hb_arm_to_holding(h);
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 150, 0);  // 食い込み +34（保持位置との差も 34 > 20）
+  CHECK(h.ax.actual_count() == 34 && h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd());
+  CHECK(h.ax.duty_permille() == 0);
+  hb_run(h, 2000, 0);
+  CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);  // 解除しない
+  h.raw -= 20;  // 基準から −20（目標との差は 14 に縮む）: まだ
+  hb_run(h, 300, 0);
+  CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd());
+  h.raw -= 1;  // 基準から −21
+  h.set_position(0);
+  h.step(5);
+  CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd() && h.ax.state() == st::HOLDING);
+  hb_run(h, 500, 0);
+  CHECK(h.ax.actual_count() == 0 && h.ax.brake_release_cmd() && h.fault_events().empty());
+}
+
+// 作動前の誤差 pre（プラントを止めて保つ）+ 食い込み 34 の合計が hold_brake_max_err（40）以内なら作動のまま、超えたら解除して
+// 位置制御で保持の帯へ戻る（PC の rest_error_count 50 を満たせない作動を作らない）
+inline void hb_bite_with_pre_error(int pre, bool expect_braked) {
+  Harness h;
+  h.bite_count = 34;
+  hb_arm_to_holding(h);
+  h.plant_vel = 0.0;  // 作動前の誤差が残ったまま静止（荷重で戻れない軸）
+  h.raw += pre;
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 300, 0);
+  CHECK(h.ax.state() == st::HOLDING && h.fault_events().empty());
+  const int32_t e = h.ax.target_count() - h.ax.actual_count();
+  CHECK(e == -(pre + 34));
+  if (expect_braked) {
+    CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  } else {
+    CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd());
+    h.plant_vel = 4000.0;  // 解除したので位置ループで戻る
+    hb_run(h, 300, 0);
+    const int32_t e2 = h.ax.target_count() - h.ax.actual_count();
+    CHECK((e2 < 0 ? -e2 : e2) <= h.ax.tuning.hold_enter && h.ax.state() == st::HOLDING && h.fault_events().empty());
+  }
+}
+
+inline void test_hold_brake_bite_plus_pre_error_within_max_err_stays_braked() { hb_bite_with_pre_error(3, true); }
+inline void test_hold_brake_bite_plus_pre_error_over_max_err_releases() { hb_bite_with_pre_error(10, false); }
+inline void test_hold_brake_max_err_boundary_40_41() {
+  CHECK(V1_HOLD_BRAKE_MAX_ERR_COUNT == 40);
+  hb_bite_with_pre_error(6, true);    // 合計 40: 作動のまま
+  hb_bite_with_pre_error(7, false);   // 合計 41: 解除
+}
+
+// 作動中に目標との差が上限を超えたら（基準からのずれが slip 以内でも）解除
+inline void test_hold_brake_max_err_while_braked_releases() {
+  Harness h;
+  h.bite_count = 20;
+  hb_arm_to_holding(h);
+  h.plant_vel = 0.0;
+  h.raw += 18;
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 200, 0);
+  CHECK(h.ax.hold_brake_phase() == 3);  // 18 + 20 = 38
+  h.raw += 3;  // 基準から 3（slip 以内）だが目標との差は 41
+  h.set_position(0);
+  h.step(5);
+  CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd());
+}
+
+inline void test_hold_brake_slip_within_limit_stays_braked() {
+  Harness h;
+  hb_arm_to_braked(h);
+  h.raw += 20;  // ちょうど 20 は越えない
+  hb_run(h, 1000, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  h.raw -= 40;  // 反対側へ −20
+  hb_run(h, 1000, 0);
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  CHECK(h.fault_events().empty());
+}
+
+inline void test_hold_brake_disarm_from_braked_holding() {
+  Harness h;
+  hb_arm_to_braked(h);
+  CHECK(!h.ax.brake_release_cmd());
+  Harness::accepted(h.disarm());
+  CHECK(h.ax.state() == st::DISARMING && !h.ax.brake_release_cmd());
+  CHECK(h.run_until([&] { return h.ax.state() == st::DISARMED; }, 1000));
+  CHECK(!h.ax.brake_release_cmd() && !h.ax.power_on_cmd() && h.ax.duty_permille() == 0);
+  CHECK(h.fault_events().empty());
+  // もう一度 ARM → HOLDING で静止待ちから始まる（前の状態を引きずらない）
+  Harness::accepted(h.arm());
+  const int32_t here = h.ax.actual_count();
+  for (int i = 0; i < 400 && h.ax.state() != st::HOLDING; ++i) {
+    if (i % 2 == 0) h.set_position(here);
+    h.step(5);
+  }
+  CHECK(h.ax.state() == st::HOLDING && h.ax.brake_release_cmd() && h.ax.hold_brake_phase() == 1);
+}
+
+inline void test_hold_brake_command_timeout_still_faults() {
+  Harness h;
+  hb_arm_to_braked(h);
+  CHECK(!h.ax.brake_release_cmd());
+  h.idle(250);  // SET_POSITION を送らない（command_timeout 100 ms）
+  CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::COMMAND_TIMEOUT);
+  CHECK(!h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+}
+
+inline void test_hold_brake_off_keeps_brake_released_in_holding() {
+  Harness h;
+  hb_arm_to_holding(h, false);
+  CHECK(h.ax.brake_release_cmd());
+  h.raw += 15;
+  for (int k = 0; k < 40; ++k) {
+    hb_run(h, 50, 0);
+    CHECK(h.ax.state() == st::HOLDING && h.ax.brake_release_cmd());
+  }
+  CHECK(h.ax.actual_count() == 0 && h.fault_events().empty());
+  h.set_position(0);
+  Harness::accepted(h.start());
+  CHECK(h.ax.state() == st::ACTIVE && h.ax.brake_release_cmd());
+}
+
+inline void test_hold_brake_long_hold_with_load_drift_no_fault() {
+  Harness h;
+  hb_arm_to_braked(h);
+  const int64_t base = h.raw;
+  for (int k = 0; k < 600; ++k) {  // 60 s、100 ms ごとに荷重で ±18 の範囲を行き来（20 以内）
+    const int phase = k % 8;
+    const int off = phase < 4 ? phase * 6 : (8 - phase) * 6 - 6;  // 0,6,12,18,12,6,0,-6 ...
+    h.raw = base + off;
+    hb_run(h, 100, 0);
+    if (h.ax.state() != st::HOLDING || h.ax.brake_release_cmd()) {
+      CHECK(false);
+      break;
+    }
+  }
+  CHECK(h.ax.state() == st::HOLDING && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  CHECK(h.fault_events().empty());
 }
 
 inline void run_all() {
@@ -5371,6 +5795,28 @@ inline void run_all() {
   test_host_fault_during_calibration();
   test_local_estop_and_overrun_during_calibration();
   test_fault_during_calibration_shutdown_keeps_final_result();
+  test_hold_brake_engages_after_rest_and_idles_after_support();
+  test_hold_brake_support_boundary_is_exact();
+  test_hold_brake_waits_for_rest_when_lagging();
+  test_hold_brake_rest_break_resets_dwell();
+  test_hold_brake_release_grace_inhibits_breakaway();
+  test_hold_brake_estop_in_braked_holding_recovers();
+  test_hold_brake_host_fault_in_braked_holding_recovers();
+  test_hold_brake_start_releases_in_same_call();
+  test_hold_brake_start_during_support_releases();
+  test_hold_brake_start_while_waiting_for_rest();
+  test_hold_brake_reengages_after_stop_to_holding();
+  test_hold_brake_slip_over_limit_releases_and_resumes();
+  test_hold_brake_bite_is_absorbed_by_anchor();
+  test_hold_brake_bite_plus_pre_error_within_max_err_stays_braked();
+  test_hold_brake_bite_plus_pre_error_over_max_err_releases();
+  test_hold_brake_max_err_boundary_40_41();
+  test_hold_brake_max_err_while_braked_releases();
+  test_hold_brake_slip_within_limit_stays_braked();
+  test_hold_brake_disarm_from_braked_holding();
+  test_hold_brake_command_timeout_still_faults();
+  test_hold_brake_off_keeps_brake_released_in_holding();
+  test_hold_brake_long_hold_with_load_drift_no_fault();
 }
 
 }  // namespace v1axis_test

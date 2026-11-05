@@ -300,6 +300,27 @@ constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこ�
 constexpr uint32_t POWER_SETTLE_MS = V1_ARM_POWER_SETTLE_MS;
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
+// HOLDING 中はブレーキを作動させて保持する（座った荷重での位置ループの微振動を避ける）。START で即解除（待ちなし）。
+// 作動の完了までの時間は未測定（暫定 300 ms）: その間は位置ループをそのまま回して沈みを防ぎ、過ぎたら Duty 0。
+#ifndef V1_HOLD_BRAKE
+#define V1_HOLD_BRAKE 1
+#endif
+// 2026-11-06 空席の実測: 作動指令から 40 ms 以内に効き（カウントが止まる）、#2 では効く瞬間に 6〜34 count ずれる（ブレーキの食い込み）
+#ifndef V1_HOLD_BRAKE_SUPPORT_MS
+#define V1_HOLD_BRAKE_SUPPORT_MS 100
+#endif
+// ブレーキ解除指令（START・ずれによる解除）から物理的に外れるまで、動き出しパルスと停止ブーストを出さない時間（未測定、仮に 150 ms）
+#ifndef V1_HOLD_BRAKE_RELEASE_GRACE_MS
+#define V1_HOLD_BRAKE_RELEASE_GRACE_MS 150
+#endif
+// ブレーキ作動中の |目標 − 実位置| の上限。超えたら解除して位置制御へ戻る。PC の静止判定（timing.rest_error_count 50）と
+// 中立到達（game.center_tolerance_count 50）を満たせなくならないよう、それより小さくする（作動前 20 + 食い込み ≤ 38 の合計を抑える）
+#ifndef V1_HOLD_BRAKE_MAX_ERR_COUNT
+#define V1_HOLD_BRAKE_MAX_ERR_COUNT 40
+#endif
+#ifndef V1_HOLD_BRAKE_SLIP_COUNT
+#define V1_HOLD_BRAKE_SLIP_COUNT 20  // ブレーキ作動後に保持位置からこれを超えてずれたら解除して位置制御へ戻る（異常にはしない）
+#endif
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）
 constexpr int V1_CAL_HOME_DUTY = 13;            // v1 の校正（CALIBRATE）の端当て Duty。従来 env の HOME_DUTY（10 %）では #2 が下限から持ち上がる方向で始動しないことがあった（2026-11-01、2 回）。10/31 の実測で 13 % は 920〜985 count/s。端当ての衝撃は 15 %（従来 env の UPPER の速い区間）より小さい。仮値
 constexpr uint32_t CAL_POWER_SETTLE_MS = 5000;  // CALIBRATING: 主電源 ON 指令からブレーキ解除指令まで（protocol.md §1.2）。2026-10-31 に電源投入 4 s 後は動かず
