@@ -325,10 +325,11 @@ impl Default for SimBackendConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SerialBackendConfig {
-    /// Ports to probe. Each is assigned from its HELLO (`selected_axis`, else
-    /// the `[[axis]]` with its `device_id`) before use; a port that resolves
-    /// to no axis is closed without sending anything except HELLO_REQ.
-    pub ports: Vec<String>,
+    /// Ports to probe: a list of names, or `"auto"`. Each opened port is
+    /// assigned from its HELLO (`selected_axis`, else the `[[axis]]` with its
+    /// `device_id`) before use; a port that resolves to no axis is closed
+    /// without sending anything except HELLO_REQ.
+    pub ports: PortList,
     #[serde(default = "default_baud")]
     pub baud: u32,
     /// Axes served by an in-process simulated unit instead of a real one
@@ -347,6 +348,75 @@ pub struct SerialBackendConfig {
 
 fn default_baud() -> u32 {
     115_200
+}
+
+/// `backend.ports`: `"auto"` or a list of port names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortList {
+    /// Open only the USB ports whose serial number (the CoreS3 eFuse MAC)
+    /// matches the `device_id` of an `[[axis]]` that is not in `sim_axes`.
+    /// The port list is rescanned while running, so a unit that comes back
+    /// under another port name is found again. Nothing else is opened.
+    Auto,
+    /// Exactly these port names (opened whatever is attached to them).
+    Named(Vec<String>),
+}
+
+impl PortList {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, PortList::Auto)
+    }
+
+    /// The configured names (empty for `Auto`).
+    pub fn names(&self) -> &[String] {
+        match self {
+            PortList::Auto => &[],
+            PortList::Named(v) => v,
+        }
+    }
+}
+
+impl From<Vec<String>> for PortList {
+    fn from(v: Vec<String>) -> Self {
+        PortList::Named(v)
+    }
+}
+
+impl std::fmt::Display for PortList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortList::Auto => write!(f, "auto"),
+            PortList::Named(v) => write!(f, "{v:?}"),
+        }
+    }
+}
+
+impl Serialize for PortList {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PortList::Auto => s.serialize_str("auto"),
+            PortList::Named(v) => v.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PortList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Word(String),
+            List(Vec<String>),
+        }
+        match Raw::deserialize(d) {
+            Ok(Raw::List(v)) => Ok(PortList::Named(v)),
+            Ok(Raw::Word(w)) if w == "auto" => Ok(PortList::Auto),
+            Ok(Raw::Word(w)) => Err(serde::de::Error::custom(format!(
+                "backend.ports must be \"auto\" or a list of port names, got \"{w}\""
+            ))),
+            Err(_) => Err(serde::de::Error::custom("backend.ports must be \"auto\" or a list of port names")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -713,8 +783,27 @@ impl Config {
                 }
             }
             BackendConfig::Serial(b) => {
-                if b.ports.is_empty() && b.sim_axes.len() < AXIS_COUNT {
-                    errs.push("backend.ports must list at least one port (or sim_axes must cover every axis)".into());
+                match &b.ports {
+                    PortList::Named(v) => {
+                        if v.is_empty() && b.sim_axes.len() < AXIS_COUNT {
+                            errs.push(
+                                "backend.ports must list at least one port, or be \"auto\" (or sim_axes must cover every axis)"
+                                    .into(),
+                            );
+                        }
+                    }
+                    PortList::Auto => {
+                        // Auto finds a unit only through its device_id.
+                        for a in &self.axes {
+                            if a.device_id.is_unassigned() && !b.sim_axes.contains(&a.axis_id) {
+                                errs.push(format!(
+                                    "backend.ports = \"auto\" needs a device_id on [[axis]] axis_id = {} \
+                                     (the unit is found by its USB serial number = eFuse MAC)",
+                                    a.axis_id.get()
+                                ));
+                            }
+                        }
+                    }
                 }
                 if b.baud == 0 {
                     errs.push("backend.baud must be > 0".into());

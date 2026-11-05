@@ -40,10 +40,29 @@
 //!   Like a serial port, a sim port is reopened [`SERIAL_RETRY`] after its
 //!   link closed (e.g. `status_timeout` after a host sleep), on the same
 //!   simulated unit (state kept); `RunningServer::sims` holds views of them.
-//! - Serial backend: one task per configured port opens it (retry every
+//! - Serial backend: one task per port opens it (retry every
 //!   [`SERIAL_RETRY`], never fatal) and forwards the link's events. After an
 //!   unknown device the port is reopened only once it has disappeared from
 //!   the port list; `PortClosed` is sent then.
+//!   - `ports = [..]`: one task per configured name, for the whole run.
+//!   - `ports = "auto"`: a discovery task lists the ports every
+//!     [`DISCOVERY_PERIOD`] (enumeration only) and starts a port task for
+//!     each CoreS3 USB port whose serial number matches the `device_id` of a
+//!     non-simulated `[[axis]]` (`crate::port_discovery`). Before every
+//!     (re)open such a task checks that its name still carries that unit and
+//!     ends otherwise, so a unit re-plugged under a new name is picked up by
+//!     a later scan and the old name is not reopened for another device.
+//!     The check and the open are separate OS calls: a device that takes the
+//!     same name in between (milliseconds) would still be opened; the open
+//!     cannot be bound to the enumerated USB device. At most one task per
+//!     name and per unit, so a unit that moved waits until its old task has
+//!     ended. After `UnknownDevice` the task waits until that unit has left
+//!     the name (not just until the name is gone). The port tasks belong to
+//!     the discovery task (a `JoinSet`): on shutdown it stops scanning but
+//!     keeps them forwarding while the control loop DISARMs; aborting it
+//!     (after the control loop) aborts them. Reconnecting under a new name
+//!     is an ordinary reconnect for the supervisor; a latched fault or a lost
+//!     reference still needs the operator.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -55,7 +74,8 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::api::{self, lock, AdminRequest, AppState};
 use crate::axis_link::{self, LinkHandle, LinkSendError};
-use crate::config::{BackendConfig, Config, ConfigError, SerialBackendConfig};
+use crate::config::{BackendConfig, Config, ConfigError, PortList, SerialBackendConfig};
+use crate::port_discovery;
 use crate::protocol::HostMsg;
 use crate::limits::{self as motion_limits, MotionLimits, SharedLimits};
 use crate::session::{AcceptedPose, PoseIntake};
@@ -68,6 +88,8 @@ use crate::types::{AxisId, DeviceId, RigState};
 pub const SHUTDOWN_DISARM_WAIT: Duration = Duration::from_secs(3);
 /// Serial open retry period.
 pub const SERIAL_RETRY: Duration = Duration::from_secs(3);
+/// `ports = "auto"`: port list rescan period.
+pub const DISCOVERY_PERIOD: Duration = Duration::from_secs(1);
 /// Link event queue (all links → control loop).
 pub const EVENT_QUEUE_LEN: usize = 1024;
 /// At most this many link events are taken per tick.
@@ -76,6 +98,38 @@ const MAX_EVENTS_PER_TICK: usize = 1024;
 const TELEMETRY_SUMMARY_EVERY: u64 = 10;
 /// Sim backend: port index (0-based) → axis id on that port.
 const SIM_PORT_AXES: [u8; 3] = [3, 1, 2];
+
+/// A byte stream of an opened port (the serial stream, or a test double).
+pub trait PortIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PortIo for T {}
+pub type PortStream = Box<dyn PortIo>;
+pub type OpenFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<PortStream>> + Send + 'a>>;
+
+/// How the serial backend lists and opens ports: the OS ([`OsSerialPorts`])
+/// unless [`ServerOptions::serial_ports`] substitutes another (tests drive
+/// `ports = "auto"` with simulated USB units this way).
+pub trait SerialPorts: Send + Sync + std::fmt::Debug + 'static {
+    /// The port list (enumeration only; called on a blocking thread).
+    fn list(&self) -> Vec<port_discovery::ListedPort>;
+    /// Open `port` for a link.
+    fn open<'a>(&'a self, port: &'a str, baud: u32) -> OpenFuture<'a>;
+}
+
+/// The real serial ports.
+#[derive(Debug, Default)]
+pub struct OsSerialPorts;
+
+impl SerialPorts for OsSerialPorts {
+    fn list(&self) -> Vec<port_discovery::ListedPort> {
+        port_discovery::list_ports()
+    }
+    fn open<'a>(&'a self, port: &'a str, baud: u32) -> OpenFuture<'a> {
+        Box::pin(async move {
+            let s = axis_link::open_serial(port, baud).await?;
+            Ok(Box::new(s) as PortStream)
+        })
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerOptions {
@@ -86,6 +140,8 @@ pub struct ServerOptions {
     /// The file `cfg` was read from; `POST /v1/calibration/export` writes
     /// next to it (refused with 500 `no_config_path` when unset).
     pub config_path: Option<std::path::PathBuf>,
+    /// Serial backend: how ports are listed and opened (`None` = the OS).
+    pub serial_ports: Option<Arc<dyn SerialPorts>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -235,6 +291,7 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
             sims.sort_by_key(|(a, _)| *a);
         }
         BackendConfig::Serial(serial) => {
+            let ports: Arc<dyn SerialPorts> = opts.serial_ports.clone().unwrap_or_else(|| Arc::new(OsSerialPorts));
             // Simulated stand-ins first, so a real unit selecting the same
             // axis shows up as a conflict rather than taking it over.
             for id in &serial.sim_axes {
@@ -242,15 +299,34 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
                 spawn_sim(a, &serial.sim, format!("sim:{}", id.get()));
             }
             sims.sort_by_key(|(a, _)| *a);
-            for port in &serial.ports {
-                port_tasks.push(tokio::spawn(serial_port_task(
-                    port.clone(),
-                    serial.clone(),
-                    cfg.clone(),
-                    events_tx.clone(),
-                    links_tx.clone(),
-                    shutdown_rx.clone(),
-                )));
+            match &serial.ports {
+                PortList::Named(names) => {
+                    for port in names {
+                        let task = serial_port_task(
+                            ports.clone(),
+                            port.clone(),
+                            None,
+                            serial.clone(),
+                            cfg.clone(),
+                            events_tx.clone(),
+                            links_tx.clone(),
+                            shutdown_rx.clone(),
+                        );
+                        port_tasks.push(tokio::spawn(async move {
+                            task.await;
+                        }));
+                    }
+                }
+                PortList::Auto => {
+                    port_tasks.push(tokio::spawn(serial_discovery_task(
+                        ports.clone(),
+                        serial.clone(),
+                        cfg.clone(),
+                        events_tx.clone(),
+                        links_tx.clone(),
+                        shutdown_rx.clone(),
+                    )));
+                }
             }
         }
     }
@@ -695,32 +771,148 @@ async fn sleep_or_shutdown(d: Duration, shutdown: &watch::Receiver<bool>) -> boo
     }
 }
 
-async fn port_present(port: &str) -> bool {
+async fn port_present(ports: &Arc<dyn SerialPorts>, port: &str) -> bool {
+    let ports = ports.clone();
     let port = port.to_string();
-    tokio::task::spawn_blocking(move || axis_link::list_serial_ports().contains(&port))
+    tokio::task::spawn_blocking(move || ports.list().iter().any(|p| p.name == port))
         .await
         .unwrap_or(true)
 }
 
-/// Open / reopen one serial port forever (until shutdown).
-async fn serial_port_task(
-    port: String,
+async fn listed_ports(ports: &Arc<dyn SerialPorts>) -> Vec<port_discovery::ListedPort> {
+    let ports = ports.clone();
+    tokio::task::spawn_blocking(move || ports.list()).await.unwrap_or_default()
+}
+
+/// `ports = "auto"`: start a port task for every configured unit found in
+/// the port list, rescanning every [`DISCOVERY_PERIOD`] until shutdown.
+async fn serial_discovery_task(
+    ports: Arc<dyn SerialPorts>,
     serial: SerialBackendConfig,
     cfg: Arc<Config>,
     events: mpsc::Sender<(String, LinkEvent)>,
     links: mpsc::Sender<LinkHandle>,
     shutdown: watch::Receiver<bool>,
 ) {
+    let wanted: Vec<(AxisId, DeviceId)> = cfg
+        .axes
+        .iter()
+        .filter(|a| !serial.sim_axes.contains(&a.axis_id) && !a.device_id.is_unassigned())
+        .map(|a| (a.axis_id, a.device_id))
+        .collect();
+    let wanted_ids: Vec<DeviceId> = wanted.iter().map(|(_, d)| *d).collect();
+    tracing::info!(
+        units = ?wanted.iter().map(|(a, d)| format!("axis{}={d}", a.get())).collect::<Vec<_>>(),
+        "ports = auto: looking for these units by USB serial number"
+    );
+    // Port tasks by task id → (port name, unit). Removed when the task ends,
+    // also on a panic, so the name and the unit can be picked up again.
+    let mut tasks: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
+    let mut running = std::collections::BTreeMap::<tokio::task::Id, (String, DeviceId)>::new();
+    // Last logged state, so each change is logged once.
+    let mut found_logged = std::collections::BTreeMap::<DeviceId, String>::new();
+    let mut missing_logged = std::collections::BTreeSet::<DeviceId>::new();
+    let mut unmatched_logged = std::collections::BTreeSet::<(String, String)>::new();
+    loop {
+        while let Some(done) = tasks.try_join_next_with_id() {
+            let id = match done {
+                Ok((id, _)) => id,
+                Err(e) => {
+                    tracing::error!("ports = auto: port task ended abnormally: {e}");
+                    e.id()
+                }
+            };
+            running.remove(&id);
+        }
+        let listed = listed_ports(&ports).await;
+        let found = port_discovery::find_units(&listed, &wanted_ids);
+        for (axis, id) in &wanted {
+            match found.iter().find(|(_, d)| d == id) {
+                Some((name, _)) => {
+                    missing_logged.remove(id);
+                    if found_logged.get(id) != Some(name) {
+                        tracing::info!(port = %name, device_id = %id, "ports = auto: axis{} unit found", axis.get());
+                        found_logged.insert(*id, name.clone());
+                    }
+                }
+                None => {
+                    found_logged.remove(id);
+                    if missing_logged.insert(*id) {
+                        tracing::warn!(device_id = %id, "ports = auto: axis{} unit not in the USB port list", axis.get());
+                    }
+                }
+            }
+        }
+        let unmatched: std::collections::BTreeSet<(String, String)> =
+            port_discovery::unmatched_units(&listed, &wanted_ids).into_iter().collect();
+        for (name, ser) in unmatched.difference(&unmatched_logged) {
+            tracing::warn!(
+                port = %name,
+                usb_serial = %ser,
+                "ports = auto: ESP32-S3 USB port not opened (its serial matches no [[axis]] device_id)"
+            );
+        }
+        unmatched_logged = unmatched;
+        for (name, id) in found {
+            // One task per name and per unit: a unit that moved to a new name
+            // waits until the task of its old name has ended (within
+            // SERIAL_RETRY of losing it), so it never claims its axis twice.
+            if running.values().any(|(n, d)| *n == name || *d == id) {
+                continue;
+            }
+            let handle = tasks.spawn(serial_port_task(
+                ports.clone(),
+                name.clone(),
+                Some(id),
+                serial.clone(),
+                cfg.clone(),
+                events.clone(),
+                links.clone(),
+                shutdown.clone(),
+            ));
+            running.insert(handle.id(), (name, id));
+        }
+        if sleep_or_shutdown(DISCOVERY_PERIOD, &shutdown).await {
+            break;
+        }
+    }
+    // Shutdown: no more scans or opens, but keep the port tasks forwarding
+    // link events while the control loop DISARMs (they end once their link
+    // is closed). `RunningServer::shutdown` aborts this task after the
+    // control loop has stopped; dropping the JoinSet then aborts the rest.
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Open / reopen one serial port until shutdown. With `expect` (auto
+/// discovery) only while the port name still carries that unit: the task
+/// ends, returning the name, once it does not.
+#[allow(clippy::too_many_arguments)]
+async fn serial_port_task(
+    ports: Arc<dyn SerialPorts>,
+    port: String,
+    expect: Option<DeviceId>,
+    serial: SerialBackendConfig,
+    cfg: Arc<Config>,
+    events: mpsc::Sender<(String, LinkEvent)>,
+    links: mpsc::Sender<LinkHandle>,
+    shutdown: watch::Receiver<bool>,
+) -> String {
     loop {
         if *shutdown.borrow() {
-            return;
+            return port;
         }
-        let stream = match axis_link::open_serial(&port, serial.baud).await {
+        if let Some(id) = expect {
+            if !port_discovery::still_matches(&listed_ports(&ports).await, &port, id) {
+                tracing::info!(%port, device_id = %id, "port no longer carries this unit; port task ends");
+                return port;
+            }
+        }
+        let stream = match ports.open(&port, serial.baud).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(%port, "open failed: {e}; retrying in {}s", SERIAL_RETRY.as_secs());
                 if sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
-                    return;
+                    return port;
                 }
                 continue;
             }
@@ -729,31 +921,37 @@ async fn serial_port_task(
         let (tx, mut rx) = mpsc::channel(256);
         let handle = axis_link::spawn_link(stream, port.clone(), cfg.clone(), tx);
         if links.send(handle).await.is_err() {
-            return;
+            return port;
         }
         // Forward until the link task ends (it drops its sender).
         let mut unknown = false;
         while let Some((p, ev)) = rx.recv().await {
             unknown |= matches!(ev, LinkEvent::UnknownDevice { .. });
             if events.send((p, ev)).await.is_err() {
-                return;
+                return port;
             }
         }
         if unknown {
-            // Do not keep re-probing a device that is not ours.
+            // Do not keep re-probing a device that is not ours. Wait until it
+            // is gone: the name (named ports), or the unit from this name
+            // (auto: another unit may take the name within one period).
             loop {
                 if sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
-                    return;
+                    return port;
                 }
-                if !port_present(&port).await {
+                let gone = match expect {
+                    Some(id) => !port_discovery::still_matches(&listed_ports(&ports).await, &port, id),
+                    None => !port_present(&ports, &port).await,
+                };
+                if gone {
                     break;
                 }
             }
             if events.send((port.clone(), LinkEvent::PortClosed { port: port.clone() })).await.is_err() {
-                return;
+                return port;
             }
         } else if sleep_or_shutdown(SERIAL_RETRY, &shutdown).await {
-            return;
+            return port;
         }
     }
 }

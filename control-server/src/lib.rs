@@ -8,6 +8,7 @@ pub mod config;
 pub mod governor;
 pub mod limits;
 pub mod planner;
+pub mod port_discovery;
 pub mod prehistory;
 pub mod protocol;
 pub mod server;
