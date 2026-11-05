@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 オペレーター</title>
+<!--
+  オペレーター管理画面（docs/superpowers/specs/2026-11-05-operator-console-design.md）。
+  /console = 監視、/console/setup = 設定。外部資源なし。読み込んだだけでは何も動かさない。
+  新しい API（/v1/operator/*, /v1/calibration/apply|declare, /v1/units/assign, status の
+  operator_hold / unregistered_units / axes[].config_stroke）は、サーバーにあれば使い、
+  無ければ従来の手順を案内する。
+-->
+<style>
+:root{
+  --bg:#050605; --panel:#0B0E0C; --ink:#EEE9DA; --mut:#8E978C; --dim:#59625A;
+  --org:#FF8A1F; --red:#E8322A; --grn:#5FE08C; --yel:#F2CE3A; --blu:#4C9BE8; --rule:#26332A;
+  --min:"Hiragino Mincho ProN","YuMincho","Yu Mincho","Noto Serif JP",serif;
+  --sans:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo","Noto Sans JP",system-ui,sans-serif;
+  --cond:"Bahnschrift SemiCondensed","Arial Narrow","Roboto Condensed","Helvetica Neue",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55}
+body{min-height:100vh}
+button{font:inherit;color:inherit;background:none;border:2px solid currentColor;padding:9px 14px;cursor:pointer;font-weight:700;border-radius:0;min-height:44px}
+button:disabled{opacity:.35;cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--org);outline-offset:2px}
+input,select{font:inherit;color:var(--ink);background:#000;border:1px solid var(--rule);padding:6px 8px;border-radius:0}
+.tnum{font-variant-numeric:tabular-nums}
+.lbl{font-family:var(--cond);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--org)}
+.mono{font-family:var(--mono);font-size:12px;color:var(--mut)}
+.small{font-size:13px}
+.mut{color:var(--mut)}
+.hide{display:none!important}
+
+/* ---- top strip */
+.strip{display:flex;align-items:stretch;border-bottom:1px solid var(--rule);min-height:44px}
+.strip .id{padding:8px 16px;display:flex;flex-direction:column;justify-content:center;border-right:1px solid var(--rule)}
+.strip .id b{font-family:var(--cond);font-size:20px;letter-spacing:.08em;color:var(--org);line-height:1}
+.strip nav{display:flex}
+.strip nav a{display:flex;align-items:center;padding:0 22px;color:var(--mut);text-decoration:none;font-weight:700;border-right:1px solid var(--rule)}
+.strip nav a[aria-current=page]{color:#000;background:var(--org)}
+.strip .meta{margin-left:auto;display:flex;gap:18px;align-items:center;padding:0 16px}
+.link{display:flex;gap:6px;align-items:center}
+.link i{width:10px;height:10px;display:inline-block;background:var(--grn)}
+.link.bad i{background:var(--red)}
+
+/* ---- band (A 案) */
+.band{position:relative;padding:18px 24px 16px;display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,34%);gap:16px 28px;align-items:end;border-bottom:1px solid var(--rule)}
+.band .verdict{font-family:var(--min);font-weight:800;line-height:.92;letter-spacing:-.02em;font-size:clamp(44px,8.4vw,128px);margin:4px 0 0}
+.band .why{font-size:17px;font-weight:700;line-height:1.5}
+.band .why .code{font-family:var(--mono);font-size:12px;font-weight:400;display:block;margin-top:4px}
+.band.calm{min-height:150px}
+.band.calm .verdict{font-size:clamp(40px,6vw,88px)}
+.band.calm.ok .verdict{color:var(--grn)}
+.band.calm.idle .verdict{color:var(--ink)}
+.band.fault{background:var(--red);color:#000;min-height:44vh}
+.band.fault .lbl,.band.fault .code{color:#3a0000}
+.band.hold{background:var(--yel);color:#000;min-height:38vh}
+.band.hold .lbl,.band.hold .code{color:#3a3000}
+.band.warn{border-top:6px solid var(--yel)}
+.band.warn .verdict{color:var(--yel)}
+.band.lost{background:repeating-linear-gradient(135deg,#111 0 14px,#0a0a0a 14px 28px);min-height:30vh}
+.band.lost .verdict{color:var(--mut)}
+.band .recent{grid-column:1/-1;font-size:14px;border-top:1px solid rgba(0,0,0,.25);padding-top:8px}
+.band.calm .recent{border-top-color:var(--rule);color:var(--yel)}
+
+/* ---- monitor body */
+.mon{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,34%);gap:0}
+.axes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid var(--rule)}
+.ax{padding:14px 16px 16px;border-right:1px solid var(--rule);min-width:0}
+.ax .v{font-family:var(--min);font-weight:800;font-size:clamp(28px,3.6vw,48px);line-height:1;margin:6px 0 8px}
+.ax.ok .v{color:var(--grn)} .ax.bad .v{color:var(--red)} .ax.warn .v{color:var(--yel)} .ax.off .v{color:var(--mut)}
+.ax.bad{box-shadow:inset 0 6px 0 var(--red)}
+.ax .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:13px}
+.ax .kv span:nth-child(odd){color:var(--mut)}
+.side{border-left:1px solid var(--rule);padding:16px 20px;display:flex;flex-direction:column;gap:12px}
+.steps{margin:0;padding-left:1.4em;font-size:15px;line-height:1.7}
+.btn-main{background:var(--org);color:#000;border-color:var(--org);font-size:20px;padding:14px 18px;min-height:60px}
+.btn-red{background:var(--red);color:#000;border-color:var(--red)}
+.btn-stop{background:#000;color:var(--red);border-color:var(--red);font-size:20px;min-height:64px;letter-spacing:.06em}
+.btn-go{color:var(--grn)}
+.btn-warn{color:var(--yel)}
+.btn-arm{color:var(--org)}
+.armed{background:var(--org);color:#000}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.row>button{flex:1 1 auto}
+.note{font-size:13px;color:var(--mut)}
+.result{font-family:var(--mono);font-size:12px;white-space:pre-wrap;color:var(--mut);min-height:1.4em}
+.result.err{color:var(--red)}
+
+/* ---- sections */
+.sec{border-bottom:1px solid var(--rule);padding:16px 24px 20px}
+.sec>header{display:flex;align-items:baseline;gap:14px;margin-bottom:10px}
+.sec>header h2{margin:0;font-family:var(--min);font-weight:800;font-size:24px;line-height:1.1}
+.sec>header .num{font-family:var(--cond);color:var(--org);font-size:28px;line-height:1}
+.grid2{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:0}
+.grid2>.sec+.sec{border-left:1px solid var(--rule)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--cond);font-weight:400;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--org)}
+td.num{text-align:right}
+.tag{display:inline-block;font-size:11px;font-weight:700;padding:0 5px;border:1px solid currentColor;margin-left:4px;line-height:1.5}
+.t-game{color:var(--blu)} .t-lim{color:var(--yel)} .t-bad{color:var(--red)} .t-ok{color:var(--grn)}
+.log{max-height:280px;overflow:auto;font-size:13px}
+.log table td{padding:3px 8px}
+.log .k{font-family:var(--mono);font-size:12px;color:var(--org);white-space:nowrap}
+.log tr.f td{color:var(--red)}
+.check{display:flex;gap:10px;align-items:flex-start;font-weight:700;font-size:16px;padding:10px 12px;border:2px solid var(--yel);color:var(--yel);cursor:pointer}
+.check input{width:22px;height:22px;margin-top:2px;accent-color:var(--yel)}
+.big-ok{font-family:var(--min);font-weight:800;font-size:28px}
+.unit{border:1px dashed var(--yel);padding:10px 12px;margin-top:10px}
+.cards3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0;border:1px solid var(--rule)}
+.cards3>div{padding:10px 12px;border-right:1px solid var(--rule)}
+.cards3>div:last-child{border-right:0}
+.stroke{font-family:var(--cond);font-size:34px;line-height:1}
+.sev-ok{color:var(--grn)} .sev-warn{color:var(--yel)} .sev-bad{color:var(--red)}
+
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:var(--bg);width:100%;max-width:760px;border-top:8px solid var(--org);border-bottom:1px solid var(--org);display:grid;grid-template-columns:64px minmax(0,1fr)}
+.modal .rail{background:var(--org);color:#000;display:flex;flex-direction:column;justify-content:space-between;align-items:center;padding:12px 0}
+.modal .rail b{writing-mode:vertical-rl;font-family:var(--cond);font-size:26px;letter-spacing:.32em;line-height:1}
+.modal .rail span{writing-mode:vertical-rl;font-family:var(--mono);font-size:10px;letter-spacing:.2em}
+.modal .body{padding:18px 24px 0}
+.modal .head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--rule);padding-bottom:6px}
+.modal h3{font-family:var(--min);font-weight:800;font-size:clamp(30px,4.4vw,48px);line-height:1.05;letter-spacing:-.02em;margin:14px 0 14px}
+.modal ol{list-style:none;margin:0 0 16px;padding:0;border-top:1px solid var(--rule)}
+.modal ol li{display:grid;grid-template-columns:44px 1fr;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--rule);font-size:16px;font-weight:700}
+.modal ol li i{font-style:normal;font-family:var(--cond);font-size:22px;color:var(--org);line-height:1}
+.modal .caution{height:12px;margin:0 -24px;background:repeating-linear-gradient(135deg,var(--yel) 0 12px,#000 12px 24px)}
+.modal .acts{display:grid;grid-template-columns:1fr 1.4fr;margin:0 -24px}
+.modal .acts button{min-height:68px;font-size:20px;border:0;border-top:1px solid var(--rule)}
+.modal .acts #modal-cancel{color:var(--ink);background:#000;border-right:1px solid var(--rule)}
+.modal .acts #modal-ok{background:var(--org);color:#000;font-family:var(--sans);letter-spacing:.04em}
+@media (max-width: 900px){
+  .band,.mon,.grid2{grid-template-columns:1fr}
+  .side{border-left:0;border-top:1px solid var(--rule)}
+  .grid2>.sec+.sec{border-left:0}
+  .axes,.cards3{grid-template-columns:1fr}
+  .ax{border-right:0;border-bottom:1px solid var(--rule)}
+}
+@media (prefers-reduced-motion: no-preference){
+  .band{transition:background-color .14s linear,min-height .14s linear}
+}
+</style>
+</head>
+<body>
+<div class="strip">
+  <div class="id"><span class="lbl">H3 MOTION SEAT</span><b>OPERATOR</b></div>
+  <nav>
+    <a href="/console" id="nav-mon">監視</a>
+    <a href="/console/setup" id="nav-setup">設定</a>
+  </nav>
+  <div class="meta">
+    <span class="mono" id="m-rig">rig —</span>
+    <span class="link bad" id="m-link"><i></i><span class="small">サーバー</span></span>
+    <span class="mono tnum" id="m-clock">--:--:--</span>
+  </div>
+</div>
+
+<!-- ============================================================ 監視 -->
+<main id="view-mon">
+  <section class="band calm idle" id="band" aria-live="polite">
+    <div>
+      <div class="lbl" id="band-lbl">RIG STATE</div>
+      <h1 class="verdict" id="band-verdict">接続中</h1>
+    </div>
+    <div class="why" id="band-why"></div>
+    <div class="recent hide" id="band-recent"></div>
+  </section>
+
+  <div class="mon">
+    <div>
+      <div class="axes" id="axes"></div>
+    </div>
+    <aside class="side">
+      <div class="lbl">次の手順</div>
+      <ol class="steps" id="steps"></ol>
+      <button class="btn-main hide" id="primary"></button>
+      <button class="btn-stop" id="estop">非常停止</button>
+      <div class="note" id="estop-note">画面の非常停止はブレーキで止めます。24 V を切る物理の非常停止の代わりではありません。</div>
+      <div class="result" id="act-result"></div>
+    </aside>
+  </div>
+</main>
+
+<!-- ============================================================ 設定 -->
+<main id="view-setup" class="hide">
+  <section class="band calm idle" id="sband">
+    <div>
+      <div class="lbl">SETUP</div>
+      <h1 class="verdict" id="sband-verdict">準備</h1>
+    </div>
+    <div class="why" id="sband-why"></div>
+  </section>
+
+  <section class="sec">
+    <header><span class="num">01</span><h2>USB・接続</h2><span class="lbl">UNITS / PORTS</span></header>
+    <table>
+      <thead><tr><th>軸</th><th>判定</th><th>設定の個体</th><th>つながっている個体</th><th>ポート</th><th>MCU</th><th>起動 ID</th><th>受信</th></tr></thead>
+      <tbody id="units"></tbody>
+    </table>
+    <div class="note" id="usb-hint">「USB には見えるのに応答しない」ときは、USB ハブの上流ケーブルを抜いて約 10 秒待ってから挿し直してください（Issue #11）。</div>
+    <div id="unreg"></div>
+  </section>
+
+  <section class="sec">
+    <header><span class="num">02</span><h2>校正と反映</h2><span class="lbl">CALIBRATE / APPLY / DECLARE</span></header>
+    <div class="row" style="align-items:center">
+      <span class="small">対象:</span>
+      <label><input type="checkbox" class="cal-ax" value="1" checked disabled> #1</label>
+      <label><input type="checkbox" class="cal-ax" value="2" checked> #2</label>
+      <label><input type="checkbox" class="cal-ax" value="3" checked> #3</label>
+      <span class="note">#1 は主電源の担当なので必ず含めます（#1 がないと他の軸に 24 V が来ません）。</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn-warn" id="cal-run">校正する</button>
+      <button id="cal-cancel">校正を中止</button>
+    </div>
+    <div class="result" id="cal-result"></div>
+    <div class="cards3" id="cal-cards" style="margin-top:12px"></div>
+    <div id="apply-new" class="hide" style="margin-top:10px">
+      <div class="note">校正の結果は、各軸のカードの「反映する」で設定に保存してその場で使います（再起動は不要）。全軸が止まっているときだけ押せます。行程が前回と ±30 を超えていても止めずに知らせるので、確かめてから反映してください。同じ個体で ±30 以内なら「宣言」は引き継がれます。</div>
+      <div class="row" style="margin-top:8px"><button class="btn-go" id="apply-all">結果が OK の軸をまとめて反映</button></div>
+    </div>
+    <div id="apply-old" style="margin-top:10px">
+      <div class="note">このサーバーは、まだその場での反映に対応していません。校正のあとは「設定に書き出す」→ 書き出したファイルを確認して <code>calibration_valid = true</code> にする → そのファイルでサーバーを再起動、の順で進めます（hardware-bringup.md §5.0）。</div>
+      <div class="row" style="margin-top:10px"><button id="cal-export">校正結果を設定に書き出す</button></div>
+    </div>
+    <div class="result" id="apply-result"></div>
+  </section>
+
+
+
+  <section class="sec" id="tok-sec">
+    <header><span class="num">··</span><h2>管理トークン</h2><span class="lbl">ADMIN TOKEN</span></header>
+    <div class="row" style="align-items:center"><input id="token" type="password" placeholder="Bearer トークン（不要な設定なら空のまま）" style="flex:1"> <span class="note">このタブにだけ保存</span></div>
+  </section>
+</main>
+
+<!-- ============================================================ 両方（4〜6） -->
+<div class="grid2">
+  <section class="sec">
+    <header><span class="num">04</span><h2>リミット</h2><span class="lbl">MOTION LIMITS</span></header>
+    <table>
+      <thead><tr><th>項目</th><th class="num">いまの値</th><th class="num">要求</th><th class="num">操作者の上限</th><th class="num">ファーム上限</th><th>変更</th></tr></thead>
+      <tbody id="limits"></tbody>
+    </table>
+    <div class="row" style="margin-top:8px"><button id="lim-send">変更を送る</button></div>
+    <div class="note" id="lim-note"></div>
+    <div class="result" id="lim-result"></div>
+  </section>
+  <section class="sec">
+    <header><span class="num">05</span><h2>ゲーム</h2><span class="lbl">SESSION</span></header>
+    <table><tbody id="session"></tbody></table>
+  </section>
+</div>
+<section class="sec">
+  <header><span class="num">06</span><h2>操作</h2><span class="lbl">ACTIONS</span></header>
+  <div class="row">
+    <button class="btn-go" id="a-center">中立へ戻す</button>
+    <button class="btn-arm" id="a-arm">ARM</button>
+    <button id="a-disarm">DISARM</button>
+    <button class="btn-red" id="a-reset">異常をリセット</button>
+    <button class="btn-warn hide" id="a-release">オペレーター停止を解除</button>
+  </div>
+  <div class="note">動かす操作（中立へ・ARM）は、確認の画面が出ます。</div>
+  <div class="result" id="a-result"></div>
+</section>
+<section class="sec">
+  <header><span class="num">07</span><h2>履歴</h2><span class="lbl">EVENTS / COMMANDS</span><label class="small" style="margin-left:auto"><input type="checkbox" id="ev-all"> 細かいものも出す</label></header>
+  <div class="log" id="log-wrap"><table><tbody id="log"></tbody></table></div>
+</section>
+
+<div class="modal-bg hide" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <div class="rail"><b>CONFIRM</b><span id="modal-code"></span></div>
+    <div class="body">
+      <div class="head"><span class="lbl">OPERATOR CONFIRMATION</span><span class="mono" id="modal-sub"></span></div>
+      <h3 id="modal-title"></h3>
+      <div id="modal-body"></div>
+      <div class="caution" aria-hidden="true"></div>
+      <div class="acts">
+        <button id="modal-cancel">やめる</button>
+        <button id="modal-ok"></button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+// ------------------------------------------------------------ 共通
+const $ = id => document.getElementById(id);
+const AX_NAMES = {1:'右手前リフト', 2:'左リフト', 3:'後部ヨー'};
+const SETUP = location.pathname.replace(/\/+$/,'').endsWith('/setup');
+$('view-mon').classList.toggle('hide', SETUP);
+$('view-setup').classList.toggle('hide', !SETUP);
+$((SETUP ? 'nav-setup' : 'nav-mon')).setAttribute('aria-current', 'page');
+document.title = SETUP ? 'H3 設定' : 'H3 監視';
+
+const TOKEN_KEY = 'h3cs.admin_token';
+try { $('token').value = sessionStorage.getItem(TOKEN_KEY) || ''; } catch (_) {}
+$('token').addEventListener('input', () => { try { sessionStorage.setItem(TOKEN_KEY, $('token').value); } catch (_) {} });
+
+async function api(method, path, body) {
+  const headers = {'X-H3-Operator': '1'};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const t = $('token').value.trim();
+  if (t) headers['Authorization'] = 'Bearer ' + t;
+  let resp;
+  try {
+    resp = await fetch(path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'});
+  } catch (e) {
+    return {ok: false, status: 0, json: null, text: 'サーバーに届きません: ' + e};
+  }
+  const text = await resp.text();
+  let json = null; try { json = JSON.parse(text); } catch (_) {}
+  return {ok: resp.ok, status: resp.status, json, text};
+}
+
+function show(el, r, okText) {
+  el.classList.toggle('err', !r.ok);
+  if (r.ok) { el.textContent = okText || 'OK'; return; }
+  const j = r.json || {};
+  const reason = j.error || j.reason || j.code || '';
+  el.textContent = `失敗 (${r.status}) ${humanErr(reason)}${j.detail ? ' — ' + j.detail : ''}${!r.json ? ' ' + r.text.slice(0, 200) : ''}`;
+}
+
+const ERRS = {
+  operator_hold: 'オペレーター停止中です。先に解除してください',
+  not_disarmed: '動いている間はできません。先に止めてください',
+  fault_latched: '異常停止中です。先に異常をリセットしてください',
+  calibrating: '校正中です',
+  power_axis_required: '#1（主電源の担当）を対象に含めてください',
+  axis_disconnected: 'つながっていない軸があります',
+  mcu_not_disarmed: 'MCU が停止状態ではありません',
+  axis_conflict: '同じ系統を 2 台が名乗っています',
+  no_calibration_result: '校正の結果がありません',
+  no_config_path: 'サーバーが設定ファイルから起動していません',
+  confirm_mismatch: '入力した 4 桁が個体と一致しません',
+  unauthorized: '管理トークンが必要です（設定画面の下）',
+  exists: '同じ名前のファイルがすでにあります',
+  device_in_use: 'その個体はすでに別の軸に割り当てられています',
+  config_file_changed: '起動後に設定ファイルが手で書き換えられています（サーバーを再起動してください）',
+  reset_in_progress: '異常のリセット中です',
+  bad_device_id: '個体の ID が読めません',
+  write_failed: '設定ファイルに書けませんでした',
+  invalid_result: '校正の結果から値を作れません（端の余裕が入りきらない など）',
+  config_read_failed: '設定ファイルを読めませんでした',
+  calibration_stale: '校正の値が未反映',
+  position_outside_soft_limits: '位置が可動範囲の外',
+  not_referenced: '基準位置がない（校正が必要）',
+  calibration_invalid: '「この軸で測った」の宣言がない',
+  not_connected: 'つながっていない',
+  not_configured: '設定を送り中',
+  status_stale: '状態が古い',
+  axis_device_mismatch: '設定と違う個体',
+  unknown_device: '知らない装置',
+  reference_stale: '系統を変えたので基準の取り直しが必要',
+  limits_unconfirmed: 'リミットの確認待ち',
+  power_role_mismatch: '主電源の担当が設定と違う',
+};
+const humanErr = c => ERRS[c] ? `${ERRS[c]} [${c}]` : c;
+
+// 確認のモーダル。OK で true、やめる・Esc・背景で false
+function confirmModal(title, items, okLabel, code) {
+  return new Promise(resolve => {
+    const m = $('modal');
+    $('modal-title').textContent = title;
+    $('modal-body').innerHTML = items && items.length ? '<ol>' + items.map((t, k) => `<li><i>${String(k + 1).padStart(2, '0')}</i><span>${esc(t)}</span></li>`).join('') + '</ol>' : '';
+    $('modal-sub').textContent = (S && S.rig_state ? 'RIG ' + S.rig_state : '') + '  ' + new Date().toTimeString().slice(0, 8);
+    $('modal-code').textContent = code || '';
+    $('modal-ok').textContent = okLabel;
+    m.classList.remove('hide');
+    const prev = document.activeElement;
+    $('modal-cancel').focus();
+    const done = v => { m.classList.add('hide'); document.removeEventListener('keydown', key); m.onclick = null; $('modal-ok').onclick = null; $('modal-cancel').onclick = null; if (prev && prev.focus) prev.focus(); resolve(v); };
+    const key = e => { if (e.key === 'Escape') done(false); };
+    document.addEventListener('keydown', key);
+    m.onclick = e => { if (e.target === m) done(false); };
+    $('modal-ok').onclick = () => done(true);
+    $('modal-cancel').onclick = () => done(false);
+  });
+}
+function withConfirm(btn, title, items, okLabel, code, run) {
+  btn.addEventListener('click', async () => { if (await confirmModal(title, items, okLabel, code)) await run(); });
+}
+
+// ------------------------------------------------------------ 文言
+const FAULT_CODE = {
+  COMMAND_TIMEOUT: '指令が途切れた', FOLLOWING_ERROR: '追従できない（負荷・引っかかり）', OVERSPEED: '速度超過',
+  SOFT_LIMIT: '可動範囲の外', ENCODER_FAULT: 'エンコーダ異常（位置が読めない・動かない）', CONTROL_OVERRUN: '制御の処理落ち',
+  CONFIG_INVALID: '設定が無効', STOP_TIMEOUT: '止まりきれない', POWER_FAULT: '電源異常', HOST_FAULT: 'PC からの停止',
+  NOT_REFERENCED: '基準位置がない', LOCAL_ESTOP: 'M5Stack の画面の非常停止', UNKNOWN: '不明な異常',
+};
+const MCU = {BOOT:'起動中', DISARMED:'停止', ARMING:'準備中', HOLDING:'保持', ACTIVE:'追従', STOPPING:'減速', DISARMING:'停止処理', FAULT:'異常', CALIBRATING:'校正中'};
+const axName = n => `#${n} ${AX_NAMES[n] || ''}`;
+
+function faultText(f) {
+  if (!f) return {what: '', code: ''};
+  const a = f.axis ? axName(f.axis) + '　' : '';
+  switch (f.kind) {
+    case 'axis_fault': return {what: a + (FAULT_CODE[f.code] || f.code), code: f.code};
+    case 'axis_disconnected': return {what: a + '接続が切れた', code: 'AXIS_DISCONNECTED'};
+    case 'axis_rebooted': return {what: a + 'M5Stack が再起動した', code: 'AXIS_REBOOTED'};
+    case 'axis_changed': return {what: a + '動作中に系統が変わった', code: 'AXIS_CHANGED'};
+    case 'axis_state_mismatch': return {what: a + `状態の食い違い（期待 ${f.expected} / 実際 ${f.actual}）`, code: 'AXIS_STATE_MISMATCH'};
+    case 'arm_timeout': return {what: 'ARM が完了しない', code: 'ARM_TIMEOUT'};
+    case 'start_timeout': return {what: a + 'START が確認できない', code: 'START_TIMEOUT'};
+    case 'stop_timeout': return {what: '止まりきれない', code: 'STOP_TIMEOUT'};
+    case 'frame_skew': return {what: '軸どうしの同期がずれた', code: 'FRAME_SKEW'};
+    case 'operator': return {what: '操作者による停止' + (f.note ? `（${f.note}）` : ''), code: 'OPERATOR'};
+    default: return {what: f.kind, code: (f.kind || '').toUpperCase()};
+  }
+}
+
+function recoverySteps(f) {
+  const base = ['来場者を降ろす', '座席のまわりに挟まり・異物がないか見る'];
+  if (!f) return base.concat(['「異常をリセット」を押す']);
+  if (f.kind === 'axis_fault' && f.code === 'LOCAL_ESTOP')
+    return ['来場者を降ろす', `${axName(f.axis)} の M5Stack の画面を 1.5 秒長押しして非常停止を外す`, '「異常をリセット」を押す'];
+  if (f.kind === 'axis_fault' && f.code === 'ENCODER_FAULT')
+    return base.concat([`${axName(f.axis)} の機構（ベルト・コードホイール）を見る`, '「異常をリセット」を押す', '基準位置が消えるので、設定画面で校正する']);
+  if (f.kind === 'axis_disconnected' || f.kind === 'axis_rebooted')
+    return base.concat([`${f.axis ? axName(f.axis) : '該当軸'} の USB と電源を確かめる（設定画面の 01）`, '「異常をリセット」を押す']);
+  return base.concat(['「異常をリセット」を押す', '必要なら「中立へ戻す」']);
+}
+
+// ------------------------------------------------------------ 状態
+let S = null, lastOk = 0, nowMs = null;
+let evAfter = 0, events = [];
+
+async function pollStatus() {
+  const r = await api('GET', '/v1/status');
+  if (r.ok && r.json) { S = r.json; lastOk = Date.now(); }
+  render();
+}
+async function pollEvents() {
+  const r = await api('GET', `/v1/events?after=${evAfter}&n=200`);
+  if (r.ok && r.json) {
+    nowMs = r.json.now_ms;
+    for (const e of r.json.events) { events.push(e); evAfter = Math.max(evAfter, e.id); }
+    if (events.length > 500) events = events.slice(-500);
+    renderLog();
+  }
+}
+
+const lost = () => !S || Date.now() - lastOk > 1500;
+const hasNewApi = () => S && S.operator_hold !== undefined;
+
+function band(el, verdictEl, whyEl, cls, lbl, verdict, whyHtml) {
+  el.className = 'band ' + cls;
+  if (lbl !== null && $('band-lbl') && el.id === 'band') $('band-lbl').textContent = lbl;
+  verdictEl.textContent = verdict;
+  whyEl.innerHTML = whyHtml || '';
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function render() {
+  const t = new Date();
+  $('m-clock').textContent = t.toTimeString().slice(0, 8);
+  $('m-link').classList.toggle('bad', lost());
+  $('m-rig').textContent = S ? `rig ${S.rig_state}` : 'rig —';
+  renderMonitor();
+  renderSetup();
+  renderLimits();
+  renderSession();
+  renderActions();
+}
+
+function renderMonitor() {
+  const b = $('band'), v = $('band-verdict'), w = $('band-why'), steps = $('steps'), prim = $('primary');
+  let stepList = [], primary = null;
+  if (lost()) {
+    band(b, v, w, 'lost', 'NO SIGNAL', '通信途絶', '<span>サーバーから状態が届いていません。表示は最後に受け取った値ではありません。</span><span class="code">GET /v1/status</span>');
+    stepList = ['サーバーが動いているか確かめる（ターミナル）', 'このページを再読み込みする'];
+  } else if (S.operator_hold) {
+    band(b, v, w, 'hold', 'OPERATOR HOLD', 'オペレーター停止中', '画面の非常停止で止めています。解除するまで、ゲームからの ARM・START・異常リセットは断ります。<span class="code">operator_hold</span>');
+    stepList = ['来場者と座席のまわりの安全を確かめる', '「オペレーター停止を解除」を押す', 'ゲームを再開する'];
+    primary = {label: 'オペレーター停止を解除', run: release};
+  } else if (S.rig_state === 'FAULT_LATCHED') {
+    const f = faultText(S.fault);
+    band(b, v, w, 'fault', 'RIG STATE / FAULT_LATCHED', '異常停止', `${esc(f.what)}<span class="code">${esc(f.code)}</span>`);
+    stepList = recoverySteps(S.fault);
+    primary = {label: '異常をリセット', run: faultReset};
+  } else if (S.rig_state === 'OFFLINE' || (S.axes || []).some(a => !a.connected)) {
+    const miss = (S.axes || []).filter(a => !a.connected).map(a => axName(a.axis_id)).join('、');
+    band(b, v, w, 'calm warn', 'RIG STATE / OFFLINE', '接続待機', `つながっていない軸: ${esc(miss || '—')}`);
+    stepList = ['設定画面の 01 で USB・電源を確かめる'];
+    primary = {label: '設定画面へ', run: () => { location.href = '/console/setup'; }};
+  } else if (S.rig_state === 'CALIBRATION_REQUIRED') {
+    band(b, v, w, 'calm warn', 'RIG STATE / CALIBRATION_REQUIRED', '校正が必要', esc((S.blockers || []).slice(0, 3).map(blockerText).join(' / ')));
+    stepList = ['設定画面の 02 で校正する'];
+    primary = {label: '設定画面へ', run: () => { location.href = '/console/setup'; }};
+  } else if (S.rig_state === 'ACTIVE') {
+    band(b, v, w, 'calm ok', 'RIG STATE / ACTIVE', S.active_source === 'center' ? '中立へ移動中' : '稼働中', S.active_source === 'game' ? 'ゲームの姿勢に追従しています' : '');
+    stepList = ['異常があれば「非常停止」'];
+  } else if (S.rig_state === 'HOLDING' || S.rig_state === 'ARMING') {
+    band(b, v, w, 'calm idle', `RIG STATE / ${S.rig_state}`, '保持', 'ブレーキを外して位置を保っています。ゲームの START を待っています。');
+    stepList = ['ゲームを始める（START はゲームから）'];
+  } else if (S.rig_state === 'STOPPING' || S.rig_state === 'BRAKED_DISARMED') {
+    band(b, v, w, 'calm warn', `RIG STATE / ${S.rig_state}`, S.rig_state === 'STOPPING' ? '減速中' : '停止', 'ブレーキで止めています。再開には ARM が必要です。');
+    stepList = ['安全を確かめてから ARM（ゲームが自動で行うこともあります）'];
+  } else if (S.rig_state === 'READY_TO_ARM') {
+    band(b, v, w, 'calm idle', 'RIG STATE / READY_TO_ARM', '待機', '3 軸とも準備ができています。');
+    stepList = ['座席に人が乗ったら ARM（ゲームが自動で行うこともあります）'];
+  } else {
+    band(b, v, w, 'calm idle', `RIG STATE / ${S.rig_state}`, S.rig_state, '');
+  }
+  // 直近の異常（ゲームが自動で解除したものも残す）
+  const rec = $('band-recent');
+  const fh = S && S.fault_history && S.fault_history.length ? S.fault_history[S.fault_history.length - 1] : null;
+  if (!lost() && fh && S.rig_state !== 'FAULT_LATCHED' && nowMs !== null && nowMs - fh.at_ms < 10 * 60 * 1000) {
+    const f = faultText(fh.fault);
+    const ago = Math.round((nowMs - fh.at_ms) / 1000);
+    rec.innerHTML = `直近の異常 ${ago} 秒前: <b>${esc(f.what)}</b> <span class="mono">${esc(f.code)}</span>（解除済み）`;
+    rec.classList.remove('hide');
+  } else rec.classList.add('hide');
+
+  steps.innerHTML = stepList.map(s => `<li>${esc(s)}</li>`).join('');
+  if (primary) { prim.textContent = primary.label; prim.onclick = primary.run; prim.classList.remove('hide'); }
+  else prim.classList.add('hide');
+
+  // 3 軸
+  const axes = (S && S.axes) || [];
+  $('axes').innerHTML = [1, 2, 3].map(n => {
+    const a = axes.find(x => x.axis_id === n);
+    let cls = 'off', word = '未接続';
+    if (!lost() && a && a.connected) {
+      if (a.mcu_state === 'FAULT' || (a.fault_code && a.fault_code !== 'NONE')) { cls = 'bad'; word = '異常'; }
+      else if (a.calibration_stale || !a.referenced || !a.calibration_valid) { cls = 'warn'; word = '要校正'; }
+      else { cls = 'ok'; word = MCU[a.mcu_state] || a.mcu_state; }
+    } else if (lost()) { word = '不明'; }
+    const fc = a && a.fault_code && a.fault_code !== 'NONE' ? (FAULT_CODE[a.fault_code] || a.fault_code) : '—';
+    return `<div class="ax ${cls}">
+      <div class="lbl">AXIS 0${n} · ${esc(AX_NAMES[n])}</div>
+      <div class="v">${word}</div>
+      <div class="kv tnum">
+        <span>位置</span><span>${a && a.actual_count != null && !lost() ? a.actual_count + ' cnt' : '—'}</span>
+        <span>目標</span><span>${a && a.target_count != null && !lost() ? a.target_count + ' cnt' : '—'}</span>
+        <span>追従誤差</span><span>${a && a.following_error_count != null && !lost() ? a.following_error_count : '—'}</span>
+        <span>異常</span><span>${esc(fc)}</span>
+        <span>MCU</span><span class="mono">${esc(a ? a.mcu_state : '—')}</span>
+      </div></div>`;
+  }).join('');
+}
+
+function blockerText(b) {
+  const str = String(b), code = str.split(':')[0];
+  const m = str.match(/axis(\d)/);
+  return ERRS[code] ? (m ? axName(Number(m[1])) + ' ' : '') + ERRS[code] : str;
+}
+
+// ------------------------------------------------------------ 設定画面
+function renderSetup() {
+  if (!SETUP) return;
+  const axes = (S && S.axes) || [];
+  // 帯
+  let verdict = '準備', why = '', cls = 'calm idle';
+  if (lost()) { verdict = '通信途絶'; cls = 'lost'; why = 'サーバーから状態が届いていません。'; }
+  else if (S.rig_state === 'READY_TO_ARM') { verdict = '準備完了'; cls = 'calm ok'; why = '3 軸ともつながり、校正済みです。'; }
+  else if ((S.blockers || []).length) { why = esc([...new Set(S.blockers.map(blockerText))].slice(0, 6).join(' / ')); cls = 'calm warn'; verdict = S.rig_state === 'OFFLINE' ? '接続待機' : '準備中'; }
+  $('sband').className = 'band ' + cls; $('sband-verdict').textContent = verdict; $('sband-why').innerHTML = why;
+
+  // 01 USB
+  $('units').innerHTML = [1, 2, 3].map(n => {
+    const a = axes.find(x => x.axis_id === n) || {};
+    const mism = a.connected && a.expected_device_id && a.device_id && a.expected_device_id !== '0000000000000000' && a.device_id !== a.expected_device_id;
+    let w = '<span class="sev-bad">未接続</span>';
+    if (a.connected && mism) w = '<span class="sev-bad">個体違い</span>';
+    else if (a.connected && (a.status_age_ms ?? 0) > 500) w = '<span class="sev-warn">応答なし</span>';
+    else if (a.connected) w = '<span class="sev-ok">接続</span>';
+    const rx = `${a.rx_error_count ?? 0} / ${a.decode_errors ?? 0}`;
+    return `<tr><td><b>${esc(axName(n))}</b></td><td class="big-ok" style="font-size:20px">${w}</td>
+      <td class="mono">${esc(macOf(a.expected_device_id))}</td><td class="mono">${esc(a.connected ? macOf(a.device_id) : '—')}</td>
+      <td class="mono">${esc(a.port || '—')}</td><td class="mono">${esc(a.mcu_state || '—')}</td><td class="mono">${esc(a.boot_id ?? '—')}</td><td class="mono" title="rx_error / decode_errors">${esc(rx)}</td></tr>`;
+  }).join('');
+  // 未登録の個体（新しい API があれば）
+  const un = (S && S.unregistered_units) || [];
+  $('unreg').innerHTML = !hasNewApi() ? '' : (un.length === 0 ? '<div class="note" style="margin-top:8px">未登録の個体: なし</div>' :
+    un.map((u, i) => `<div class="unit"><div class="lbl">UNREGISTERED UNIT</div>
+      <div><b>${esc(u.port)}</b> <span class="mono">SER=${esc(u.usb_serial)} device_id ${esc(u.device_id || '—')}</span></div>
+      <div class="note">他のプロジェクトの ESP32-S3（扉の鍵など）もここに出ます。その CoreS3 の画面に出ている <b>dev XXXX</b> の 4 桁を入れてから割り当ててください。</div>
+      <div class="row" style="align-items:center;margin-top:6px">
+        <select id="un-ax-${i}"><option value="1">#1 右手前リフト</option><option value="2">#2 左リフト</option><option value="3">#3 後部ヨー</option></select>
+        <input id="un-sfx-${i}" maxlength="4" placeholder="画面の 4 桁" style="width:9em">
+        <button class="btn-warn" data-un="${i}" ${u.device_id ? '' : 'disabled title="USB のシリアル番号が MAC ではないので割り当てられません"'}>この個体を割り当てる</button>
+      </div></div>`).join(''));
+  document.querySelectorAll('[data-un]').forEach(btn => btn.onclick = () => assignUnit(Number(btn.dataset.un)));
+
+  // 02 校正
+  $('cal-run').disabled = lost();
+  // 結果カードに反映・宣言のボタンを入れる（新しい API があるとき）
+  $('cal-cards').innerHTML = [1, 2, 3].map(n => calCard(axes.find(x => x.axis_id === n) || {}, n, hasNewApi())).join('');
+  $('apply-new').classList.toggle('hide', !hasNewApi());
+  $('apply-old').classList.toggle('hide', hasNewApi());
+  if (hasNewApi()) {
+    document.querySelectorAll('[data-apply]').forEach(b => b.onclick = () => applyCal(Number(b.dataset.apply)));
+    document.querySelectorAll('[data-declare]').forEach(b => b.onclick = () => declare(Number(b.dataset.declare)));
+    $('apply-all').disabled = !axes.some(a => a.calibration_stale && a.calibration && a.calibration.result === 'OK');
+  }
+}
+
+function macOf(id) {
+  if (!id || id === '0000000000000000') return '—';
+  const h = id.slice(-12).toUpperCase();
+  return h.match(/../g).join(':');
+}
+
+function calCard(a, n, withApply) {
+  const c = a.calibration;
+  let body = '<div class="mut">結果なし</div>';
+  const prev = a.config_stroke;
+  if (a.mcu_state === 'CALIBRATING') body = '<div class="stroke sev-warn">校正中</div>';
+  else if (c) {
+    const stroke = c.n_end_count != null ? Math.abs(c.n_end_count) : null;
+    if (c.result === 'OK') {
+      const d = prev != null && stroke != null ? stroke - prev : null;
+      const within = d == null ? null : Math.abs(d) <= 30;
+      body = `<div class="stroke ${within === false ? 'sev-warn' : 'sev-ok'} tnum">${stroke}</div>
+        <div class="small">${prev != null ? `前回 ${prev}（差 ${d > 0 ? '+' : ''}${d}）` : '前回の値は不明'} ${within === false ? '<b class="sev-warn">±30 を超えています</b>' : within ? '<span class="sev-ok">±30 以内</span>' : ''}</div>
+        <div class="mono">中立 ${c.neutral_count} · 符号 ${c.sign}</div>`;
+    } else body = `<div class="stroke sev-bad">${esc(c.result)}</div><div class="mono">${esc(c.reason || '')}</div>`;
+  }
+  let flags = '';
+  if (a.calibration_stale) flags += '<span class="tag t-lim">未反映</span>';
+  if (a.calibration_valid) flags += '<span class="tag t-ok">宣言済み</span>'; else flags += '<span class="tag t-bad">未宣言</span>';
+  let btns = '';
+  if (withApply) {
+    btns = `<div class="row" style="margin-top:8px">
+      <button data-apply="${n}" ${a.calibration_stale && c && c.result === 'OK' ? '' : 'disabled'}>反映する</button>
+      <button data-declare="${n}" ${!a.calibration_valid && !a.calibration_stale ? '' : 'disabled'}>この軸で測ったと宣言</button></div>`;
+  }
+  return `<div><div class="lbl">AXIS 0${n} · ${esc(AX_NAMES[n])} ${flags}</div>${body}${btns}</div>`;
+}
+
+$('cal-run').addEventListener('click', async () => {
+  const axes = [...document.querySelectorAll('.cal-ax')].filter(x => x.checked).map(x => Number(x.value));
+  const ok = await confirmModal('校正しますか？', [
+    `${axes.map(n => '#' + n).join('・')} が端から端まで動きます（#1 は主電源の担当なので必ず動きます）`,
+    '座席に人がいない',
+    '座席に手が触れていない',
+    'まわりに物がない',
+    '物理の非常停止を押せる位置にいる',
+  ], '校正する', 'CALIBRATE');
+  if (!ok) return;
+  const r = await api('POST', '/v1/calibrate', {axes});
+  show($('cal-result'), r, `校正を始めました（${axes.map(n => '#' + n).join(' ')}）。終わるまで座席に近づかないでください。`);
+});
+$('cal-cancel').addEventListener('click', async () => show($('cal-result'), await api('POST', '/v1/calibrate/cancel'), '中止しました'));
+$('cal-export').addEventListener('click', async () => {
+  const r = await api('POST', '/v1/calibration/export');
+  show($('apply-result'), r, r.json ? `書き出しました: ${r.json.path}\nファイルを確認し、calibration_valid = true にしてから、そのファイルでサーバーを再起動してください。` : 'OK');
+});
+async function applyCal(n) {
+  const r = await api('POST', '/v1/calibration/apply', {axis: n});
+  const j = r.json || {};
+  show($('apply-result'), r, `#${n} を反映しました。行程 ${j.stroke}（前回 ${j.prev_stroke}）${j.within_tolerance ? '' : ' ±30 超'} / 宣言 ${j.calibration_valid ? '引き継ぎ' : 'やり直しが必要'}\n保存: ${j.path || ''}（元のファイル: ${j.backup || ''}）`);
+}
+$('apply-all').addEventListener('click', async () => {
+  const axes = ((S && S.axes) || []).filter(a => a.calibration_stale && a.calibration && a.calibration.result === 'OK').map(a => a.axis_id);
+  const lines = [];
+  for (const n of axes) {
+    const r = await api('POST', '/v1/calibration/apply', {axis: n});
+    const j = r.json || {};
+    lines.push(r.ok ? `#${n} 反映: 行程 ${j.stroke}（前回 ${j.prev_stroke}）${j.within_tolerance ? '' : ' ±30 超'} / 宣言 ${j.calibration_valid ? '引き継ぎ' : 'やり直しが必要'}`
+                    : `#${n} 失敗 (${r.status}) ${humanErr((r.json || {}).error || '')}`);
+  }
+  const el = $('apply-result'); el.classList.toggle('err', lines.some(l => l.includes('失敗'))); el.textContent = lines.join('\n') || '反映するものがありません';
+});
+async function declare(n) {
+  const ok = await confirmModal(`#${n} の値は、この軸・この個体で測ったものですか？`, ['行程が過去の値と大きく違わない', '中立で止めた位置が正しい', '座席に人がいない', '物理の非常停止を押せる人がいる'], '測ったと宣言する', `DECLARE ${n}`);
+  if (!ok) return;
+  show($('apply-result'), await api('POST', '/v1/calibration/declare', {axis: n}), `#${n} を宣言しました`);
+}
+async function assignUnit(i) {
+  const u = ((S && S.unregistered_units) || [])[i]; if (!u) return;
+  const axis = Number($(`un-ax-${i}`).value), sfx = $(`un-sfx-${i}`).value.trim();
+  const r = await api('POST', '/v1/units/assign', {axis, device_id: u.device_id, confirm_suffix: sfx});
+  show($('apply-result'), r, `#${axis} に割り当てました。新しい個体の画面で系統 #${axis} を選び、02 で校正してください。`);
+}
+
+// ------------------------------------------------------------ 4 リミット
+const LIM = [['max_gain', 'ゲイン上限', 0.01], ['max_vel_count_s', '速度上限 (count/s)', 1], ['max_acc_count_s2', '加速度上限 (count/s²)', 1], ['duty_max_percent', 'Duty 上限 (%)', 1]];
+let limBuilt = false;
+function renderLimits() {
+  const m = S && S.motion_limits; if (!m) return;
+  if (!limBuilt) {
+    $('limits').innerHTML = LIM.map(([k, name, step]) => `<tr><td>${name} <span id="lt-${k}"></span></td>
+      <td class="num tnum" id="le-${k}"></td><td class="num tnum" id="lr-${k}"></td><td class="num tnum" id="lo-${k}"></td><td class="num tnum" id="lc-${k}"></td>
+      <td><input id="li-${k}" type="number" step="${step}" style="width:8em"></td></tr>`).join('');
+    limBuilt = true;
+  }
+  for (const [k] of LIM) {
+    $('le-' + k).textContent = m.effective?.[k] ?? '—';
+    $('lr-' + k).textContent = m.requested?.[k] ?? '—';
+    $('lo-' + k).textContent = m.operator_max?.[k] ?? '—';
+    $('lc-' + k).textContent = m.ceiling?.[k] ?? '—';
+    const game = (m.game_fields || []).includes(k);
+    const lim = (m.limited || []).includes(k);
+    $('lt-' + k).innerHTML = (game ? '<span class="tag t-game">ゲーム</span>' : '') + (lim ? '<span class="tag t-lim">頭打ち</span>' : '');
+  }
+  $('lim-note').textContent = (m.reasons || []).length ? '頭打ちの理由: ' + m.reasons.join(', ') : (m.pending ? '反映待ち' : '');
+}
+$('lim-send').addEventListener('click', async () => {
+  const body = {};
+  for (const [k] of LIM) { const v = $('li-' + k).value; if (v !== '') body[k] = Number(v); }
+  if (!Object.keys(body).length) { $('lim-result').textContent = '変える値を入れてください'; return; }
+  const r = await api('POST', '/v1/limits', body);
+  show($('lim-result'), r, '送りました');
+  if (r.ok) for (const [k] of LIM) $('li-' + k).value = '';
+});
+
+// ------------------------------------------------------------ 5 セッション
+function renderSession() {
+  const s = S && S.session;
+  const rows = [
+    ['セッション ID（先頭 8 桁）', s?.source_session_prefix || 'なし'],
+    ['姿勢の鮮度', !s || !s.source_session_prefix ? 'ゲーム未接続' : (s.fresh ? '<span class="sev-ok">新しい</span>' : '<span class="sev-warn">途切れている</span>')],
+    ['最後の姿勢からの時間', s?.source_age_ms != null ? s.source_age_ms + ' ms' : '—'],
+    ['最後の seq / frame_seq', s ? `${s.last_seq ?? '—'} / ${s.last_frame_seq ?? '—'}` : '—'],
+    ['要求の姿勢 (pitch, roll, yaw)', S?.requested_pose ? ['pitch', 'roll', 'yaw'].map(k => (+S.requested_pose[k]).toFixed(2)).join(', ') : '—'],
+    ['ゲイン（要求 → 有効）', S ? `${S.requested_gain ?? '—'} → ${S.effective_gain ?? '—'}` : '—'],
+    ['動作の元', S?.active_source || '—'],
+  ];
+  $('session').innerHTML = rows.map(([k, v]) => `<tr><th style="width:44%">${k}</th><td class="tnum">${v}</td></tr>`).join('');
+}
+
+// ------------------------------------------------------------ 6 操作
+async function faultReset() { show($('act-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'); }
+async function release() { show($('act-result'), await api('POST', '/v1/operator/release'), 'オペレーター停止を解除しました'); }
+$('estop').addEventListener('click', async () => {
+  // 新しい API があればオペレーター停止（ゲームが勝手に動かし直さない）、なければ従来の stop
+  // オペレーター停止は応答が 503 でも立っていることがある。結果は status.operator_hold で判断する
+  if (hasNewApi()) {
+    const r = await api('POST', '/v1/operator/hold');
+    await pollStatus();
+    if (S && S.operator_hold) { $('act-result').classList.remove('err'); $('act-result').textContent = 'オペレーター停止しました。解除するまでゲームは動かせません。'; }
+    else show($('act-result'), r);
+  } else {
+    show($('act-result'), await api('POST', '/v1/stop'), '停止しました（ゲームが動かし直すことがあります）');
+  }
+});
+withConfirm($('a-center'), '中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', 'CENTER', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
+withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
+$('a-disarm').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'));
+$('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
+$('a-release').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/operator/release'), '解除しました'));
+function renderActions() {
+  $('a-release').classList.toggle('hide', !(S && S.operator_hold));
+  $('a-reset').disabled = !(S && S.rig_state === 'FAULT_LATCHED');
+  $('a-arm').disabled = !(S && S.rig_state === 'READY_TO_ARM') || !!(S && S.operator_hold);
+  $('a-arm').classList.toggle('armed', !!(S && S.armed));
+}
+
+// ------------------------------------------------------------ 7 履歴
+const CMDJ = {Arm:'ARM', Start:'START', Stop:'停止', Disarm:'DISARM', Center:'中立へ', FaultReset:'異常リセット', Fault:'操作者の停止', Calibrate:'校正', CalibrateCancel:'校正の中止', ReplaceAxis:'設定の反映', Reference:'基準位置', SetLimits:'リミット変更', OperatorHold:'オペレーター停止', OperatorRelease:'オペレーター停止の解除'};
+const QUIET = new Set(['fault_prehistory', 'rig_state_tick']);
+const EVJ = {identified: '接続', disconnected: '切断', axis_rebooted: '再起動', admin: '操作', ack_rejected: '拒否', rig_state: '状態',
+  stopping: '減速', center_reached: '中立に到達', session_changed: 'セッション', ack_timeout: '応答なし', fault: '異常', fault_event: '異常（MCU）',
+  fault_reset_timeout: 'リセット失敗', fault_cleared: '異常の解除', calibrate: '校正', calibrate_cancelled: '校正中止', cal_result: '校正結果', calibration_stale: '要反映', operator_hold: 'オペレーター停止', config_applied: '設定反映'};
+function evSummary(e) {
+  const d = e.detail || {};
+  switch (e.kind) {
+    case 'rig_state': return `${d.from} → ${d.to}`;
+    case 'fault': return faultText(d.fault).what + (d.detail ? ` — ${d.detail}` : '');
+    case 'fault_event': return `${d.axis ? axName(d.axis) : ''} ${FAULT_CODE[d.fault_code] || d.fault_code || ''}`;
+    case 'cal_result': { const r = d.result || {}; return `${d.axis ? axName(d.axis) : ''} ${r.result || ''}${r.n_end_count != null ? ' 行程 ' + Math.abs(r.n_end_count) : ''}${r.result && r.result !== 'OK' ? ' (' + (r.reason || '') + ')' : ''}`; }
+    case 'calibration_stale': return `${d.axis ? axName(d.axis) : ''} 校正の値が未反映（行程 ${d.stroke}）`;
+    case 'calibrate': return '校正を開始 ' + (d.axes || []).map(n => '#' + n).join(' ');
+    case 'calibrate_power_release': return `${d.axis ? axName(d.axis) : ''} 校正後に主電源の保持を解除`;
+    case 'fault_cleared': return '解除: ' + faultText(d.fault).what;
+    case 'admin': {
+      const c = String(d.cmd || '');
+      const name = Object.keys(CMDJ).find(k => c === k || c.startsWith(k + ' ') || c.startsWith(k + '{'));
+      return `${name ? CMDJ[name] : c}${d.ok === false ? ' — 拒否' : ''}${d.note ? ` (${d.note})` : ''}`;
+    }
+    default: { const j = JSON.stringify(d); return j.length > 160 ? j.slice(0, 160) + '…' : j; }
+  }
+}
+function fmtT(ms) { if (ms == null) return '—'; const s = ms / 1000; const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = Math.floor(s % 60); return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}`; }
+function renderLog() {
+  const wrap = $('log-wrap');
+  const atTop = wrap.scrollTop < 8;
+  const all = $('ev-all').checked;
+  const rows = events.filter(e => all || !QUIET.has(e.kind)).slice(-200).reverse();
+  $('log').innerHTML = rows.map(e => `<tr class="${e.kind.startsWith('fault') && e.kind !== 'fault_cleared' ? 'f' : ''}"><td class="mono tnum">${fmtT(e.t_ms)}</td><td class="k">${esc(EVJ[e.kind] || e.kind)}</td><td>${esc(evSummary(e))}</td></tr>`).join('');
+  if (atTop) wrap.scrollTop = 0; // 読んでいる途中はスクロールを奪わない
+}
+$('ev-all').addEventListener('change', renderLog);
+
+// ------------------------------------------------------------ ループ
+let busyS = false, busyE = false;
+setInterval(async () => { if (busyS) return; busyS = true; try { await pollStatus(); } finally { busyS = false; } }, 200);
+setInterval(async () => { if (busyE) return; busyE = true; try { await pollEvents(); } finally { busyE = false; } }, 1000);
+pollStatus(); pollEvents();
+</script>
+</body>
+</html>

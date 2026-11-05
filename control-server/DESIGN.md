@@ -311,6 +311,15 @@ USB プロトコル: [docs/control-server/protocol.md](../docs/control-server/pr
   - 「リセット」（常に押せる）: 自動開始を止め、送信を止め、指令姿勢と「姿勢を 0 に固定」を戻し、armed（ARMING / HOLDING / ACTIVE）なら `POST /v1/stop`、FAULT_LATCHED なら `POST /v1/fault/reset` を送ってから自動開始を最初からやり直す。
 - 断られた操作と途切れた送信の表示（Issue #36）: 管理操作（ARM / START / DISARM / FAULT RESET / CENTER / STOP。自動開始が送った ARM / START / CENTER も）の応答が `ok: false` なら、`error` と `blockers`（409 の supervisor の拒否。401 / 429 / 503 などは `error` だけ）をボタンの下にそのまま出し、`error` ごとの和文の説明と次の手を添える（`pose_not_near_hold` なら速度モードは「中央へ」、位置モードはスティックを中央へ、姿勢が 0 でも断られるなら CENTER ボタン）。自動開始の START が `pose_not_near_hold` で自動の CENTER に回るときは黄で blockers とこれからすることを出し、断られて中止したら赤で出す。次に成功した操作で消える。自動開始が走っていないときに、速度モードで指令姿勢が中央から離れたまま START の前の状態にいれば、START の下と title に「中央へ」の案内を出す（関門の count はサーバーの中の向き・混合・校正で決まるので、ページは「0 から離れている」だけを見る案内。判定はサーバー）。ack の `stale_session`、送信中に WS が意図せず閉じた（サーバー再起動）、送信中に status の session が 2 回続けて自分のものでない（姿勢が無く ack が来ないときの保険。送信も止める）、のどれかで送信を止めて赤いバナーを出し「送信開始」の押し直し（自動で START まで進め直すなら「リセット」）を求める。自動開始の途中でも同じで、自動開始は中止する（新しい WS が開くか、操作者が送信を止めるか「リセット」で消える）。
 
+### 7.6 オペレーター管理画面 `GET /console`（監視）・`GET /console/setup`（設定）
+
+`control-server/static/console.html`（1 枚。パスで表示を切り替える。外部資源なし、日本語 UI）。設計は docs/superpowers/specs/2026-11-05-operator-console-design.md。展示の準備と展示中の監視・復旧を任されたスタッフ向け（開発者向けの試験ページ・ジョイスティックページは残す）。
+
+- 監視: 上部の状態の帯（異常停止は赤の塗りで上半分、通常時は細く静か。判定語・人の言葉の理由・元のコード）、3 軸、次の手順と主ボタン（異常をリセットなど）、非常停止。ゲームが自分で解除した異常も「直近の異常」として 10 分残す。status が 1.5 s 届かなければ「通信途絶」（最後の値を正常として出さない）。
+- 設定: 01 USB・接続（設定の個体と接続中の個体の MAC、ポート、MCU、起動 ID、受信エラー）、02 校正と反映（「校正する」で確認のモーダル（座席が空・手が離れている・物がない）。#1 は必ず含む。結果の行程を設定の行程と比べて ±30。結果カードで反映・宣言、OK の軸をまとめて反映）。
+- 両方: 04 リミット（ゲームが書いた項目・頭打ちに印）、05 ゲーム（セッション先頭 8 桁・鮮度・seq）、06 操作（中立へ・ARM は確認のモーダル）、07 履歴（`/v1/events?after=` を 1 s ごと）。
+- すべての要求に `X-H3-Operator: 1` を付ける。status に `operator_hold` があるサーバーでは、非常停止を `/v1/operator/hold`、反映を `/v1/calibration/apply|declare`、入れ替えを `/v1/units/assign` で行う（設計 §12）。無いサーバーでは `/v1/stop` と、書き出し → 再起動の従来の手順を案内する。
+
 ## 8. Python クライアントと h3game アダプター
 
 - `clients/python/h3_motion_client.py`: `MotionClient(base_url)`。`start()`, `close()`, `submit_pose(pitch, roll, yaw, gain, frame_seq=None, source_age_ms=0.0)`（非ブロッキング、最新 1 件スロット）, `submit_gain(gain)`, `submit_limits(max_gain=, max_vel_count_s=, max_acc_count_s2=, duty_max_percent=)`（省略可、pose より先に送る、`last_limits_ack`）, `status() -> dict | None`, `connected`, `reconnect()`（通信の再確立だけ。ARM/START しない）, `stop()`（POST /v1/stop）。背景スレッドが session 取得 → WS 接続 → スロット送信・status 受信・再接続（指数バックオフ、新しい session）。`source_age_ms` は「submit 時の年齢 + submit から送信までの経過」で送り、キュー待ちで 0 に作り直さない。依存: `websockets>=13`（同期クライアント）。HTTP は標準ライブラリ。

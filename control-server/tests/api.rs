@@ -115,7 +115,7 @@ async fn foreign_origin_is_forbidden() {
     let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     // The embedded pages too (a foreign page must not read them).
-    for p in ["/", "/joystick"] {
+    for p in ["/", "/joystick", "/console", "/console/setup"] {
         let (st, body) = call(&s.app, req("GET", p, &[("origin", "http://evil.example")], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(body["error"], "forbidden_origin", "{p}");
@@ -1433,4 +1433,29 @@ async fn limits_message_is_rejected_during_an_axis_conflict() {
     assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["requested"]["max_gain"], 0.5, "not applied");
+}
+
+#[tokio::test]
+async fn operator_console_is_served_and_self_contained() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/console", "/console/setup"] {
+        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), api::CONSOLE_PAGE);
+    }
+    for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
+        assert!(!api::CONSOLE_PAGE.contains(needle), "external resource in the console: {needle}");
+    }
+    // Reads status / events; the operator header goes on every request; the new APIs are used
+    // only when the server reports them (operator_hold present).
+    for needle in ["/v1/status", "/v1/events?after=", "X-H3-Operator", "/v1/fault/reset", "/v1/stop", "/v1/operator/hold",
+                   "/v1/calibration/apply", "/v1/units/assign", "confirmModal('校正しますか？'", "hasNewApi"] {
+        assert!(api::CONSOLE_PAGE.contains(needle), "missing in the console: {needle}");
+    }
+    // Loading the page sends nothing that moves the rig.
+    assert!(s.seen.lock().unwrap().is_empty());
 }
