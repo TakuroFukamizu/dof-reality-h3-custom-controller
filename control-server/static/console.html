@@ -207,8 +207,7 @@ td.num{text-align:right}
 
   <section class="sec">
     <header><span class="num">02</span><h2>校正と反映</h2><span class="lbl">CALIBRATE / APPLY / DECLARE</span></header>
-    <label class="check"><input type="checkbox" id="seat-empty"> 座席に人がいない・手が離れている・まわりに物がない（校正では各軸が端から端まで動きます）</label>
-    <div class="row" style="margin-top:10px;align-items:center">
+    <div class="row" style="align-items:center">
       <span class="small">対象:</span>
       <label><input type="checkbox" class="cal-ax" value="1" checked disabled> #1</label>
       <label><input type="checkbox" class="cal-ax" value="2" checked> #2</label>
@@ -216,7 +215,7 @@ td.num{text-align:right}
       <span class="note">#1 は主電源の担当なので必ず含めます（#1 がないと他の軸に 24 V が来ません）。</span>
     </div>
     <div class="row" style="margin-top:10px">
-      <button class="btn-warn" id="cal-run" disabled>校正する</button>
+      <button class="btn-warn" id="cal-run">校正する</button>
       <button id="cal-cancel">校正を中止</button>
     </div>
     <div class="result" id="cal-result"></div>
@@ -592,7 +591,7 @@ function renderSetup() {
   document.querySelectorAll('[data-un]').forEach(btn => btn.onclick = () => assignUnit(Number(btn.dataset.un)));
 
   // 02 校正
-  $('cal-run').disabled = !$('seat-empty').checked || lost();
+  $('cal-run').disabled = lost();
   // 結果カードに反映・宣言のボタンを入れる（新しい API があるとき）
   $('cal-cards').innerHTML = [1, 2, 3].map(n => calCard(axes.find(x => x.axis_id === n) || {}, n, hasNewApi())).join('');
   $('apply-new').classList.toggle('hide', !hasNewApi());
@@ -637,13 +636,18 @@ function calCard(a, n, withApply) {
   return `<div><div class="lbl">AXIS 0${n} · ${esc(AX_NAMES[n])} ${flags}</div>${body}${btns}</div>`;
 }
 
-$('seat-empty').addEventListener('change', render);
 $('cal-run').addEventListener('click', async () => {
-  if (!$('seat-empty').checked) return;
   const axes = [...document.querySelectorAll('.cal-ax')].filter(x => x.checked).map(x => Number(x.value));
+  const ok = await confirmModal('校正しますか？', [
+    `${axes.map(n => '#' + n).join('・')} が端から端まで動きます（#1 は主電源の担当なので必ず動きます）`,
+    '座席に人がいない',
+    '座席に手が触れていない',
+    'まわりに物がない',
+    '物理の非常停止を押せる位置にいる',
+  ], '校正する', 'CALIBRATE');
+  if (!ok) return;
   const r = await api('POST', '/v1/calibrate', {axes});
   show($('cal-result'), r, `校正を始めました（${axes.map(n => '#' + n).join(' ')}）。終わるまで座席に近づかないでください。`);
-  $('seat-empty').checked = false; render();
 });
 $('cal-cancel').addEventListener('click', async () => show($('cal-result'), await api('POST', '/v1/calibrate/cancel'), '中止しました'));
 $('cal-export').addEventListener('click', async () => {

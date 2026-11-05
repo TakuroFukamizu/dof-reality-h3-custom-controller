@@ -1451,7 +1451,7 @@ async fn operator_console_is_served_and_self_contained() {
     // Reads status / events; the operator header goes on every request; the new APIs are used
     // only when the server reports them (operator_hold present).
     for needle in ["/v1/status", "/v1/events?after=", "X-H3-Operator", "/v1/fault/reset", "/v1/stop", "/v1/operator/hold",
-                   "/v1/calibration/apply", "/v1/units/assign", "id=\"seat-empty\"", "hasNewApi"] {
+                   "/v1/calibration/apply", "/v1/units/assign", "confirmModal('校正しますか？'", "hasNewApi"] {
         assert!(api::CONSOLE_PAGE.contains(needle), "missing in the console: {needle}");
     }
     // Loading the page sends nothing that moves the rig.
