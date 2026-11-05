@@ -100,19 +100,25 @@ impl Streamer {
 /// Server up, all axes READY_TO_ARM, poses streaming, armed and ACTIVE.
 async fn active_rig(cfg: Config) -> (h3cs::server::RunningServer, Streamer) {
     let srv = start_sim(cfg).await;
-    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let streamer = activate(&srv).await;
+    (srv, streamer)
+}
+
+/// READY_TO_ARM → session + 30 Hz poses → ARM → START → ACTIVE.
+async fn activate(srv: &h3cs::server::RunningServer) -> Streamer {
+    wait_state(srv, RigState::ReadyToArm, 3 * S).await;
     let id = new_session(srv.local_addr).await;
     let ws = ws_connect(srv.local_addr, &id).await;
     let streamer = Streamer::start(ws, id, 1, POSE, GAIN);
-    wait_status(&srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
+    wait_status(srv, S, "fresh session", |s| s.session.as_ref().is_some_and(|v| v["fresh"] == true)).await;
 
     let r = admin(srv.local_addr, "/v1/arm").await;
     assert_eq!(r.status, 200, "arm: {r:?}");
-    wait_state(&srv, RigState::Holding, 3 * S).await;
+    wait_state(srv, RigState::Holding, 3 * S).await;
     let r = admin(srv.local_addr, "/v1/start").await;
     assert_eq!(r.status, 200, "start: {r:?}");
-    wait_state(&srv, RigState::Active, 2 * S).await;
-    (srv, streamer)
+    wait_state(srv, RigState::Active, 2 * S).await;
+    streamer
 }
 
 async fn wait_converged(srv: &h3cs::server::RunningServer, expected: [Counts; 3]) {
@@ -360,7 +366,7 @@ async fn stop_without_token_brakes_and_late_poses_do_not_restart() {
 async fn non_loopback_bind_is_refused() {
     let r = server::start(
         sim_cfg(),
-        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()), config_path: None },
+        ServerOptions { admin_token: Some(TOKEN.into()), bind_override: Some("0.0.0.0:0".parse().unwrap()), config_path: None, serial_ports: None },
     )
     .await;
     assert!(matches!(r, Err(ServerError::NonLoopback(_))), "{:?}", r.err());
@@ -1040,7 +1046,7 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     // in-process simulators (no serial port is opened for them).
     let mut cfg = fast_cfg();
     cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
-        ports: vec![],
+        ports: vec![].into(),
         baud: 115_200,
         sim_axes: vec![AxisId::new(1).unwrap(), AxisId::new(2).unwrap(), AxisId::new(3).unwrap()],
         sim: h3cs::config::SimBackendConfig::default(),
@@ -1057,4 +1063,614 @@ async fn serial_backend_sim_axes_stand_in_for_missing_units() {
     assert_eq!(srv.sims.len(), 3);
     assert!(st.axes.iter().all(|a| a.assignment == Some("selected")));
     srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn serial_backend_ports_auto_opens_nothing_that_does_not_match() {
+    // `ports = "auto"` with device_ids no real unit has: the discovery task
+    // scans the port list (on any machine) but never starts a port task, so
+    // every axis stays unconnected, and shutdown stops the discovery task.
+    let mut cfg = fast_cfg();
+    for (k, a) in cfg.axes.iter_mut().enumerate() {
+        a.device_id = h3cs::types::DeviceId(0x5131_0000_0000_0a01 + k as u64);
+    }
+    cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
+        ports: h3cs::config::PortList::Auto,
+        baud: 115_200,
+        sim_axes: vec![],
+        sim: h3cs::config::SimBackendConfig::default(),
+    });
+    let srv = h3cs::server::start(
+        cfg,
+        h3cs::server::ServerOptions { admin_token: None, bind_override: Some("127.0.0.1:0".parse().unwrap()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    // Two discovery periods.
+    tokio::time::sleep(h3cs::server::DISCOVERY_PERIOD * 2 + Duration::from_millis(200)).await;
+    let st = srv.status();
+    assert_eq!(st.rig_state, RigState::Offline);
+    assert!(st.axes.iter().all(|a| !a.connected && a.port.is_none()), "{:?}", st.axes);
+    tokio::time::timeout(Duration::from_secs(10), srv.shutdown()).await.expect("shutdown hung");
+}
+
+// ------------------------------------------------- ports = "auto" (fake USB)
+//
+// `FakeUsb` lists simulated CoreS3 units as USB ports (VID:PID 303A:1001,
+// serial = MAC; each also under its macOS `/dev/tty.*` alias) and opens
+// them onto the simulator. Every open is recorded, so a test can assert what
+// was never opened.
+
+mod fake_usb {
+    use h3cs::port_discovery::{ListedPort, UsbIds};
+    use h3cs::server::{OpenFuture, PortStream, SerialPorts};
+    use h3cs::sim_axis::{sim_detached, SimHandle, SimParams};
+    use h3cs::types::DeviceId;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    pub const ID: [DeviceId; 3] =
+        [DeviceId(0x5131_0000_0000_0a01), DeviceId(0x5131_0000_0000_0a02), DeviceId(0x5131_0000_0000_0a03)];
+    /// Another project's ESP32-S3 (same VID:PID).
+    pub const FOREIGN: DeviceId = DeviceId(0x5131_d0cf_130e_96f8);
+
+    pub fn mac(id: DeviceId) -> String {
+        let b = id.0.to_be_bytes();
+        format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[2], b[3], b[4], b[5], b[6], b[7])
+    }
+
+    /// A unit: USB serial from `usb_id`; its HELLO says `hello_id` / `axis`.
+    pub fn unit(usb_id: DeviceId, hello_id: DeviceId, axis: u8) -> (String, SimHandle) {
+        let params = SimParams::from_backend(&Default::default(), hello_id, rand::random::<u32>().max(1), axis);
+        (mac(usb_id), sim_detached(params))
+    }
+
+    #[derive(Debug, Default)]
+    pub struct FakeUsb {
+        state: Mutex<State>,
+    }
+
+    #[derive(Debug, Default)]
+    struct State {
+        plugged: BTreeMap<String, (String, SimHandle)>,
+        opened: Vec<String>,
+    }
+
+    impl FakeUsb {
+        pub fn plug(&self, name: &str, unit: (String, SimHandle)) {
+            self.state.lock().unwrap().plugged.insert(name.into(), unit);
+        }
+        /// Pull the cable: the open link sees EOF. Returns the unit.
+        pub fn unplug(&self, name: &str) -> (String, SimHandle) {
+            let (ser, mut sim) = self.state.lock().unwrap().plugged.remove(name).expect("plugged");
+            drop(sim.attach()); // stops the runner of the open link
+            (ser, sim)
+        }
+        pub fn view(&self, name: &str) -> SimHandle {
+            self.state.lock().unwrap().plugged[name].1.view()
+        }
+        pub fn opened(&self) -> Vec<String> {
+            self.state.lock().unwrap().opened.clone()
+        }
+        pub fn opens_of(&self, name: &str) -> usize {
+            self.opened().iter().filter(|n| *n == name).count()
+        }
+    }
+
+    impl SerialPorts for FakeUsb {
+        fn list(&self) -> Vec<ListedPort> {
+            let st = self.state.lock().unwrap();
+            let mut v = vec![ListedPort { name: "/dev/cu.Bluetooth-Incoming-Port".into(), usb: None }];
+            for (name, (ser, _)) in &st.plugged {
+                let usb = Some(UsbIds { vid: 0x303A, pid: 0x1001, serial: Some(ser.clone()) });
+                v.push(ListedPort { name: name.clone(), usb: usb.clone() });
+                v.push(ListedPort { name: name.replace("/dev/cu.", "/dev/tty."), usb });
+            }
+            v
+        }
+        fn open<'a>(&'a self, port: &'a str, _baud: u32) -> OpenFuture<'a> {
+            let r = {
+                let mut st = self.state.lock().unwrap();
+                st.opened.push(port.to_string());
+                match st.plugged.get_mut(port) {
+                    Some((_, sim)) => Ok(Box::new(sim.attach()) as PortStream),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such port")),
+                }
+            };
+            Box::pin(async move { r })
+        }
+    }
+}
+
+use fake_usb::{FakeUsb, FOREIGN, ID};
+
+const P1: &str = "/dev/cu.usbmodem11101";
+const P2: &str = "/dev/cu.usbmodem11301";
+const P3: &str = "/dev/cu.usbmodem11501";
+
+fn auto_cfg() -> Config {
+    let mut cfg = fast_cfg();
+    for a in cfg.axes.iter_mut() {
+        a.device_id = ID[a.axis_id.index()];
+    }
+    cfg.backend = h3cs::config::BackendConfig::Serial(h3cs::config::SerialBackendConfig {
+        ports: h3cs::config::PortList::Auto,
+        baud: 115_200,
+        sim_axes: vec![],
+        sim: h3cs::config::SimBackendConfig::default(),
+    });
+    cfg
+}
+
+async fn start_auto(usb: &std::sync::Arc<FakeUsb>) -> h3cs::server::RunningServer {
+    let ports: std::sync::Arc<dyn h3cs::server::SerialPorts> = usb.clone();
+    server::start(
+        auto_cfg(),
+        ServerOptions {
+            admin_token: Some(TOKEN.into()),
+            bind_override: Some("127.0.0.1:0".parse().unwrap()),
+            config_path: None,
+            serial_ports: Some(ports),
+        },
+    )
+    .await
+    .expect("server start")
+}
+
+/// The three configured units on P1..P3 plus a foreign ESP32-S3.
+fn rig_usb() -> std::sync::Arc<FakeUsb> {
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], ID[0], 1));
+    usb.plug(P2, fake_usb::unit(ID[1], ID[1], 2));
+    usb.plug(P3, fake_usb::unit(ID[2], ID[2], 3));
+    usb.plug("/dev/cu.usbmodem2101", fake_usb::unit(FOREIGN, FOREIGN, 1));
+    usb
+}
+
+fn axis_port(st: &h3cs::supervisor::StatusSnapshot, axis: u8) -> Option<String> {
+    st.axes[usize::from(axis - 1)].port.clone()
+}
+
+#[tokio::test]
+async fn ports_auto_opens_the_configured_units_and_nothing_else() {
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    let st = wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    assert_eq!([1, 2, 3].map(|a| axis_port(&st, a)), [Some(P1.into()), Some(P2.into()), Some(P3.into())]);
+    let mut opened = usb.opened();
+    opened.sort();
+    assert_eq!(opened, [P1, P2, P3], "only the configured units, each once, never a tty alias or the foreign unit");
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_follows_a_unit_replugged_under_a_new_name() {
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    // Hub socket change: unit 1 comes back as 14101, and the foreign unit
+    // now sits on its old name.
+    let unit1 = usb.unplug(P1);
+    let foreign = usb.unplug("/dev/cu.usbmodem2101");
+    usb.plug("/dev/cu.usbmodem14101", unit1);
+    usb.plug(P1, foreign);
+    let st = wait_status(&srv, 10 * S, "axis 1 on 14101", |s| {
+        s.rig_state == RigState::ReadyToArm && axis_port(s, 1).as_deref() == Some("/dev/cu.usbmodem14101")
+    })
+    .await;
+    assert!(st.blockers.is_empty(), "{:?}", st.blockers);
+    // Give the old name's task time to look again: it must not reopen.
+    tokio::time::sleep(h3cs::server::SERIAL_RETRY + S).await;
+    assert_eq!(usb.opens_of(P1), 1, "old name reopened with the foreign unit on it: {:?}", usb.opened());
+    assert_eq!(usb.opens_of("/dev/cu.usbmodem2101"), 0);
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_shutdown_while_active_still_disarms() {
+    // The port tasks must keep forwarding the DISARM ACK / STATUS while the
+    // control loop disarms (Codex review P1 on PR #59).
+    let usb = rig_usb();
+    let srv = start_auto(&usb).await;
+    let streamer = activate(&srv).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let views = [P1, P2, P3].map(|p| usb.view(p));
+    let t0 = tokio::time::Instant::now();
+    srv.shutdown().await;
+    for (i, v) in views.iter().enumerate() {
+        let s = v.snapshot();
+        assert_eq!(s.state, McuState::Disarmed, "axis {} after shutdown: {s:?}", i + 1);
+    }
+    assert!(t0.elapsed() < server::SHUTDOWN_DISARM_WAIT, "DISARM was not confirmed (waited {:?})", t0.elapsed());
+    streamer.stop().await;
+}
+
+#[tokio::test]
+async fn ports_auto_rejected_unit_replaced_on_the_same_name() {
+    // P1 carries unit 1's USB serial, but its HELLO names no axis and an
+    // unknown device: the link is rejected (`unknown_device`). Then that
+    // unit is swapped for unit 2 on the same name: the port task must notice
+    // the unit left (not just wait for the name to vanish), clear the
+    // blocker, and unit 2 must be opened on P1.
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], FOREIGN, 0));
+    usb.plug(P3, fake_usb::unit(ID[2], ID[2], 3));
+    let srv = start_auto(&usb).await;
+    wait_status(&srv, 5 * S, "unknown_device", |s| s.blockers.iter().any(|b| b.starts_with("unknown_device"))).await;
+    let _gone = usb.unplug(P1);
+    usb.plug(P1, fake_usb::unit(ID[1], ID[1], 2));
+    let st = wait_status(&srv, 10 * S, "axis 2 on P1", |s| axis_port(s, 2).as_deref() == Some(P1)).await;
+    wait_status(&srv, 2 * S, "unknown_device cleared", |s| !s.blockers.iter().any(|b| b.starts_with("unknown_device")))
+        .await;
+    assert!(axis_port(&st, 1).is_none());
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn ports_auto_opens_a_unit_seen_under_two_names_once() {
+    let usb = std::sync::Arc::new(FakeUsb::default());
+    usb.plug(P1, fake_usb::unit(ID[0], ID[0], 1));
+    usb.plug("/dev/cu.usbmodem99", fake_usb::unit(ID[0], ID[0], 1));
+    let srv = start_auto(&usb).await;
+    wait_status(&srv, 5 * S, "axis 1 connected", |s| axis_port(s, 1).is_some()).await;
+    tokio::time::sleep(h3cs::server::DISCOVERY_PERIOD * 3).await;
+    let st = srv.status();
+    assert!(st.axis_conflict.is_empty(), "{:?}", st.axis_conflict);
+    assert_eq!(usb.opened().len(), 1, "{:?}", usb.opened());
+    srv.shutdown().await;
+}
+
+// ------------------------------------------------------------------ operator hold (console)
+
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
+
+#[tokio::test]
+async fn operator_hold_stops_and_refuses_the_games_arm_start_reset_until_released() {
+    let (srv, streamer) = active_rig(fast_cfg()).await;
+    // Hold: no token needed (a stop), and it performs the Stop.
+    let r = http(srv.local_addr, "POST", "/v1/operator/hold", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.json()["operator_hold"], true);
+    let st = wait_state(&srv, RigState::BrakedDisarmed, 3 * S).await;
+    assert!(st.operator_hold);
+    assert!(st.blockers.iter().any(|b| b.starts_with("operator_hold")), "{:?}", st.blockers);
+    // The game (no header) is refused on all three.
+    for path in ["/v1/arm", "/v1/start", "/v1/fault/reset"] {
+        let r = admin(srv.local_addr, path).await;
+        assert_eq!(r.status, 409, "{path}: {r:?}");
+        assert_eq!(r.json()["error"], "operator_hold", "{path}");
+    }
+    // A wrong header value is not the operator.
+    let auth = bearer();
+    let r = http(srv.local_addr, "POST", "/v1/arm", &[("Authorization", &auth), ("X-H3-Operator", "0")], None).await;
+    assert_eq!(r.json()["error"], "operator_hold", "{r:?}");
+    assert_eq!(srv.status().rig_state, RigState::BrakedDisarmed);
+    // The console (header) works as before, also while held.
+    let r = http(srv.local_addr, "POST", "/v1/arm", &[("Authorization", &auth), ("X-H3-Operator", "1")], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+    let r = admin(srv.local_addr, "/v1/disarm").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(&srv, 3 * S, "disarmed", |s| !s.armed).await;
+    // Release: never arms by itself; the game may arm again.
+    let r = admin(srv.local_addr, "/v1/operator/release").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let st = wait_status(&srv, S, "hold cleared", |s| !s.operator_hold).await;
+    assert!(!st.armed);
+    assert!(!st.blockers.iter().any(|b| b.starts_with("operator_hold")));
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // Both changes are in the event log.
+    let ev = http(srv.local_addr, "GET", "/v1/events?n=500", &[], None).await.json();
+    let holds: Vec<&Value> = ev["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "operator_hold").collect();
+    assert_eq!(holds.len(), 2, "{holds:?}");
+    // Release needs the token when one is required (hold does not).
+    let r = http(srv.local_addr, "POST", "/v1/operator/release", &[], None).await;
+    assert_eq!(r.status, 401, "{r:?}");
+    streamer.stop().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn operator_header_passes_the_same_origin_check() {
+    let srv = start_sim(fast_cfg()).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let r = http(srv.local_addr, "POST", "/v1/operator/hold", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // The console page's own origin with the custom header.
+    let origin = format!("http://{}", srv.local_addr);
+    let auth = bearer();
+    let r = http(
+        srv.local_addr,
+        "POST",
+        "/v1/arm",
+        &[("Origin", &origin), ("Authorization", &auth), ("X-H3-Operator", "1")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    srv.shutdown().await;
+}
+
+// ------------------------------------------------------------------ hot apply (console)
+
+/// sim.toml's sections with three hand-made axes (unreferenced sims with end
+/// stops ±500: stroke 1000, neutral 500 after calibration):
+/// - axis 1: margin 350 inside the soft limits (like the live config),
+///   decel 50, stroke 5556 → not within ±30 of 1000;
+/// - axis 2: stroke 1020 (within ±30), calibration_valid = true, margins 100 / 120;
+/// - axis 3: stroke 2000, calibration_valid = false, margin 100.
+fn hot_cfg_text() -> String {
+    let sim = std::fs::read_to_string(SIM).unwrap();
+    let head = &sim[..sim.find("[[axis]]").unwrap()];
+    let head = head
+        .replace("start_referenced = true", "start_referenced = false")
+        .replace("end_min_count = -3000", "end_min_count = -500")
+        .replace("end_max_count = 3000", "end_max_count = 500");
+    let axis = |id: u8, valid: bool, c: [i32; 3], mech: [i32; 2], soft: [i32; 2], decel: i32| {
+        format!(
+            "[[axis]]\naxis_id = {id}\ndevice_id = \"513100000000000{id}\"   # 照合用\nname = \"axis {id}\"\n\
+             calibration_valid = {valid}   # 宣言\ncount_at_virtual_0 = {}        # soft_min + margin\n\
+             count_at_virtual_512 = {}\ncount_at_virtual_1023 = {}\nmechanical_min_count = {}\n\
+             mechanical_max_count = {}\nsoft_min_count = {}\nsoft_max_count = {}\ndecel_zone_count = {decel}\n\n",
+            c[0], c[1], c[2], mech[0], mech[1], soft[0], soft[1]
+        )
+    };
+    format!(
+        "{head}{}{}{}",
+        axis(1, true, [-1950, 0, 1950], [-2742, 2814], [-2300, 2300], 50),
+        axis(2, true, [-100, 0, 100], [-500, 520], [-200, 220], 300),
+        axis(3, false, [-500, 0, 500], [-1000, 1000], [-600, 600], 300),
+    )
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("h3cs-server-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+async fn post(srv: &h3cs::server::RunningServer, path: &str, body: &str) -> Resp {
+    let auth = bearer();
+    http(srv.local_addr, "POST", path, &[("Authorization", &auth), ("X-H3-Operator", "1")], Some(body)).await
+}
+
+async fn calibrate_all(srv: &h3cs::server::RunningServer) {
+    let r = post(srv, "/v1/calibrate", "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(srv, 8 * S, "all CAL_RESULT OK", |s| {
+        s.axes.iter().all(|a| {
+            a.calibration.as_ref().is_some_and(|c| c.result == h3cs::protocol::CalResultCode::Ok)
+                && a.referenced
+                && a.mcu_state == Some(McuState::Disarmed)
+                && a.calibration_stale
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn calibration_apply_keeps_margins_persists_with_backup_and_arms_without_restart() {
+    let dir = scratch("apply");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let srv = start_sim_with_path(cfg, Some(path.clone())).await;
+    let st = wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    assert_eq!(st.config_path.as_deref(), Some(path.to_str().unwrap()));
+    assert_eq!(st.axes.iter().map(|a| a.config_stroke).collect::<Vec<_>>(), [5556, 1020, 2000]);
+
+    // Nothing measured yet.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("no_calibration_result")), "{r:?}");
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":4}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("bad_axis")), "{r:?}");
+
+    // While calibrating: refused.
+    let r = post(&srv, "/v1/calibrate", "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(&srv, 2 * S, "CALIBRATING", |s| s.axes.iter().any(|a| a.mcu_state == Some(McuState::Calibrating))).await;
+    let r = post(&srv, "/v1/calibration/declare", r#"{"axis":3}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("calibrating")), "{r:?}");
+    wait_status(&srv, 8 * S, "all CAL_RESULT OK", |s| {
+        s.axes.iter().all(|a| a.calibration.is_some() && a.calibration_stale && a.mcu_state == Some(McuState::Disarmed))
+    })
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "nothing written so far");
+
+    // Axis 1: margin 350 kept; stroke 1000 vs 5556 → declaration dropped.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let b = r.json();
+    assert_eq!((b["ok"].as_bool(), b["axis"].as_u64(), b["stroke"].as_i64(), b["prev_stroke"].as_i64()), (Some(true), Some(1), Some(1000), Some(5556)));
+    assert_eq!((b["within_tolerance"].as_bool(), b["calibration_valid"].as_bool()), (Some(false), Some(false)));
+    assert_eq!(b["path"].as_str(), path.to_str());
+    let backup = std::path::PathBuf::from(b["backup"].as_str().unwrap());
+    assert_eq!(backup.parent(), Some(dir.as_path()));
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), text, "backup is the file before the apply");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("count_at_virtual_0 = 400        # soft_min + margin"), "value replaced, comment kept: {written}");
+    let a1 = Config::load(&path).unwrap().axes[0].clone();
+    assert_eq!((a1.mechanical_min_count, a1.mechanical_max_count, a1.soft_min_count, a1.soft_max_count), (0, 1000, 50, 950));
+    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (400, 500, 600));
+    assert!(!a1.calibration_valid);
+    let st = wait_status(&srv, S, "axis 1 no longer stale", |s| !s.axes[0].calibration_stale).await;
+    assert_eq!(st.axes[0].config_stroke, 1000);
+    assert!(st.axes[1].calibration_stale && st.axes[2].calibration_stale);
+
+    // Axis 2: same unit, 1000 vs 1020 → within ±30, declaration inherited.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":2}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!((r.json()["within_tolerance"].as_bool(), r.json()["calibration_valid"].as_bool()), (Some(true), Some(true)));
+    assert_ne!(r.json()["backup"], b["backup"], "a second backup in the same second gets its own name");
+    // Axis 3: 1000 vs 2000 → not within; it was not declared anyway.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":3}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!((r.json()["within_tolerance"].as_bool(), r.json()["calibration_valid"].as_bool()), (Some(false), Some(false)));
+    let out = Config::load(&path).unwrap();
+    assert_eq!((out.axes[1].count_at_virtual_0, out.axes[1].count_at_virtual_1023), (400, 580), "axis 2 margins 100 / 120");
+    assert!(out.axes[1].calibration_valid);
+
+    // Only the declarations of axes 1 and 3 stand between the rig and ARM.
+    let st = wait_status(&srv, S, "stale cleared", |s| blocker_codes(s) == ["calibration_invalid"]).await;
+    assert_eq!(st.blockers.len(), 2, "{:?}", st.blockers);
+    for axis in [1, 3] {
+        let r = post(&srv, "/v1/calibration/declare", &format!(r#"{{"axis":{axis}}}"#)).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(r.json()["calibration_valid"], true);
+    }
+    assert!(Config::load(&path).unwrap().axes.iter().all(|a| a.calibration_valid));
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    assert!(st.calibration_valid);
+    assert!(st.axes.iter().all(|a| a.configured), "CONFIG resent with the new geometry");
+    let r = post(&srv, "/v1/arm", "").await;
+    assert_eq!(r.status, 200, "ARM without a restart: {r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+
+    // Armed: every edit is refused and the file stays.
+    let before = std::fs::read_to_string(&path).unwrap();
+    for (route, body) in [
+        ("/v1/calibration/apply", r#"{"axis":1}"#),
+        ("/v1/calibration/declare", r#"{"axis":1}"#),
+        ("/v1/units/assign", r#"{"axis":1,"device_id":"5131000000000009","confirm_suffix":"0009"}"#),
+    ] {
+        let r = post(&srv, route, body).await;
+        assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("not_disarmed")), "{route}: {r:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    let ev = http(srv.local_addr, "GET", "/v1/events?n=1000", &[], None).await.json();
+    let applied = ev["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "config_applied").count();
+    assert_eq!(applied, 5);
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn calibration_apply_that_cannot_write_leaves_memory_and_file_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("applyfail");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let srv = start_sim_with_path(Config::from_toml_str(&text).unwrap(), Some(path.clone())).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    calibrate_all(&srv).await;
+    let before = srv.status();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    let r2 = post(&srv, "/v1/calibration/declare", r#"{"axis":3}"#).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!((r.status, r.json()["error"].as_str()), (500, Some("write_failed")), "{r:?}");
+    assert_eq!((r2.status, r2.json()["error"].as_str()), (500, Some("write_failed")), "{r2:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = srv.status();
+    for (b, a) in before.axes.iter().zip(&after.axes) {
+        assert!(a.calibration_stale, "axis {}", a.axis_id);
+        assert_eq!((a.config_stroke, a.expected_device_id), (b.config_stroke, b.expected_device_id));
+    }
+    assert_eq!(blocker_codes(&after), blocker_codes(&before));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup or temp file left");
+    // Without a config file: 500 no_config_path.
+    srv.shutdown().await;
+    let srv = start_sim(Config::from_toml_str(&text).unwrap()).await;
+    let r = post(&srv, "/v1/calibration/declare", r#"{"axis":1}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (500, Some("no_config_path")), "{r:?}");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ unit swap (console)
+
+const NEW_UNIT: h3cs::types::DeviceId = h3cs::types::DeviceId(0x5131_00aa_bbcc_8d58);
+
+#[tokio::test]
+async fn units_assign_swaps_the_device_id_and_ports_auto_follows_it() {
+    let dir = scratch("assign");
+    let path = dir.join("rig.toml");
+    let cfg = auto_cfg();
+    std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+    let usb = rig_usb();
+    let ports: std::sync::Arc<dyn h3cs::server::SerialPorts> = usb.clone();
+    let srv = server::start(
+        cfg,
+        ServerOptions {
+            admin_token: Some(TOKEN.into()),
+            bind_override: Some("127.0.0.1:0".parse().unwrap()),
+            config_path: Some(path.clone()),
+            serial_ports: Some(ports),
+        },
+    )
+    .await
+    .expect("server start");
+    wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    // The spare is plugged in: listed as unregistered, never opened.
+    const P4: &str = "/dev/cu.usbmodem14701";
+    usb.plug(P4, fake_usb::unit(NEW_UNIT, NEW_UNIT, 2));
+    let st = wait_status(&srv, 3 * S, "spare listed", |s| s.unregistered_units.iter().any(|u| u.port == P4)).await;
+    let spare = st.unregistered_units.iter().find(|u| u.port == P4).unwrap();
+    assert_eq!((spare.usb_serial.as_str(), spare.device_id), ("00:AA:BB:CC:8D:58", Some(NEW_UNIT)));
+    assert!(st.unregistered_units.iter().any(|u| u.port == "/dev/cu.usbmodem2101" && u.device_id == Some(FOREIGN)));
+    assert!(!st.unregistered_units.iter().any(|u| u.port.starts_with("/dev/tty.") || u.port == P1));
+    assert_eq!(usb.opens_of(P4), 0);
+
+    // The suffix shown on the unit's screen must match.
+    let body = |suffix: &str| format!(r#"{{"axis":2,"device_id":"{NEW_UNIT}","confirm_suffix":"{suffix}"}}"#);
+    let r = post(&srv, "/v1/units/assign", &body("8D59")).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("confirm_mismatch")), "{r:?}");
+    let r = post(&srv, "/v1/units/assign", &format!(r#"{{"axis":2,"device_id":"{}","confirm_suffix":"0a01"}}"#, ID[0])).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("device_in_use")), "{r:?}");
+    assert_eq!(usb.opens_of(P4), 0);
+    // The broken unit is pulled first (as the console's steps say).
+    let old2 = usb.unplug(P2);
+    let r = post(&srv, "/v1/units/assign", &body("8d58")).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let b = r.json();
+    assert_eq!((b["device_id"].as_str(), b["previous_device_id"].as_str()), (Some(NEW_UNIT.to_string().as_str()), Some(ID[1].to_string().as_str())));
+    assert_eq!(b["calibration_valid"], false);
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved.axes[1].device_id, NEW_UNIT);
+    assert!(!saved.axes[1].calibration_valid);
+
+    // Discovery now opens the spare for axis 2; the declaration is gone.
+    let st = wait_status(&srv, 5 * S, "axis 2 on the spare", |s| axis_port(s, 2).as_deref() == Some(P4)).await;
+    assert_eq!(st.axes[1].expected_device_id, NEW_UNIT);
+    assert_eq!(usb.opens_of(P4), 1);
+    let st = wait_status(&srv, 2 * S, "spare no longer unregistered", |s| !s.unregistered_units.iter().any(|u| u.port == P4)).await;
+    assert!(st.blockers.iter().any(|b| b == "calibration_invalid: axis2 calibration_valid = false"), "{:?}", st.blockers);
+    assert!(!st.blockers.iter().any(|b| b.starts_with("axis_device_mismatch")), "{:?}", st.blockers);
+
+    // The old unit plugged back in is no longer ours: never reopened.
+    usb.plug(P2, old2);
+    wait_status(&srv, 3 * S, "old unit unregistered", |s| s.unregistered_units.iter().any(|u| u.port == P2)).await;
+    tokio::time::sleep(h3cs::server::SERIAL_RETRY + h3cs::server::DISCOVERY_PERIOD).await;
+    assert_eq!(usb.opens_of(P2), 1, "{:?}", usb.opened());
+    assert_eq!(axis_port(&srv.status(), 2).as_deref(), Some(P4));
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn units_assign_with_named_ports_changes_only_the_cross_check() {
+    let dir = scratch("assign-sim");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let srv = start_sim_with_path(Config::from_toml_str(&text).unwrap(), Some(path.clone())).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected)).await;
+    let r = post(&srv, "/v1/units/assign", r#"{"axis":3,"device_id":"0","confirm_suffix":"0000"}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("bad_device_id")), "{r:?}");
+    let r = post(&srv, "/v1/units/assign", r#"{"axis":3,"device_id":"5131000000000abc","confirm_suffix":"0ABC"}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let st = wait_status(&srv, S, "mismatch", |s| s.blockers.iter().any(|b| b.starts_with("axis_device_mismatch: axis3"))).await;
+    assert_eq!(st.axes[2].expected_device_id, h3cs::types::DeviceId(0x5131_0000_0000_0abc));
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("device_id = \"5131000000000abc\"   # 照合用"), "{written}");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

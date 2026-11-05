@@ -3,7 +3,8 @@
 //! - `h3-control-server --config <path> [--bind <addr>]` runs the server.
 //! - `h3-control-server check-config <path>` validates a config and prints
 //!   calibration hashes and the ARM blockers knowable without hardware.
-//! - `h3-control-server list-ports` lists serial ports (opens nothing).
+//! - `h3-control-server list-ports` lists serial ports with their USB ids and,
+//!   for a CoreS3, the device_id its serial number maps to (opens nothing).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -64,10 +65,15 @@ fn check_config(path: &Path) -> ExitCode {
         BackendConfig::Sim(_) => "sim".to_string(),
         BackendConfig::Serial(s) => {
             let sims: Vec<u8> = s.sim_axes.iter().map(|a| a.get()).collect();
-            if sims.is_empty() {
-                format!("serial {:?}", s.ports)
+            let ports = if s.ports.is_auto() {
+                "ports auto (CoreS3 USB ports whose serial number matches a device_id)".to_string()
             } else {
-                format!("serial {:?} + simulated axes {:?}", s.ports, sims)
+                s.ports.to_string()
+            };
+            if sims.is_empty() {
+                format!("serial {ports}")
+            } else {
+                format!("serial {ports} + simulated axes {sims:?}")
             }
         }
     };
@@ -105,12 +111,25 @@ fn check_config(path: &Path) -> ExitCode {
 }
 
 fn list_ports() -> ExitCode {
-    let ports = h3cs::axis_link::list_serial_ports();
+    let ports = h3cs::port_discovery::list_ports();
     if ports.is_empty() {
         println!("(no serial ports found)");
     }
     for p in ports {
-        println!("{p}");
+        let mut line = p.name.clone();
+        if let Some(u) = &p.usb {
+            line += &format!("  USB {:04X}:{:04X}", u.vid, u.pid);
+            if let Some(ser) = &u.serial {
+                line += &format!(" SER={ser}");
+            }
+        }
+        if let Some(id) = p.cores3_device_id() {
+            line += &format!("  device_id {id}");
+            if p.is_dialin_alias() {
+                line += " (tty alias; ports = auto uses the cu name)";
+            }
+        }
+        println!("{line}");
     }
     ExitCode::SUCCESS
 }
@@ -135,7 +154,7 @@ fn run(path: &Path, bind: Option<SocketAddr>) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()) };
+        let opts = ServerOptions { admin_token: None, bind_override: bind, config_path: Some(path.to_path_buf()), serial_ports: None };
         let srv = match server::start(cfg, opts).await {
             Ok(s) => s,
             Err(e) => {

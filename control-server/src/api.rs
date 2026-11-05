@@ -64,9 +64,22 @@
 //!   when the server was not started from a file, 500 `invalid_result` when
 //!   the produced file does not validate (nothing is written then). None of
 //!   the three is in [`lan_allowed`].
+//! - Operator console (DESIGN.md §7, §11.1): `POST /v1/operator/hold` (no
+//!   token, not rate limited: it is a stop) sets the shared hold flag, then
+//!   runs the ordinary Stop; `POST /v1/operator/release` (token) clears it.
+//!   While held, `/v1/arm`, `/v1/start` and `/v1/fault/reset` without
+//!   `X-H3-Operator: 1` get 409 `operator_hold` (checked here, not by the
+//!   supervisor, so rig_state and the operator's own ARM are unaffected).
+//!   The console is same-origin, so the custom header needs no CORS
+//!   preflight (there is no CORS layer: a page on another origin could not
+//!   send it). Hot apply (`/v1/calibration/apply`, `/declare`,
+//!   `/v1/units/assign`, token + rate limit) runs in its own task so a
+//!   client going away cannot leave the file written without the swap:
+//!   file first ([`crate::config_edit`]), then `AdminCmd::ReplaceAxis`; if
+//!   the supervisor refuses, the file is restored from its backup.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -160,7 +173,19 @@ pub struct AppState {
     events: SharedEventLog,
     /// The config file the server was started from (export target directory).
     config_path: Option<Arc<std::path::PathBuf>>,
+    /// Operator stop (`/v1/operator/hold`), shared with the control loop.
+    operator_hold: Arc<AtomicBool>,
+    /// The configuration in force (hot apply swaps it; the serial discovery
+    /// and new links read it). `None`: API alone (tests), no hot apply.
+    shared_cfg: Option<Arc<watch::Sender<Arc<Config>>>>,
+    /// One hot apply at a time.
+    edit_lock: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// Header the operator console sends with ARM / START / FAULT_RESET; without
+/// it those are refused while the operator hold is in force. A loopback-only
+/// convention to keep the game out, not authentication.
+pub const OPERATOR_HEADER: &str = "x-h3-operator";
 
 struct Inner {
     cfg: Arc<Config>,
@@ -193,7 +218,20 @@ impl AppState {
             inner: Arc::new(Inner { cfg, limits, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
             events: shared_event_log(Instant::now()),
             config_path: None,
+            operator_hold: Arc::new(AtomicBool::new(false)),
+            shared_cfg: None,
+            edit_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// The swappable configuration (server): enables the hot apply routes.
+    pub fn with_shared_config(self, cfg: Arc<watch::Sender<Arc<Config>>>) -> Self {
+        Self { shared_cfg: Some(cfg), ..self }
+    }
+
+    /// Share the operator-hold flag with the control loop (status).
+    pub fn with_operator_hold(self, flag: Arc<AtomicBool>) -> Self {
+        Self { operator_hold: flag, ..self }
     }
 
     /// Share the requested motion limits with the control loop (the server
@@ -288,20 +326,24 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub fn router(state: AppState) -> Router {
     let max_body = state.inner.cfg.server.max_body_bytes;
     let limited = Router::new()
-        .route("/v1/arm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Arm)))
-        .route("/v1/start", post(|s: State<AppState>| admin_simple(s, AdminCmd::Start)))
-        .route("/v1/fault/reset", post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)))
+        .route("/v1/arm", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::Arm)))
+        .route("/v1/start", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::Start)))
+        .route("/v1/fault/reset", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::FaultReset)))
         .route("/v1/center", post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)))
         .route("/v1/reference", post(reference))
         .route("/v1/limits", post(set_limits))
         .route("/v1/calibrate", post(calibrate))
         .route("/v1/calibration/export", post(calibration_export))
+        .route("/v1/calibration/apply", post(calibration_apply))
+        .route("/v1/calibration/declare", post(calibration_declare))
+        .route("/v1/units/assign", post(units_assign))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
     // Safety direction: token, but never rate limited.
     let admin = Router::new()
         .route("/v1/disarm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Disarm)))
         .route("/v1/fault", post(fault))
         .route("/v1/calibrate/cancel", post(|s: State<AppState>| admin_simple(s, AdminCmd::CalibrateCancel)))
+        .route("/v1/operator/release", post(operator_release))
         .merge(limited)
         // Outermost: auth before the rate limit.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -316,6 +358,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/limits", get(get_limits))
         .route("/v1/events", get(events))
         .route("/v1/stop", post(|s: State<AppState>| admin_simple(s, AdminCmd::Stop)))
+        // A stop: no token, no rate limit, like /v1/stop.
+        .route("/v1/operator/hold", post(operator_hold))
         .merge(admin)
         .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed") })
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
@@ -498,33 +542,21 @@ fn embedded_page(html: &'static str) -> Response {
 
 // ------------------------------------------------------------------ admin
 
+/// What became of an admin command.
+enum AdminOutcome {
+    Done(AdminReply),
+    /// The loop never took it (it will not run, unless [`runs_when_abandoned`]).
+    NotRun,
+    /// Taken, but no answer in time (outcome unknown).
+    Unknown,
+}
+
 async fn send_admin(st: &AppState, cmd: AdminCmd) -> Response {
-    let (tx, mut rx) = oneshot::channel();
-    let claim = Arc::new(AtomicU8::new(CLAIM_WAITING));
-    let reply = AdminReplyTx { tx, claim: claim.clone() };
-    let fut = async {
-        st.inner.admin_tx.send((cmd, reply)).await.ok()?;
-        (&mut rx).await.ok()
-    };
-    let answer = match tokio::time::timeout(ADMIN_TIMEOUT, fut).await {
-        Ok(a) => a,
-        Err(_) => {
-            let gave_up = claim
-                .compare_exchange(CLAIM_WAITING, CLAIM_ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-            if gave_up {
-                None
-            } else {
-                // The loop took it just now and is executing it: wait for the answer.
-                tokio::time::timeout(ADMIN_TIMEOUT, rx).await.ok().and_then(Result::ok)
-            }
-        }
-    };
-    match answer {
-        Some(Ok(ok)) => {
+    match send_admin_raw(st, cmd).await {
+        AdminOutcome::Done(Ok(ok)) => {
             (StatusCode::OK, Json(json!({"ok": true, "rig_state": ok.rig_state, "note": ok.note}))).into_response()
         }
-        Some(Err(e)) => (
+        AdminOutcome::Done(Err(e)) => (
             StatusCode::CONFLICT,
             Json(json!({"ok": false, "error": e.error, "blockers": e.blockers})),
         )
@@ -533,8 +565,90 @@ async fn send_admin(st: &AppState, cmd: AdminCmd) -> Response {
     }
 }
 
+async fn send_admin_raw(st: &AppState, cmd: AdminCmd) -> AdminOutcome {
+    let (tx, mut rx) = oneshot::channel();
+    let claim = Arc::new(AtomicU8::new(CLAIM_WAITING));
+    let reply = AdminReplyTx { tx, claim: claim.clone() };
+    let fut = async {
+        st.inner.admin_tx.send((cmd, reply)).await.ok()?;
+        (&mut rx).await.ok()
+    };
+    match tokio::time::timeout(ADMIN_TIMEOUT, fut).await {
+        Ok(Some(a)) => AdminOutcome::Done(a),
+        Ok(None) => {
+            // Queue closed or reply dropped: taken only if claimed.
+            if claim.load(Ordering::SeqCst) == CLAIM_TAKEN {
+                AdminOutcome::Unknown
+            } else {
+                AdminOutcome::NotRun
+            }
+        }
+        Err(_) => {
+            let gave_up = claim
+                .compare_exchange(CLAIM_WAITING, CLAIM_ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            if gave_up {
+                AdminOutcome::NotRun
+            } else {
+                // The loop took it just now and is executing it: wait for the answer.
+                match tokio::time::timeout(ADMIN_TIMEOUT, rx).await {
+                    Ok(Ok(a)) => AdminOutcome::Done(a),
+                    _ => AdminOutcome::Unknown,
+                }
+            }
+        }
+    }
+}
+
 async fn admin_simple(State(st): State<AppState>, cmd: AdminCmd) -> Response {
     send_admin(&st, cmd).await
+}
+
+/// ARM / START / FAULT_RESET: refused with 409 `operator_hold` while the
+/// operator hold is in force, unless the request carries `X-H3-Operator: 1`.
+async fn admin_guarded(State(st): State<AppState>, headers: HeaderMap, cmd: AdminCmd) -> Response {
+    let operator = headers.get(OPERATOR_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    if st.operator_hold.load(Ordering::SeqCst) && !operator {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "operator_hold",
+                "blockers": ["operator_hold: operator stop in force; release it from the operator console"]})),
+        )
+            .into_response();
+    }
+    send_admin(&st, cmd).await
+}
+
+/// `POST /v1/operator/hold`: set the hold first, then the ordinary Stop.
+async fn operator_hold(State(st): State<AppState>) -> Response {
+    if !st.operator_hold.swap(true, Ordering::SeqCst) {
+        tracing::warn!("operator hold set");
+        lock_events(&st.events).push(Instant::now(), "operator_hold", json!({"hold": true}));
+    }
+    let resp = send_admin(&st, AdminCmd::Stop).await;
+    with_hold_field(resp, true).await
+}
+
+/// `POST /v1/operator/release`: clear the hold (never arms).
+async fn operator_release(State(st): State<AppState>) -> Response {
+    if st.operator_hold.swap(false, Ordering::SeqCst) {
+        tracing::warn!("operator hold released");
+        lock_events(&st.events).push(Instant::now(), "operator_hold", json!({"hold": false}));
+    }
+    Json(json!({"ok": true, "operator_hold": false})).into_response()
+}
+
+/// Add `"operator_hold": hold` to a JSON response body.
+async fn with_hold_field(resp: Response, hold: bool) -> Response {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+    };
+    let mut v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    if let Value::Object(m) = &mut v {
+        m.insert("operator_hold".into(), Value::from(hold));
+    }
+    (parts.status, Json(v)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -624,13 +738,23 @@ async fn calibration_export(State(st): State<AppState>) -> Response {
     let Some(path) = st.config_path.as_ref().map(|p| p.to_path_buf()) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "no_config_path");
     };
-    let cfg = st.inner.cfg.clone();
+    // The configuration in force (after any hot apply).
+    let cfg = st.shared_cfg.as_ref().map_or_else(|| st.inner.cfg.clone(), |c| c.borrow().clone());
     let snap = st.inner.status_rx.borrow().clone();
     let mut axes: Vec<AxisExport> = Vec::new();
+    let mut margins_not_kept: Vec<AxisId> = Vec::new();
     for a in &snap.axes {
         let Some(r) = a.calibration.as_ref().filter(|r| r.result == CalResultCode::Ok) else { continue };
         let Some(ac) = cfg.axis(a.axis_id) else { continue };
-        match calibration_export::derive(a.axis_id, r.device_id, ac.decel_zone_count, r) {
+        // Same margin rule as the hot apply; when the margins of the config
+        // in force do not fit the measured window, the plain soft limits
+        // (the file is reviewed before use; `margins_not_kept` says so).
+        let derived = calibration_export::derive_keeping(ac, r.device_id, r).or_else(|why| {
+            tracing::warn!("export: {why}; writing the soft limits as end points");
+            margins_not_kept.push(a.axis_id);
+            calibration_export::derive(a.axis_id, r.device_id, ac.decel_zone_count, r)
+        });
+        match derived {
             Ok(e) => axes.push(e),
             Err(e) => return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e),
         }
@@ -648,7 +772,7 @@ async fn calibration_export(State(st): State<AppState>) -> Response {
     match result {
         Ok(Ok((written, axes))) => {
             tracing::info!(path = %written.display(), "calibration exported");
-            Json(json!({"ok": true, "path": written, "axes": axes})).into_response()
+            Json(json!({"ok": true, "path": written, "axes": axes, "margins_not_kept": margins_not_kept})).into_response()
         }
         Ok(Err((code, err, detail))) => error_detail(code, err, detail),
         Err(e) => error_detail(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e.to_string()),
@@ -684,6 +808,235 @@ fn write_export(
         .and_then(|()| f.sync_all())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "write_failed", format!("{}: {e}", out.display())))?;
     Ok((out, axes.to_vec()))
+}
+
+// ------------------------------------------------------------------ hot apply
+
+/// `|new stroke − config stroke|` up to this keeps `calibration_valid` (same unit).
+pub const STROKE_TOLERANCE: Counts = 30;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AxisBody {
+    axis: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignBody {
+    axis: u8,
+    device_id: String,
+    confirm_suffix: String,
+}
+
+enum Edit {
+    Calibration,
+    Declare,
+    Assign(crate::types::DeviceId),
+}
+
+/// `{"axis":N}` → the axis, or the 400 error code.
+fn parse_axis(body: &[u8]) -> Result<AxisId, &'static str> {
+    let b = serde_json::from_slice::<AxisBody>(body).map_err(|_| "bad_request")?;
+    AxisId::new(b.axis).ok_or("bad_axis")
+}
+
+/// `POST /v1/calibration/apply {"axis":N}` (design 2026-11-05 §6.1, §12).
+async fn calibration_apply(State(st): State<AppState>, body: Bytes) -> Response {
+    match parse_axis(&body) {
+        Ok(axis) => run_edit(st, axis, Edit::Calibration).await,
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `POST /v1/calibration/declare {"axis":N}`: `calibration_valid = true`.
+async fn calibration_declare(State(st): State<AppState>, body: Bytes) -> Response {
+    match parse_axis(&body) {
+        Ok(axis) => run_edit(st, axis, Edit::Declare).await,
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `POST /v1/units/assign {"axis":N,"device_id":"…","confirm_suffix":"XXXX"}`.
+async fn units_assign(State(st): State<AppState>, body: Bytes) -> Response {
+    let Ok(b) = serde_json::from_slice::<AssignBody>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let Some(axis) = AxisId::new(b.axis) else {
+        return error(StatusCode::BAD_REQUEST, "bad_axis");
+    };
+    let Ok(id) = crate::types::DeviceId::try_from(b.device_id.clone()) else {
+        return error(StatusCode::BAD_REQUEST, "bad_device_id");
+    };
+    if id.is_unassigned() {
+        return error(StatusCode::BAD_REQUEST, "bad_device_id");
+    }
+    let text = id.to_string();
+    let suffix = &text[text.len() - 4..];
+    if !b.confirm_suffix.trim().eq_ignore_ascii_case(suffix) {
+        return error(StatusCode::BAD_REQUEST, "confirm_mismatch");
+    }
+    run_edit(st, axis, Edit::Assign(id)).await
+}
+
+/// Run a hot apply to completion even if the client goes away (a write
+/// without the matching swap would leave file and memory apart).
+async fn run_edit(st: AppState, axis: AxisId, edit: Edit) -> Response {
+    match tokio::spawn(async move { do_edit(&st, axis, edit).await }).await {
+        Ok(r) => r,
+        Err(e) => error_detail(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn do_edit(st: &AppState, axis: AxisId, edit: Edit) -> Response {
+    if !loop_alive(st) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+    }
+    let Some(path) = st.config_path.as_ref().map(|p| p.to_path_buf()) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no_config_path");
+    };
+    let Some(shared) = st.shared_cfg.clone() else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no_config_path");
+    };
+    let _guard = st.edit_lock.lock().await;
+    let snap = st.inner.status_rx.borrow().clone();
+    // Early refusal (the supervisor checks again when swapping).
+    if snap.armed {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "not_disarmed", "blockers": [format!("rig_state: {:?}", snap.rig_state)]})),
+        )
+            .into_response();
+    }
+    let calibrating: Vec<String> = snap
+        .axes
+        .iter()
+        .filter(|a| a.mcu_state == Some(crate::types::McuState::Calibrating))
+        .map(|a| format!("calibrating: {}", a.axis_id))
+        .collect();
+    if !calibrating.is_empty() {
+        return (StatusCode::CONFLICT, Json(json!({"ok": false, "error": "calibrating", "blockers": calibrating})))
+            .into_response();
+    }
+    let current = shared.borrow().clone();
+    let Some(cur) = current.axis(axis).cloned() else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_result");
+    };
+    let prev_stroke = cur.mechanical_max_count.saturating_sub(cur.mechanical_min_count);
+    let mut new_axis = cur.clone();
+    let mut extra = serde_json::Map::new();
+    let (values, what): (Vec<(&'static str, String)>, &'static str) = match edit {
+        Edit::Calibration => {
+            let Some(r) = snap
+                .axes
+                .get(axis.index())
+                .and_then(|a| a.calibration.as_ref())
+                .filter(|r| r.result == CalResultCode::Ok)
+            else {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok": false, "error": "no_calibration_result",
+                        "blockers": [format!("no_calibration_result: {axis} has no OK CAL_RESULT in this boot")]})),
+                )
+                    .into_response();
+            };
+            let e = match calibration_export::derive_keeping(&cur, r.device_id, r) {
+                Ok(e) => e,
+                Err(d) => return error_detail(StatusCode::CONFLICT, "invalid_result", d),
+            };
+            let stroke = e.mechanical_max_count.saturating_sub(e.mechanical_min_count);
+            let within = (stroke - prev_stroke).abs() <= STROKE_TOLERANCE;
+            // Same unit, same stroke (±30): the operator's declaration stands.
+            let valid = within && r.device_id == cur.device_id && cur.calibration_valid;
+            e.apply_to(&mut new_axis);
+            new_axis.calibration_valid = valid;
+            extra.insert("stroke".into(), json!(stroke));
+            extra.insert("prev_stroke".into(), json!(prev_stroke));
+            extra.insert("within_tolerance".into(), json!(within));
+            extra.insert("device_id".into(), json!(e.device_id));
+            extra.insert("values".into(), json!(e));
+            (e.values(valid), "calibration")
+        }
+        Edit::Declare => {
+            new_axis.calibration_valid = true;
+            (vec![("calibration_valid", "true".to_string())], "declare")
+        }
+        Edit::Assign(id) => {
+            if let Some(other) = current.axes.iter().find(|a| a.axis_id != axis && a.device_id == id) {
+                return error_detail(
+                    StatusCode::CONFLICT,
+                    "device_in_use",
+                    format!("{id} is configured for {}", other.axis_id),
+                );
+            }
+            extra.insert("previous_device_id".into(), json!(cur.device_id));
+            extra.insert("device_id".into(), json!(id));
+            new_axis.device_id = id;
+            new_axis.calibration_valid = false;
+            (
+                vec![("device_id", format!("\"{id}\"")), ("calibration_valid", "false".to_string())],
+                "assign",
+            )
+        }
+    };
+    let mut new_cfg = (*current).clone();
+    if let Some(a) = new_cfg.axes.iter_mut().find(|a| a.axis_id == axis) {
+        *a = new_axis.clone();
+    }
+    if let Err(e) = new_cfg.validate() {
+        return error_detail(StatusCode::CONFLICT, "invalid_result", e.to_string());
+    }
+    let hash = crate::calibration::calibration_hash(
+        &new_cfg.rig_id,
+        &crate::calibration::AxisCalibration::from_config(&new_axis),
+    );
+    // File first; memory only after it is on disk.
+    let (p, expect) = (path.clone(), new_axis.clone());
+    let written = tokio::task::spawn_blocking(move || crate::config_edit::persist_axis(&p, axis, &values, &expect)).await;
+    let backup = match written {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            let code = if e.code == "config_file_changed" { StatusCode::CONFLICT } else { StatusCode::INTERNAL_SERVER_ERROR };
+            return error_detail(code, e.code, e.detail);
+        }
+        Err(e) => return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "write_failed", e.to_string()),
+    };
+    let cmd = AdminCmd::ReplaceAxis { axis, axis_cfg: Box::new(new_axis.clone()), hash, what };
+    let undo = |p: std::path::PathBuf, b: std::path::PathBuf| async move {
+        let r = tokio::task::spawn_blocking(move || crate::config_edit::restore(&p, &b)).await;
+        if !matches!(r, Ok(Ok(()))) {
+            tracing::error!("hot apply: could not restore the config file from its backup: {r:?}");
+        }
+    };
+    match send_admin_raw(st, cmd).await {
+        AdminOutcome::Done(Ok(_)) => {}
+        AdminOutcome::Done(Err(e)) => {
+            undo(path.clone(), backup.clone()).await;
+            return (StatusCode::CONFLICT, Json(json!({"ok": false, "error": e.error, "blockers": e.blockers})))
+                .into_response();
+        }
+        AdminOutcome::NotRun => {
+            undo(path.clone(), backup.clone()).await;
+            return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+        }
+        AdminOutcome::Unknown => {
+            // The supervisor took it; assume it swapped (file stays new).
+            tracing::error!(%axis, what, "hot apply: no answer from the control loop; config file kept");
+            shared.send_replace(Arc::new(new_cfg));
+            return error(StatusCode::SERVICE_UNAVAILABLE, "control_loop_unavailable");
+        }
+    }
+    shared.send_replace(Arc::new(new_cfg));
+    tracing::info!(%axis, what, path = %path.display(), backup = %backup.display(), "config applied");
+    let mut body = serde_json::Map::new();
+    body.insert("ok".into(), json!(true));
+    body.insert("axis".into(), json!(axis));
+    body.insert("what".into(), json!(what));
+    body.extend(extra);
+    body.insert("calibration_valid".into(), json!(new_axis.calibration_valid));
+    body.insert("path".into(), json!(path));
+    body.insert("backup".into(), json!(backup));
+    Json(Value::Object(body)).into_response()
 }
 
 // ------------------------------------------------------------------ game
