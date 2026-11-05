@@ -1799,6 +1799,9 @@ fn snapshot_json_shape() {
         "telemetry",
         "motion_limits",
         "governor",
+        "operator_hold",
+        "unregistered_units",
+        "config_path",
     ];
     let mut got = keys.clone();
     got.sort_unstable();
@@ -1831,6 +1834,7 @@ fn snapshot_json_shape() {
         "claimants",
         "reference_stale",
         "calibration_stale",
+        "config_stroke",
         "boot_id",
         "mcu_state",
         "fault_code",

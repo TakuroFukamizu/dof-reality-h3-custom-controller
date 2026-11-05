@@ -420,6 +420,9 @@ pub struct AxisSnapshot {
     /// `calibration_stale`) until the server restarts with the exported
     /// config (Issue #15 H3).
     pub calibration_stale: bool,
+    /// `mechanical_max_count − mechanical_min_count` of the configuration in
+    /// force (follows hot apply).
+    pub config_stroke: Counts,
     pub actual_count: Option<Counts>,
     pub target_count: Option<Counts>,
     pub velocity_count_s: Option<i32>,
@@ -479,6 +482,23 @@ pub struct StatusSnapshot {
     pub motion_limits: MotionLimitsSnapshot,
     /// 追従ガバナ。`scale < 1` のとき `limits` に `tracking_governed` が入る。
     pub governor: GovernorStatus,
+    /// Operator stop (`POST /v1/operator/hold`) is in force: the game's ARM /
+    /// START / FAULT_RESET are refused (409 `operator_hold`). Set by the server.
+    pub operator_hold: bool,
+    /// CoreS3-looking USB ports whose serial matches no configured
+    /// `device_id` (enumeration only, never opened). Set by the server.
+    pub unregistered_units: Vec<UnregisteredUnit>,
+    /// The config file the server was started from (hot apply writes it).
+    pub config_path: Option<String>,
+}
+
+/// One entry of `StatusSnapshot::unregistered_units`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnregisteredUnit {
+    pub port: String,
+    pub usb_serial: String,
+    /// The v1 firmware `device_id` the serial maps to (`None`: not a MAC).
+    pub device_id: Option<DeviceId>,
 }
 
 // ------------------------------------------------------------------ internals
@@ -1442,6 +1462,9 @@ impl Supervisor {
                         .collect(),
                     reference_stale: self.reference_stale(i),
                     calibration_stale: self.calibration_stale[i].is_some(),
+                    config_stroke: self.cal[i]
+                        .mechanical_max_count
+                        .saturating_sub(self.cal[i].mechanical_min_count),
                     boot_id: t.boot_id,
                     mcu_state: t.mcu_state(),
                     fault_code: s.map(|s| s.fault_code),
@@ -1497,6 +1520,9 @@ impl Supervisor {
             telemetry: None,
             motion_limits: self.motion_limits_snapshot(),
             governor,
+            operator_hold: false,
+            unregistered_units: Vec::new(),
+            config_path: None,
         }
     }
 

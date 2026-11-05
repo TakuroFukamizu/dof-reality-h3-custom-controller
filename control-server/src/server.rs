@@ -247,6 +247,7 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
     let done_tx = Arc::new(done_tx);
     let session = Arc::new(Mutex::new(PoseIntake::new()));
     let limits = motion_limits::shared(MotionLimits::from_config(&cfg.limits));
+    let operator_hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let sup = Supervisor::new(&cfg);
     tracing::info!(session_epoch = sup.session_epoch(), "supervisor ready");
@@ -350,6 +351,8 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
         shutting_down: false,
         last_state: RigState::Offline,
         last_pose_seq: None,
+        operator_hold: operator_hold.clone(),
+        config_path: opts.config_path.as_ref().map(|p| p.display().to_string()),
     };
     let control = {
         let done = DoneGuard(done_tx.clone());
@@ -372,6 +375,7 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
     )
     .with_limits(limits)
     .with_event_log(event_log)
+    .with_operator_hold(operator_hold)
     .with_config_path(opts.config_path.clone());
     let app = api::router(state);
     let http = {
@@ -466,6 +470,9 @@ struct ControlLoop {
     shutting_down: bool,
     last_state: RigState,
     last_pose_seq: Option<u64>,
+    /// Operator stop flag (set / cleared by the API).
+    operator_hold: Arc<std::sync::atomic::AtomicBool>,
+    config_path: Option<String>,
 }
 
 impl ControlLoop {
@@ -693,6 +700,13 @@ impl ControlLoop {
         }
         snap.session = serde_json::to_value(lock(&self.session).snapshot(now)).ok();
         snap.telemetry = self.telemetry_summary.clone();
+        snap.operator_hold = self.operator_hold.load(std::sync::atomic::Ordering::SeqCst);
+        if snap.operator_hold && !snap.armed {
+            // Visible like a blocker; not one for the supervisor (the
+            // operator's ARM with X-H3-Operator still works).
+            snap.blockers.push("operator_hold: operator stop in force; release it from the operator console".into());
+        }
+        snap.config_path = self.config_path.clone();
         self.status_tx.send_replace(Arc::new(snap));
     }
 }

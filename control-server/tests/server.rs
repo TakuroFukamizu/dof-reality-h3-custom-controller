@@ -1319,3 +1319,77 @@ async fn ports_auto_opens_a_unit_seen_under_two_names_once() {
     assert_eq!(usb.opened().len(), 1, "{:?}", usb.opened());
     srv.shutdown().await;
 }
+
+// ------------------------------------------------------------------ operator hold (console)
+
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
+
+#[tokio::test]
+async fn operator_hold_stops_and_refuses_the_games_arm_start_reset_until_released() {
+    let (srv, streamer) = active_rig(fast_cfg()).await;
+    // Hold: no token needed (a stop), and it performs the Stop.
+    let r = http(srv.local_addr, "POST", "/v1/operator/hold", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.json()["operator_hold"], true);
+    let st = wait_state(&srv, RigState::BrakedDisarmed, 3 * S).await;
+    assert!(st.operator_hold);
+    assert!(st.blockers.iter().any(|b| b.starts_with("operator_hold")), "{:?}", st.blockers);
+    // The game (no header) is refused on all three.
+    for path in ["/v1/arm", "/v1/start", "/v1/fault/reset"] {
+        let r = admin(srv.local_addr, path).await;
+        assert_eq!(r.status, 409, "{path}: {r:?}");
+        assert_eq!(r.json()["error"], "operator_hold", "{path}");
+    }
+    // A wrong header value is not the operator.
+    let auth = bearer();
+    let r = http(srv.local_addr, "POST", "/v1/arm", &[("Authorization", &auth), ("X-H3-Operator", "0")], None).await;
+    assert_eq!(r.json()["error"], "operator_hold", "{r:?}");
+    assert_eq!(srv.status().rig_state, RigState::BrakedDisarmed);
+    // The console (header) works as before, also while held.
+    let r = http(srv.local_addr, "POST", "/v1/arm", &[("Authorization", &auth), ("X-H3-Operator", "1")], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+    let r = admin(srv.local_addr, "/v1/disarm").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(&srv, 3 * S, "disarmed", |s| !s.armed).await;
+    // Release: never arms by itself; the game may arm again.
+    let r = admin(srv.local_addr, "/v1/operator/release").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let st = wait_status(&srv, S, "hold cleared", |s| !s.operator_hold).await;
+    assert!(!st.armed);
+    assert!(!st.blockers.iter().any(|b| b.starts_with("operator_hold")));
+    let r = admin(srv.local_addr, "/v1/arm").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // Both changes are in the event log.
+    let ev = http(srv.local_addr, "GET", "/v1/events?n=500", &[], None).await.json();
+    let holds: Vec<&Value> = ev["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "operator_hold").collect();
+    assert_eq!(holds.len(), 2, "{holds:?}");
+    // Release needs the token when one is required (hold does not).
+    let r = http(srv.local_addr, "POST", "/v1/operator/release", &[], None).await;
+    assert_eq!(r.status, 401, "{r:?}");
+    streamer.stop().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn operator_header_passes_the_same_origin_check() {
+    let srv = start_sim(fast_cfg()).await;
+    wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    let r = http(srv.local_addr, "POST", "/v1/operator/hold", &[], None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // The console page's own origin with the custom header.
+    let origin = format!("http://{}", srv.local_addr);
+    let auth = bearer();
+    let r = http(
+        srv.local_addr,
+        "POST",
+        "/v1/arm",
+        &[("Origin", &origin), ("Authorization", &auth), ("X-H3-Operator", "1")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    srv.shutdown().await;
+}

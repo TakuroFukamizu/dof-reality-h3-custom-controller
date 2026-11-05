@@ -66,7 +66,7 @@
 //!   the three is in [`lan_allowed`].
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -160,7 +160,14 @@ pub struct AppState {
     events: SharedEventLog,
     /// The config file the server was started from (export target directory).
     config_path: Option<Arc<std::path::PathBuf>>,
+    /// Operator stop (`/v1/operator/hold`), shared with the control loop.
+    operator_hold: Arc<AtomicBool>,
 }
+
+/// Header the operator console sends with ARM / START / FAULT_RESET; without
+/// it those are refused while the operator hold is in force. A loopback-only
+/// convention to keep the game out, not authentication.
+pub const OPERATOR_HEADER: &str = "x-h3-operator";
 
 struct Inner {
     cfg: Arc<Config>,
@@ -193,7 +200,13 @@ impl AppState {
             inner: Arc::new(Inner { cfg, limits, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
             events: shared_event_log(Instant::now()),
             config_path: None,
+            operator_hold: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Share the operator-hold flag with the control loop (status).
+    pub fn with_operator_hold(self, flag: Arc<AtomicBool>) -> Self {
+        Self { operator_hold: flag, ..self }
     }
 
     /// Share the requested motion limits with the control loop (the server
@@ -288,9 +301,9 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub fn router(state: AppState) -> Router {
     let max_body = state.inner.cfg.server.max_body_bytes;
     let limited = Router::new()
-        .route("/v1/arm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Arm)))
-        .route("/v1/start", post(|s: State<AppState>| admin_simple(s, AdminCmd::Start)))
-        .route("/v1/fault/reset", post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)))
+        .route("/v1/arm", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::Arm)))
+        .route("/v1/start", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::Start)))
+        .route("/v1/fault/reset", post(|s: State<AppState>, h: HeaderMap| admin_guarded(s, h, AdminCmd::FaultReset)))
         .route("/v1/center", post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)))
         .route("/v1/reference", post(reference))
         .route("/v1/limits", post(set_limits))
@@ -302,6 +315,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/disarm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Disarm)))
         .route("/v1/fault", post(fault))
         .route("/v1/calibrate/cancel", post(|s: State<AppState>| admin_simple(s, AdminCmd::CalibrateCancel)))
+        .route("/v1/operator/release", post(operator_release))
         .merge(limited)
         // Outermost: auth before the rate limit.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -316,6 +330,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/limits", get(get_limits))
         .route("/v1/events", get(events))
         .route("/v1/stop", post(|s: State<AppState>| admin_simple(s, AdminCmd::Stop)))
+        // A stop: no token, no rate limit, like /v1/stop.
+        .route("/v1/operator/hold", post(operator_hold))
         .merge(admin)
         .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed") })
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
@@ -535,6 +551,53 @@ async fn send_admin(st: &AppState, cmd: AdminCmd) -> Response {
 
 async fn admin_simple(State(st): State<AppState>, cmd: AdminCmd) -> Response {
     send_admin(&st, cmd).await
+}
+
+/// ARM / START / FAULT_RESET: refused with 409 `operator_hold` while the
+/// operator hold is in force, unless the request carries `X-H3-Operator: 1`.
+async fn admin_guarded(State(st): State<AppState>, headers: HeaderMap, cmd: AdminCmd) -> Response {
+    let operator = headers.get(OPERATOR_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    if st.operator_hold.load(Ordering::SeqCst) && !operator {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "operator_hold",
+                "blockers": ["operator_hold: operator stop in force; release it from the operator console"]})),
+        )
+            .into_response();
+    }
+    send_admin(&st, cmd).await
+}
+
+/// `POST /v1/operator/hold`: set the hold first, then the ordinary Stop.
+async fn operator_hold(State(st): State<AppState>) -> Response {
+    if !st.operator_hold.swap(true, Ordering::SeqCst) {
+        tracing::warn!("operator hold set");
+        lock_events(&st.events).push(Instant::now(), "operator_hold", json!({"hold": true}));
+    }
+    let resp = send_admin(&st, AdminCmd::Stop).await;
+    with_hold_field(resp, true).await
+}
+
+/// `POST /v1/operator/release`: clear the hold (never arms).
+async fn operator_release(State(st): State<AppState>) -> Response {
+    if st.operator_hold.swap(false, Ordering::SeqCst) {
+        tracing::warn!("operator hold released");
+        lock_events(&st.events).push(Instant::now(), "operator_hold", json!({"hold": false}));
+    }
+    Json(json!({"ok": true, "operator_hold": false})).into_response()
+}
+
+/// Add `"operator_hold": hold` to a JSON response body.
+async fn with_hold_field(resp: Response, hold: bool) -> Response {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+    };
+    let mut v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    if let Value::Object(m) = &mut v {
+        m.insert("operator_hold".into(), Value::from(hold));
+    }
+    (parts.status, Json(v)).into_response()
 }
 
 #[derive(Deserialize)]
