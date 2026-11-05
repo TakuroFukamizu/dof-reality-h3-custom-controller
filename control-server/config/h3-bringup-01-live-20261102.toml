@@ -155,12 +155,12 @@ name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 2754     # = stroke / 2
-count_at_virtual_1023 = 5109    # soft_max − 350
+count_at_virtual_512 = 2752     # = stroke / 2
+count_at_virtual_1023 = 5104    # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 5509
+mechanical_max_count = 5504
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5459           # mechanical_max − decel_zone
+soft_max_count = 5454           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
