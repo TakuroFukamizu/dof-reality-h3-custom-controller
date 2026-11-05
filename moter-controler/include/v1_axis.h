@@ -61,6 +61,7 @@ struct V1Tuning {
   bool hold_brake = V1_HOLD_BRAKE != 0;                          // HOLDING 中はブレーキ作動（START で即解除）
   uint32_t hold_brake_support_ms = V1_HOLD_BRAKE_SUPPORT_MS;     // 作動指令からこの間は位置ループを回して支える
   int32_t hold_brake_slip_count = V1_HOLD_BRAKE_SLIP_COUNT;      // 作動後にこれを超えてずれたら解除（作動前の静止判定の |誤差| 上限も同じ値）
+  int32_t hold_brake_max_err = V1_HOLD_BRAKE_MAX_ERR_COUNT;      // 作動中の |目標 − 実位置| の上限（PC の rest_error_count 50 より小さく）
   uint32_t hold_brake_release_grace_ms = V1_HOLD_BRAKE_RELEASE_GRACE_MS;  // 解除指令の後、動き出しパルス・停止ブーストを出さない時間
   uint32_t brake_apply_wait_ms = BRAKE_APPLY_WAIT_MS;
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
@@ -995,11 +996,15 @@ class V1Axis {
       hold_brake_phase_ = 3;
       hold_brake_anchor_ = actual_count();
     }
-    const int64_t sd = static_cast<int64_t>(actual_count()) - static_cast<int64_t>(hold_brake_anchor_);
-    if (hold_brake_phase_ == 3 && (sd < 0 ? -sd : sd) > static_cast<int64_t>(tuning.hold_brake_slip_count)) {
-      brake_release_cmd_ = true;  // 滑った: 解除して位置制御へ戻る（この HOLDING の間はそのまま）
-      hold_brake_phase_ = 4;
-      hold_brake_grace_until_us_ = now + ms_to_us(tuning.hold_brake_release_grace_ms);
+    if (hold_brake_phase_ == 3) {
+      const int64_t sd = static_cast<int64_t>(actual_count()) - static_cast<int64_t>(hold_brake_anchor_);
+      // 基準からのずれ、または目標との差（作動前 + 食い込み + ずれの合計。PC の静止判定を満たせる範囲）が上限を超えたら解除
+      if ((sd < 0 ? -sd : sd) > static_cast<int64_t>(tuning.hold_brake_slip_count) ||
+          d_abs > static_cast<int64_t>(tuning.hold_brake_max_err)) {
+        brake_release_cmd_ = true;  // 解除して位置制御へ戻る（この HOLDING の間はそのまま。異常にはしない）
+        hold_brake_phase_ = 4;
+        hold_brake_grace_until_us_ = now + ms_to_us(tuning.hold_brake_release_grace_ms);
+      }
     }
   }
 

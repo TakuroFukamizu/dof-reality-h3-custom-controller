@@ -313,6 +313,11 @@ constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電
 #ifndef V1_HOLD_BRAKE_RELEASE_GRACE_MS
 #define V1_HOLD_BRAKE_RELEASE_GRACE_MS 150
 #endif
+// ブレーキ作動中の |目標 − 実位置| の上限。超えたら解除して位置制御へ戻る。PC の静止判定（timing.rest_error_count 50）と
+// 中立到達（game.center_tolerance_count 50）を満たせなくならないよう、それより小さくする（作動前 20 + 食い込み ≤ 38 の合計を抑える）
+#ifndef V1_HOLD_BRAKE_MAX_ERR_COUNT
+#define V1_HOLD_BRAKE_MAX_ERR_COUNT 40
+#endif
 #ifndef V1_HOLD_BRAKE_SLIP_COUNT
 #define V1_HOLD_BRAKE_SLIP_COUNT 20  // ブレーキ作動後に保持位置からこれを超えてずれたら解除して位置制御へ戻る（異常にはしない）
 #endif

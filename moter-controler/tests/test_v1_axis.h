@@ -5498,15 +5498,63 @@ inline void test_hold_brake_bite_is_absorbed_by_anchor() {
   CHECK(h.ax.duty_permille() == 0);
   hb_run(h, 2000, 0);
   CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);  // 解除しない
-  h.raw += 20;  // 基準から 20: まだ
+  h.raw -= 20;  // 基準から −20（目標との差は 14 に縮む）: まだ
   hb_run(h, 300, 0);
   CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd());
-  h.raw += 1;  // 基準から 21
+  h.raw -= 1;  // 基準から −21
   h.set_position(0);
   h.step(5);
   CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd() && h.ax.state() == st::HOLDING);
   hb_run(h, 500, 0);
   CHECK(h.ax.actual_count() == 0 && h.ax.brake_release_cmd() && h.fault_events().empty());
+}
+
+// 作動前の誤差 pre（プラントを止めて保つ）+ 食い込み 34 の合計が hold_brake_max_err（40）以内なら作動のまま、超えたら解除して
+// 位置制御で保持の帯へ戻る（PC の rest_error_count 50 を満たせない作動を作らない）
+inline void hb_bite_with_pre_error(int pre, bool expect_braked) {
+  Harness h;
+  h.bite_count = 34;
+  hb_arm_to_holding(h);
+  h.plant_vel = 0.0;  // 作動前の誤差が残ったまま静止（荷重で戻れない軸）
+  h.raw += pre;
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 300, 0);
+  CHECK(h.ax.state() == st::HOLDING && h.fault_events().empty());
+  const int32_t e = h.ax.target_count() - h.ax.actual_count();
+  CHECK(e == -(pre + 34));
+  if (expect_braked) {
+    CHECK(h.ax.hold_brake_phase() == 3 && !h.ax.brake_release_cmd() && h.ax.duty_permille() == 0);
+  } else {
+    CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd());
+    h.plant_vel = 4000.0;  // 解除したので位置ループで戻る
+    hb_run(h, 300, 0);
+    const int32_t e2 = h.ax.target_count() - h.ax.actual_count();
+    CHECK((e2 < 0 ? -e2 : e2) <= h.ax.tuning.hold_enter && h.ax.state() == st::HOLDING && h.fault_events().empty());
+  }
+}
+
+inline void test_hold_brake_bite_plus_pre_error_within_max_err_stays_braked() { hb_bite_with_pre_error(3, true); }
+inline void test_hold_brake_bite_plus_pre_error_over_max_err_releases() { hb_bite_with_pre_error(10, false); }
+inline void test_hold_brake_max_err_boundary_40_41() {
+  CHECK(V1_HOLD_BRAKE_MAX_ERR_COUNT == 40);
+  hb_bite_with_pre_error(6, true);    // 合計 40: 作動のまま
+  hb_bite_with_pre_error(7, false);   // 合計 41: 解除
+}
+
+// 作動中に目標との差が上限を超えたら（基準からのずれが slip 以内でも）解除
+inline void test_hold_brake_max_err_while_braked_releases() {
+  Harness h;
+  h.bite_count = 20;
+  hb_arm_to_holding(h);
+  h.plant_vel = 0.0;
+  h.raw += 18;
+  CHECK(hb_wait_brake_cmd(h) != 0);
+  hb_run(h, 200, 0);
+  CHECK(h.ax.hold_brake_phase() == 3);  // 18 + 20 = 38
+  h.raw += 3;  // 基準から 3（slip 以内）だが目標との差は 41
+  h.set_position(0);
+  h.step(5);
+  CHECK(h.ax.hold_brake_phase() == 4 && h.ax.brake_release_cmd());
 }
 
 inline void test_hold_brake_slip_within_limit_stays_braked() {
@@ -5760,6 +5808,10 @@ inline void run_all() {
   test_hold_brake_reengages_after_stop_to_holding();
   test_hold_brake_slip_over_limit_releases_and_resumes();
   test_hold_brake_bite_is_absorbed_by_anchor();
+  test_hold_brake_bite_plus_pre_error_within_max_err_stays_braked();
+  test_hold_brake_bite_plus_pre_error_over_max_err_releases();
+  test_hold_brake_max_err_boundary_40_41();
+  test_hold_brake_max_err_while_braked_releases();
   test_hold_brake_slip_within_limit_stays_braked();
   test_hold_brake_disarm_from_braked_holding();
   test_hold_brake_command_timeout_still_faults();
