@@ -117,11 +117,22 @@ td.num{text-align:right}
 .stroke{font-family:var(--cond);font-size:34px;line-height:1}
 .sev-ok{color:var(--grn)} .sev-warn{color:var(--yel)} .sev-bad{color:var(--red)}
 
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
-.modal{background:var(--bg);border:2px solid var(--org);max-width:560px;width:100%;padding:20px 22px}
-.modal h3{font-family:var(--min);font-weight:800;font-size:30px;line-height:1.15;margin:6px 0 10px}
-.modal ul{margin:0 0 14px;padding-left:1.3em;line-height:1.7}
-.modal .row button{min-height:56px;font-size:18px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:var(--bg);width:100%;max-width:760px;border-top:8px solid var(--org);border-bottom:1px solid var(--org);display:grid;grid-template-columns:64px minmax(0,1fr)}
+.modal .rail{background:var(--org);color:#000;display:flex;flex-direction:column;justify-content:space-between;align-items:center;padding:12px 0}
+.modal .rail b{writing-mode:vertical-rl;font-family:var(--cond);font-size:26px;letter-spacing:.32em;line-height:1}
+.modal .rail span{writing-mode:vertical-rl;font-family:var(--mono);font-size:10px;letter-spacing:.2em}
+.modal .body{padding:18px 24px 0}
+.modal .head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--rule);padding-bottom:6px}
+.modal h3{font-family:var(--min);font-weight:800;font-size:clamp(30px,4.4vw,48px);line-height:1.05;letter-spacing:-.02em;margin:14px 0 14px}
+.modal ol{list-style:none;margin:0 0 16px;padding:0;border-top:1px solid var(--rule)}
+.modal ol li{display:grid;grid-template-columns:44px 1fr;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--rule);font-size:16px;font-weight:700}
+.modal ol li i{font-style:normal;font-family:var(--cond);font-size:22px;color:var(--org);line-height:1}
+.modal .caution{height:12px;margin:0 -24px;background:repeating-linear-gradient(135deg,var(--yel) 0 12px,#000 12px 24px)}
+.modal .acts{display:grid;grid-template-columns:1fr 1.4fr;margin:0 -24px}
+.modal .acts button{min-height:68px;font-size:20px;border:0;border-top:1px solid var(--rule)}
+.modal .acts #modal-cancel{color:var(--ink);background:#000;border-right:1px solid var(--rule)}
+.modal .acts #modal-ok{background:var(--org);color:#000;font-family:var(--sans);letter-spacing:.04em}
 @media (max-width: 900px){
   .band,.mon,.grid2{grid-template-columns:1fr}
   .side{border-left:0;border-top:1px solid var(--rule)}
@@ -265,12 +276,16 @@ td.num{text-align:right}
 
 <div class="modal-bg hide" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
   <div class="modal">
-    <div class="lbl">CONFIRM</div>
-    <h3 id="modal-title"></h3>
-    <div id="modal-body"></div>
-    <div class="row">
-      <button id="modal-cancel">やめる</button>
-      <button class="btn-main" id="modal-ok"></button>
+    <div class="rail"><b>CONFIRM</b><span id="modal-code"></span></div>
+    <div class="body">
+      <div class="head"><span class="lbl">OPERATOR CONFIRMATION</span><span class="mono" id="modal-sub"></span></div>
+      <h3 id="modal-title"></h3>
+      <div id="modal-body"></div>
+      <div class="caution" aria-hidden="true"></div>
+      <div class="acts">
+        <button id="modal-cancel">やめる</button>
+        <button id="modal-ok"></button>
+      </div>
     </div>
   </div>
 </div>
@@ -350,11 +365,13 @@ const ERRS = {
 const humanErr = c => ERRS[c] ? `${ERRS[c]} [${c}]` : c;
 
 // 確認のモーダル。OK で true、やめる・Esc・背景で false
-function confirmModal(title, items, okLabel) {
+function confirmModal(title, items, okLabel, code) {
   return new Promise(resolve => {
     const m = $('modal');
     $('modal-title').textContent = title;
-    $('modal-body').innerHTML = items && items.length ? '<ul>' + items.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>' : '';
+    $('modal-body').innerHTML = items && items.length ? '<ol>' + items.map((t, k) => `<li><i>${String(k + 1).padStart(2, '0')}</i><span>${esc(t)}</span></li>`).join('') + '</ol>' : '';
+    $('modal-sub').textContent = (S && S.rig_state ? 'RIG ' + S.rig_state : '') + '  ' + new Date().toTimeString().slice(0, 8);
+    $('modal-code').textContent = code || '';
     $('modal-ok').textContent = okLabel;
     m.classList.remove('hide');
     const prev = document.activeElement;
@@ -367,8 +384,8 @@ function confirmModal(title, items, okLabel) {
     $('modal-cancel').onclick = () => done(false);
   });
 }
-function withConfirm(btn, title, items, okLabel, run) {
-  btn.addEventListener('click', async () => { if (await confirmModal(title, items, okLabel)) await run(); });
+function withConfirm(btn, title, items, okLabel, code, run) {
+  btn.addEventListener('click', async () => { if (await confirmModal(title, items, okLabel, code)) await run(); });
 }
 
 // ------------------------------------------------------------ 文言
@@ -650,7 +667,7 @@ $('apply-all').addEventListener('click', async () => {
   const el = $('apply-result'); el.classList.toggle('err', lines.some(l => l.includes('失敗'))); el.textContent = lines.join('\n') || '反映するものがありません';
 });
 async function declare(n) {
-  const ok = await confirmModal(`#${n} の値は、この軸・この個体で測ったものですか？`, ['行程が過去の値と大きく違わない', '中立で止めた位置が正しい', '座席に人がいない', '物理の非常停止を押せる人がいる'], '測ったと宣言する');
+  const ok = await confirmModal(`#${n} の値は、この軸・この個体で測ったものですか？`, ['行程が過去の値と大きく違わない', '中立で止めた位置が正しい', '座席に人がいない', '物理の非常停止を押せる人がいる'], '測ったと宣言する', `DECLARE ${n}`);
   if (!ok) return;
   show($('apply-result'), await api('POST', '/v1/calibration/declare', {axis: n}), `#${n} を宣言しました`);
 }
@@ -722,8 +739,8 @@ $('estop').addEventListener('click', async () => {
     show($('act-result'), await api('POST', '/v1/stop'), '停止しました（ゲームが動かし直すことがあります）');
   }
 });
-withConfirm($('a-center'), '中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
-withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
+withConfirm($('a-center'), '中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', 'CENTER', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
+withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
 $('a-disarm').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'));
 $('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
 $('a-release').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/operator/release'), '解除しました'));
