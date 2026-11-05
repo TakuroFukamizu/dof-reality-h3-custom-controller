@@ -107,6 +107,9 @@ pub const TEST_PAGE: &str = include_str!("../static/test_page.html");
 /// Joystick test page (DESIGN.md §7.5): roll / pitch from a stick, same
 /// status / admin handling as the operator page. Embedded like [`TEST_PAGE`].
 pub const JOYSTICK_PAGE: &str = include_str!("../static/joystick_page.html");
+/// Operator console (`GET /console` monitor, `GET /console/setup` setup;
+/// one page, the path picks the view). docs/superpowers/specs/2026-11-05-operator-console-design.md.
+pub const CONSOLE_PAGE: &str = include_str!("../static/console.html");
 
 pub type AdminReply = Result<AdminOk, AdminError>;
 /// One admin command and where to send its result.
@@ -310,6 +313,8 @@ pub fn router(state: AppState) -> Router {
         .route("/index.html", get(test_page))
         .route("/joystick", get(joystick_page))
         .route("/joystick.html", get(joystick_page))
+        .route("/console", get(console_page))
+        .route("/console/setup", get(console_page))
         .route("/v1/session", post(new_session))
         .route("/v1/motion", get(motion))
         .route("/v1/status", get(status))
@@ -489,6 +494,10 @@ async fn test_page() -> Response {
 
 async fn joystick_page() -> Response {
     embedded_page(JOYSTICK_PAGE)
+}
+
+async fn console_page() -> Response {
+    embedded_page(CONSOLE_PAGE)
 }
 
 /// `text/html`, `Cache-Control: no-store` (the pages change with the binary).
