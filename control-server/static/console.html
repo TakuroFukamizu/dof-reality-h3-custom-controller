@@ -313,6 +313,13 @@ const ERRS = {
   confirm_mismatch: '入力した 4 桁が個体と一致しません',
   unauthorized: '管理トークンが必要です（設定画面の下）',
   exists: '同じ名前のファイルがすでにあります',
+  device_in_use: 'その個体はすでに別の軸に割り当てられています',
+  config_file_changed: '起動後に設定ファイルが手で書き換えられています（サーバーを再起動してください）',
+  reset_in_progress: '異常のリセット中です',
+  bad_device_id: '個体の ID が読めません',
+  write_failed: '設定ファイルに書けませんでした',
+  invalid_result: '校正の結果から値を作れません（端の余裕が入りきらない など）',
+  config_read_failed: '設定ファイルを読めませんでした',
   calibration_stale: '校正の値が未反映',
   position_outside_soft_limits: '位置が可動範囲の外',
   not_referenced: '基準位置がない（校正が必要）',
@@ -545,7 +552,7 @@ function renderSetup() {
       <div class="row" style="align-items:center;margin-top:6px">
         <select id="un-ax-${i}"><option value="1">#1 右手前リフト</option><option value="2">#2 左リフト</option><option value="3">#3 後部ヨー</option></select>
         <input id="un-sfx-${i}" maxlength="4" placeholder="画面の 4 桁" style="width:9em">
-        <button class="btn-warn" data-un="${i}">この個体を割り当てる</button>
+        <button class="btn-warn" data-un="${i}" ${u.device_id ? '' : 'disabled title="USB のシリアル番号が MAC ではないので割り当てられません"'}>この個体を割り当てる</button>
       </div></div>`).join(''));
   document.querySelectorAll('[data-un]').forEach(btn => btn.onclick = () => assignUnit(Number(btn.dataset.un)));
 
@@ -676,8 +683,15 @@ async function faultReset() { show($('act-result'), await api('POST', '/v1/fault
 async function release() { show($('act-result'), await api('POST', '/v1/operator/release'), 'オペレーター停止を解除しました'); }
 $('estop').addEventListener('click', async () => {
   // 新しい API があればオペレーター停止（ゲームが勝手に動かし直さない）、なければ従来の stop
-  const r = hasNewApi() ? await api('POST', '/v1/operator/hold') : await api('POST', '/v1/stop');
-  show($('act-result'), r, hasNewApi() ? 'オペレーター停止しました。解除するまでゲームは動かせません。' : '停止しました（ゲームが動かし直すことがあります）');
+  // オペレーター停止は応答が 503 でも立っていることがある。結果は status.operator_hold で判断する
+  if (hasNewApi()) {
+    const r = await api('POST', '/v1/operator/hold');
+    await pollStatus();
+    if (S && S.operator_hold) { $('act-result').classList.remove('err'); $('act-result').textContent = 'オペレーター停止しました。解除するまでゲームは動かせません。'; }
+    else show($('act-result'), r);
+  } else {
+    show($('act-result'), await api('POST', '/v1/stop'), '停止しました（ゲームが動かし直すことがあります）');
+  }
 });
 armConfirm($('a-center'), '中立へ戻す', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
 armConfirm($('a-arm'), 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
