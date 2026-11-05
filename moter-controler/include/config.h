@@ -300,6 +300,17 @@ constexpr uint32_t V1_OVERRUN_MS = 15;          // 制御 tick の間隔がこ�
 constexpr uint32_t POWER_SETTLE_MS = V1_ARM_POWER_SETTLE_MS;
 constexpr uint32_t BRAKE_RELEASE_WAIT_MS = 300; // ARMING: ブレーキ解除指令から HOLDING まで（POWER_SETTLE_MS との和を ARM 全体 5000 ms より十分短く）
 constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電 OFF から PWM 0・主電源 OFF・DISARMED まで
+// HOLDING 中はブレーキを作動させて保持する（座った荷重での位置ループの微振動を避ける）。START で即解除（待ちなし）。
+// 作動の完了までの時間は未測定（暫定 300 ms）: その間は位置ループをそのまま回して沈みを防ぎ、過ぎたら Duty 0。
+#ifndef V1_HOLD_BRAKE
+#define V1_HOLD_BRAKE 1
+#endif
+#ifndef V1_HOLD_BRAKE_SUPPORT_MS
+#define V1_HOLD_BRAKE_SUPPORT_MS 300
+#endif
+#ifndef V1_HOLD_BRAKE_SLIP_COUNT
+#define V1_HOLD_BRAKE_SLIP_COUNT 20  // ブレーキ作動後に保持位置からこれを超えてずれたら解除して位置制御へ戻る（異常にはしない）
+#endif
 constexpr uint32_t CAL_POWER_HOLD_TIMEOUT_MS = 120000;  // KEEP_POWER: 校正が終わってから主電源を保つ最長時間（protocol.md §4、仮値）
 constexpr int V1_CAL_HOME_DUTY = 13;            // v1 の校正（CALIBRATE）の端当て Duty。従来 env の HOME_DUTY（10 %）では #2 が下限から持ち上がる方向で始動しないことがあった（2026-11-01、2 回）。10/31 の実測で 13 % は 920〜985 count/s。端当ての衝撃は 15 %（従来 env の UPPER の速い区間）より小さい。仮値
 constexpr uint32_t CAL_POWER_SETTLE_MS = 5000;  // CALIBRATING: 主電源 ON 指令からブレーキ解除指令まで（protocol.md §1.2）。2026-10-31 に電源投入 4 s 後は動かず

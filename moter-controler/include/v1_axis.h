@@ -58,6 +58,9 @@ struct V1Tuning {
   uint32_t overrun_ms = V1_OVERRUN_MS;
   uint32_t power_settle_ms = POWER_SETTLE_MS;
   uint32_t brake_release_wait_ms = BRAKE_RELEASE_WAIT_MS;
+  bool hold_brake = V1_HOLD_BRAKE != 0;                          // HOLDING 中はブレーキ作動（START で即解除）
+  uint32_t hold_brake_support_ms = V1_HOLD_BRAKE_SUPPORT_MS;     // 作動指令からこの間は位置ループを回して支える
+  int32_t hold_brake_slip_count = V1_HOLD_BRAKE_SLIP_COUNT;      // 作動後にこれを超えてずれたら解除
   uint32_t brake_apply_wait_ms = BRAKE_APPLY_WAIT_MS;
   uint32_t cal_power_settle_ms = CAL_POWER_SETTLE_MS;
   uint32_t status_period_ms = 20;
@@ -761,6 +764,8 @@ class V1Axis {
   uint64_t lease_us_ = 0;
   uint64_t valid_until_us_ = 0;
   bool brake_release_cmd_ = false;
+  uint8_t hold_brake_phase_ = 0;      // HOLDING のブレーキ保持: 0 なし / 1 作動待ち（位置ループ継続）/ 2 作動中（Duty 0）/ 3 ずれて解除
+  uint64_t hold_brake_at_us_ = 0;
 
   // --- SET_POSITION ---
   uint32_t last_rx_seq_ = 0;
@@ -936,6 +941,51 @@ class V1Axis {
   // ENCODER_FAULT の無パルスは FAULT 中（ブレーキ作動・PWM 0）には観測できないので原因として残さず、解除は通す
   // （POSITION_REFERENCED は消える）。
   bool fault_cause_present() const { return estop_latched_; }
+
+  // HOLDING に入る（ARMING の完了・STOPPING(Hold) の完了）。ブレーキ保持が有効なら作動指令を出し、支えの時間を数え始める
+  void enter_holding(uint64_t now) {
+    state_ = v1::state::HOLDING;
+    hold_brake_phase_ = 0;
+    if (tuning.hold_brake) {
+      brake_release_cmd_ = false;
+      hold_brake_phase_ = 1;
+      hold_brake_at_us_ = now;
+    }
+  }
+
+  // HOLDING を出る（START・DISARM・FAULT）。ブレーキ保持の状態を消す（ブレーキ指令は呼び元が決める）
+  void clear_hold_brake() { hold_brake_phase_ = 0; }
+
+  // ブレーキで保持している間（作動中。Duty 0・ループの状態を持たない）
+  bool hold_braked() const { return state_ == v1::state::HOLDING && hold_brake_phase_ == 2; }
+
+  // tick ごと（update_duty の頭）: 支えの時間が過ぎたら作動中へ。作動中に保持位置から slip_count を超えてずれたら解除
+  void update_hold_brake(uint64_t now) {
+    if (state_ != v1::state::HOLDING) { hold_brake_phase_ = 0; return; }
+    if (hold_brake_phase_ == 1 && now - hold_brake_at_us_ >= ms_to_us(tuning.hold_brake_support_ms)) {
+      hold_brake_phase_ = 2;
+    }
+    if (hold_brake_phase_ == 2) {
+      const int64_t d = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
+      if ((d < 0 ? -d : d) > static_cast<int64_t>(tuning.hold_brake_slip_count)) {
+        brake_release_cmd_ = true;  // 滑った: 異常にはせず解除して位置制御へ戻る（この HOLDING の間はそのまま）
+        hold_brake_phase_ = 3;
+      }
+    }
+  }
+
+  // 位置ループの状態を捨てる（位置制御なし・ブレーキ作動中の Duty 0 で共用）
+  void reset_loop_state() {
+    duty_permille_ = 0;
+    stall_running_ = false;
+    duty_state_ = V1DutyState{};
+    reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
+    settle_dwell_us_ = 0;
+    reset_track_assist();
+    reset_breakaway();
+    reset_stall_boost();
+    terms_ = V1DutyTerms{};
+  }
 
   void hold_here() {
     const double a = static_cast<double>(actual_count());
@@ -1148,6 +1198,7 @@ class V1Axis {
     lease_us_ = now;
     valid_until_us_ = 0;  // START に数えるのは以後に受けたフレームだけ
     brake_release_cmd_ = false;
+    clear_hold_brake();
     hold_here();
     return v1::ack_reason::NONE;
   }
@@ -1159,6 +1210,12 @@ class V1Axis {
     if (config_.session_epoch != epoch) return v1::ack_reason::EPOCH_MISMATCH;
     if (now > valid_until_us_) return v1::ack_reason::BAD_STATE;  // 受理しても次の tick で期限切れになる
     state_ = v1::state::ACTIVE;
+    if (hold_brake_phase_ != 0) {
+      // ブレーキ保持から出る: 待たずにこの場で解除。ループの状態は作動中に捨てたまま（作動待ち・解除済みなら続ける）
+      brake_release_cmd_ = true;
+      if (hold_brake_phase_ == 2) reset_loop_state();
+      clear_hold_brake();
+    }
     control_target_ = setpoint_;
     playout_.clear();  // 前の ACTIVE の残りや HOLDING 中のフレームは再生しない（目標は次の SET_POSITION まで保持位置）
     frame_max_vel_ = static_cast<double>(config_.max_vel_count_s);
@@ -1430,7 +1487,7 @@ class V1Axis {
   void finish_stop(uint64_t now) {
     switch (stop_kind_) {
       case StopKind::Hold:
-        state_ = v1::state::HOLDING;
+        enter_holding(now);
         control_target_ = setpoint_;
         break;
       case StopKind::Disarm: enter_disarming(now); break;
@@ -1443,6 +1500,7 @@ class V1Axis {
     state_ = v1::state::DISARMING;
     disarming_started_us_ = now;
     brake_release_cmd_ = false;
+    clear_hold_brake();
     stop_kind_ = StopKind::Hold;
   }
 
@@ -1461,6 +1519,7 @@ class V1Axis {
     fault_code_ = code;
     stop_kind_ = StopKind::Hold;
     brake_release_cmd_ = false;
+    clear_hold_brake();
     duty_permille_ = 0;  // 次の tick を待たず PWM 0
     terms_ = V1DutyTerms{};
     duty_state_ = V1DutyState{};  // 積分（保持バイアス）も捨てる（Issue #25 手順 9「F」）
@@ -1547,7 +1606,7 @@ class V1Axis {
         brake_release_at_us_ = now;
       }
       if (brake_release_cmd_ && now - brake_release_at_us_ >= ms_to_us(tuning.brake_release_wait_ms)) {
-        state_ = v1::state::HOLDING;
+        enter_holding(now);
       }
     } else if (state_ == v1::state::DISARMING) {
       if (now - disarming_started_us_ >= ms_to_us(tuning.brake_apply_wait_ms)) {
@@ -1936,16 +1995,9 @@ class V1Axis {
 
   // 位置制御の Duty と無パルス判定。dt_us は前の tick からの時間（積分の刻み。overrun_ms で頭打ち: 間隔が飛んだ直後に I を跳ねさせない）
   void update_duty(uint64_t now, uint64_t dt_us = 0) {
-    if (!position_control_on()) {
-      duty_permille_ = 0;  // CALIBRATING では直後の tick_calibration が書き直す
-      stall_running_ = false;
-      duty_state_ = V1DutyState{};
-      reset_v_fast();  // r9: 位置制御が始まってから 20〜40 ms は推定なし（減衰項 0）
-      settle_dwell_us_ = 0;
-      reset_track_assist();
-      reset_breakaway();
-      reset_stall_boost();
-      terms_ = V1DutyTerms{};
+    update_hold_brake(now);
+    if (!position_control_on() || hold_braked()) {
+      reset_loop_state();  // CALIBRATING では直後の tick_calibration が書き直す。ブレーキ作動中の HOLDING は Duty 0
       return;
     }
     const int64_t err = static_cast<int64_t>(target_count()) - static_cast<int64_t>(actual_count());
