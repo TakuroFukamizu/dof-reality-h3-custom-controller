@@ -117,6 +117,11 @@ td.num{text-align:right}
 .stroke{font-family:var(--cond);font-size:34px;line-height:1}
 .sev-ok{color:var(--grn)} .sev-warn{color:var(--yel)} .sev-bad{color:var(--red)}
 
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:var(--bg);border:2px solid var(--org);max-width:560px;width:100%;padding:20px 22px}
+.modal h3{font-family:var(--min);font-weight:800;font-size:30px;line-height:1.15;margin:6px 0 10px}
+.modal ul{margin:0 0 14px;padding-left:1.3em;line-height:1.7}
+.modal .row button{min-height:56px;font-size:18px}
 @media (max-width: 900px){
   .band,.mon,.grid2{grid-template-columns:1fr}
   .side{border-left:0;border-top:1px solid var(--rule)}
@@ -250,7 +255,7 @@ td.num{text-align:right}
     <button class="btn-red" id="a-reset">異常をリセット</button>
     <button class="btn-warn hide" id="a-release">オペレーター停止を解除</button>
   </div>
-  <div class="note">動かす操作（中立へ・ARM）は、押すと確認に変わります。3 秒以内にもう一度押すと実行します。</div>
+  <div class="note">動かす操作（中立へ・ARM）は、確認の画面が出ます。</div>
   <div class="result" id="a-result"></div>
 </section>
 <section class="sec">
@@ -258,6 +263,17 @@ td.num{text-align:right}
   <div class="log" id="log-wrap"><table><tbody id="log"></tbody></table></div>
 </section>
 
+<div class="modal-bg hide" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <div class="lbl">CONFIRM</div>
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="row">
+      <button id="modal-cancel">やめる</button>
+      <button class="btn-main" id="modal-ok"></button>
+    </div>
+  </div>
+</div>
 <script>
 'use strict';
 // ------------------------------------------------------------ 共通
@@ -333,22 +349,26 @@ const ERRS = {
 };
 const humanErr = c => ERRS[c] ? `${ERRS[c]} [${c}]` : c;
 
-// 押すと確認に変わり、3 秒以内にもう一度押すと実行する
-function armConfirm(btn, label, run) {
-  let until = 0, timer = null;
-  const base = btn.textContent;
-  btn.addEventListener('click', async () => {
-    const now = Date.now();
-    if (now > until) {
-      until = now + 3000;
-      btn.textContent = label + ' — もう一度押して確定';
-      clearTimeout(timer);
-      timer = setTimeout(() => { btn.textContent = base; until = 0; }, 3000);
-      return;
-    }
-    until = 0; clearTimeout(timer); btn.textContent = base;
-    await run();
+// 確認のモーダル。OK で true、やめる・Esc・背景で false
+function confirmModal(title, items, okLabel) {
+  return new Promise(resolve => {
+    const m = $('modal');
+    $('modal-title').textContent = title;
+    $('modal-body').innerHTML = items && items.length ? '<ul>' + items.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>' : '';
+    $('modal-ok').textContent = okLabel;
+    m.classList.remove('hide');
+    const prev = document.activeElement;
+    $('modal-cancel').focus();
+    const done = v => { m.classList.add('hide'); document.removeEventListener('keydown', key); m.onclick = null; $('modal-ok').onclick = null; $('modal-cancel').onclick = null; if (prev && prev.focus) prev.focus(); resolve(v); };
+    const key = e => { if (e.key === 'Escape') done(false); };
+    document.addEventListener('keydown', key);
+    m.onclick = e => { if (e.target === m) done(false); };
+    $('modal-ok').onclick = () => done(true);
+    $('modal-cancel').onclick = () => done(false);
   });
+}
+function withConfirm(btn, title, items, okLabel, run) {
+  btn.addEventListener('click', async () => { if (await confirmModal(title, items, okLabel)) await run(); });
 }
 
 // ------------------------------------------------------------ 文言
@@ -630,7 +650,7 @@ $('apply-all').addEventListener('click', async () => {
   const el = $('apply-result'); el.classList.toggle('err', lines.some(l => l.includes('失敗'))); el.textContent = lines.join('\n') || '反映するものがありません';
 });
 async function declare(n) {
-  const ok = window.confirm(`#${n} の値は、この軸・この個体で測ったものですか？\n・行程が過去の値と大きく違わない\n・中立で止めた位置が正しい\n・座席に人がいない\n・物理の非常停止を押せる人がいる`);
+  const ok = await confirmModal(`#${n} の値は、この軸・この個体で測ったものですか？`, ['行程が過去の値と大きく違わない', '中立で止めた位置が正しい', '座席に人がいない', '物理の非常停止を押せる人がいる'], '測ったと宣言する');
   if (!ok) return;
   show($('apply-result'), await api('POST', '/v1/calibration/declare', {axis: n}), `#${n} を宣言しました`);
 }
@@ -702,8 +722,8 @@ $('estop').addEventListener('click', async () => {
     show($('act-result'), await api('POST', '/v1/stop'), '停止しました（ゲームが動かし直すことがあります）');
   }
 });
-armConfirm($('a-center'), '中立へ戻す', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
-armConfirm($('a-arm'), 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
+withConfirm($('a-center'), '中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
+withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
 $('a-disarm').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'));
 $('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
 $('a-release').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/operator/release'), '解除しました'));
@@ -715,7 +735,7 @@ function renderActions() {
 }
 
 // ------------------------------------------------------------ 7 履歴
-const CMDJ = {Arm:'ARM', Start:'START', Stop:'停止', Disarm:'DISARM', Center:'中立へ', FaultReset:'異常リセット', Fault:'操作者の停止', Calibrate:'校正', CalibrateCancel:'校正の中止', Reference:'基準位置', SetLimits:'リミット変更', OperatorHold:'オペレーター停止', OperatorRelease:'オペレーター停止の解除'};
+const CMDJ = {Arm:'ARM', Start:'START', Stop:'停止', Disarm:'DISARM', Center:'中立へ', FaultReset:'異常リセット', Fault:'操作者の停止', Calibrate:'校正', CalibrateCancel:'校正の中止', ReplaceAxis:'設定の反映', Reference:'基準位置', SetLimits:'リミット変更', OperatorHold:'オペレーター停止', OperatorRelease:'オペレーター停止の解除'};
 const QUIET = new Set(['fault_prehistory', 'rig_state_tick']);
 const EVJ = {identified: '接続', disconnected: '切断', axis_rebooted: '再起動', admin: '操作', ack_rejected: '拒否', rig_state: '状態',
   stopping: '減速', center_reached: '中立に到達', session_changed: 'セッション', ack_timeout: '応答なし', fault: '異常', fault_event: '異常（MCU）',
