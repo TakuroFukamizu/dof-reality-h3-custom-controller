@@ -137,12 +137,12 @@ name = "右手前リフト (motor #1)"
 #   向き（仮想 0→1023 が上か下か）は §7 で低ゲインで確認する。逆なら count_at_virtual_0 と 1023 の値を入れ替えて再起動
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 2778     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
-count_at_virtual_1023 = 5156    # soft_max − 350
+count_at_virtual_512 = 2777     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
+count_at_virtual_1023 = 5155    # soft_max − 350
 mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
-mechanical_max_count = 5556     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
+mechanical_max_count = 5555     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5506           # mechanical_max − decel_zone
+soft_max_count = 5505           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
@@ -155,12 +155,12 @@ name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 2753     # = stroke / 2
-count_at_virtual_1023 = 5107    # soft_max − 350
+count_at_virtual_512 = 2754     # = stroke / 2
+count_at_virtual_1023 = 5108    # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 5507
+mechanical_max_count = 5508
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5457           # mechanical_max − decel_zone
+soft_max_count = 5458           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
@@ -175,10 +175,10 @@ name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 3103  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
-count_at_virtual_1023 = 5806  # soft_max − 350
+count_at_virtual_512 = 3102  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
+count_at_virtual_1023 = 5804  # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 6206  # 11-02 夕方の CAL
+mechanical_max_count = 6204  # 11-02 夕方の CAL
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 6156  # mechanical_max − decel_zone
+soft_max_count = 6154  # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
