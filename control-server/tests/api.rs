@@ -68,15 +68,26 @@ fn stub(cfg: Config, reply: Option<Reply>) -> Stub {
         TOKEN.into(),
         shutdown_rx,
     );
-    Stub { app: api::router(state), pose_rx, seen, _shutdown: shutdown_tx }
+    Stub {
+        app: api::router(state),
+        pose_rx,
+        seen,
+        _shutdown: shutdown_tx,
+    }
 }
 
 fn ok_reply(_: &AdminCmd) -> Result<AdminOk, AdminError> {
-    Ok(AdminOk { rig_state: RigState::ReadyToArm, note: None })
+    Ok(AdminOk {
+        rig_state: RigState::ReadyToArm,
+        note: None,
+    })
 }
 
 fn not_ready(_: &AdminCmd) -> Result<AdminOk, AdminError> {
-    Err(AdminError { error: "not_ready".into(), blockers: vec!["not_connected: axis2".into()] })
+    Err(AdminError {
+        error: "not_ready".into(),
+        blockers: vec!["not_connected: axis2".into()],
+    })
 }
 
 fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Request<Body> {
@@ -85,7 +96,9 @@ fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Reques
         b = b.header(*k, *v);
     }
     if !body.is_empty() {
-        b = b.header("content-type", "application/json").header("content-length", body.len().to_string());
+        b = b
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string());
     }
     b.body(Body::from(body.to_string())).unwrap()
 }
@@ -94,7 +107,10 @@ async fn call(app: &Router, r: Request<Body>) -> (StatusCode, Value) {
     let resp = app.clone().oneshot(r).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn bearer() -> String {
@@ -106,46 +122,96 @@ fn bearer() -> String {
 #[tokio::test]
 async fn foreign_origin_is_forbidden() {
     let s = stub(sim_cfg(), Some(ok_reply));
-    let (st, body) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://evil.example")], "")).await;
+    let (st, body) = call(
+        &s.app,
+        req(
+            "GET",
+            "/v1/status",
+            &[("origin", "http://evil.example")],
+            "",
+        ),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "forbidden_origin");
     // Even /v1/stop and the WS route are behind the Origin check.
-    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("origin", "http://evil.example")], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/stop", &[("origin", "http://evil.example")], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     // The embedded pages too (a foreign page must not read them).
     for p in ["/", "/joystick"] {
-        let (st, body) = call(&s.app, req("GET", p, &[("origin", "http://evil.example")], "")).await;
+        let (st, body) = call(
+            &s.app,
+            req("GET", p, &[("origin", "http://evil.example")], ""),
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(body["error"], "forbidden_origin", "{p}");
     }
-    assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
+    assert!(
+        s.seen.lock().unwrap().is_empty(),
+        "nothing reached the control loop"
+    );
 
-    let (st, _) = call(&s.app, req("GET", "/v1/status", &[("origin", "http://localhost:8891")], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req(
+            "GET",
+            "/v1/status",
+            &[("origin", "http://localhost:8891")],
+            "",
+        ),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let (st, _) = call(&s.app, req("GET", "/v1/status", &[], "")).await;
-    assert_eq!(st, StatusCode::OK, "no Origin (non-browser client) is allowed");
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "no Origin (non-browser client) is allowed"
+    );
 }
 
 #[tokio::test]
 async fn test_page_is_served_at_root_and_index_html() {
     let s = stub(sim_cfg(), Some(ok_reply));
     for path in ["/", "/index.html"] {
-        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        let resp = s
+            .app
+            .clone()
+            .oneshot(req("GET", path, &[], ""))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(ct.starts_with("text/html"), "{path}: {ct}");
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
         assert_eq!(html, api::TEST_PAGE);
         assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
-        assert!(html.contains("h3-control-server 試験ページ") && html.contains("/v1/motion"), "{path}");
+        assert!(
+            html.contains("h3-control-server 試験ページ") && html.contains("/v1/motion"),
+            "{path}"
+        );
     }
     // No external resources: the page must work offline.
     for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
-        assert!(!api::TEST_PAGE.contains(needle), "external resource in the page: {needle}");
+        assert!(
+            !api::TEST_PAGE.contains(needle),
+            "external resource in the page: {needle}"
+        );
     }
     // POST / is a known path with the wrong method.
     let (st, body) = call(&s.app, req("POST", "/", &[], "")).await;
@@ -158,29 +224,70 @@ async fn test_page_is_served_at_root_and_index_html() {
 async fn joystick_page_is_served_and_self_contained() {
     let s = stub(sim_cfg(), Some(ok_reply));
     for path in ["/joystick", "/joystick.html"] {
-        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        let resp = s
+            .app
+            .clone()
+            .oneshot(req("GET", path, &[], ""))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(ct.starts_with("text/html"), "{path}: {ct}");
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
         assert_eq!(html, api::JOYSTICK_PAGE);
         assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
-        assert!(html.contains("ジョイスティック") && html.contains("/v1/motion") && html.contains("/v1/session"), "{path}");
+        assert!(
+            html.contains("ジョイスティック")
+                && html.contains("/v1/motion")
+                && html.contains("/v1/session"),
+            "{path}"
+        );
     }
     assert_ne!(api::JOYSTICK_PAGE, api::TEST_PAGE);
     // The pure stick mapping lives in a `H3Joy` module (exercised from the browser check) and
     // follows h3game: roll from the X axis, pitch from the Y axis, `getGamepads` for the pads.
     // The 50 Hz tick runs in a Web Worker (main-thread timers and rAF are throttled when the
     // window is hidden or covered); rAF is kept for rendering only.
-    for needle in ["window.H3Joy", "navigator.getGamepads", "new Worker", "requestAnimationFrame", "frame_seq", "/v1/status", "/v1/stop", "/v1/arm"] {
-        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    for needle in [
+        "window.H3Joy",
+        "navigator.getGamepads",
+        "new Worker",
+        "requestAnimationFrame",
+        "frame_seq",
+        "/v1/status",
+        "/v1/stop",
+        "/v1/arm",
+    ] {
+        assert!(
+            api::JOYSTICK_PAGE.contains(needle),
+            "missing in the joystick page: {needle}"
+        );
     }
     // Auto start (one shot on load / reset) with a reset button; the manual buttons stay for
     // troubleshooting. START refused with pose_not_near_hold goes through /v1/center once.
-    for needle in ["id=\"bReset\"", "id=\"autoOnLoad\"", "function autoTick", "pose_not_near_hold", "/v1/center", "/v1/fault/reset", "id=\"bArm\"", "id=\"bStart\"", "id=\"bStream\""] {
-        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+    for needle in [
+        "id=\"bReset\"",
+        "id=\"autoOnLoad\"",
+        "function autoTick",
+        "pose_not_near_hold",
+        "/v1/center",
+        "/v1/fault/reset",
+        "id=\"bArm\"",
+        "id=\"bStart\"",
+        "id=\"bStream\"",
+    ] {
+        assert!(
+            api::JOYSTICK_PAGE.contains(needle),
+            "missing in the joystick page: {needle}"
+        );
     }
     // Issue #36: a refused admin command shows the server's `error` / `blockers` next to the
     // buttons (`#opResult`, the pure `H3Joy.adminReject`), rate mode hints 「中央へ」 before START
@@ -202,13 +309,22 @@ async fn joystick_page_is_served_and_self_contained() {
         "CENTER ボタン",
         "auto.on ? null : J.startGateHint",
     ] {
-        assert!(api::JOYSTICK_PAGE.contains(needle), "missing in the joystick page: {needle}");
+        assert!(
+            api::JOYSTICK_PAGE.contains(needle),
+            "missing in the joystick page: {needle}"
+        );
     }
     // Server text is drawn with textContent only.
-    assert!(!api::JOYSTICK_PAGE.contains("innerHTML ="), "the page must not assign innerHTML");
+    assert!(
+        !api::JOYSTICK_PAGE.contains("innerHTML ="),
+        "the page must not assign innerHTML"
+    );
     // No external resources: the page must work offline.
     for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
-        assert!(!api::JOYSTICK_PAGE.contains(needle), "external resource in the page: {needle}");
+        assert!(
+            !api::JOYSTICK_PAGE.contains(needle),
+            "external resource in the page: {needle}"
+        );
     }
     // POST /joystick is a known path with the wrong method.
     let (st, body) = call(&s.app, req("POST", "/joystick", &[], "")).await;
@@ -229,19 +345,57 @@ async fn same_origin_loopback_requests_pass_the_origin_check() {
         ("127.0.0.5:18892", "http://127.0.0.5:18892"),
         ("localhost", "http://localhost"),
     ] {
-        let (st, body) = call(&s.app, req("POST", "/v1/stop", &[("host", host), ("origin", origin)], "")).await;
+        let (st, body) = call(
+            &s.app,
+            req(
+                "POST",
+                "/v1/stop",
+                &[("host", host), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "host {host} origin {origin}: {body}");
-        let (st, _) = call(&s.app, req("GET", "/v1/status", &[("host", host), ("origin", origin)], "")).await;
+        let (st, _) = call(
+            &s.app,
+            req(
+                "GET",
+                "/v1/status",
+                &[("host", host), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "host {host} origin {origin}");
-        let h = [("host", host), ("origin", origin), ("authorization", &bearer())];
+        let h = [
+            ("host", host),
+            ("origin", origin),
+            ("authorization", &bearer()),
+        ];
         let (st, _) = call(&s.app, req("POST", "/v1/arm", &h, "")).await;
         assert_eq!(st, StatusCode::OK, "host {host} origin {origin}");
     }
     // The configured bridge origins still pass whatever the Host is.
-    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("host", "127.0.0.1:8892"), ("origin", "http://localhost:8891")], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req(
+            "POST",
+            "/v1/stop",
+            &[
+                ("host", "127.0.0.1:8892"),
+                ("origin", "http://localhost:8891"),
+            ],
+            "",
+        ),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     // No Origin (curl, the Python client) is unchanged.
-    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("host", "127.0.0.1:8892")], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/stop", &[("host", "127.0.0.1:8892")], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
 }
 
@@ -257,21 +411,63 @@ async fn foreign_origins_stay_forbidden_even_when_they_match_the_host() {
         ("127.0.0.1:8892", "http://127.0.0.1", "missing port"),
         ("127.0.0.1:8892", "https://127.0.0.1:8892", "https"),
         ("127.0.0.1:8892", "http://127.0.0.1:8892/", "trailing slash"),
-        ("127.0.0.1:8892", "http://localhost:8892", "host literal vs name"),
+        (
+            "127.0.0.1:8892",
+            "http://localhost:8892",
+            "host literal vs name",
+        ),
         ("127.0.0.1:8892", "null", "opaque origin"),
-        ("192.168.1.10:8892", "http://192.168.1.10:8892", "LAN address"),
+        (
+            "192.168.1.10:8892",
+            "http://192.168.1.10:8892",
+            "LAN address",
+        ),
     ];
     for (host, origin, why) in cases {
-        let (st, body) = call(&s.app, req("POST", "/v1/stop", &[("host", host), ("origin", origin)], "")).await;
-        assert_eq!(st, StatusCode::FORBIDDEN, "{why}: host {host} origin {origin}");
+        let (st, body) = call(
+            &s.app,
+            req(
+                "POST",
+                "/v1/stop",
+                &[("host", host), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "{why}: host {host} origin {origin}"
+        );
         assert_eq!(body["error"], "forbidden_origin", "{why}");
-        let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("host", host), ("origin", origin)], "")).await;
+        let (st, _) = call(
+            &s.app,
+            req(
+                "GET",
+                "/v1/motion",
+                &[("host", host), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{why} (ws)");
     }
     // Without a Host header the same-origin rule cannot apply.
-    let (st, _) = call(&s.app, req("POST", "/v1/stop", &[("origin", "http://127.0.0.1:8892")], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req(
+            "POST",
+            "/v1/stop",
+            &[("origin", "http://127.0.0.1:8892")],
+            "",
+        ),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "no Host");
-    assert!(s.seen.lock().unwrap().is_empty(), "nothing reached the control loop");
+    assert!(
+        s.seen.lock().unwrap().is_empty(),
+        "nothing reached the control loop"
+    );
 }
 
 #[test]
@@ -288,10 +484,19 @@ fn same_origin_loopback_rule() {
     assert!(!same("http://10.0.0.1:8892", Some("10.0.0.1:8892")));
     assert!(!same("https://127.0.0.1:8892", Some("127.0.0.1:8892")));
     assert!(!same("http://127.0.0.1:8892/", Some("127.0.0.1:8892")));
-    assert!(!same("http://[::1]:8892", Some("[::1:8892")), "unterminated bracket");
-    assert!(!same("http://::1:8892", Some("::1:8892")), "unbracketed v6 is not a valid Host");
+    assert!(
+        !same("http://[::1]:8892", Some("[::1:8892")),
+        "unterminated bracket"
+    );
+    assert!(
+        !same("http://::1:8892", Some("::1:8892")),
+        "unbracketed v6 is not a valid Host"
+    );
     // IPv4-mapped loopback: canonical form is loopback.
-    assert!(same("http://[::ffff:127.0.0.1]:8892", Some("[::ffff:127.0.0.1]:8892")));
+    assert!(same(
+        "http://[::ffff:127.0.0.1]:8892",
+        Some("[::ffff:127.0.0.1]:8892")
+    ));
 }
 
 #[tokio::test]
@@ -300,7 +505,11 @@ async fn same_origin_requests_keep_body_limit_and_rate_limit() {
     cfg.server.max_body_bytes = 64;
     cfg.server.admin_rate_limit_per_s = 2;
     let s = stub(cfg, Some(ok_reply));
-    let same = [("host", "127.0.0.1:8892"), ("origin", "http://127.0.0.1:8892"), ("authorization", &bearer())];
+    let same = [
+        ("host", "127.0.0.1:8892"),
+        ("origin", "http://127.0.0.1:8892"),
+        ("authorization", &bearer()),
+    ];
     let big = "x".repeat(65);
     let (st, body) = call(&s.app, req("POST", "/v1/fault", &same, &big)).await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
@@ -310,23 +519,46 @@ async fn same_origin_requests_keep_body_limit_and_rate_limit() {
         let (st, _) = call(&s.app, req("POST", "/v1/arm", &same, "")).await;
         codes.push(st);
     }
-    assert_eq!(codes, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+    assert_eq!(
+        codes,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS
+        ]
+    );
 }
 
 #[tokio::test]
 async fn admin_routes_need_the_bearer_token() {
     let s = stub(sim_cfg(), Some(ok_reply));
-    for path in ["/v1/arm", "/v1/start", "/v1/disarm", "/v1/fault/reset", "/v1/center", "/v1/reference", "/v1/fault"] {
+    for path in [
+        "/v1/arm",
+        "/v1/start",
+        "/v1/disarm",
+        "/v1/fault/reset",
+        "/v1/center",
+        "/v1/reference",
+        "/v1/fault",
+    ] {
         let (st, body) = call(&s.app, req("POST", path, &[], "")).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} without token");
         assert_eq!(body["error"], "unauthorized");
-        let (st, _) = call(&s.app, req("POST", path, &[("authorization", "Bearer wrong-token")], "")).await;
+        let (st, _) = call(
+            &s.app,
+            req("POST", path, &[("authorization", "Bearer wrong-token")], ""),
+        )
+        .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} wrong token");
         let (st, _) = call(&s.app, req("POST", path, &[("authorization", TOKEN)], "")).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{path} without Bearer prefix");
     }
     assert!(s.seen.lock().unwrap().is_empty());
-    let (st, body) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    let (st, body) = call(
+        &s.app,
+        req("POST", "/v1/arm", &[("authorization", &bearer())], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["ok"], true);
     assert_eq!(body["rig_state"], "READY_TO_ARM");
@@ -339,27 +571,59 @@ async fn stop_needs_no_token_and_is_not_rate_limited() {
     cfg.server.admin_rate_limit_per_s = 1;
     let s = stub(cfg, Some(ok_reply));
     // Use up the admin budget.
-    let (st, _) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/arm", &[("authorization", &bearer())], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
-    let (st, _) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/arm", &[("authorization", &bearer())], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
     for _ in 0..5 {
         let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body["ok"], true);
     }
-    assert_eq!(s.seen.lock().unwrap().iter().filter(|c| **c == AdminCmd::Stop).count(), 5);
+    assert_eq!(
+        s.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == AdminCmd::Stop)
+            .count(),
+        5
+    );
 }
 
 #[tokio::test]
 async fn oversize_body_is_413() {
     let s = stub(sim_cfg(), Some(ok_reply));
     let big = format!("{{\"note\":\"{}\"}}", "x".repeat(5000));
-    let (st, body) = call(&s.app, req("POST", "/v1/fault", &[("authorization", &bearer())], &big)).await;
+    let (st, body) = call(
+        &s.app,
+        req("POST", "/v1/fault", &[("authorization", &bearer())], &big),
+    )
+    .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["ok"], false);
-    let big = format!("{{\"axis\":1,\"count\":0,\"pad\":\"{}\"}}", "x".repeat(5000));
-    let (st, _) = call(&s.app, req("POST", "/v1/reference", &[("authorization", &bearer())], &big)).await;
+    let big = format!(
+        "{{\"axis\":1,\"count\":0,\"pad\":\"{}\"}}",
+        "x".repeat(5000)
+    );
+    let (st, _) = call(
+        &s.app,
+        req(
+            "POST",
+            "/v1/reference",
+            &[("authorization", &bearer())],
+            &big,
+        ),
+    )
+    .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(s.seen.lock().unwrap().is_empty());
 }
@@ -377,7 +641,11 @@ async fn admin_rate_limit_is_429_and_refills() {
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"], "rate_limited");
     tokio::time::advance(Duration::from_millis(400)).await;
-    assert_eq!(call(&s.app, arm()).await.0, StatusCode::OK, "refilled at 3/s");
+    assert_eq!(
+        call(&s.app, arm()).await.0,
+        StatusCode::OK,
+        "refilled at 3/s"
+    );
     assert_eq!(call(&s.app, arm()).await.0, StatusCode::TOO_MANY_REQUESTS);
     // Unauthenticated requests do not spend the budget.
     tokio::time::advance(Duration::from_secs(2)).await;
@@ -407,7 +675,11 @@ fn constant_time_eq_basics() {
 #[tokio::test]
 async fn refused_admin_command_is_409_with_blockers() {
     let s = stub(sim_cfg(), Some(not_ready));
-    let (st, body) = call(&s.app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    let (st, body) = call(
+        &s.app,
+        req("POST", "/v1/arm", &[("authorization", &bearer())], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(body["ok"], false);
     assert_eq!(body["error"], "not_ready");
@@ -429,14 +701,26 @@ async fn reference_and_fault_bodies() {
     let s = stub(sim_cfg(), Some(ok_reply));
     let h = [("authorization", bearer())];
     let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let (st, _) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":2,"count":-15}"#)).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/reference", &h, r#"{"axis":2,"count":-15}"#),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
-    let (st, body) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":4,"count":0}"#)).await;
+    let (st, body) = call(
+        &s.app,
+        req("POST", "/v1/reference", &h, r#"{"axis":4,"count":0}"#),
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "bad_axis");
     let (st, _) = call(&s.app, req("POST", "/v1/reference", &h, r#"{"axis":1}"#)).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    let (st, _) = call(&s.app, req("POST", "/v1/fault", &h, r#"{"note":"operator test"}"#)).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/fault", &h, r#"{"note":"operator test"}"#),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let (st, _) = call(&s.app, req("POST", "/v1/fault", &h, "")).await;
     assert_eq!(st, StatusCode::OK, "empty fault body is still a fault");
@@ -444,9 +728,16 @@ async fn reference_and_fault_bodies() {
     assert_eq!(
         seen,
         vec![
-            AdminCmd::Reference { axis: h3cs::types::AxisId::new(2).unwrap(), count: -15 },
-            AdminCmd::Fault { note: "operator test".into() },
-            AdminCmd::Fault { note: String::new() },
+            AdminCmd::Reference {
+                axis: h3cs::types::AxisId::new(2).unwrap(),
+                count: -15
+            },
+            AdminCmd::Fault {
+                note: "operator test".into()
+            },
+            AdminCmd::Fault {
+                note: String::new()
+            },
         ]
     );
 }
@@ -514,7 +805,11 @@ async fn malformed_ws_messages_get_bad_message_and_the_socket_stays_open() {
     let id = new_session(srv.local_addr).await;
     let mut ws = ws_connect(srv.local_addr, &id).await;
 
-    for bad in ["not json".to_string(), r#"{"type":"teleport"}"#.into(), r#"{"type":"pose","seq":1}"#.into()] {
+    for bad in [
+        "not json".to_string(),
+        r#"{"type":"teleport"}"#.into(),
+        r#"{"type":"pose","seq":1}"#.into(),
+    ] {
         ws_send(&mut ws, bad).await;
         let ack = next_ack(&mut ws).await;
         assert_eq!(ack["accepted"], false);
@@ -525,7 +820,9 @@ async fn malformed_ws_messages_get_bad_message_and_the_socket_stays_open() {
     let huge = format!("{{\"type\":\"pose\",\"pad\":\"{}\"}}", "x".repeat(6000));
     ws_send(&mut ws, huge).await;
     assert_eq!(next_ack(&mut ws).await["reason"], "bad_message");
-    ws.send(Message::Binary(vec![1u8, 2, 3].into())).await.unwrap();
+    ws.send(Message::Binary(vec![1u8, 2, 3].into()))
+        .await
+        .unwrap();
     assert_eq!(next_ack(&mut ws).await["reason"], "bad_message");
 
     // Non-finite and protocol errors are acked with their seq.
@@ -539,7 +836,9 @@ async fn malformed_ws_messages_get_bad_message_and_the_socket_stays_open() {
     assert_eq!(ack["accepted"], true, "socket still usable: {ack}");
     ws_send(&mut ws, pose_json(&id, 5, 2, 0.2, 0.1, 0.0, 0.35)).await;
     assert_eq!(next_ack(&mut ws).await["reason"], "old_seq");
-    let gain = serde_json::json!({"type":"gain","protocol":1,"source_session":id,"seq":6,"gain":0.2}).to_string();
+    let gain =
+        serde_json::json!({"type":"gain","protocol":1,"source_session":id,"seq":6,"gain":0.2})
+            .to_string();
     ws_send(&mut ws, gain).await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true);
@@ -548,28 +847,89 @@ async fn malformed_ws_messages_get_bad_message_and_the_socket_stays_open() {
 }
 
 fn assert_keys(v: &Value, keys: &[&str], what: &str) {
-    let obj = v.as_object().unwrap_or_else(|| panic!("{what} is not an object: {v}"));
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("{what} is not an object: {v}"));
     for k in keys {
         assert!(obj.contains_key(*k), "{what} lacks key {k:?}: {v}");
     }
 }
 
 const STATUS_KEYS: &[&str] = &[
-    "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
-    "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
-    "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "axis_conflict", "measured_angles",
-    "physical_estop", "telemetry", "motion_limits", "governor",
+    "protocol",
+    "rig_state",
+    "armed",
+    "active_source",
+    "calibration_valid",
+    "fault",
+    "fault_history",
+    "blockers",
+    "session",
+    "requested_pose",
+    "requested_gain",
+    "effective_gain",
+    "limits",
+    "virtual_targets",
+    "target_counts",
+    "session_epoch",
+    "group_frame_id",
+    "axes",
+    "axis_conflict",
+    "measured_angles",
+    "physical_estop",
+    "telemetry",
+    "motion_limits",
+    "governor",
 ];
 const AXIS_KEYS: &[&str] = &[
-    "axis_id", "name", "connected", "port", "device_id", "expected_device_id", "assignment", "claimants",
-    "reference_stale", "boot_id", "mcu_state", "fault_code", "configured",
-    "referenced", "calibration_valid", "actual_count", "target_count", "velocity_count_s",
-    "following_error_count", "pwm_permille", "power_on_cmd", "brake_release_cmd", "power_controller", "current_a",
-    "last_applied_frame", "status_age_ms", "rx_error_count", "stale_drop_count", "decode_errors", "fw_limits",
+    "axis_id",
+    "name",
+    "connected",
+    "port",
+    "device_id",
+    "expected_device_id",
+    "assignment",
+    "claimants",
+    "reference_stale",
+    "boot_id",
+    "mcu_state",
+    "fault_code",
+    "configured",
+    "referenced",
+    "calibration_valid",
+    "actual_count",
+    "target_count",
+    "velocity_count_s",
+    "following_error_count",
+    "pwm_permille",
+    "power_on_cmd",
+    "brake_release_cmd",
+    "power_controller",
+    "current_a",
+    "last_applied_frame",
+    "status_age_ms",
+    "rx_error_count",
+    "stale_drop_count",
+    "decode_errors",
+    "fw_limits",
 ];
-const SESSION_KEYS: &[&str] = &["source_session_prefix", "fresh", "freshness_mode", "source_age_ms", "last_seq", "last_frame_seq"];
-const TELEMETRY_KEYS: &[&str] =
-    &["tick_count", "tick_overruns", "tick_dt_ms", "pose_rx_to_tick_ms", "status_age_ms", "frame_skew", "log_dropped"];
+const SESSION_KEYS: &[&str] = &[
+    "source_session_prefix",
+    "fresh",
+    "freshness_mode",
+    "source_age_ms",
+    "last_seq",
+    "last_frame_seq",
+];
+const TELEMETRY_KEYS: &[&str] = &[
+    "tick_count",
+    "tick_overruns",
+    "tick_dt_ms",
+    "pose_rx_to_tick_ms",
+    "status_age_ms",
+    "frame_skew",
+    "log_dropped",
+];
 
 fn check_status_shape(v: &Value) {
     assert_keys(v, STATUS_KEYS, "status");
@@ -583,22 +943,52 @@ fn check_status_shape(v: &Value) {
     }
     assert_keys(&v["session"], SESSION_KEYS, "session");
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
-    assert_keys(&v["governor"], &["scale", "active", "axis", "reason"], "governor");
+    assert_keys(
+        &v["governor"],
+        &["scale", "active", "axis", "reason"],
+        "governor",
+    );
     assert_keys(
         &v["motion_limits"],
-        &["effective", "requested", "ceiling", "defaults", "operator_max", "game_fields", "limited", "reasons", "pending"],
+        &[
+            "effective",
+            "requested",
+            "ceiling",
+            "defaults",
+            "operator_max",
+            "game_fields",
+            "limited",
+            "reasons",
+            "pending",
+        ],
         "motion_limits",
     );
     assert!(v["motion_limits"]["pending"].is_boolean());
     assert!(v["motion_limits"]["game_fields"].is_array());
-    for k in ["effective", "requested", "ceiling", "defaults", "operator_max"] {
+    for k in [
+        "effective",
+        "requested",
+        "ceiling",
+        "defaults",
+        "operator_max",
+    ] {
         assert_keys(
             &v["motion_limits"][k],
-            &["max_gain", "max_vel_count_s", "max_acc_count_s2", "duty_max_percent"],
+            &[
+                "max_gain",
+                "max_vel_count_s",
+                "max_acc_count_s2",
+                "duty_max_percent",
+            ],
             k,
         );
     }
-    for k in ["tick_dt_ms", "pose_rx_to_tick_ms", "status_age_ms", "frame_skew"] {
+    for k in [
+        "tick_dt_ms",
+        "pose_rx_to_tick_ms",
+        "status_age_ms",
+        "frame_skew",
+    ] {
         assert_keys(&v["telemetry"][k], &["p50", "p95", "p99", "max"], k);
     }
 }
@@ -614,7 +1004,10 @@ async fn status_json_has_every_documented_key() {
     assert_eq!(v["rig_state"], "READY_TO_ARM");
     assert_eq!(v["armed"], false);
     assert!(v["telemetry"]["tick_count"].as_u64().unwrap() > 0);
-    assert!(v["axes"][0]["current_a"].is_null(), "no current sensor: null, not 0");
+    assert!(
+        v["axes"][0]["current_a"].is_null(),
+        "no current sensor: null, not 0"
+    );
 
     // WS pushes the same shape with type = status, without any pose sent.
     let id = new_session(srv.local_addr).await;
@@ -631,7 +1024,10 @@ async fn status_json_has_every_documented_key() {
     }
     // Only a prefix is public: the full id gates pose input.
     assert_eq!(st["session"]["source_session_prefix"], &id[..8]);
-    assert!(!st.to_string().contains(id.as_str()), "full session id leaked in status");
+    assert!(
+        !st.to_string().contains(id.as_str()),
+        "full session id leaked in status"
+    );
     let st2 = next_status(&mut ws).await;
     assert_eq!(st2["type"], "status");
     let _ = ws.next().await;
@@ -641,7 +1037,13 @@ async fn status_json_has_every_documented_key() {
 // ------------------------------------------------------------------ review fixes (stage B)
 
 /// Router whose admin queue and status sender the test holds directly.
-fn manual(cfg: Config) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>) {
+fn manual(
+    cfg: Config,
+) -> (
+    Router,
+    mpsc::Receiver<AdminRequest>,
+    watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>,
+) {
     manual_with_path(cfg, None)
 }
 
@@ -649,7 +1051,11 @@ fn manual(cfg: Config) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<A
 fn manual_with_path(
     cfg: Config,
     config_path: Option<std::path::PathBuf>,
-) -> (Router, mpsc::Receiver<AdminRequest>, watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>) {
+) -> (
+    Router,
+    mpsc::Receiver<AdminRequest>,
+    watch::Sender<Arc<h3cs::supervisor::StatusSnapshot>>,
+) {
     let cfg = Arc::new(cfg);
     let (admin_tx, admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
     let (pose_tx, _pose_rx) = watch::channel(None);
@@ -683,13 +1089,22 @@ async fn fault_latches_whatever_the_body() {
         seen,
         vec![
             AdminCmd::Fault { note: "x".into() },
-            AdminCmd::Fault { note: "unparsed body: note=x".into() },
-            AdminCmd::Fault { note: "unparsed body: {not json".into() },
-            AdminCmd::Fault { note: String::new() },
+            AdminCmd::Fault {
+                note: "unparsed body: note=x".into()
+            },
+            AdminCmd::Fault {
+                note: "unparsed body: {not json".into()
+            },
+            AdminCmd::Fault {
+                note: String::new()
+            },
         ]
     );
     let long = "y".repeat(1000);
-    assert_eq!(api::fault_note(long.as_bytes()).chars().count(), "unparsed body: ".len() + 200);
+    assert_eq!(
+        api::fault_note(long.as_bytes()).chars().count(),
+        "unparsed body: ".len() + 200
+    );
 }
 
 #[tokio::test]
@@ -699,15 +1114,35 @@ async fn disarm_and_fault_are_not_rate_limited() {
     let s = stub(cfg, Some(ok_reply));
     let auth = [("authorization", bearer())];
     let auth: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    assert_eq!(call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0, StatusCode::OK);
-    assert_eq!(call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/arm", &auth, "")).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
     for _ in 0..5 {
-        assert_eq!(call(&s.app, req("POST", "/v1/disarm", &auth, "")).await.0, StatusCode::OK);
-        assert_eq!(call(&s.app, req("POST", "/v1/fault", &auth, "")).await.0, StatusCode::OK);
+        assert_eq!(
+            call(&s.app, req("POST", "/v1/disarm", &auth, "")).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&s.app, req("POST", "/v1/fault", &auth, "")).await.0,
+            StatusCode::OK
+        );
     }
     // Still behind the token.
-    assert_eq!(call(&s.app, req("POST", "/v1/fault", &[], "")).await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(call(&s.app, req("POST", "/v1/fault/reset", &auth, "")).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/fault", &[], "")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/fault/reset", &auth, ""))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]
@@ -727,7 +1162,11 @@ async fn admin_command_answered_503_is_never_executed_late() {
     let (app, mut admin_rx, _status) = manual(sim_cfg());
     let auth = bearer();
     let t = Instant::now();
-    let (st, body) = call(&app, req("POST", "/v1/arm", &[("authorization", &auth)], "")).await;
+    let (st, body) = call(
+        &app,
+        req("POST", "/v1/arm", &[("authorization", &auth)], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "control_loop_unavailable");
     assert!(t.elapsed() >= api::ADMIN_TIMEOUT);
@@ -741,7 +1180,12 @@ async fn admin_command_answered_503_is_never_executed_late() {
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     let (cmd, reply) = admin_rx.try_recv().expect("queued");
     assert!(!reply.claim() && api::runs_when_abandoned(&cmd));
-    for c in [AdminCmd::Disarm, AdminCmd::Fault { note: String::new() }] {
+    for c in [
+        AdminCmd::Disarm,
+        AdminCmd::Fault {
+            note: String::new(),
+        },
+    ] {
         assert!(api::runs_when_abandoned(&c));
     }
     for c in [AdminCmd::Start, AdminCmd::Center, AdminCmd::FaultReset] {
@@ -758,9 +1202,16 @@ async fn claimed_admin_command_is_answered_even_after_the_timeout() {
         assert!(reply.claim());
         // Executing takes past the API timeout.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = reply.send(Ok(AdminOk { rig_state: RigState::Arming, note: None }));
+        let _ = reply.send(Ok(AdminOk {
+            rig_state: RigState::Arming,
+            note: None,
+        }));
     });
-    let (st, body) = call(&app, req("POST", "/v1/arm", &[("authorization", &bearer())], "")).await;
+    let (st, body) = call(
+        &app,
+        req("POST", "/v1/arm", &[("authorization", &bearer())], ""),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["rig_state"], "ARMING");
     loop_task.await.unwrap();
@@ -790,25 +1241,46 @@ async fn non_loopback_peers_get_only_status_and_stop() {
         assert_eq!(st, StatusCode::FORBIDDEN, "{m} {p}");
         assert_eq!(body["error"], "loopback_only");
     }
-    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::OK);
-    assert_eq!(call(&app, req("POST", "/v1/stop", &[], "")).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&app, req("GET", "/v1/status", &[], "")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, req("POST", "/v1/stop", &[], "")).await.0,
+        StatusCode::OK
+    );
     assert_eq!(s.seen.lock().unwrap().as_slice(), &[AdminCmd::Stop]);
     // Loopback peers (also IPv4-mapped) keep everything.
     for local in ["127.0.0.1:50000", "[::ffff:127.0.0.1]:50000", "[::1]:50000"] {
-        let app = s.app.clone().layer(MockConnectInfo(local.parse::<std::net::SocketAddr>().unwrap()));
-        assert_eq!(call(&app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::OK, "{local}");
+        let app = s.app.clone().layer(MockConnectInfo(
+            local.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            call(&app, req("POST", "/v1/session", &[], "")).await.0,
+            StatusCode::OK,
+            "{local}"
+        );
     }
     // Unknown peer: fail closed.
-    assert_eq!(call(&s.app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/session", &[], "")).await.0,
+        StatusCode::FORBIDDEN
+    );
     // Without the knob the bind is loopback-only and nothing is filtered.
     let s = stub(sim_cfg(), Some(ok_reply));
-    assert_eq!(call(&s.app, req("POST", "/v1/session", &[], "")).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&s.app, req("POST", "/v1/session", &[], "")).await.0,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
 async fn status_is_503_once_the_control_loop_is_gone() {
     let (app, _admin_rx, status_tx) = manual(sim_cfg());
-    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&app, req("GET", "/v1/status", &[], "")).await.0,
+        StatusCode::OK
+    );
     drop(status_tx);
     let (st, body) = call(&app, req("GET", "/v1/status", &[], "")).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
@@ -825,7 +1297,8 @@ async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
     let (admin_tx, _admin_rx) = mpsc::channel::<AdminRequest>(api::ADMIN_QUEUE_LEN);
     let (pose_tx, _pose_rx) = watch::channel(None);
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (status_tx, status_rx) = watch::channel(Arc::new(Supervisor::new(&cfg).snapshot(Instant::now())));
+    let (status_tx, status_rx) =
+        watch::channel(Arc::new(Supervisor::new(&cfg).snapshot(Instant::now())));
     let log = shared_event_log(Instant::now());
     let state = AppState::new(
         cfg,
@@ -837,7 +1310,9 @@ async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
         shutdown_rx,
     )
     .with_event_log(log.clone());
-    let app = api::router(state).layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()));
+    let app = api::router(state).layer(MockConnectInfo(
+        "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+    ));
     for k in 1..=5 {
         lock_events(&log).push(Instant::now(), "probe", serde_json::json!({ "k": k }));
     }
@@ -846,18 +1321,47 @@ async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
     assert_eq!(st, StatusCode::OK, "no token needed: {body}");
     assert_eq!(body["next_id"], 6);
     assert_eq!(body["dropped"], 0);
-    let ks = |b: &Value| b["events"].as_array().unwrap().iter().map(|e| e["detail"]["k"].as_i64().unwrap()).collect::<Vec<_>>();
+    let ks = |b: &Value| {
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["detail"]["k"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
     assert_eq!(ks(&body), [1, 2, 3, 4, 5], "oldest first");
-    assert_eq!(ks(&call(&app, req("GET", "/v1/events?n=2", &[], "")).await.1), [4, 5]);
-    assert_eq!(ks(&call(&app, req("GET", "/v1/events?after=3", &[], "")).await.1), [4, 5]);
-    assert_eq!(ks(&call(&app, req("GET", "/v1/events?after=1&n=2", &[], "")).await.1), [4, 5]);
-    assert!(ks(&call(&app, req("GET", "/v1/events?after=5", &[], "")).await.1).is_empty());
+    assert_eq!(
+        ks(&call(&app, req("GET", "/v1/events?n=2", &[], "")).await.1),
+        [4, 5]
+    );
+    assert_eq!(
+        ks(&call(&app, req("GET", "/v1/events?after=3", &[], ""))
+            .await
+            .1),
+        [4, 5]
+    );
+    assert_eq!(
+        ks(&call(&app, req("GET", "/v1/events?after=1&n=2", &[], ""))
+            .await
+            .1),
+        [4, 5]
+    );
+    assert!(ks(&call(&app, req("GET", "/v1/events?after=5", &[], ""))
+        .await
+        .1)
+    .is_empty());
     let (st, body) = call(&app, req("GET", "/v1/events?n=lots", &[], "")).await;
-    assert_eq!((st, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")));
+    assert_eq!(
+        (st, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
 
     // Post-mortem: the loop is gone (status 503) but its events stay readable.
     drop(status_tx);
-    assert_eq!(call(&app, req("GET", "/v1/status", &[], "")).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        call(&app, req("GET", "/v1/status", &[], "")).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     let (st, body) = call(&app, req("GET", "/v1/events", &[], "")).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(ks(&body).len(), 5);
@@ -872,13 +1376,23 @@ async fn events_endpoint_reads_the_shared_ring_even_after_the_loop_died() {
         Arc::new(Mutex::new(PoseIntake::new())),
         Arc::new(watch::channel(None).0),
         mpsc::channel::<AdminRequest>(1).0,
-        watch::channel(Arc::new(Supervisor::new(&sim_cfg()).snapshot(Instant::now()))).1,
+        watch::channel(Arc::new(
+            Supervisor::new(&sim_cfg()).snapshot(Instant::now()),
+        ))
+        .1,
         TOKEN.into(),
         watch::channel(false).1,
     ))
-    .layer(MockConnectInfo("192.168.1.20:50000".parse::<std::net::SocketAddr>().unwrap()));
+    .layer(MockConnectInfo(
+        "192.168.1.20:50000"
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
+    ));
     let (st, body) = call(&lan, req("GET", "/v1/events", &[], "")).await;
-    assert_eq!((st, body["error"].as_str()), (StatusCode::FORBIDDEN, Some("loopback_only")));
+    assert_eq!(
+        (st, body["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("loopback_only"))
+    );
 }
 
 // ------------------------------------------------------------------ axis conflict (DESIGN §10)
@@ -888,7 +1402,11 @@ async fn serve(app: Router) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     addr
 }
@@ -903,7 +1421,15 @@ async fn pose_and_gain_are_rejected_axis_conflict_without_reaching_the_intake() 
     snap.axis_conflict = vec![h3cs::types::AxisId::new(2).unwrap()];
     let (status_tx, status_rx) = watch::channel(Arc::new(snap.clone()));
     let session = Arc::new(Mutex::new(PoseIntake::new()));
-    let state = AppState::new(cfg, session.clone(), Arc::new(pose_tx), admin_tx, status_rx, TOKEN.into(), shutdown_rx);
+    let state = AppState::new(
+        cfg,
+        session.clone(),
+        Arc::new(pose_tx),
+        admin_tx,
+        status_rx,
+        TOKEN.into(),
+        shutdown_rx,
+    );
     let addr = serve(api::router(state)).await;
 
     let id = new_session(addr).await;
@@ -917,8 +1443,14 @@ async fn pose_and_gain_are_rejected_axis_conflict_without_reaching_the_intake() 
     let gain = serde_json::json!({"type": "gain", "protocol": 1, "source_session": id, "seq": 2, "gain": 0.2}).to_string();
     ws_send(&mut ws, gain).await;
     let ack = next_ack(&mut ws).await;
-    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
-    assert!(pose_rx.borrow().is_none(), "nothing stored for the supervisor");
+    assert_eq!(
+        (ack["accepted"].as_bool(), ack["reason"].as_str()),
+        (Some(false), Some("axis_conflict"))
+    );
+    assert!(
+        pose_rx.borrow().is_none(),
+        "nothing stored for the supervisor"
+    );
     {
         let s = session.lock().unwrap();
         assert!(s.latest().is_none());
@@ -955,7 +1487,13 @@ async fn arm_start_center_pass_the_supervisors_axis_conflict_as_409() {
         assert_eq!(st, StatusCode::CONFLICT, "{path}: {body}");
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"], "axis_conflict");
-        assert!(body["blockers"][0].as_str().unwrap().starts_with("axis_conflict: axis2"), "{body}");
+        assert!(
+            body["blockers"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("axis_conflict: axis2"),
+            "{body}"
+        );
     }
     // Stop (no token) is unaffected.
     let (st, body) = call(&s.app, req("POST", "/v1/stop", &[], "")).await;
@@ -973,20 +1511,32 @@ async fn calibrate_routes_need_the_token_and_carry_the_axes() {
     let s = stub(sim_cfg(), Some(ok_reply));
     let h = auth_headers();
     let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    for p in ["/v1/calibrate", "/v1/calibrate/cancel", "/v1/calibration/export"] {
+    for p in [
+        "/v1/calibrate",
+        "/v1/calibrate/cancel",
+        "/v1/calibration/export",
+    ] {
         let (st, body) = call(&s.app, req("POST", p, &[], "")).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{p}");
         assert_eq!(body["error"], "unauthorized");
         let (st, _) = call(&s.app, req("GET", p, &h, "")).await;
         assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "{p}");
-        let (st, body) = call(&s.app, req("POST", p, &[("origin", "http://evil.example")], "")).await;
+        let (st, body) = call(
+            &s.app,
+            req("POST", p, &[("origin", "http://evil.example")], ""),
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(body["error"], "forbidden_origin");
     }
     assert!(s.seen.lock().unwrap().is_empty());
     let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, "")).await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (st, _) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[3,1]}"#)).await;
+    let (st, _) = call(
+        &s.app,
+        req("POST", "/v1/calibrate", &h, r#"{"axes":[3,1]}"#),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[4]}"#)).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -994,8 +1544,16 @@ async fn calibrate_routes_need_the_token_and_carry_the_axes() {
     let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, "{not json")).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "bad_request");
-    let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[1],"mode":0}"#)).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "unknown fields are refused: {body}");
+    let (st, body) = call(
+        &s.app,
+        req("POST", "/v1/calibrate", &h, r#"{"axes":[1],"mode":0}"#),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "unknown fields are refused: {body}"
+    );
     let (st, _) = call(&s.app, req("POST", "/v1/calibrate/cancel", &h, "")).await;
     assert_eq!(st, StatusCode::OK);
     let ax = |n: u8| h3cs::types::AxisId::new(n).unwrap();
@@ -1003,18 +1561,29 @@ async fn calibrate_routes_need_the_token_and_carry_the_axes() {
         s.seen.lock().unwrap().clone(),
         vec![
             AdminCmd::Calibrate { axes: vec![] },
-            AdminCmd::Calibrate { axes: vec![ax(3), ax(1)] },
+            AdminCmd::Calibrate {
+                axes: vec![ax(3), ax(1)]
+            },
             AdminCmd::CalibrateCancel,
         ]
     );
     // Supervisor refusal → 409 with the code and blockers.
-    let s = stub(sim_cfg(), Some(|_: &AdminCmd| {
-        Err(AdminError { error: "power_axis_required".into(), blockers: vec!["power_axis_required: axis1 drives the main power".into()] })
-    }));
+    let s = stub(
+        sim_cfg(),
+        Some(|_: &AdminCmd| {
+            Err(AdminError {
+                error: "power_axis_required".into(),
+                blockers: vec!["power_axis_required: axis1 drives the main power".into()],
+            })
+        }),
+    );
     let (st, body) = call(&s.app, req("POST", "/v1/calibrate", &h, r#"{"axes":[2]}"#)).await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(body["error"], "power_axis_required");
-    assert_eq!(body["blockers"][0], "power_axis_required: axis1 drives the main power");
+    assert_eq!(
+        body["blockers"][0],
+        "power_axis_required: axis1 drives the main power"
+    );
 }
 
 #[tokio::test]
@@ -1026,7 +1595,11 @@ async fn calibration_routes_are_closed_to_the_lan() {
     let s = stub(cfg, Some(ok_reply));
     let app = s.app.clone().layer(MockConnectInfo(lan));
     let auth = bearer();
-    for p in ["/v1/calibrate", "/v1/calibrate/cancel", "/v1/calibration/export"] {
+    for p in [
+        "/v1/calibrate",
+        "/v1/calibrate/cancel",
+        "/v1/calibration/export",
+    ] {
         let (st, body) = call(&app, req("POST", p, &[("authorization", &auth)], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(body["error"], "loopback_only");
@@ -1073,20 +1646,29 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "no_calibration_result");
-    assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "nothing written");
+    assert!(
+        std::fs::read_dir(&dir).unwrap().count() == 1,
+        "nothing written"
+    );
 
     // Axis 1 OK (sign +1), axis 3 OK (sign −1), axis 2 FAILED (left alone).
     let mut snap = Supervisor::new(&cfg).snapshot(Instant::now());
     snap.axes[0].calibration = Some(cal_ok(6000));
     // The result carries the unit that measured it; the snapshot's own
     // device_id (here sim.toml's) is not what gets written.
-    assert_ne!(snap.axes[0].device_id, h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58));
+    assert_ne!(
+        snap.axes[0].device_id,
+        h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58)
+    );
     snap.axes[1].calibration = Some(h3cs::supervisor::CalibrationResult {
         result: h3cs::protocol::CalResultCode::Failed,
         reason: "stall".into(),
         ..cal_ok(0)
     });
-    snap.axes[2].calibration = Some(h3cs::supervisor::CalibrationResult { device_id: h3cs::types::DeviceId(0x5131_30ed_a00b_2040), ..cal_ok(-6138) });
+    snap.axes[2].calibration = Some(h3cs::supervisor::CalibrationResult {
+        device_id: h3cs::types::DeviceId(0x5131_30ed_a00b_2040),
+        ..cal_ok(-6138)
+    });
     status_tx.send_replace(Arc::new(snap));
 
     // Overwrite refusal: the names of this second and the next already exist.
@@ -1102,7 +1684,11 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "exists");
     for p in &taken {
-        assert_eq!(std::fs::read_to_string(p).unwrap(), "placeholder", "not overwritten");
+        assert_eq!(
+            std::fs::read_to_string(p).unwrap(),
+            "placeholder",
+            "not overwritten"
+        );
         std::fs::remove_file(p).unwrap();
     }
 
@@ -1112,22 +1698,51 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
     assert_eq!(path.parent(), Some(dir.as_path()));
     let name = path.file_name().unwrap().to_str().unwrap();
-    assert!(name.starts_with("h3-sim.calibration-") && name.ends_with(".toml"), "{name}");
+    assert!(
+        name.starts_with("h3-sim.calibration-") && name.ends_with(".toml"),
+        "{name}"
+    );
     let axes = body["axes"].as_array().unwrap();
     assert_eq!(axes.len(), 2);
     assert_eq!(axes[0]["axis_id"], 1);
     assert_eq!(axes[0]["device_id"], "51311cdbd4ba8d58");
-    assert_eq!((axes[0]["mechanical_min_count"].as_i64(), axes[0]["mechanical_max_count"].as_i64()), (Some(0), Some(6000)));
-    assert_eq!((axes[0]["soft_min_count"].as_i64(), axes[0]["soft_max_count"].as_i64()), (Some(300), Some(5700)));
     assert_eq!(
-        (axes[0]["count_at_virtual_0"].as_i64(), axes[0]["count_at_virtual_512"].as_i64(), axes[0]["count_at_virtual_1023"].as_i64()),
+        (
+            axes[0]["mechanical_min_count"].as_i64(),
+            axes[0]["mechanical_max_count"].as_i64()
+        ),
+        (Some(0), Some(6000))
+    );
+    assert_eq!(
+        (
+            axes[0]["soft_min_count"].as_i64(),
+            axes[0]["soft_max_count"].as_i64()
+        ),
+        (Some(300), Some(5700))
+    );
+    assert_eq!(
+        (
+            axes[0]["count_at_virtual_0"].as_i64(),
+            axes[0]["count_at_virtual_512"].as_i64(),
+            axes[0]["count_at_virtual_1023"].as_i64()
+        ),
         (Some(300), Some(3000), Some(5700))
     );
     assert_eq!(axes[1]["axis_id"], 3);
     assert_eq!(axes[1]["device_id"], "513130eda00b2040");
-    assert_eq!((axes[1]["mechanical_min_count"].as_i64(), axes[1]["mechanical_max_count"].as_i64()), (Some(-6138), Some(0)));
     assert_eq!(
-        (axes[1]["count_at_virtual_0"].as_i64(), axes[1]["count_at_virtual_512"].as_i64(), axes[1]["count_at_virtual_1023"].as_i64()),
+        (
+            axes[1]["mechanical_min_count"].as_i64(),
+            axes[1]["mechanical_max_count"].as_i64()
+        ),
+        (Some(-6138), Some(0))
+    );
+    assert_eq!(
+        (
+            axes[1]["count_at_virtual_0"].as_i64(),
+            axes[1]["count_at_virtual_512"].as_i64(),
+            axes[1]["count_at_virtual_1023"].as_i64()
+        ),
         (Some(-300), Some(-3069), Some(-5838)),
         "sign −1: virtual still grows from the P end (0) toward the N end"
     );
@@ -1135,24 +1750,70 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     // The file is a valid config with those numbers, the untouched axis, the
     // original comments and a header.
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.starts_with("# h3-control-server が校正結果から書き出した設定"), "{text}");
+    assert!(
+        text.starts_with("# h3-control-server が校正結果から書き出した設定"),
+        "{text}"
+    );
     assert!(text.contains("（UTC）"));
     assert!(text.contains("# axis 1: device_id 51311cdbd4ba8d58 / CAL_RESULT n_end_count 6000 neutral_count 3000 sign +1"));
-    assert!(text.contains("axis 1 mechanical_max_count: 2814 -> 6000"), "previous value in the header: {text}");
-    assert!(text.contains("calibration_valid = false   # 模擬軸のみ"), "value replaced, comment kept: {text}");
-    assert!(text.contains("# 模擬軸 N は selected_axis = N を名乗る"), "other comments kept");
+    assert!(
+        text.contains("axis 1 mechanical_max_count: 2814 -> 6000"),
+        "previous value in the header: {text}"
+    );
+    assert!(
+        text.contains("calibration_valid = false   # 模擬軸のみ"),
+        "value replaced, comment kept: {text}"
+    );
+    assert!(
+        text.contains("# 模擬軸 N は selected_axis = N を名乗る"),
+        "other comments kept"
+    );
     let out = Config::load(&path).unwrap();
     let a1 = out.axis(h3cs::types::AxisId::new(1).unwrap()).unwrap();
     assert_eq!(a1.device_id, h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58));
     assert!(!a1.calibration_valid);
-    assert_eq!((a1.mechanical_min_count, a1.mechanical_max_count, a1.soft_min_count, a1.soft_max_count), (0, 6000, 300, 5700));
-    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (300, 3000, 5700));
+    assert_eq!(
+        (
+            a1.mechanical_min_count,
+            a1.mechanical_max_count,
+            a1.soft_min_count,
+            a1.soft_max_count
+        ),
+        (0, 6000, 300, 5700)
+    );
+    assert_eq!(
+        (
+            a1.count_at_virtual_0,
+            a1.count_at_virtual_512,
+            a1.count_at_virtual_1023
+        ),
+        (300, 3000, 5700)
+    );
     assert_eq!(a1.decel_zone_count, 300);
     let a2 = out.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap();
-    assert_eq!(a2, cfg.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap(), "FAILED axis left as it was");
+    assert_eq!(
+        a2,
+        cfg.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap(),
+        "FAILED axis left as it was"
+    );
     let a3 = out.axis(h3cs::types::AxisId::new(3).unwrap()).unwrap();
-    assert_eq!((a3.mechanical_min_count, a3.mechanical_max_count, a3.soft_min_count, a3.soft_max_count), (-6138, 0, -5838, -300));
-    assert_eq!((a3.count_at_virtual_0, a3.count_at_virtual_512, a3.count_at_virtual_1023), (-300, -3069, -5838));
+    assert_eq!(
+        (
+            a3.mechanical_min_count,
+            a3.mechanical_max_count,
+            a3.soft_min_count,
+            a3.soft_max_count
+        ),
+        (-6138, 0, -5838, -300)
+    );
+    assert_eq!(
+        (
+            a3.count_at_virtual_0,
+            a3.count_at_virtual_512,
+            a3.count_at_virtual_1023
+        ),
+        (-300, -3069, -5838)
+    );
     assert!(!a3.calibration_valid);
     // Everything but the axis values is the running config.
     assert_eq!(out.rig_id, cfg.rig_id);
@@ -1168,7 +1829,10 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     let (st, body) = call(&app, req("POST", "/v1/calibration/export", &h, "")).await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "invalid_result");
-    assert!(body["detail"].as_str().unwrap().contains("soft_min_count"), "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("soft_min_count"),
+        "{body}"
+    );
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
 
     // Without a config path (server not started from a file): 500.
@@ -1185,7 +1849,8 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
 // ------------------------------------------------------------------ motion limits (design 2026-11-01 §5.3)
 
 fn limits_json(session: &str, seq: u64, fields: Value) -> String {
-    let mut m = serde_json::json!({"type": "limits", "protocol": 1, "source_session": session, "seq": seq});
+    let mut m =
+        serde_json::json!({"type": "limits", "protocol": 1, "source_session": session, "seq": seq});
     for (k, v) in fields.as_object().unwrap() {
         m[k] = v.clone();
     }
@@ -1207,7 +1872,10 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(v["ceiling"]["duty_max_percent"], 60);
     assert_eq!(v["ceiling"]["max_vel_count_s"], 6000);
     assert_eq!(v["defaults"]["max_acc_count_s2"], 15000);
-    assert_eq!(v["operator_max"], v["defaults"], "the game channel's cap is the operator's [limits]");
+    assert_eq!(
+        v["operator_max"], v["defaults"],
+        "the game channel's cap is the operator's [limits]"
+    );
     assert_eq!(v["game_fields"], serde_json::json!([]));
     assert_eq!(v["limited"], serde_json::json!([]));
 
@@ -1215,7 +1883,15 @@ async fn limits_over_ws_and_rest() {
     // [limits] allow → held to them, not to the firmware ceilings (Issue #15).
     let id = new_session(addr).await;
     let mut ws = ws_connect(addr, &id).await;
-    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_gain": 0.8, "max_vel_count_s": 7000}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(
+            &id,
+            1,
+            serde_json::json!({"max_gain": 0.8, "max_vel_count_s": 7000}),
+        ),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["seq"], 1);
@@ -1224,7 +1900,10 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
     assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 15000);
     assert_eq!(ack["limits"], serde_json::json!(["operator_limited"]));
-    assert_eq!(ack["fresh"], false, "a limits message never extends freshness");
+    assert_eq!(
+        ack["fresh"], false,
+        "a limits message never extends freshness"
+    );
     // The pose is still held to the operator's 0.5.
     ws_send(&mut ws, pose_json(&id, 2, 1, 0.1, 0.0, 0.0, 0.7)).await;
     let ack = next_ack(&mut ws).await;
@@ -1234,7 +1913,11 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(ack["fresh"], true);
     // Lowering is the game's to do, and re-clamps the pose being tracked
     // (no new pose needed).
-    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_gain": 0.3}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 3, serde_json::json!({"max_gain": 0.3})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_gain"], 0.3);
@@ -1251,14 +1934,32 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(st["requested_gain"], 0.7);
     assert_eq!(st["effective_gain"], 0.3, "{st}");
     assert_eq!(st["limits"], serde_json::json!(["gain_limited"]));
-    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_gain": 0.8}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 4, serde_json::json!({"max_gain": 0.8})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
-    assert_eq!((ack["accepted"].as_bool(), ack["effective_gain"].as_f64()), (Some(true), Some(0.5)));
+    assert_eq!(
+        (ack["accepted"].as_bool(), ack["effective_gain"].as_f64()),
+        (Some(true), Some(0.5))
+    );
     // Invalid value: rejected, seq not consumed.
-    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 0}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 5, serde_json::json!({"duty_max_percent": 0})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
-    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("out_of_range")));
-    ws_send(&mut ws, limits_json(&id, 5, serde_json::json!({"duty_max_percent": 30}))).await;
+    assert_eq!(
+        (ack["accepted"].as_bool(), ack["reason"].as_str()),
+        (Some(false), Some("out_of_range"))
+    );
+    ws_send(
+        &mut ws,
+        limits_json(&id, 5, serde_json::json!({"duty_max_percent": 30})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["duty_max_percent"], 30);
@@ -1278,15 +1979,30 @@ async fn limits_over_ws_and_rest() {
     assert_eq!(ml["requested"]["max_vel_count_s"], 7000);
     assert_eq!(ml["requested"]["max_gain"], 0.8);
     assert_eq!(ml["operator_max"]["max_vel_count_s"], 3000);
-    assert_eq!(ml["game_fields"], serde_json::json!(["max_gain", "max_vel_count_s", "duty_max_percent"]));
-    assert_eq!(ml["limited"], serde_json::json!(["max_gain", "max_vel_count_s"]));
-    assert_eq!(ml["reasons"], serde_json::json!(["operator_limited"]), "{ml}");
+    assert_eq!(
+        ml["game_fields"],
+        serde_json::json!(["max_gain", "max_vel_count_s", "duty_max_percent"])
+    );
+    assert_eq!(
+        ml["limited"],
+        serde_json::json!(["max_gain", "max_vel_count_s"])
+    );
+    assert_eq!(
+        ml["reasons"],
+        serde_json::json!(["operator_limited"]),
+        "{ml}"
+    );
     // The simulated axes received the new duty cap.
     let mut ok = false;
     for _ in 0..30 {
         let r = http(addr, "GET", "/v1/status", &[], None).await;
         let v = r.json();
-        if v["axes"].as_array().unwrap().iter().all(|a| a["fw_limits"]["duty_max_percent"] == 30) {
+        if v["axes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["fw_limits"]["duty_max_percent"] == 30)
+        {
             ok = true;
             break;
         }
@@ -1296,14 +2012,42 @@ async fn limits_over_ws_and_rest() {
 
     // REST (the admin): token required; applies the same patch rules.
     let bearer = format!("Bearer {TOKEN}");
-    let r = http(addr, "POST", "/v1/limits", &[], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[],
+        Some(r#"{"max_acc_count_s2": 1000}"#),
+    )
+    .await;
     assert_eq!(r.status, 401);
-    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some("not json")).await;
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[("Authorization", &bearer)],
+        Some("not json"),
+    )
+    .await;
     assert_eq!(r.status, 400);
-    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_vel_count_s": -1}"#)).await;
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[("Authorization", &bearer)],
+        Some(r#"{"max_vel_count_s": -1}"#),
+    )
+    .await;
     assert_eq!(r.status, 400);
     assert_eq!(r.json()["error"], "out_of_range");
-    let r = http(addr, "POST", "/v1/limits", &[("Authorization", &bearer)], Some(r#"{"max_acc_count_s2": 1000}"#)).await;
+    let r = http(
+        addr,
+        "POST",
+        "/v1/limits",
+        &[("Authorization", &bearer)],
+        Some(r#"{"max_acc_count_s2": 1000}"#),
+    )
+    .await;
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
     // The game's 7000 is still held to 3000; 3000 count/s at 1000 count/s²
@@ -1311,8 +2055,14 @@ async fn limits_over_ws_and_rest() {
     // reported (Issue #15 H2).
     assert_eq!(v["requested"]["max_acc_count_s2"], 1000);
     assert_eq!(v["effective"]["max_acc_count_s2"], 2500);
-    assert_eq!(v["limited"], serde_json::json!(["max_gain", "max_vel_count_s", "max_acc_count_s2"]));
-    assert_eq!(v["reasons"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    assert_eq!(
+        v["limited"],
+        serde_json::json!(["max_gain", "max_vel_count_s", "max_acc_count_s2"])
+    );
+    assert_eq!(
+        v["reasons"],
+        serde_json::json!(["operator_limited", "stop_time_limited"])
+    );
     assert_eq!(v["effective"]["duty_max_percent"], 30, "other fields kept");
     // The admin may raise above the operator's values, up to the firmware
     // ceilings; the fields it writes leave the game's cap.
@@ -1328,21 +2078,40 @@ async fn limits_over_ws_and_rest() {
     let v = r.json();
     assert_eq!(v["effective"]["max_gain"], 0.8);
     assert_eq!(v["effective"]["max_vel_count_s"], 6000, "firmware ceiling");
-    assert_eq!(v["effective"]["max_acc_count_s2"], 5000, "6000 count/s needs 5000 count/s² to stop in time");
+    assert_eq!(
+        v["effective"]["max_acc_count_s2"], 5000,
+        "6000 count/s needs 5000 count/s² to stop in time"
+    );
     assert_eq!(v["game_fields"], serde_json::json!(["duty_max_percent"]));
-    assert_eq!(v["limited"], serde_json::json!(["max_vel_count_s", "max_acc_count_s2"]));
-    assert_eq!(v["reasons"], serde_json::json!(["ceiling_clamped", "stop_time_limited"]));
+    assert_eq!(
+        v["limited"],
+        serde_json::json!(["max_vel_count_s", "max_acc_count_s2"])
+    );
+    assert_eq!(
+        v["reasons"],
+        serde_json::json!(["ceiling_clamped", "stop_time_limited"])
+    );
     // The game writing the field again puts it back under the cap.
-    ws_send(&mut ws, limits_json(&id, 6, serde_json::json!({"max_vel_count_s": 6500}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 6, serde_json::json!({"max_vel_count_s": 6500})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["max_vel_count_s"], 3000);
     assert_eq!(ack["effective_gain"], 0.8, "the admin's gain stays");
     // (the admin's max_acc 1000 is again raised for the capped 3000 count/s)
     assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 2500);
-    assert_eq!(ack["limits"], serde_json::json!(["operator_limited", "stop_time_limited"]));
+    assert_eq!(
+        ack["limits"],
+        serde_json::json!(["operator_limited", "stop_time_limited"])
+    );
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
-    assert_eq!(v["game_fields"], serde_json::json!(["max_vel_count_s", "duty_max_percent"]));
+    assert_eq!(
+        v["game_fields"],
+        serde_json::json!(["max_vel_count_s", "duty_max_percent"])
+    );
 
     // A new session resets everything to the configured defaults (and
     // releases every field).
@@ -1367,26 +2136,50 @@ async fn limits_stop_time_rule_over_ws() {
     let id = new_session(addr).await;
     let mut ws = ws_connect(addr, &id).await;
 
-    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_vel_count_s": 600}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 1, serde_json::json!({"max_vel_count_s": 600})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["limits"], serde_json::json!([]));
     // acc 1 at 600 count/s: 600 s to stop. Raised to ceil(600 / 1.2) = 500.
-    ws_send(&mut ws, limits_json(&id, 2, serde_json::json!({"max_acc_count_s2": 1}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 2, serde_json::json!({"max_acc_count_s2": 1})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["max_vel_count_s"], 600);
     assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 500);
     assert_eq!(ack["limits"], serde_json::json!(["stop_time_limited"]));
     // A consistent pair in one message is taken as is …
-    ws_send(&mut ws, limits_json(&id, 3, serde_json::json!({"max_vel_count_s": 300, "max_acc_count_s2": 250}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(
+            &id,
+            3,
+            serde_json::json!({"max_vel_count_s": 300, "max_acc_count_s2": 250}),
+        ),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["max_vel_count_s"], 300);
     assert_eq!(ack["effective_limits"]["max_acc_count_s2"], 250);
     assert_eq!(ack["limits"], serde_json::json!([]));
     // … and an inconsistent one is judged on the NEW velocity (1200 needs 1000).
-    ws_send(&mut ws, limits_json(&id, 4, serde_json::json!({"max_vel_count_s": 1200, "max_acc_count_s2": 900}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(
+            &id,
+            4,
+            serde_json::json!({"max_vel_count_s": 1200, "max_acc_count_s2": 900}),
+        ),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
     assert_eq!(ack["accepted"], true, "{ack}");
     assert_eq!(ack["effective_limits"]["max_vel_count_s"], 1200);
@@ -1400,10 +2193,19 @@ async fn limits_stop_time_rule_over_ws() {
         }
         st = next_status(&mut ws).await;
     }
-    assert_eq!(st["motion_limits"]["effective"]["max_vel_count_s"], 1200, "{st}");
+    assert_eq!(
+        st["motion_limits"]["effective"]["max_vel_count_s"], 1200,
+        "{st}"
+    );
     assert_eq!(st["motion_limits"]["requested"]["max_acc_count_s2"], 900);
-    assert_eq!(st["motion_limits"]["limited"], serde_json::json!(["max_acc_count_s2"]));
-    assert_eq!(st["motion_limits"]["reasons"], serde_json::json!(["stop_time_limited"]));
+    assert_eq!(
+        st["motion_limits"]["limited"],
+        serde_json::json!(["max_acc_count_s2"])
+    );
+    assert_eq!(
+        st["motion_limits"]["reasons"],
+        serde_json::json!(["stop_time_limited"])
+    );
     assert_eq!(st["motion_limits"]["pending"], false);
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["effective"]["max_acc_count_s2"], 1000);
@@ -1422,13 +2224,28 @@ async fn limits_message_is_rejected_during_an_axis_conflict() {
     snap.axis_conflict = vec![h3cs::types::AxisId::new(2).unwrap()];
     let (_status_tx, status_rx) = watch::channel(Arc::new(snap));
     let session = Arc::new(Mutex::new(PoseIntake::new()));
-    let state = AppState::new(cfg, session, Arc::new(pose_tx), admin_tx, status_rx, TOKEN.into(), shutdown_rx);
+    let state = AppState::new(
+        cfg,
+        session,
+        Arc::new(pose_tx),
+        admin_tx,
+        status_rx,
+        TOKEN.into(),
+        shutdown_rx,
+    );
     let addr = serve(api::router(state)).await;
     let id = new_session(addr).await;
     let mut ws = ws_connect(addr, &id).await;
-    ws_send(&mut ws, limits_json(&id, 1, serde_json::json!({"max_gain": 0.9}))).await;
+    ws_send(
+        &mut ws,
+        limits_json(&id, 1, serde_json::json!({"max_gain": 0.9})),
+    )
+    .await;
     let ack = next_ack(&mut ws).await;
-    assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
+    assert_eq!(
+        (ack["accepted"].as_bool(), ack["reason"].as_str()),
+        (Some(false), Some("axis_conflict"))
+    );
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["requested"]["max_gain"], 0.5, "not applied");
 }

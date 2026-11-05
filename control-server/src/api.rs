@@ -71,9 +71,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::connect_info::{ConnectInfo, MockConnectInfo};
 use axum::extract::rejection::QueryRejection;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -89,10 +89,11 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::calibration_export::{self, AxisExport};
 use crate::config::{bounded_ms, Config};
 use crate::limits::{
-    self as motion_limits, Ceilings, LimitsPatch, LimitsRequest, MotionLimits, PatchError, SharedLimits, Source,
+    self as motion_limits, Ceilings, LimitsPatch, LimitsRequest, MotionLimits, PatchError,
+    SharedLimits, Source,
 };
 use crate::protocol::CalResultCode;
-use crate::session::{AckMsg, AcceptedPose, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
+use crate::session::{AcceptedPose, AckMsg, ClientMsg, PoseIntake, RejectReason, PROTOCOL_VERSION};
 use crate::supervisor::{AdminCmd, AdminError, AdminOk, StatusSnapshot};
 use crate::telemetry::{lock_events, shared_event_log, SharedEventLog};
 use crate::types::{AxisId, Counts};
@@ -131,7 +132,12 @@ impl AdminReplyTx {
     /// the API's give-up wins.
     pub fn claim(&self) -> bool {
         self.claim
-            .compare_exchange(CLAIM_WAITING, CLAIM_TAKEN, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                CLAIM_WAITING,
+                CLAIM_TAKEN,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok()
     }
 
@@ -144,7 +150,10 @@ impl AdminReplyTx {
 /// Commands that run even after the requester gave up: they only make the rig
 /// safer, so a late execution is better than none.
 pub fn runs_when_abandoned(cmd: &AdminCmd) -> bool {
-    matches!(cmd, AdminCmd::Stop | AdminCmd::Disarm | AdminCmd::Fault { .. })
+    matches!(
+        cmd,
+        AdminCmd::Stop | AdminCmd::Disarm | AdminCmd::Fault { .. }
+    )
 }
 
 /// Hard per-frame/message cap of the WS transport. Larger messages close
@@ -187,10 +196,23 @@ impl AppState {
         admin_token: String,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
-        let bucket = Mutex::new(TokenBucket::new(cfg.server.admin_rate_limit_per_s, Instant::now()));
+        let bucket = Mutex::new(TokenBucket::new(
+            cfg.server.admin_rate_limit_per_s,
+            Instant::now(),
+        ));
         let limits = motion_limits::shared(MotionLimits::from_config(&cfg.limits));
         Self {
-            inner: Arc::new(Inner { cfg, limits, session, pose_tx, admin_tx, status_rx, admin_token, bucket, shutdown_rx }),
+            inner: Arc::new(Inner {
+                cfg,
+                limits,
+                session,
+                pose_tx,
+                admin_tx,
+                status_rx,
+                admin_token,
+                bucket,
+                shutdown_rx,
+            }),
             events: shared_event_log(Instant::now()),
             config_path: None,
         }
@@ -208,10 +230,16 @@ impl AppState {
             admin_tx: arc.admin_tx.clone(),
             status_rx: arc.status_rx.clone(),
             admin_token: arc.admin_token.clone(),
-            bucket: Mutex::new(TokenBucket::new(arc.cfg.server.admin_rate_limit_per_s, Instant::now())),
+            bucket: Mutex::new(TokenBucket::new(
+                arc.cfg.server.admin_rate_limit_per_s,
+                Instant::now(),
+            )),
             shutdown_rx: arc.shutdown_rx.clone(),
         });
-        Self { inner: Arc::new(Inner { limits, ..inner }), ..self }
+        Self {
+            inner: Arc::new(Inner { limits, ..inner }),
+            ..self
+        }
     }
 
     /// The `[limits]` values (what a new session resets to).
@@ -266,7 +294,10 @@ impl AppState {
     /// Where the running config was read from: `POST /v1/calibration/export`
     /// writes next to it. Without it the export answers 500 `no_config_path`.
     pub fn with_config_path(self, path: Option<std::path::PathBuf>) -> Self {
-        Self { config_path: path.map(Arc::new), ..self }
+        Self {
+            config_path: path.map(Arc::new),
+            ..self
+        }
     }
 
     /// Serve `GET /v1/events` from this log (the control loop's). Without it
@@ -288,10 +319,22 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub fn router(state: AppState) -> Router {
     let max_body = state.inner.cfg.server.max_body_bytes;
     let limited = Router::new()
-        .route("/v1/arm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Arm)))
-        .route("/v1/start", post(|s: State<AppState>| admin_simple(s, AdminCmd::Start)))
-        .route("/v1/fault/reset", post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)))
-        .route("/v1/center", post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)))
+        .route(
+            "/v1/arm",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::Arm)),
+        )
+        .route(
+            "/v1/start",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::Start)),
+        )
+        .route(
+            "/v1/fault/reset",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::FaultReset)),
+        )
+        .route(
+            "/v1/center",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::Center)),
+        )
         .route("/v1/reference", post(reference))
         .route("/v1/limits", post(set_limits))
         .route("/v1/calibrate", post(calibrate))
@@ -299,9 +342,15 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
     // Safety direction: token, but never rate limited.
     let admin = Router::new()
-        .route("/v1/disarm", post(|s: State<AppState>| admin_simple(s, AdminCmd::Disarm)))
+        .route(
+            "/v1/disarm",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::Disarm)),
+        )
         .route("/v1/fault", post(fault))
-        .route("/v1/calibrate/cancel", post(|s: State<AppState>| admin_simple(s, AdminCmd::CalibrateCancel)))
+        .route(
+            "/v1/calibrate/cancel",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::CalibrateCancel)),
+        )
         .merge(limited)
         // Outermost: auth before the rate limit.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -315,9 +364,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/limits", get(get_limits))
         .route("/v1/events", get(events))
-        .route("/v1/stop", post(|s: State<AppState>| admin_simple(s, AdminCmd::Stop)))
+        .route(
+            "/v1/stop",
+            post(|s: State<AppState>| admin_simple(s, AdminCmd::Stop)),
+        )
         .merge(admin)
-        .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed") })
+        .method_not_allowed_fallback(|| async {
+            error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+        })
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
         .layer(DefaultBodyLimit::max(max_body))
         .layer(RequestBodyLimitLayer::new(max_body))
@@ -334,7 +388,8 @@ fn error(code: StatusCode, err: &str) -> Response {
 
 /// Routes a non-loopback peer may use when `allow_non_loopback` is set.
 fn lan_allowed(method: &Method, path: &str) -> bool {
-    (method == Method::GET && path == "/v1/status") || (method == Method::POST && path == "/v1/stop")
+    (method == Method::GET && path == "/v1/status")
+        || (method == Method::POST && path == "/v1/stop")
 }
 
 fn peer_addr(req: &Request) -> Option<SocketAddr> {
@@ -379,11 +434,16 @@ pub fn same_origin_loopback(origin: &str, host: Option<&str>) -> bool {
         h
     };
     let loopback = hostname.eq_ignore_ascii_case("localhost")
-        || hostname.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+        || hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback());
     if !loopback {
         return false;
     }
-    let Some(rest) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("HTTP://")) else {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("HTTP://"))
+    else {
         return false;
     };
     rest.eq_ignore_ascii_case(host)
@@ -399,7 +459,8 @@ fn request_host(req: &Request) -> Option<&str> {
 async fn check_origin(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let allowed = origin.to_str().is_ok_and(|o| {
-            st.inner.cfg.server.allowed_origins.iter().any(|a| a == o) || same_origin_loopback(o, request_host(&req))
+            st.inner.cfg.server.allowed_origins.iter().any(|a| a == o)
+                || same_origin_loopback(o, request_host(&req))
         });
         if !allowed {
             return error(StatusCode::FORBIDDEN, "forbidden_origin");
@@ -419,7 +480,8 @@ async fn require_token(State(st): State<AppState>, req: Request, next: Next) -> 
         return next.run(req).await;
     }
     let mut resp = error(StatusCode::UNAUTHORIZED, "unauthorized");
-    resp.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     resp
 }
 
@@ -461,7 +523,11 @@ pub struct TokenBucket {
 impl TokenBucket {
     pub fn new(rate_per_s: u32, now: Instant) -> Self {
         let rate = f64::from(rate_per_s);
-        Self { rate, tokens: rate, last: now }
+        Self {
+            rate,
+            tokens: rate,
+            last: now,
+        }
     }
 
     /// Take one token; false when exhausted.
@@ -493,7 +559,11 @@ async fn joystick_page() -> Response {
 
 /// `text/html`, `Cache-Control: no-store` (the pages change with the binary).
 fn embedded_page(html: &'static str) -> Response {
-    ([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], Html(html)).into_response()
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Html(html),
+    )
+        .into_response()
 }
 
 // ------------------------------------------------------------------ admin
@@ -501,7 +571,10 @@ fn embedded_page(html: &'static str) -> Response {
 async fn send_admin(st: &AppState, cmd: AdminCmd) -> Response {
     let (tx, mut rx) = oneshot::channel();
     let claim = Arc::new(AtomicU8::new(CLAIM_WAITING));
-    let reply = AdminReplyTx { tx, claim: claim.clone() };
+    let reply = AdminReplyTx {
+        tx,
+        claim: claim.clone(),
+    };
     let fut = async {
         st.inner.admin_tx.send((cmd, reply)).await.ok()?;
         (&mut rx).await.ok()
@@ -510,20 +583,30 @@ async fn send_admin(st: &AppState, cmd: AdminCmd) -> Response {
         Ok(a) => a,
         Err(_) => {
             let gave_up = claim
-                .compare_exchange(CLAIM_WAITING, CLAIM_ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(
+                    CLAIM_WAITING,
+                    CLAIM_ABANDONED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok();
             if gave_up {
                 None
             } else {
                 // The loop took it just now and is executing it: wait for the answer.
-                tokio::time::timeout(ADMIN_TIMEOUT, rx).await.ok().and_then(Result::ok)
+                tokio::time::timeout(ADMIN_TIMEOUT, rx)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
             }
         }
     };
     match answer {
-        Some(Ok(ok)) => {
-            (StatusCode::OK, Json(json!({"ok": true, "rig_state": ok.rig_state, "note": ok.note}))).into_response()
-        }
+        Some(Ok(ok)) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "rig_state": ok.rig_state, "note": ok.note})),
+        )
+            .into_response(),
         Some(Err(e)) => (
             StatusCode::CONFLICT,
             Json(json!({"ok": false, "error": e.error, "blockers": e.blockers})),
@@ -551,7 +634,14 @@ async fn reference(State(st): State<AppState>, body: Bytes) -> Response {
     let Some(axis) = AxisId::new(b.axis) else {
         return error(StatusCode::BAD_REQUEST, "bad_axis");
     };
-    send_admin(&st, AdminCmd::Reference { axis, count: b.count }).await
+    send_admin(
+        &st,
+        AdminCmd::Reference {
+            axis,
+            count: b.count,
+        },
+    )
+    .await
 }
 
 /// Longest note kept from an unparsable /v1/fault body (characters).
@@ -572,14 +662,23 @@ pub fn fault_note(body: &[u8]) -> String {
     match serde_json::from_slice::<FaultBody>(body) {
         Ok(b) => b.note,
         Err(_) => {
-            let text: String = String::from_utf8_lossy(body).chars().take(FAULT_NOTE_MAX_CHARS).collect();
+            let text: String = String::from_utf8_lossy(body)
+                .chars()
+                .take(FAULT_NOTE_MAX_CHARS)
+                .collect();
             format!("unparsed body: {text}")
         }
     }
 }
 
 async fn fault(State(st): State<AppState>, body: Bytes) -> Response {
-    send_admin(&st, AdminCmd::Fault { note: fault_note(&body) }).await
+    send_admin(
+        &st,
+        AdminCmd::Fault {
+            note: fault_note(&body),
+        },
+    )
+    .await
 }
 
 // ------------------------------------------------------------------ calibration
@@ -612,7 +711,11 @@ async fn calibrate(State(st): State<AppState>, body: Bytes) -> Response {
 }
 
 fn error_detail(code: StatusCode, err: &str, detail: String) -> Response {
-    (code, Json(json!({"ok": false, "error": err, "detail": detail}))).into_response()
+    (
+        code,
+        Json(json!({"ok": false, "error": err, "detail": detail})),
+    )
+        .into_response()
 }
 
 /// `POST /v1/calibration/export`: see the module docs and
@@ -628,8 +731,16 @@ async fn calibration_export(State(st): State<AppState>) -> Response {
     let snap = st.inner.status_rx.borrow().clone();
     let mut axes: Vec<AxisExport> = Vec::new();
     for a in &snap.axes {
-        let Some(r) = a.calibration.as_ref().filter(|r| r.result == CalResultCode::Ok) else { continue };
-        let Some(ac) = cfg.axis(a.axis_id) else { continue };
+        let Some(r) = a
+            .calibration
+            .as_ref()
+            .filter(|r| r.result == CalResultCode::Ok)
+        else {
+            continue;
+        };
+        let Some(ac) = cfg.axis(a.axis_id) else {
+            continue;
+        };
         match calibration_export::derive(a.axis_id, r.device_id, ac.decel_zone_count, r) {
             Ok(e) => axes.push(e),
             Err(e) => return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e),
@@ -651,7 +762,11 @@ async fn calibration_export(State(st): State<AppState>) -> Response {
             Json(json!({"ok": true, "path": written, "axes": axes})).into_response()
         }
         Ok(Err((code, err, detail))) => error_detail(code, err, detail),
-        Err(e) => error_detail(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e.to_string()),
+        Err(e) => error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_failed",
+            e.to_string(),
+        ),
     }
 }
 
@@ -662,27 +777,62 @@ fn write_export(
     rig_id: &str,
     axes: &[AxisExport],
 ) -> Result<(std::path::PathBuf, Vec<AxisExport>), ExportError> {
-    let text = std::fs::read_to_string(config_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "config_read_failed", format!("{}: {e}", config_path.display())))?;
+    let text = std::fs::read_to_string(config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_read_failed",
+            format!("{}: {e}", config_path.display()),
+        )
+    })?;
     let rewrite = calibration_export::rewrite_toml(&text, axes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "rewrite_failed", e))?;
     let ts = calibration_export::utc_timestamp(std::time::SystemTime::now());
-    let head = calibration_export::header(&ts, &config_path.display().to_string(), axes, &rewrite.replaced);
+    let head = calibration_export::header(
+        &ts,
+        &config_path.display().to_string(),
+        axes,
+        &rewrite.replaced,
+    );
     let full = format!("{head}{}", rewrite.text);
-    Config::from_toml_str(&full).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "invalid_result", e.to_string()))?;
-    let dir = config_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    Config::from_toml_str(&full).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_result",
+            e.to_string(),
+        )
+    })?;
+    let dir = config_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
     let out = dir.join(calibration_export::file_name(rig_id, &ts));
-    let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&out) {
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err((StatusCode::CONFLICT, "exists", out.display().to_string()))
         }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "write_failed", format!("{}: {e}", out.display()))),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "write_failed",
+                format!("{}: {e}", out.display()),
+            ))
+        }
     };
     use std::io::Write as _;
     f.write_all(full.as_bytes())
         .and_then(|()| f.sync_all())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "write_failed", format!("{}: {e}", out.display())))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "write_failed",
+                format!("{}: {e}", out.display()),
+            )
+        })?;
     Ok((out, axes.to_vec()))
 }
 
@@ -750,7 +900,11 @@ async fn set_limits(State(st): State<AppState>, body: Bytes) -> Response {
 
 /// Replace the present fields of the shared requested set, recording who
 /// wrote them (`Source::Game` → held to the operator's values by the clamp).
-fn apply_limits_patch(st: &AppState, patch: &LimitsPatch, source: Source) -> Result<(), PatchError> {
+fn apply_limits_patch(
+    st: &AppState,
+    patch: &LimitsPatch,
+    source: Source,
+) -> Result<(), PatchError> {
     let mut guard = st.inner.limits.lock().unwrap_or_else(|e| e.into_inner());
     guard.apply(patch, source)
 }
@@ -767,7 +921,10 @@ async fn status(State(st): State<AppState>) -> Response {
     }
     let mut v = serde_json::to_value(&*st.inner.status_rx.borrow().clone()).unwrap_or(Value::Null);
     if let Value::Object(m) = &mut v {
-        m.insert("admin_token_required".into(), Value::from(!st.inner.admin_token.is_empty()));
+        m.insert(
+            "admin_token_required".into(),
+            Value::from(!st.inner.admin_token.is_empty()),
+        );
     }
     Json(v).into_response()
 }
@@ -783,7 +940,10 @@ struct EventsQuery {
 
 /// `GET /v1/events?n=&after=`: the newest `n` events (default
 /// [`EVENTS_DEFAULT_N`], at most the ring size) with `id > after`, oldest first.
-async fn events(State(st): State<AppState>, q: Result<Query<EventsQuery>, QueryRejection>) -> Response {
+async fn events(
+    State(st): State<AppState>,
+    q: Result<Query<EventsQuery>, QueryRejection>,
+) -> Response {
     let Ok(Query(q)) = q else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
@@ -806,7 +966,11 @@ struct MotionQuery {
     session: Option<String>,
 }
 
-async fn motion(State(st): State<AppState>, q: Query<MotionQuery>, ws: WebSocketUpgrade) -> Response {
+async fn motion(
+    State(st): State<AppState>,
+    q: Query<MotionQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
     let limit = ws_hard_limit(st.inner.cfg.server.max_body_bytes);
     let pinned = q.0.session;
     ws.max_message_size(limit)
@@ -852,11 +1016,16 @@ async fn motion_ws(st: AppState, mut socket: WebSocket, pinned: Option<String>) 
 }
 
 fn bad_message(st: &AppState) -> AckMsg {
-    AckMsg::rejected(None, RejectReason::BadMessage, st.session().is_fresh(Instant::now()))
+    AckMsg::rejected(
+        None,
+        RejectReason::BadMessage,
+        st.session().is_fresh(Instant::now()),
+    )
 }
 
 fn ack_json(a: &AckMsg) -> String {
-    serde_json::to_string(a).unwrap_or_else(|_| r#"{"type":"ack","accepted":false,"reason":"bad_message"}"#.into())
+    serde_json::to_string(a)
+        .unwrap_or_else(|_| r#"{"type":"ack","accepted":false,"reason":"bad_message"}"#.into())
 }
 
 fn status_json(st: &AppState) -> String {
@@ -864,7 +1033,10 @@ fn status_json(st: &AppState) -> String {
     let mut v = serde_json::to_value(&*snap).unwrap_or(Value::Null);
     if let Value::Object(m) = &mut v {
         m.insert("type".into(), Value::from("status"));
-        m.insert("admin_token_required".into(), Value::from(!st.inner.admin_token.is_empty()));
+        m.insert(
+            "admin_token_required".into(),
+            Value::from(!st.inner.admin_token.is_empty()),
+        );
     }
     v.to_string()
 }
@@ -920,9 +1092,17 @@ fn handle_text(st: &AppState, text: &str, pinned: Option<&str>) -> AckMsg {
     let max_gain = st.current_max_gain();
     let result = match &msg {
         ClientMsg::Pose(p) => s
-            .accept_pose(p, recv_at, &cfg.game, max_gain, cfg.timing.source_freshness_ms)
+            .accept_pose(
+                p,
+                recv_at,
+                &cfg.game,
+                max_gain,
+                cfg.timing.source_freshness_ms,
+            )
             .map(|a| (a.checked.effective_gain, a.checked.limits.clone(), Some(a))),
-        ClientMsg::Gain(g) => s.accept_gain(g, &cfg.game, max_gain).map(|u| (u.effective_gain, u.limits, u.pose)),
+        ClientMsg::Gain(g) => s
+            .accept_gain(g, &cfg.game, max_gain)
+            .map(|u| (u.effective_gain, u.limits, u.pose)),
         ClientMsg::Limits(_) => unreachable!("handled above"),
     };
     match result {

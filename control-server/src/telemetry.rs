@@ -59,7 +59,13 @@ impl LatencyStats {
     /// `capacity` 0 is treated as 1.
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
-        Self { buf: Vec::with_capacity(cap), cap, next: 0, count: 0, max_all: None }
+        Self {
+            buf: Vec::with_capacity(cap),
+            cap,
+            next: 0,
+            count: 0,
+            max_all: None,
+        }
     }
 
     /// Record one sample; non-finite values are ignored.
@@ -161,17 +167,33 @@ impl EventLog {
     /// `capacity` 0 is treated as 1.
     pub fn new(start: Instant, capacity: usize) -> Self {
         let cap = capacity.max(1);
-        Self { start, cap, events: VecDeque::with_capacity(cap), next_id: 1, dropped: 0 }
+        Self {
+            start,
+            cap,
+            events: VecDeque::with_capacity(cap),
+            next_id: 1,
+            dropped: 0,
+        }
     }
 
     /// Append an event; returns its id.
-    pub fn push(&mut self, now: Instant, kind: impl Into<String>, detail: serde_json::Value) -> u64 {
+    pub fn push(
+        &mut self,
+        now: Instant,
+        kind: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> u64 {
         if self.events.len() >= self.cap {
             self.events.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
         let id = self.next_id;
-        self.events.push_back(LogEvent { id, t_ms: ms_since(self.start, now), kind: kind.into(), detail });
+        self.events.push_back(LogEvent {
+            id,
+            t_ms: ms_since(self.start, now),
+            kind: kind.into(),
+            detail,
+        });
         self.next_id = self.next_id.saturating_add(1);
         id
     }
@@ -290,7 +312,10 @@ impl Telemetry {
     /// Same, appending events to an existing shared log.
     pub fn with_event_log(events: SharedEventLog) -> Self {
         let start = lock_events(&events).start();
-        Self { events, ..Self::new(start) }
+        Self {
+            events,
+            ..Self::new(start)
+        }
     }
 
     pub fn summary(&self, recorder: Option<&Recorder>) -> TelemetrySummary {
@@ -325,12 +350,21 @@ impl Recorder {
 
     /// A recorder that records nothing (and counts nothing as dropped).
     pub fn disabled() -> Self {
-        Self { tx: None, dropped: Arc::default(), written: Arc::default(), task: None }
+        Self {
+            tx: None,
+            dropped: Arc::default(),
+            written: Arc::default(),
+            task: None,
+        }
     }
 
     /// Append to `path` (created if missing). Must be called inside a runtime.
     pub async fn open(path: &Path, queue: usize) -> io::Result<Self> {
-        let file = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await?;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
         Ok(Self::spawn(file, queue))
     }
 
@@ -342,7 +376,12 @@ impl Recorder {
         let (tx, rx) = mpsc::channel(queue.max(1));
         let written = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(write_loop(writer, rx, written.clone()));
-        Self { tx: Some(tx), dropped: Arc::default(), written, task: Some(task) }
+        Self {
+            tx: Some(tx),
+            dropped: Arc::default(),
+            written,
+            task: Some(task),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -353,7 +392,9 @@ impl Recorder {
     /// (always false, uncounted, when disabled).
     pub fn record<T: Serialize + ?Sized>(&self, rec: &T) -> bool {
         let Some(tx) = &self.tx else { return false };
-        let ok = serde_json::to_string(rec).ok().is_some_and(|line| tx.try_send(line).is_ok());
+        let ok = serde_json::to_string(rec)
+            .ok()
+            .is_some_and(|line| tx.try_send(line).is_ok());
         if !ok {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -380,7 +421,11 @@ impl Recorder {
     }
 }
 
-async fn write_loop<W>(writer: W, mut rx: mpsc::Receiver<String>, written: Arc<AtomicU64>) -> io::Result<()>
+async fn write_loop<W>(
+    writer: W,
+    mut rx: mpsc::Receiver<String>,
+    written: Arc<AtomicU64>,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {

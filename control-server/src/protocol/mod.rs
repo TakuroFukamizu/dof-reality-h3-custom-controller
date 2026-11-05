@@ -325,7 +325,10 @@ fn reason_str(r: &[u8; CAL_REASON_LEN]) -> String {
     String::from_utf8_lossy(&r[..end]).into_owned()
 }
 
-fn serialize_reason<S: serde::Serializer>(r: &[u8; CAL_REASON_LEN], s: S) -> Result<S::Ok, S::Error> {
+fn serialize_reason<S: serde::Serializer>(
+    r: &[u8; CAL_REASON_LEN],
+    s: S,
+) -> Result<S::Ok, S::Error> {
     s.serialize_str(&reason_str(r))
 }
 
@@ -682,7 +685,11 @@ impl HostMsg {
                 request_id,
                 reference_count,
             } => w.u32(request_id).i32(reference_count),
-            HostMsg::Calibrate { request_id, mode, flags } => w.u32(request_id).u8(mode).u8(flags).u16(0),
+            HostMsg::Calibrate {
+                request_id,
+                mode,
+                flags,
+            } => w.u32(request_id).u8(mode).u8(flags).u16(0),
             HostMsg::SetLimits(l) => w
                 .u32(l.request_id)
                 .u8(l.duty_max_percent)

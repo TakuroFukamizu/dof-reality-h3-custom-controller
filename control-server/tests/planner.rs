@@ -7,7 +7,10 @@ use h3cs::types::LimitReason;
 const DT: f64 = 0.01;
 
 fn lim(v: f64, a: f64) -> AxisLimits {
-    AxisLimits { max_vel_count_s: v, max_acc_count_s2: a }
+    AxisLimits {
+        max_vel_count_s: v,
+        max_acc_count_s2: a,
+    }
 }
 
 fn lims(v: f64, a: f64) -> [AxisLimits; 3] {
@@ -36,7 +39,12 @@ impl Rng {
 }
 
 /// Run `step_track` until settled (or `max_steps`), returning every output.
-fn run_track(p: &mut Planner, t: [f64; 3], l: [AxisLimits; 3], max_steps: usize) -> Vec<PlanOutput> {
+fn run_track(
+    p: &mut Planner,
+    t: [f64; 3],
+    l: [AxisLimits; 3],
+    max_steps: usize,
+) -> Vec<PlanOutput> {
     let mut outs = Vec::new();
     for _ in 0..max_steps {
         let o = p.step_track(t, l, DT);
@@ -86,7 +94,10 @@ fn one_axis_saturation_scales_all_steps_by_the_same_ratio() {
         for j in 0..3 {
             let r_step = steps[i] / steps[j];
             let r_err = errs[i] / errs[j];
-            assert!((r_step - r_err).abs() < 1e-9 * r_err.abs().max(1.0), "{i}/{j}: {r_step} vs {r_err}");
+            assert!(
+                (r_step - r_err).abs() < 1e-9 * r_err.abs().max(1.0),
+                "{i}/{j}: {r_step} vs {r_err}"
+            );
         }
     }
     // The slower axes are far below their own limit: they were scaled, not clipped.
@@ -123,7 +134,10 @@ fn acceleration_ramps_from_rest() {
     for k in 1..=10 {
         let o = p.step_track([100_000.0, 0.0, 0.0], l, DT);
         let v = o.velocities[0];
-        assert!((v - prev_v - a * DT).abs() < 1e-9, "step {k}: {prev_v} → {v}");
+        assert!(
+            (v - prev_v - a * DT).abs() < 1e-9,
+            "step {k}: {prev_v} → {v}"
+        );
         assert!(o.limits.contains(&LimitReason::AccelerationLimited));
         prev_v = v;
     }
@@ -167,7 +181,11 @@ fn reaches_target_from_rest_without_overshoot_and_settles_exactly() {
     for o in &outs {
         for i in 0..3 {
             // Same side of the target as the start (0), never past it.
-            assert!(o.positions[i] * target[i].signum() <= target[i].abs() + 1e-9, "{:?}", o.positions);
+            assert!(
+                o.positions[i] * target[i].signum() <= target[i].abs() + 1e-9,
+                "{:?}",
+                o.positions
+            );
         }
     }
     // Stays settled.
@@ -193,11 +211,18 @@ fn reaches_target_without_overshoot_when_moving_the_opposite_way() {
     assert_eq!(last.positions, target);
     for o in &outs {
         for i in 0..3 {
-            assert!(o.positions[i] <= target[i] + 1e-9, "axis {i} overshot: {:?}", o.positions);
+            assert!(
+                o.positions[i] <= target[i] + 1e-9,
+                "axis {i} overshot: {:?}",
+                o.positions
+            );
         }
     }
     // It really did first continue away (decelerating at a), then come back.
-    let min0 = outs.iter().map(|o| o.positions[0]).fold(f64::INFINITY, f64::min);
+    let min0 = outs
+        .iter()
+        .map(|o| o.positions[0])
+        .fold(f64::INFINITY, f64::min);
     assert!(min0 < start[0]);
 }
 
@@ -264,9 +289,17 @@ fn step_stop_after_full_speed_tracking_stops_before_the_target() {
         let mut prev_v = q.velocities()[0];
         loop {
             let o = q.step_stop(l, DT);
-            assert!(o.positions[0] <= target + 1e-9, "stop from step {k} overshot: {}", o.positions[0]);
+            assert!(
+                o.positions[0] <= target + 1e-9,
+                "stop from step {k} overshot: {}",
+                o.positions[0]
+            );
             // Braking at a, not an abrupt stop at the target (the envelope holds).
-            assert!((prev_v - o.velocities[0]).abs() <= 20000.0 * DT + 1e-9, "step {k}: {prev_v} → {}", o.velocities[0]);
+            assert!(
+                (prev_v - o.velocities[0]).abs() <= 20000.0 * DT + 1e-9,
+                "step {k}: {prev_v} → {}",
+                o.velocities[0]
+            );
             prev_v = o.velocities[0];
             if o.settled {
                 break;
@@ -315,7 +348,13 @@ fn invalid_input_does_not_move_or_panic() {
         let o = p.step_track([0.0, t, 0.0], l, DT);
         assert_eq!(o.positions, pos);
     }
-    for bad in [lim(f64::NAN, 1.0), lim(1.0, f64::NAN), lim(-1.0, 1.0), lim(1.0, 0.0), lim(1.0, f64::INFINITY)] {
+    for bad in [
+        lim(f64::NAN, 1.0),
+        lim(1.0, f64::NAN),
+        lim(-1.0, 1.0),
+        lim(1.0, 0.0),
+        lim(1.0, f64::INFINITY),
+    ] {
         let o = p.step_track([100.0; 3], [l[0], bad, l[2]], DT);
         assert_eq!(o.positions, pos);
         let o = p.step_stop([bad, l[1], l[2]], DT);
@@ -331,7 +370,11 @@ fn invalid_input_does_not_move_or_panic() {
 #[test]
 fn zero_velocity_limit_freezes_every_axis() {
     let mut p = planner_at([0, 0, 0]);
-    let l = [lim(4000.0, 20000.0), lim(0.0, 20000.0), lim(4000.0, 20000.0)];
+    let l = [
+        lim(4000.0, 20000.0),
+        lim(0.0, 20000.0),
+        lim(4000.0, 20000.0),
+    ];
     let o = p.step_track([100.0, 100.0, 100.0], l, DT);
     assert_eq!(o.positions, [0.0; 3]);
     assert!(o.limits.contains(&LimitReason::VelocityLimited));
@@ -351,10 +394,17 @@ fn monotonic_approach_over_random_targets() {
             let o = p.step_track(target, l, DT);
             for i in 0..3 {
                 let err = (target[i] - o.positions[i]).abs();
-                assert!(err <= prev_err[i] + 1e-9, "case {case} axis {i}: {} → {err}", prev_err[i]);
+                assert!(
+                    err <= prev_err[i] + 1e-9,
+                    "case {case} axis {i}: {} → {err}",
+                    prev_err[i]
+                );
                 // Same side as the start: never crossed.
                 let side0 = target[i] - start[i] as f64;
-                assert!((target[i] - o.positions[i]) * side0 >= -1e-9, "case {case} axis {i} crossed");
+                assert!(
+                    (target[i] - o.positions[i]) * side0 >= -1e-9,
+                    "case {case} axis {i} crossed"
+                );
                 assert!(o.velocities[i].abs() <= l[i].max_vel_count_s + 1e-9);
                 prev_err[i] = err;
             }

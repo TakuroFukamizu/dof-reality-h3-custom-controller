@@ -130,6 +130,7 @@ EOF2
 | --- | --- |
 | `FAULT_LATCHED`（ENCODER_FAULT など、基準を失うもの） | 操作者に「シートが空いているか」を確認 → `POST /v1/fault/reset` → `POST /v1/calibrate {"axes":[1,2]}`（#3 単独は不可。主電源担当の #1 が要る）→ 両軸が `CALIBRATING` を抜けるまで待つ（約 20 s）→ ログの `cal_result` が `"reason":"ok"`（#1 5555〜5556 / 2777〜2778、#2 5508〜5509 / 2754 がいつもの値）→ **サーバーを再起動**（校正後は `calibration_stale` で ARM できない）→ `POST /v1/reference {"axis":3,"count":3069}` → `READY_TO_ARM` |
 | `FAULT_LATCHED`（FOLLOWING_ERROR など、軸がソフトリミットの内側） | `POST /v1/fault/reset` だけで `READY_TO_ARM` に戻ることがある（status の `blockers` を見る） |
+| `FAULT_LATCHED`（画面の非常停止 `LOCAL_ESTOP` だけ） | ボード画面でラッチを解除する。報告した軸が FAULT を出なくなり、サーバーが協調で止めた他軸の `HOST_FAULT` へ FAULT_RESET を送ると、`POST /v1/fault/reset` なしで `READY_TO_ARM` に戻る（自動では ARM しない。ログ `fault_auto_cleared`、`cause` は `local_estop_released`）。別の軸の `LOCAL_ESTOP` が残っている間、または `ENCODER_FAULT` などが混ざっているときは、従来どおり `POST /v1/fault/reset` |
 | SOFT_LIMIT で軸がソフトリミットの外 | ARM できない（`position_outside_soft_limits`）。校正で戻す。機械端のすぐそばから校正すると失敗することがある（Issue #34）。失敗したら繰り返さず、操作者に実機を見てもらう |
 | 校正が `stall` / `slow` で失敗 | 2 回失敗したら止める（モーターを端に押し付け続けない）。端に当たっていないか・主電源・MD13S の LED を操作者に確認してもらう |
 | USB の無応答（status_age が伸びる、全軸 `sof0`） | Issue #11。ハブの上流を差し直すと戻る（MCU は再起動せず基準も残る） |

@@ -29,7 +29,10 @@ fn check_pose_rejects_non_finite_with_field_name() {
     for (p, g, field) in cases {
         // Non-finite is rejected even in clamp mode.
         for clamp in [true, false] {
-            assert_eq!(check_pose(p, g, 0.35, clamp), Err(PoseError::NonFinite(field)));
+            assert_eq!(
+                check_pose(p, g, 0.35, clamp),
+                Err(PoseError::NonFinite(field))
+            );
         }
     }
 }
@@ -43,8 +46,14 @@ fn check_pose_clamps_out_of_range_and_reports_once() {
 
 #[test]
 fn check_pose_rejects_out_of_range_when_clamping_disabled() {
-    assert_eq!(check_pose(pose(0.0, 1.0001, 0.0), 0.3, 0.35, false), Err(PoseError::OutOfRange("roll")));
-    assert_eq!(check_pose(pose(-1.1, 0.0, 0.0), 0.3, 0.35, false), Err(PoseError::OutOfRange("pitch")));
+    assert_eq!(
+        check_pose(pose(0.0, 1.0001, 0.0), 0.3, 0.35, false),
+        Err(PoseError::OutOfRange("roll"))
+    );
+    assert_eq!(
+        check_pose(pose(-1.1, 0.0, 0.0), 0.3, 0.35, false),
+        Err(PoseError::OutOfRange("pitch"))
+    );
     // Boundaries are inclusive.
     assert!(check_pose(pose(-1.0, 1.0, -1.0), 0.3, 0.35, false).is_ok());
 }
@@ -64,7 +73,10 @@ fn check_pose_gain_limits() {
     assert!(c.limits.is_empty());
 
     let c = check_pose(pose(2.0, 0.0, 0.0), 0.9, 0.35, true).unwrap();
-    assert_eq!(c.limits, vec![LimitReason::PoseClamped, LimitReason::GainLimited]);
+    assert_eq!(
+        c.limits,
+        vec![LimitReason::PoseClamped, LimitReason::GainLimited]
+    );
 }
 
 #[test]
@@ -85,10 +97,19 @@ fn mixed(p: Pose, g: f64) -> [f64; 3] {
 fn mix_matches_plan_table_signs() {
     // architecture §12, gain 0.35 → g = 178.85. Signs are the h3_direct contract.
     let g = 0.35 * 511.0;
-    assert_eq!(mixed(pose(1.0, 0.0, 0.0), 0.35), [512.0 + g, 512.0 - g, 512.0]);
-    assert_eq!(mixed(pose(0.0, 1.0, 0.0), 0.35), [512.0 + g, 512.0 + g, 512.0]);
+    assert_eq!(
+        mixed(pose(1.0, 0.0, 0.0), 0.35),
+        [512.0 + g, 512.0 - g, 512.0]
+    );
+    assert_eq!(
+        mixed(pose(0.0, 1.0, 0.0), 0.35),
+        [512.0 + g, 512.0 + g, 512.0]
+    );
     assert_eq!(mixed(pose(0.0, 0.0, 1.0), 0.35), [512.0, 512.0, 512.0 + g]);
-    assert_eq!(mixed(pose(-1.0, 0.0, 0.0), 0.35), [512.0 - g, 512.0 + g, 512.0]);
+    assert_eq!(
+        mixed(pose(-1.0, 0.0, 0.0), 0.35),
+        [512.0 - g, 512.0 + g, 512.0]
+    );
     assert_eq!(mixed(Pose::ZERO, 0.35), [512.0; 3]);
 }
 
@@ -105,18 +126,36 @@ fn saturate_reports_only_when_changed() {
     let v = [VirtualPos(0.0), VirtualPos(512.0), VirtualPos(1023.0)];
     assert_eq!(saturate(v, 0.0, 1023.0), (v, false));
 
-    let (out, sat) = saturate([VirtualPos(1534.0), VirtualPos(-510.0), VirtualPos(700.0)], 0.0, 1023.0);
+    let (out, sat) = saturate(
+        [VirtualPos(1534.0), VirtualPos(-510.0), VirtualPos(700.0)],
+        0.0,
+        1023.0,
+    );
     assert!(sat);
-    assert_eq!(out, [VirtualPos(1023.0), VirtualPos(0.0), VirtualPos(700.0)]);
+    assert_eq!(
+        out,
+        [VirtualPos(1023.0), VirtualPos(0.0), VirtualPos(700.0)]
+    );
 
-    let (out, sat) = saturate([VirtualPos(50.0), VirtualPos(512.0), VirtualPos(990.0)], 100.0, 900.0);
+    let (out, sat) = saturate(
+        [VirtualPos(50.0), VirtualPos(512.0), VirtualPos(990.0)],
+        100.0,
+        900.0,
+    );
     assert!(sat);
-    assert_eq!(out, [VirtualPos(100.0), VirtualPos(512.0), VirtualPos(900.0)]);
+    assert_eq!(
+        out,
+        [VirtualPos(100.0), VirtualPos(512.0), VirtualPos(900.0)]
+    );
 }
 
 #[test]
 fn saturate_nan_and_inverted_bounds_do_not_panic() {
-    let (out, sat) = saturate([VirtualPos(f64::NAN), VirtualPos(1.0), VirtualPos(2.0)], 0.0, 1023.0);
+    let (out, sat) = saturate(
+        [VirtualPos(f64::NAN), VirtualPos(1.0), VirtualPos(2.0)],
+        0.0,
+        1023.0,
+    );
     assert!(sat);
     assert_eq!(out[0], VirtualPos(0.0));
     let _ = saturate([VirtualPos(5.0); 3], 10.0, 0.0);
@@ -140,7 +179,10 @@ fn legacy_send_value_truncates_toward_zero_then_clamps() {
 fn legacy_wire_bytes_layout() {
     assert_eq!(
         LegacyH3Model::wire_bytes([690, 333, 512]),
-        vec![b'[', b'A', 0x02, 0xB2, b']', b'[', b'B', 0x01, 0x4D, b']', b'[', b'C', 0x02, 0x00, b']']
+        vec![
+            b'[', b'A', 0x02, 0xB2, b']', b'[', b'B', 0x01, 0x4D, b']', b'[', b'C', 0x02, 0x00,
+            b']'
+        ]
     );
 }
 
@@ -193,7 +235,10 @@ struct Scenario {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn run_scenario(sc: &Scenario) {
@@ -221,8 +266,17 @@ fn run_scenario(sc: &Scenario) {
         for (si, ((v, cur), e)) in got.iter().zip(expected.iter()).enumerate() {
             let at = format!("{} op {oi} ({op:?}) send {si}", sc.name);
             assert_eq!(*v, e.v, "{at}: wire values");
-            assert_eq!(cur.map(f64::to_bits), e.cur.map(f64::to_bits), "{at}: cur {cur:?} vs {:?}", e.cur);
-            assert_eq!(LegacyH3Model::wire_bytes(*v), unhex(e.wire), "{at}: wire bytes");
+            assert_eq!(
+                cur.map(f64::to_bits),
+                e.cur.map(f64::to_bits),
+                "{at}: cur {cur:?} vs {:?}",
+                e.cur
+            );
+            assert_eq!(
+                LegacyH3Model::wire_bytes(*v),
+                unhex(e.wire),
+                "{at}: wire bytes"
+            );
         }
     }
 }
@@ -237,7 +291,10 @@ fn legacy_model_matches_python_recordings() {
 #[test]
 fn legacy_center_method_matches_recorded_center() {
     // The saturate_then_center fixture ends with H3.center(); replay it through `center()`.
-    let sc = FIXTURES.iter().find(|s| s.name == "saturate_then_center").unwrap();
+    let sc = FIXTURES
+        .iter()
+        .find(|s| s.name == "saturate_then_center")
+        .unwrap();
     let mut m = LegacyH3Model::new(sc.gain, sc.max_step);
     let (last, rest) = sc.ops.split_last().unwrap();
     for (op, _) in rest {
@@ -258,8 +315,14 @@ fn fixtures_cover_plan_table_and_first_step() {
     // First send from centre differs from the converged value by max_step.
     assert_eq!(find("plan_pitch").ops[0].1[0].v, [552, 472, 512]);
     // Converged plan table, gain 0.35.
-    assert_eq!(find("plan_pitch").ops.last().unwrap().1[0].v, [690, 333, 512]);
-    assert_eq!(find("plan_roll").ops.last().unwrap().1[0].v, [690, 690, 512]);
+    assert_eq!(
+        find("plan_pitch").ops.last().unwrap().1[0].v,
+        [690, 333, 512]
+    );
+    assert_eq!(
+        find("plan_roll").ops.last().unwrap().1[0].v,
+        [690, 690, 512]
+    );
     assert_eq!(find("plan_yaw").ops.last().unwrap().1[0].v, [512, 512, 690]);
 }
 
@@ -855,14 +918,21 @@ fn orient_identity_by_default() {
 /// versa. With the swap, a pure game pitch moves #1 and #2 the same way.
 #[test]
 fn orient_swap_sends_game_pitch_to_common_mode() {
-    let o = Orientation { swap_pitch_roll: true, ..Orientation::default() };
+    let o = Orientation {
+        swap_pitch_roll: true,
+        ..Orientation::default()
+    };
     let game_pitch = pose(1.0, 0.0, 0.0);
     let v = mix(orient(game_pitch, o), 0.35);
     assert_eq!(v[0], v[1], "swapped pitch must be common mode: {v:?}");
     assert!(v[0].0 > 512.0);
     let game_roll = pose(0.0, 1.0, 0.0);
     let v = mix(orient(game_roll, o), 0.35);
-    assert_eq!(v[0].0 - 512.0, -(v[1].0 - 512.0), "swapped roll must be differential: {v:?}");
+    assert_eq!(
+        v[0].0 - 512.0,
+        -(v[1].0 - 512.0),
+        "swapped roll must be differential: {v:?}"
+    );
     // yaw untouched by the swap
     assert_eq!(orient(pose(0.0, 0.0, 0.7), o), pose(0.0, 0.0, 0.7));
 }
@@ -871,8 +941,16 @@ fn orient_swap_sends_game_pitch_to_common_mode() {
 /// always means "the game's forward is this rig's backward".
 #[test]
 fn orient_inversions_refer_to_game_axes() {
-    let o = Orientation { swap_pitch_roll: true, invert_pitch: true, ..Orientation::default() };
+    let o = Orientation {
+        swap_pitch_roll: true,
+        invert_pitch: true,
+        ..Orientation::default()
+    };
     assert_eq!(orient(pose(0.5, 0.25, 0.0), o), pose(0.25, -0.5, 0.0));
-    let o = Orientation { invert_roll: true, invert_yaw: true, ..Orientation::default() };
+    let o = Orientation {
+        invert_roll: true,
+        invert_yaw: true,
+        ..Orientation::default()
+    };
     assert_eq!(orient(pose(0.5, 0.25, -0.1), o), pose(0.5, -0.25, 0.1));
 }

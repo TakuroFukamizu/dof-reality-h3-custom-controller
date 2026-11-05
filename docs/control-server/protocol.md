@@ -78,7 +78,7 @@ frame:         header(4) payload(N) crc(2)
 | 4 | `ACTIVE` | SET_POSITION の `target_count` に追従 |
 | 5 | `STOPPING` | CONTROLLED_STOP / 期限切れ等で、速度・加速度制限内で減速して停止中。停止後 `HOLDING`。DISARM による減速なら停止後 `DISARMING`、COMMAND_TIMEOUT による減速なら停止後 `FAULT`（この間 `fault_code ≠ NONE`、§3.2） |
 | 6 | `DISARMING` | ブレーキ給電 OFF → `BRAKE_APPLY_WAIT_MS` → PWM 0 → 主電源 OFF（電源担当軸のみ）→ `DISARMED` |
-| 7 | `FAULT` | 異常ラッチ。PWM 0・ブレーキ作動・主電源 OFF 指令。FAULT_RESET まで解除しない |
+| 7 | `FAULT` | 異常ラッチ。PWM 0・ブレーキ作動・主電源 OFF 指令。通常は FAULT_RESET まで解除しない。例外は `LOCAL_ESTOP` だけで、画面のラッチを解除し他の原因が無いとき、その場で DISARMED に戻る（§3.2） |
 | 8 | `CALIBRATING` | CALIBRATE 受理後、端当て校正の間（§1.2）。MCU 主導。終了で DISARMED |
 
 PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支えている状態。
@@ -99,7 +99,7 @@ PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支え�
 | 9 | `POWER_FAULT` | 電源系の異常（入力がある場合） |
 | 10 | `HOST_FAULT` | PC から FAULT を受けた |
 | 11 | `NOT_REFERENCED` | 予約（v1 では発生しない）。位置基準未確立の ARM_PREPARE は ACK `REJECTED/NOT_REFERENCED` で拒否し、DISARMED のまま |
-| 12 | `LOCAL_ESTOP` | MCU の画面の非常停止ボタン。ボタンのラッチを解除してから FAULT_RESET（解除前は FAULT_CAUSE_PRESENT） |
+| 12 | `LOCAL_ESTOP` | MCU の画面の非常停止（物理の非常停止もこのコードで報告する）。ラッチ中は FAULT_RESET が `FAULT_CAUSE_PRESENT`。画面でラッチを解除し、この軸のコードが `LOCAL_ESTOP` のままで他の原因が無ければ、ホストの FAULT_RESET を待たず DISARMED に戻る（基準は残す。ブレーキ作動・主電源 OFF。自動では ARM しない。FAULT_EVENT は出さない。通知は STATUS の状態変化）。`ENCODER_FAULT`・`SOFT_LIMIT`・`FOLLOWING_ERROR`・`HOST_FAULT` や、減速中に保った別の異常コードは、画面の解除では消えない。PC は、いまのラッチの記録がすべて `LOCAL_ESTOP` で、その軸が FAULT でなくなったら、協調で `HOST_FAULT` にした残りの軸へだけ FAULT_RESET を送り、操作者の FAULT_RESET と同じ出口でラッチを解く（阻害が無ければ `READY_TO_ARM`。自動では ARM しない）。他の原因が一つでも混ざっていれば、従来どおり `POST /v1/fault/reset` が要る |
 | 0xFFFF | `UNKNOWN` | |
 
 - STATUS の `fault_code` が `NONE` でないのは、`FAULT` のときと、COMMAND_TIMEOUT による減速中（`mcu_state = STOPPING`、ラッチ前）のとき。後者は停止後に FAULT をラッチし、そのとき FAULT_EVENT（`mcu_state_before = STOPPING`）を送る。減速中に HOST_FAULT を受けたら減速中の異常コードのまま即ラッチする。
@@ -208,10 +208,12 @@ ACTIVE --CONTROLLED_STOP / 期限切れ(valid_for_ms)--> STOPPING --(停止確�
 ARMING / HOLDING --DISARM--> DISARMING → DISARMED
 ACTIVE / STOPPING --DISARM--> (減速停止) → DISARMING → DISARMED
 任意 --異常 / HOST_FAULT / command_timeout--> FAULT --FAULT_RESET(原因なし)--> DISARMED
+FAULT(LOCAL_ESTOP) --画面ラッチ解除(他の原因なし)--> DISARMED   （上と同じ出口。FAULT_EVENT は出さない）
 DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中止、DISARM)--> DISARMED   （§1.2）
 ```
 
 - 停止確認 = **軌道（STATUS の `target_count`）の速度が 0 になり、かつ実測で静止していること**。MCU の STOPPING → HOLDING は軌道の速度 0 で進む（HOLDING = 目標が止まった、であって機構が止まったではない）。PC はその上で、STATUS の実測値 `|velocity_count_s| ≤ [timing].rest_velocity_count_s`（既定 50）かつ `|following_error_count| ≤ [timing].rest_error_count`（既定 50、`[limits].deadband_out_count` 以上）が `[timing].rest_dwell_ms`（既定 200）続いた軸だけを「静止」とみなし、全軸が静止するまで保持からブレーキ（DISARM）へ進まない。中立への移動（`/v1/center`）の後の整定も同じ条件。`[timing].stop_settle_timeout_ms` 内に静止しない軸があれば PC は FAULT（`StopTimeout`、detail にその軸の実測の速度と追従誤差）にする。2026-11-01 の実機では、自重のかかった軸が HOLDING のまま数百 count 手前で止まっていた。ファームの `finish_stop` に同じ実測条件を足すのは別途（Issue #15 H1）。
+- `LOCAL_ESTOP` の画面ラッチ解除（コードが `LOCAL_ESTOP` のままで、ラッチ以外の原因が無い）は FAULT → DISARMED。ホストの FAULT_RESET は要らない。終わりの状態は FAULT_RESET と同じ（基準を残す、ブレーキ作動、主電源 OFF、再 ARM しない）。FAULT_EVENT は FAULT に入ったときだけ送り、この解除では送らない。PC への通知は STATUS の `mcu_state = DISARMED`、`fault_code = NONE`。
 - 上の図にない命令と状態の組み合わせ（HOLDING での CONTROLLED_STOP、DISARMED での DISARM など）は §4 の表のとおり何もせず ACCEPTED。
 - USB 再接続・CDC の再オープンで自動 ARM・自動 START しない。NVS に ARM 状態を保存しない。
 - DISARM による減速（ACTIVE / STOPPING からの DISARM）は lease の対象外。PC が SET_POSITION を止めても COMMAND_TIMEOUT にせず、停止後 DISARMING → DISARMED へ進む（`stop_timeout_ms` を超えたら STOP_TIMEOUT）。

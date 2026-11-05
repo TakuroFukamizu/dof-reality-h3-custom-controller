@@ -5,7 +5,8 @@ use std::time::Duration;
 use h3cs::protocol::cobs::FrameAccumulator;
 use h3cs::protocol::{
     capabilities, decode_mcu_frame, msg_type, role_flags, Ack, AckReason, AckResult, CalResult,
-    CalResultCode, Config, HostMsg, Limits, McuMsg, SetLimits, SetPosition, Status, MAX_ENCODED_LEN,
+    CalResultCode, Config, HostMsg, Limits, McuMsg, SetLimits, SetPosition, Status,
+    MAX_ENCODED_LEN,
 };
 use h3cs::sim_axis::{sim_pair, SimMcu, SimParams, DEDUPE_DEPTH};
 use h3cs::types::{status_flags, FaultCode, McuState};
@@ -1182,6 +1183,47 @@ fn fault_reset_rules() {
 }
 
 #[test]
+fn local_estop_release_leaves_fault_only_for_that_code() {
+    let mut h = Harness::default();
+    h.reach_holding();
+    assert!(h.sim.is_referenced() && h.sim.is_configured());
+    h.sim.set_local_estop(true);
+    h.idle(1);
+    assert_eq!(h.state(), McuState::Fault);
+    assert_eq!(h.sim.fault_code(), FaultCode::LocalEstop);
+    rejected(h.fault_reset(), AckReason::FaultCausePresent);
+    let events = h.fault_events().len();
+    h.sim.set_local_estop(false);
+    assert_eq!(h.state(), McuState::Disarmed);
+    assert_eq!(h.sim.fault_code(), FaultCode::None);
+    assert!(h.sim.is_referenced() && h.sim.is_configured());
+    let s = h.sim.status();
+    assert_eq!(s.mcu_state, McuState::Disarmed as u8);
+    assert_eq!(s.fault_code, FaultCode::None);
+    assert_eq!(
+        s.flags & (status_flags::POWER_ON_CMD | status_flags::BRAKE_RELEASE_CMD),
+        0
+    );
+    assert_eq!(h.fault_events().len(), events);
+    rejected(h.fault_reset(), AckReason::BadState);
+
+    h.host_fault();
+    h.sim.set_local_estop(true);
+    h.idle(1);
+    assert_eq!(h.sim.fault_code(), FaultCode::HostFault);
+    h.sim.set_local_estop(false);
+    assert_eq!(h.state(), McuState::Fault);
+    assert_eq!(h.sim.fault_code(), FaultCode::HostFault);
+
+    accepted(h.fault_reset());
+    h.sim.force_fault(FaultCode::EncoderFault);
+    h.sim.set_local_estop(true);
+    h.sim.set_local_estop(false);
+    assert_eq!(h.state(), McuState::Fault);
+    assert_eq!(h.sim.fault_code(), FaultCode::EncoderFault);
+}
+
+#[test]
 fn encoder_fault_reset_clears_reference() {
     let mut h = Harness::default();
     h.sim.force_fault(FaultCode::EncoderFault);
@@ -1735,7 +1777,10 @@ fn assert_status_after_ack(out: &[McuMsg], what: &str, ok: impl Fn(&Status) -> b
         .unwrap_or_else(|| panic!("{what}: no ACK in {out:?}"));
     for m in &out[ack..] {
         if let McuMsg::Status(s) = m {
-            assert!(ok(s), "{what}: STATUS after the ACK shows the old state: {s:?}");
+            assert!(
+                ok(s),
+                "{what}: STATUS after the ACK shows the old state: {s:?}"
+            );
         }
     }
 }
@@ -1743,27 +1788,53 @@ fn assert_status_after_ack(out: &[McuMsg], what: &str, ok: impl Fn(&Status) -> b
 #[test]
 fn status_after_an_ack_shows_the_post_command_state() {
     let mut h = Harness::default();
-    let c = HostMsg::Config(Config { request_id: h.next_rid(), ..config(EPOCH) });
+    let c = HostMsg::Config(Config {
+        request_id: h.next_rid(),
+        ..config(EPOCH)
+    });
     let out = h.send(c);
     assert_status_after_ack(&out, "CONFIG", |s| s.flags & status_flags::CONFIGURED != 0);
     // A STATUS is due right after each of these: the model sends one on change.
     let r = h.next_rid();
-    let out = h.send(HostMsg::ArmPrepare { request_id: r, session_epoch: EPOCH });
-    assert!(out.iter().any(|m| matches!(m, McuMsg::Status(_))), "{out:?}");
-    assert_status_after_ack(&out, "ARM_PREPARE", |s| s.mcu_state == McuState::Arming as u8);
+    let out = h.send(HostMsg::ArmPrepare {
+        request_id: r,
+        session_epoch: EPOCH,
+    });
+    assert!(
+        out.iter().any(|m| matches!(m, McuMsg::Status(_))),
+        "{out:?}"
+    );
+    assert_status_after_ack(&out, "ARM_PREPARE", |s| {
+        s.mcu_state == McuState::Arming as u8
+    });
     let here = h.sim.actual_count();
     h.drive(60, here);
     h.set_position(here);
     let r = h.next_rid();
-    let out = h.send(HostMsg::Start { request_id: r, session_epoch: EPOCH });
+    let out = h.send(HostMsg::Start {
+        request_id: r,
+        session_epoch: EPOCH,
+    });
     assert_status_after_ack(&out, "START", |s| s.mcu_state == McuState::Active as u8);
     h.drive(20, here + 300);
     let r = h.next_rid();
-    let out = h.send(HostMsg::ControlledStop { request_id: r, session_epoch: EPOCH, reason: 1 });
-    assert_status_after_ack(&out, "CONTROLLED_STOP", |s| s.mcu_state == McuState::Stopping as u8);
+    let out = h.send(HostMsg::ControlledStop {
+        request_id: r,
+        session_epoch: EPOCH,
+        reason: 1,
+    });
+    assert_status_after_ack(&out, "CONTROLLED_STOP", |s| {
+        s.mcu_state == McuState::Stopping as u8
+    });
     let r = h.next_rid();
-    let out = h.send(HostMsg::HostFault { request_id: r, fault_code: FaultCode::HostFault });
-    assert!(out.iter().any(|m| matches!(m, McuMsg::Status(_))), "{out:?}");
+    let out = h.send(HostMsg::HostFault {
+        request_id: r,
+        fault_code: FaultCode::HostFault,
+    });
+    assert!(
+        out.iter().any(|m| matches!(m, McuMsg::Status(_))),
+        "{out:?}"
+    );
     assert_status_after_ack(&out, "HOST_FAULT", |s| {
         s.mcu_state == McuState::Fault as u8 && s.fault_code != FaultCode::None
     });
@@ -1807,7 +1878,10 @@ fn status_target_is_the_profiled_setpoint_not_the_commanded_target() {
     assert_eq!(s.mcu_state, McuState::Active as u8);
     // 30 ms at 20000 count/s² gets nowhere near +2000: STATUS shows the
     // trajectory point the loop follows, not the SET_POSITION target.
-    assert!(s.target_count > start && s.target_count < start + 100, "{s:?}");
+    assert!(
+        s.target_count > start && s.target_count < start + 100,
+        "{s:?}"
+    );
     assert_eq!(s.following_error_count, s.actual_count - s.target_count);
 }
 
@@ -1845,10 +1919,18 @@ fn select_axis_in_disarmed_clears_config_and_reference_and_announces_once() {
     let sel = axis_selects(&out);
     assert_eq!(sel.len(), 1, "{out:?}");
     assert_eq!(
-        (sel[0].selected_axis, sel[0].prev_selected_axis, sel[0].mcu_state, sel[0].boot_id),
+        (
+            sel[0].selected_axis,
+            sel[0].prev_selected_axis,
+            sel[0].mcu_state,
+            sel[0].boot_id
+        ),
         (2, 1, McuState::Disarmed as u8, h.sim.boot_id())
     );
-    let pos = out.iter().position(|m| matches!(m, McuMsg::AxisSelect(_))).unwrap();
+    let pos = out
+        .iter()
+        .position(|m| matches!(m, McuMsg::AxisSelect(_)))
+        .unwrap();
     let st = out[pos..]
         .iter()
         .find_map(|m| match m {
@@ -1857,7 +1939,10 @@ fn select_axis_in_disarmed_clears_config_and_reference_and_announces_once() {
         })
         .expect("immediate STATUS after AXIS_SELECT");
     assert_eq!(st.selected_axis, 2);
-    assert_eq!(st.flags & (status_flags::CONFIGURED | status_flags::POSITION_REFERENCED), 0);
+    assert_eq!(
+        st.flags & (status_flags::CONFIGURED | status_flags::POSITION_REFERENCED),
+        0
+    );
     assert_eq!(st.mcu_state, McuState::Disarmed as u8);
     assert!(!h.sim.is_configured() && !h.sim.is_referenced());
     assert_eq!(h.sim.selected_axis(), 2);
@@ -1922,10 +2007,18 @@ fn selection_never_moves_the_count_and_survives_reboot() {
     });
     let now = h.now;
     h.sim.select_axis(3, now);
-    assert_eq!(h.sim.actual_count(), 123, "count is raw encoder + SET_REFERENCE only");
+    assert_eq!(
+        h.sim.actual_count(),
+        123,
+        "count is raw encoder + SET_REFERENCE only"
+    );
     assert_eq!(h.sim.target_count(), 123);
     h.sim.reboot(99);
-    assert_eq!(h.sim.selected_axis(), 3, "selection is NVS: kept across reboot");
+    assert_eq!(
+        h.sim.selected_axis(),
+        3,
+        "selection is NVS: kept across reboot"
+    );
     assert_eq!(h.sim.status().selected_axis, 3);
     assert_eq!(h.sim.boot_id(), 99);
 }
@@ -1944,12 +2037,19 @@ fn cal_results(out: &[McuMsg]) -> Vec<CalResult> {
 impl Harness {
     fn calibrate(&mut self, mode: u8) -> Ack {
         let r = self.next_rid();
-        self.cmd(HostMsg::Calibrate { request_id: r, mode, flags: 0 })
+        self.cmd(HostMsg::Calibrate {
+            request_id: r,
+            mode,
+            flags: 0,
+        })
     }
     /// Unreferenced unit with the default ±3000 end stops, CONFIG accepted
     /// (so the power role is known).
     fn uncalibrated() -> Self {
-        let mut h = Harness::new(SimParams { start_referenced: false, ..SimParams::default() });
+        let mut h = Harness::new(SimParams {
+            start_referenced: false,
+            ..SimParams::default()
+        });
         assert_eq!(h.config().result, AckResult::Accepted);
         h.out.clear();
         h
@@ -1983,8 +2083,15 @@ fn calibration_finds_both_ends_then_neutral_and_references_p_end_at_zero() {
             break;
         }
     }
-    assert_eq!(h.state(), McuState::Disarmed, "calibration must end in DISARMED");
-    assert!(powered && released, "power on and brake release were commanded");
+    assert_eq!(
+        h.state(),
+        McuState::Disarmed,
+        "calibration must end in DISARMED"
+    );
+    assert!(
+        powered && released,
+        "power on and brake release were commanded"
+    );
     // The plant touched both stops and never passed them (pre-shift coordinate).
     assert_eq!((min_seen, max_seen), (-3000, 3000));
 
@@ -1999,13 +2106,20 @@ fn calibration_finds_both_ends_then_neutral_and_references_p_end_at_zero() {
     assert_eq!(r.reason_str(), "ok");
     assert_eq!(r.boot_id, h.sim.boot_id());
     // CAL_RESULT precedes the STATUS that shows DISARMED.
-    let i_res = h.out.iter().position(|m| matches!(m, McuMsg::CalResult(_))).unwrap();
+    let i_res = h
+        .out
+        .iter()
+        .position(|m| matches!(m, McuMsg::CalResult(_)))
+        .unwrap();
     let i_dis = h
         .out
         .iter()
         .position(|m| matches!(m, McuMsg::Status(s) if s.mcu_state == McuState::Disarmed as u8))
         .unwrap();
-    assert!(i_res < i_dis, "CAL_RESULT at {i_res}, DISARMED STATUS at {i_dis}");
+    assert!(
+        i_res < i_dis,
+        "CAL_RESULT at {i_res}, DISARMED STATUS at {i_dis}"
+    );
     // P end = 0 now; the unit is at the neutral and referenced.
     assert!(h.sim.is_referenced());
     assert_eq!(h.sim.end_counts(), (0, 6000));
@@ -2013,7 +2127,10 @@ fn calibration_finds_both_ends_then_neutral_and_references_p_end_at_zero() {
     let last = h.statuses().last().copied().unwrap();
     assert_eq!(last.mcu_state, McuState::Disarmed as u8);
     assert_ne!(last.flags & status_flags::POSITION_REFERENCED, 0);
-    assert_eq!(last.flags & (status_flags::POWER_ON_CMD | status_flags::BRAKE_RELEASE_CMD), 0);
+    assert_eq!(
+        last.flags & (status_flags::POWER_ON_CMD | status_flags::BRAKE_RELEASE_CMD),
+        0
+    );
     assert_eq!(last.actual_count, 3000);
     // CONFIG survived the calibration (protocol §1.2 only touches the reference).
     assert!(h.sim.is_configured());
@@ -2040,7 +2157,15 @@ fn calibrate_is_disarmed_only_and_mode_is_checked() {
     assert_eq!(h.state(), McuState::Calibrating);
     // Same message again is a resend: DUPLICATE, still calibrating.
     let rid = h.rid;
-    assert_eq!(h.cmd(HostMsg::Calibrate { request_id: rid, mode: 1, flags: 0 }).result, AckResult::Duplicate);
+    assert_eq!(
+        h.cmd(HostMsg::Calibrate {
+            request_id: rid,
+            mode: 1,
+            flags: 0
+        })
+        .result,
+        AckResult::Duplicate
+    );
     assert_eq!(h.state(), McuState::Calibrating);
 }
 
@@ -2055,7 +2180,11 @@ fn calibration_cancel_by_calibrate_0_and_by_disarm_clears_reference() {
         assert_eq!(h.state(), McuState::Calibrating);
         let pos = h.sim.actual_count();
         assert!(pos < 0, "moving toward the P end: {pos}");
-        let ack = if by_disarm { h.disarm() } else { h.calibrate(0) };
+        let ack = if by_disarm {
+            h.disarm()
+        } else {
+            h.calibrate(0)
+        };
         assert_eq!(ack.result, AckResult::Accepted);
         assert_eq!(h.state(), McuState::Calibrating, "shutdown sequence first");
         h.idle(100);
@@ -2066,9 +2195,20 @@ fn calibration_cancel_by_calibrate_0_and_by_disarm_clears_reference() {
         assert_eq!(results[0].step, 1);
         assert_eq!(results[0].reason_str(), "stop");
         assert_eq!((results[0].n_end_count, results[0].neutral_count), (0, 0));
-        assert!(!h.sim.is_referenced(), "a cancelled calibration drops POSITION_REFERENCED");
-        assert_eq!(h.sim.actual_count(), pos, "the mechanism stopped where it was");
-        assert_eq!(h.sim.end_counts(), (-3000, 3000), "no re-reference on cancel");
+        assert!(
+            !h.sim.is_referenced(),
+            "a cancelled calibration drops POSITION_REFERENCED"
+        );
+        assert_eq!(
+            h.sim.actual_count(),
+            pos,
+            "the mechanism stopped where it was"
+        );
+        assert_eq!(
+            h.sim.end_counts(),
+            (-3000, 3000),
+            "no re-reference on cancel"
+        );
     }
 }
 
@@ -2098,7 +2238,11 @@ fn host_fault_during_calibration_reports_failed_then_faults() {
     assert_eq!(ev.fault_code, FaultCode::HostFault);
     assert!(!h.sim.is_referenced());
     // CAL_RESULT came before the FAULT STATUS.
-    let i_res = h.out.iter().position(|m| matches!(m, McuMsg::CalResult(_))).unwrap();
+    let i_res = h
+        .out
+        .iter()
+        .position(|m| matches!(m, McuMsg::CalResult(_)))
+        .unwrap();
     let i_fault = h
         .out
         .iter()
@@ -2115,10 +2259,22 @@ fn commands_during_calibration_are_bad_state_and_set_position_is_dropped_uncount
     let mut h = Harness::uncalibrated();
     assert_eq!(h.calibrate(1).result, AckResult::Accepted);
     h.idle(100);
-    let before = (h.sim.stale_drop_count(), h.sim.rx_error_count(), h.sim.last_rx_seq());
+    let before = (
+        h.sim.stale_drop_count(),
+        h.sim.rx_error_count(),
+        h.sim.last_rx_seq(),
+    );
     h.set_position(0);
     h.set_position(0);
-    assert_eq!((h.sim.stale_drop_count(), h.sim.rx_error_count(), h.sim.last_rx_seq()), before, "dropped, not counted");
+    assert_eq!(
+        (
+            h.sim.stale_drop_count(),
+            h.sim.rx_error_count(),
+            h.sim.last_rx_seq()
+        ),
+        before,
+        "dropped, not counted"
+    );
     assert_eq!(h.config().reason, AckReason::BadState);
     assert_eq!(h.arm().reason, AckReason::BadState);
     assert_eq!(h.start().reason, AckReason::BadState);
@@ -2129,7 +2285,10 @@ fn commands_during_calibration_are_bad_state_and_set_position_is_dropped_uncount
     assert_eq!(h.state(), McuState::Calibrating);
     // A lease was never started: nothing times out while calibrating.
     h.idle(1000);
-    assert!(matches!(h.state(), McuState::Calibrating | McuState::Disarmed));
+    assert!(matches!(
+        h.state(),
+        McuState::Calibrating | McuState::Disarmed
+    ));
     assert_eq!(h.sim.fault_code(), FaultCode::None);
 }
 
@@ -2142,7 +2301,10 @@ fn injected_failure_and_stall_fail_the_calibration() {
     assert_eq!(h.state(), McuState::Disarmed);
     let r = cal_results(&h.out);
     assert_eq!(r.len(), 1);
-    assert_eq!((r[0].result, r[0].step, r[0].reason_str().as_str()), (CalResultCode::Failed, 1, "slow"));
+    assert_eq!(
+        (r[0].result, r[0].step, r[0].reason_str().as_str()),
+        (CalResultCode::Failed, 1, "slow")
+    );
     assert!(!h.sim.is_referenced());
     // The injection is one-shot: the next run succeeds.
     h.out.clear();
@@ -2156,12 +2318,19 @@ fn injected_failure_and_stall_fail_the_calibration() {
     h.idle(200);
     assert_eq!(h.state(), McuState::Disarmed);
     let r = cal_results(&h.out);
-    assert_eq!((r[0].result, r[0].reason_str().as_str()), (CalResultCode::Failed, "stall"));
+    assert_eq!(
+        (r[0].result, r[0].reason_str().as_str()),
+        (CalResultCode::Failed, "stall")
+    );
 }
 
 #[test]
 fn plant_never_passes_the_end_stops_and_the_stops_follow_every_reference() {
-    let mut h = Harness::new(SimParams { end_min_count: -100, end_max_count: 100, ..SimParams::default() });
+    let mut h = Harness::new(SimParams {
+        end_min_count: -100,
+        end_max_count: 100,
+        ..SimParams::default()
+    });
     // A disturbance stops at the stop.
     h.sim.nudge_actual(10_000);
     assert_eq!(h.sim.actual_count(), 100);
@@ -2173,7 +2342,12 @@ fn plant_never_passes_the_end_stops_and_the_stops_follow_every_reference() {
     assert_eq!(h.sim.end_counts(), (1000, 1200));
     // A reboot without a reference restarts the count at 0 at the same place
     // (the mechanism did not move: still 100 counts from the lower stop).
-    let mut h2 = Harness::new(SimParams { start_referenced: false, end_min_count: -100, end_max_count: 100, ..SimParams::default() });
+    let mut h2 = Harness::new(SimParams {
+        start_referenced: false,
+        end_min_count: -100,
+        end_max_count: 100,
+        ..SimParams::default()
+    });
     assert_eq!(h2.set_reference(1000).result, AckResult::Accepted);
     assert_eq!(h2.sim.end_counts(), (900, 1100));
     h2.sim.reboot(78);
@@ -2184,7 +2358,11 @@ fn plant_never_passes_the_end_stops_and_the_stops_follow_every_reference() {
     assert_eq!(h.sim.actual_count(), 1000);
     assert_eq!(h.sim.end_counts(), (1000, 1200));
     // Position control cannot push past the stop either (CONFIG soft window wider than the stops).
-    let mut h = Harness::new(SimParams { end_min_count: -100, end_max_count: 100, ..SimParams::default() });
+    let mut h = Harness::new(SimParams {
+        end_min_count: -100,
+        end_max_count: 100,
+        ..SimParams::default()
+    });
     h.reach_holding();
     h.set_position(0);
     assert_eq!(h.start().result, AckResult::Accepted);
@@ -2229,23 +2407,51 @@ fn hello_advertises_limits_capability() {
             _ => None,
         })
         .expect("hello");
-    assert_eq!(hello.capabilities, capabilities::POSITION_MODE | capabilities::LIMITS);
+    assert_eq!(
+        hello.capabilities,
+        capabilities::POSITION_MODE | capabilities::LIMITS
+    );
 }
 
 #[test]
 fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     let mut h = Harness::default();
     let d = h.sim.tuning();
-    assert_eq!((d.duty_max_percent, d.duty_min_percent), (20, 7), "firmware defaults before SET_LIMITS");
+    assert_eq!(
+        (d.duty_max_percent, d.duty_min_percent),
+        (20, 7),
+        "firmware defaults before SET_LIMITS"
+    );
     // DISARMED: ACK first, then exactly one LIMITS; values above the ceiling are clamped.
     let out = h.send(set_limits(11, 90, 70));
     assert_eq!(out[0].msg_type(), msg_type::ACK);
     accepted(acks(&out)[0]);
     let l = limits_of(&out);
     assert_eq!(l.len(), 1);
-    assert_eq!((l[0].duty_max_percent, l[0].duty_min_percent, l[0].kp_percent_per_100), (60, 60, 2));
-    assert_eq!((l[0].ff_count_s_per_percent, l[0].deadband_count, l[0].deadband_out_count), (100, 10, 20));
-    assert_eq!((l[0].abs_duty_max_percent, l[0].abs_max_vel_count_s, l[0].abs_max_acc_count_s2), (60, 6000, 40000));
+    assert_eq!(
+        (
+            l[0].duty_max_percent,
+            l[0].duty_min_percent,
+            l[0].kp_percent_per_100
+        ),
+        (60, 60, 2)
+    );
+    assert_eq!(
+        (
+            l[0].ff_count_s_per_percent,
+            l[0].deadband_count,
+            l[0].deadband_out_count
+        ),
+        (100, 10, 20)
+    );
+    assert_eq!(
+        (
+            l[0].abs_duty_max_percent,
+            l[0].abs_max_vel_count_s,
+            l[0].abs_max_acc_count_s2
+        ),
+        (60, 6000, 40000)
+    );
     assert_eq!(l[0].stop_acc_count_s2, 0, "unset stop_acc is echoed as 0");
     assert_eq!(l[0].boot_id, h.sim.status().boot_id);
     assert_eq!(h.sim.tuning().duty_max_percent, 60);
@@ -2254,7 +2460,13 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     let out = h.send(set_limits(12, 40, 3));
     accepted(acks(&out)[0]);
     assert_eq!(limits_of(&out)[0].duty_max_percent, 40);
-    assert_eq!((h.sim.tuning().duty_max_percent, h.sim.tuning().duty_min_percent), (40, 3));
+    assert_eq!(
+        (
+            h.sim.tuning().duty_max_percent,
+            h.sim.tuning().duty_min_percent
+        ),
+        (40, 3)
+    );
     assert_eq!(h.state(), McuState::Active);
     // Resend of the same message: DUPLICATE, no LIMITS.
     let out = h.send(set_limits(12, 40, 3));
@@ -2262,7 +2474,9 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     assert!(limits_of(&out).is_empty());
     // 65535 is stored and echoed as the absolute ceiling, not the request.
     let mut msg = set_limits(13, 40, 3);
-    let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+    let HostMsg::SetLimits(limits) = &mut msg else {
+        unreachable!()
+    };
     limits.stop_acc_count_s2 = 65535;
     let out = h.send(msg);
     accepted(acks(&out)[0]);
@@ -2304,9 +2518,16 @@ fn set_limits_invalid_params_and_fault_gate() {
         rejected(acks(&out)[0], AckReason::InvalidParam);
         assert!(limits_of(&out).is_empty());
         assert_eq!(h.sim.tuning(), before);
-        assert_eq!(h.sim.stop_acc_count_s2(), 0, "a rejected SET_LIMITS does not store stop_acc");
+        assert_eq!(
+            h.sim.stop_acc_count_s2(),
+            0,
+            "a rejected SET_LIMITS does not store stop_acc"
+        );
     }
-    rejected(acks(&h.send(set_limits(0, 40, 3)))[0], AckReason::InvalidParam);
+    rejected(
+        acks(&h.send(set_limits(0, 40, 3)))[0],
+        AckReason::InvalidParam,
+    );
     // Faulted: FAULT_ACTIVE like every other command.
     accepted(h.host_fault());
     assert_eq!(h.state(), McuState::Fault);
@@ -2324,7 +2545,10 @@ fn config_velocity_and_acceleration_are_clamped_to_the_absolute_ceilings() {
     c.max_acc_count_s2 = 9_999_999;
     accepted(h.config_with(c));
     let stored = h.sim.config().unwrap();
-    assert_eq!((stored.max_vel_count_s, stored.max_acc_count_s2), (6000, 40000));
+    assert_eq!(
+        (stored.max_vel_count_s, stored.max_acc_count_s2),
+        (6000, 40000)
+    );
     // Below the ceilings: kept as sent.
     let mut c = config(EPOCH);
     c.max_vel_count_s = 1234;
@@ -2337,7 +2561,10 @@ fn controlled_stop_decelerates_at_config_max_acc() {
     // CONFIG max_acc is 20000. A frame of 1250 and a frame equal to CONFIG
     // both stop at that rate. The 1250 case would take ~1 s if the frame won.
     fn stop_time_ms(frame_acc: u32, drive_ticks: u32) -> u64 {
-        let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
+        let mut h = Harness::new(SimParams {
+            plant_max_vel_count_s: 100_000.0,
+            ..SimParams::default()
+        });
         h.reach_active();
         for _ in 0..drive_ticks {
             let mut m = h.set_position_msg(2700);
@@ -2357,17 +2584,27 @@ fn controlled_stop_decelerates_at_config_max_acc() {
             h.idle(10);
             ms += 10;
         }
-        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc} after {ms} ms");
+        assert_eq!(
+            h.state(),
+            McuState::Holding,
+            "frame_acc {frame_acc} after {ms} ms"
+        );
         ms
     }
     // 1.0 s at 1250 count/s² → 1250 count/s. CONFIG 20000 stops that in 62.5 ms
     // (the 10 ms poll reports 70). The frame's own rate would take 1 s.
     let reduced = stop_time_ms(1250, 100);
-    assert!((50..=100).contains(&reduced), "frame 1250 stopped in {reduced} ms");
+    assert!(
+        (50..=100).contains(&reduced),
+        "frame 1250 stopped in {reduced} ms"
+    );
     // Frame == CONFIG. 0.4 s reaches the 2000 count/s cap and is still short of
     // the target. 2000 / 20000 = 100 ms, the same rate as before this rule.
     let same = stop_time_ms(20000, 40);
-    assert!((80..=130).contains(&same), "frame == CONFIG stopped in {same} ms");
+    assert!(
+        (80..=130).contains(&same),
+        "frame == CONFIG stopped in {same} ms"
+    );
 }
 
 /// CONFIG carries the firmware ceiling (40000). The operator's ungoverned
@@ -2376,19 +2613,31 @@ fn controlled_stop_decelerates_at_config_max_acc() {
 #[test]
 fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
     fn prep(stop_acc: u16) -> Harness {
-        let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
+        let mut h = Harness::new(SimParams {
+            plant_max_vel_count_s: 100_000.0,
+            ..SimParams::default()
+        });
         let mut c = config(EPOCH);
         c.max_acc_count_s2 = 40000;
         c.command_timeout_ms = 500;
         c.stop_timeout_ms = 5000;
         assert_eq!(h.config_with(c).result, AckResult::Accepted);
         let mut msg = set_limits(1, 40, 3);
-        let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+        let HostMsg::SetLimits(limits) = &mut msg else {
+            unreachable!()
+        };
         limits.stop_acc_count_s2 = stop_acc;
         let out = h.send(msg);
         assert_eq!(out[0].msg_type(), msg_type::ACK);
-        let expect = if stop_acc == 0 { 0 } else { stop_acc.min(40_000) };
-        assert_eq!(limits_of(&out).last().map(|l| l.stop_acc_count_s2), Some(expect));
+        let expect = if stop_acc == 0 {
+            0
+        } else {
+            stop_acc.min(40_000)
+        };
+        assert_eq!(
+            limits_of(&out).last().map(|l| l.stop_acc_count_s2),
+            Some(expect)
+        );
         assert_eq!(h.arm().result, AckResult::Accepted);
         let here = h.sim.actual_count();
         h.drive(60, here);
@@ -2425,10 +2674,15 @@ fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
     assert_eq!(h.sim.config().unwrap().max_acc_count_s2, 40000);
     assert_eq!(h.sim.stop_acc_count_s2(), 20000);
     let dv = dv_after(&mut h, 1250, 800);
-    assert!((190.0..210.0).contains(&dv), "operator 20000, frame 1250: dv {dv}");
+    assert!(
+        (190.0..210.0).contains(&dv),
+        "operator 20000, frame 1250: dv {dv}"
+    );
     // A SET_LIMITS during the stop is stored but does not change this stop.
     let mut msg = set_limits(2, 40, 3);
-    let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+    let HostMsg::SetLimits(limits) = &mut msg else {
+        unreachable!()
+    };
     limits.stop_acc_count_s2 = 6000;
     let out = h.send(msg);
     assert_eq!(acks(&out)[0].result, AckResult::Accepted);
@@ -2438,7 +2692,10 @@ fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
     h.now += 10 * MS;
     let _ = h.sim.tick(h.now);
     let still = (v0 - h.sim.setpoint_vel()).abs();
-    assert!((190.0..210.0).contains(&still), "in-progress stop stays at 20000: dv {still}");
+    assert!(
+        (190.0..210.0).contains(&still),
+        "in-progress stop stays at 20000: dv {still}"
+    );
 
     // Next stop, after the new rate is stored: 6000 count/s² → 60 count/s in 10 ms.
     while h.state() == McuState::Stopping {
@@ -2451,5 +2708,8 @@ fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
     h.set_position(here);
     assert_eq!(h.start().result, AckResult::Accepted);
     let dv = dv_after(&mut h, 1250, 800);
-    assert!((50.0..70.0).contains(&dv), "runtime 6000, frame 1250: dv {dv}");
+    assert!(
+        (50.0..70.0).contains(&dv),
+        "runtime 6000, frame 1250: dv {dv}"
+    );
 }

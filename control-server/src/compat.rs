@@ -33,9 +33,18 @@ pub enum PoseError {
 /// Validate a pose: reject non-finite; clamp (or reject if `clamp_out_of_range`
 /// is false) components outside -1..=1; gain clamped to 0..=max_gain with
 /// GainNegative / GainLimited reported. Gain is applied once, later, by `mix`.
-pub fn check_pose(pose: Pose, requested_gain: f64, max_gain: f64, clamp_out_of_range: bool)
-    -> Result<CheckedPose, PoseError> {
-    let fields = [("pitch", pose.pitch), ("roll", pose.roll), ("yaw", pose.yaw), ("gain", requested_gain)];
+pub fn check_pose(
+    pose: Pose,
+    requested_gain: f64,
+    max_gain: f64,
+    clamp_out_of_range: bool,
+) -> Result<CheckedPose, PoseError> {
+    let fields = [
+        ("pitch", pose.pitch),
+        ("roll", pose.roll),
+        ("yaw", pose.yaw),
+        ("gain", requested_gain),
+    ];
     if let Some((name, _)) = fields.iter().find(|(_, v)| !v.is_finite()) {
         return Err(PoseError::NonFinite(name));
     }
@@ -60,7 +69,11 @@ pub fn check_pose(pose: Pose, requested_gain: f64, max_gain: f64, clamp_out_of_r
         limits.push(LimitReason::PoseClamped);
     }
     // A bad max_gain (negative / NaN) degrades to 0 instead of panicking.
-    let max_gain = if max_gain.is_finite() && max_gain > 0.0 { max_gain } else { 0.0 };
+    let max_gain = if max_gain.is_finite() && max_gain > 0.0 {
+        max_gain
+    } else {
+        0.0
+    };
     let effective_gain = if requested_gain < 0.0 {
         limits.push(LimitReason::GainNegative);
         0.0
@@ -70,7 +83,11 @@ pub fn check_pose(pose: Pose, requested_gain: f64, max_gain: f64, clamp_out_of_r
     } else {
         requested_gain
     };
-    Ok(CheckedPose { pose, effective_gain, limits })
+    Ok(CheckedPose {
+        pose,
+        effective_gain,
+        limits,
+    })
 }
 
 /// Rig orientation: how the game's pitch / roll / yaw map onto the mixer's
@@ -91,11 +108,19 @@ pub struct Orientation {
 /// Apply the rig orientation to a game pose (inversion first, then the swap,
 /// so `invert_pitch` always refers to the game's pitch).
 pub fn orient(pose: Pose, o: Orientation) -> Pose {
-    let pitch = if o.invert_pitch { -pose.pitch } else { pose.pitch };
+    let pitch = if o.invert_pitch {
+        -pose.pitch
+    } else {
+        pose.pitch
+    };
     let roll = if o.invert_roll { -pose.roll } else { pose.roll };
     let yaw = if o.invert_yaw { -pose.yaw } else { pose.yaw };
     if o.swap_pitch_roll {
-        Pose { pitch: roll, roll: pitch, yaw }
+        Pose {
+            pitch: roll,
+            roll: pitch,
+            yaw,
+        }
     } else {
         Pose { pitch, roll, yaw }
     }
@@ -115,8 +140,11 @@ pub fn mix(pose: Pose, gain: f64) -> [VirtualPos; AXIS_COUNT] {
 
 /// Saturate virtual positions into [virtual_min, virtual_max]; returns whether any saturated.
 /// NaN inputs are mapped to `virtual_min` and reported as saturated.
-pub fn saturate(v: [VirtualPos; AXIS_COUNT], virtual_min: f64, virtual_max: f64)
-    -> ([VirtualPos; AXIS_COUNT], bool) {
+pub fn saturate(
+    v: [VirtualPos; AXIS_COUNT],
+    virtual_min: f64,
+    virtual_max: f64,
+) -> ([VirtualPos; AXIS_COUNT], bool) {
     let mut any = false;
     let out = v.map(|VirtualPos(x)| {
         // Manual min/max: f64::clamp panics on NaN or inverted bounds.
@@ -153,7 +181,11 @@ pub struct LegacyH3Model {
 
 impl LegacyH3Model {
     pub fn new(gain: f64, max_step: f64) -> Self {
-        Self { gain, max_step, cur: [VIRTUAL_CENTER; AXIS_COUNT] }
+        Self {
+            gain,
+            max_step,
+            cur: [VIRTUAL_CENTER; AXIS_COUNT],
+        }
     }
     /// `H3.move(pitch, roll, yaw)` → the three values written to the wire.
     pub fn move_(&mut self, pose: Pose) -> [u16; AXIS_COUNT] {
@@ -174,7 +206,9 @@ impl LegacyH3Model {
     }
     /// `H3.center()`: `steps` calls of `set_motors(512, 512, 512)`; returns each send.
     pub fn center(&mut self, steps: usize) -> Vec<[u16; AXIS_COUNT]> {
-        (0..steps).map(|_| self.set_motors([VIRTUAL_CENTER; AXIS_COUNT])).collect()
+        (0..steps)
+            .map(|_| self.set_motors([VIRTUAL_CENTER; AXIS_COUNT]))
+            .collect()
     }
     /// `H3._send` value: `max(0, min(1023, int(v)))`. `as i64` truncates toward
     /// zero like Python `int()` (and saturates instead of raising on inf/NaN).

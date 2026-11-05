@@ -27,7 +27,11 @@ fn inc() -> AxisCalibration {
 
 /// Decreasing calibration (axis mounted the other way round).
 fn dec() -> AxisCalibration {
-    AxisCalibration { axis_id: axis(2), count_at: [2500, 200, -1000], ..inc() }
+    AxisCalibration {
+        axis_id: axis(2),
+        count_at: [2500, 200, -1000],
+        ..inc()
+    }
 }
 
 fn close(a: f64, b: f64) -> bool {
@@ -37,9 +41,18 @@ fn close(a: f64, b: f64) -> bool {
 #[test]
 fn passes_through_the_three_points() {
     for cal in [inc(), dec()] {
-        assert_eq!(cal.virtual_to_count_f(VirtualPos(0.0)), f64::from(cal.count_at[0]));
-        assert_eq!(cal.virtual_to_count_f(VirtualPos(512.0)), f64::from(cal.count_at[1]));
-        assert_eq!(cal.virtual_to_count_f(VirtualPos(1023.0)), f64::from(cal.count_at[2]));
+        assert_eq!(
+            cal.virtual_to_count_f(VirtualPos(0.0)),
+            f64::from(cal.count_at[0])
+        );
+        assert_eq!(
+            cal.virtual_to_count_f(VirtualPos(512.0)),
+            f64::from(cal.count_at[1])
+        );
+        assert_eq!(
+            cal.virtual_to_count_f(VirtualPos(1023.0)),
+            f64::from(cal.count_at[2])
+        );
         assert_eq!(cal.neutral_count(), 200);
     }
 }
@@ -50,17 +63,26 @@ fn piecewise_linear_per_segment() {
     // Lower segment: slope 1200/512.
     assert!(close(cal.virtual_to_count_f(VirtualPos(256.0)), -400.0));
     // Upper segment: slope 2300/511.
-    assert!(close(cal.virtual_to_count_f(VirtualPos(512.0 + 511.0 / 2.0)), 1350.0));
+    assert!(close(
+        cal.virtual_to_count_f(VirtualPos(512.0 + 511.0 / 2.0)),
+        1350.0
+    ));
     let d = dec();
     assert!(close(d.virtual_to_count_f(VirtualPos(256.0)), 1350.0));
-    assert!(close(d.virtual_to_count_f(VirtualPos(512.0 + 511.0 / 2.0)), -400.0));
+    assert!(close(
+        d.virtual_to_count_f(VirtualPos(512.0 + 511.0 / 2.0)),
+        -400.0
+    ));
 }
 
 #[test]
 fn extrapolates_linearly_outside_range() {
     let cal = inc();
     assert!(close(cal.virtual_to_count_f(VirtualPos(-512.0)), -2200.0));
-    assert!(close(cal.virtual_to_count_f(VirtualPos(1023.0 + 511.0)), 4800.0));
+    assert!(close(
+        cal.virtual_to_count_f(VirtualPos(1023.0 + 511.0)),
+        4800.0
+    ));
     let d = dec();
     assert!(close(d.virtual_to_count_f(VirtualPos(-512.0)), 4800.0));
     assert!(close(d.virtual_to_count_f(VirtualPos(1534.0)), -2200.0));
@@ -115,10 +137,21 @@ fn valid_calibrations_pass() {
     assert_eq!(inc().validate(), Ok(()));
     assert_eq!(dec().validate(), Ok(()));
     // Exactly decel_zone_count margin is allowed.
-    let edge = AxisCalibration { soft_min_count: -1300, mechanical_min_count: -1600, ..inc() };
+    let edge = AxisCalibration {
+        soft_min_count: -1300,
+        mechanical_min_count: -1600,
+        ..inc()
+    };
     assert_eq!(edge.validate(), Ok(()));
     // operator_marked_valid is not a structural invariant.
-    assert_eq!(AxisCalibration { operator_marked_valid: false, ..inc() }.validate(), Ok(()));
+    assert_eq!(
+        AxisCalibration {
+            operator_marked_valid: false,
+            ..inc()
+        }
+        .validate(),
+        Ok(())
+    );
 }
 
 fn invalid_msg(cal: AxisCalibration) -> String {
@@ -132,22 +165,98 @@ fn invalid_msg(cal: AxisCalibration) -> String {
 fn rejects_invalid_calibrations_naming_the_field() {
     let base = inc();
     let cases: Vec<(AxisCalibration, &str)> = vec![
-        (AxisCalibration { count_at: [-1000, 200, 200], ..base.clone() }, "monotonic"),
-        (AxisCalibration { count_at: [-1000, 300, 200], ..base.clone() }, "monotonic"),
-        (AxisCalibration { count_at: [0, 0, 0], ..base.clone() }, "monotonic"),
-        (AxisCalibration { count_at: [-1300, 200, 2500], ..base.clone() }, "count_at_virtual_0"),
-        (AxisCalibration { count_at: [-1000, 200, 2701], ..base.clone() }, "count_at_virtual_1023"),
-        (AxisCalibration { decel_zone_count: -1, ..base.clone() }, "decel_zone_count"),
-        (AxisCalibration { soft_min_count: -1400, ..base.clone() }, "soft_min_count"),
-        (AxisCalibration { soft_max_count: 2900, ..base.clone() }, "soft_max_count"),
-        (AxisCalibration { soft_min_count: -1700, ..base.clone() }, "soft_min_count"),
-        (AxisCalibration { soft_max_count: 3200, ..base.clone() }, "soft_max_count"),
-        (AxisCalibration { mechanical_min_count: 5000, ..base.clone() }, "mechanical_min_count"),
-        (AxisCalibration { soft_min_count: 3000, soft_max_count: 2000, ..base.clone() }, "soft_min_count"),
+        (
+            AxisCalibration {
+                count_at: [-1000, 200, 200],
+                ..base.clone()
+            },
+            "monotonic",
+        ),
+        (
+            AxisCalibration {
+                count_at: [-1000, 300, 200],
+                ..base.clone()
+            },
+            "monotonic",
+        ),
+        (
+            AxisCalibration {
+                count_at: [0, 0, 0],
+                ..base.clone()
+            },
+            "monotonic",
+        ),
+        (
+            AxisCalibration {
+                count_at: [-1300, 200, 2500],
+                ..base.clone()
+            },
+            "count_at_virtual_0",
+        ),
+        (
+            AxisCalibration {
+                count_at: [-1000, 200, 2701],
+                ..base.clone()
+            },
+            "count_at_virtual_1023",
+        ),
+        (
+            AxisCalibration {
+                decel_zone_count: -1,
+                ..base.clone()
+            },
+            "decel_zone_count",
+        ),
+        (
+            AxisCalibration {
+                soft_min_count: -1400,
+                ..base.clone()
+            },
+            "soft_min_count",
+        ),
+        (
+            AxisCalibration {
+                soft_max_count: 2900,
+                ..base.clone()
+            },
+            "soft_max_count",
+        ),
+        (
+            AxisCalibration {
+                soft_min_count: -1700,
+                ..base.clone()
+            },
+            "soft_min_count",
+        ),
+        (
+            AxisCalibration {
+                soft_max_count: 3200,
+                ..base.clone()
+            },
+            "soft_max_count",
+        ),
+        (
+            AxisCalibration {
+                mechanical_min_count: 5000,
+                ..base.clone()
+            },
+            "mechanical_min_count",
+        ),
+        (
+            AxisCalibration {
+                soft_min_count: 3000,
+                soft_max_count: 2000,
+                ..base.clone()
+            },
+            "soft_min_count",
+        ),
     ];
     for (cal, needle) in cases {
         let msg = invalid_msg(cal.clone());
-        assert!(msg.contains(needle), "{needle:?} not in {msg:?} for {cal:?}");
+        assert!(
+            msg.contains(needle),
+            "{needle:?} not in {msg:?} for {cal:?}"
+        );
     }
 }
 
@@ -170,7 +279,12 @@ fn extreme_values_do_not_overflow() {
 
 #[test]
 fn error_display_names_axis() {
-    let e = AxisCalibration { decel_zone_count: -1, ..dec() }.validate().unwrap_err();
+    let e = AxisCalibration {
+        decel_zone_count: -1,
+        ..dec()
+    }
+    .validate()
+    .unwrap_err();
     assert!(e.to_string().starts_with("axis2: "), "{e}");
 }
 
@@ -182,7 +296,10 @@ fn hash_golden_values_for_sim_config() {
     // documented layout (u32 len | rig_id | u8 axis | 3×i32 | 5×i32, LE; geometry only).
     let cfg = Config::from_toml_str(SIM_TOML).unwrap();
     let cals = from_config(&cfg);
-    let got: Vec<u32> = cals.iter().map(|c| calibration_hash(&cfg.rig_id, c)).collect();
+    let got: Vec<u32> = cals
+        .iter()
+        .map(|c| calibration_hash(&cfg.rig_id, c))
+        .collect();
     assert_eq!(got, vec![0x2c2a_144a, 0xf84d_5380, 0xcebf_c373]);
 }
 
@@ -193,34 +310,82 @@ fn hash_is_stable_and_changes_with_every_hashed_field() {
     assert_eq!(h0, calibration_hash("rig", &base.clone()));
 
     let variants = [
-        AxisCalibration { axis_id: axis(3), ..base.clone() },
-        AxisCalibration { count_at: [-999, 200, 2500], ..base.clone() },
-        AxisCalibration { count_at: [-1000, 201, 2500], ..base.clone() },
-        AxisCalibration { count_at: [-1000, 200, 2501], ..base.clone() },
-        AxisCalibration { mechanical_min_count: -1601, ..base.clone() },
-        AxisCalibration { mechanical_max_count: 3101, ..base.clone() },
-        AxisCalibration { soft_min_count: -1201, ..base.clone() },
-        AxisCalibration { soft_max_count: 2701, ..base.clone() },
-        AxisCalibration { decel_zone_count: 301, ..base.clone() },
+        AxisCalibration {
+            axis_id: axis(3),
+            ..base.clone()
+        },
+        AxisCalibration {
+            count_at: [-999, 200, 2500],
+            ..base.clone()
+        },
+        AxisCalibration {
+            count_at: [-1000, 201, 2500],
+            ..base.clone()
+        },
+        AxisCalibration {
+            count_at: [-1000, 200, 2501],
+            ..base.clone()
+        },
+        AxisCalibration {
+            mechanical_min_count: -1601,
+            ..base.clone()
+        },
+        AxisCalibration {
+            mechanical_max_count: 3101,
+            ..base.clone()
+        },
+        AxisCalibration {
+            soft_min_count: -1201,
+            ..base.clone()
+        },
+        AxisCalibration {
+            soft_max_count: 2701,
+            ..base.clone()
+        },
+        AxisCalibration {
+            decel_zone_count: 301,
+            ..base.clone()
+        },
     ];
     for v in &variants {
         assert_ne!(calibration_hash("rig", v), h0, "{v:?}");
     }
     assert_ne!(calibration_hash("rig2", &base), h0);
     // Length prefix: moving a byte between rig_id and the payload changes the hash.
-    assert_ne!(calibration_hash("", &base), calibration_hash("\u{1}", &base));
+    assert_ne!(
+        calibration_hash("", &base),
+        calibration_hash("\u{1}", &base)
+    );
     // Operator flag is policy, not an MCU parameter: excluded on purpose.
-    assert_eq!(calibration_hash("rig", &AxisCalibration { operator_marked_valid: false, ..base }), h0);
+    assert_eq!(
+        calibration_hash(
+            "rig",
+            &AxisCalibration {
+                operator_marked_valid: false,
+                ..base
+            }
+        ),
+        h0
+    );
 }
 
 #[test]
 fn hash_independent_of_axis_order_in_config() {
     // Reverse the [[axis]] blocks in the TOML text.
     let (head, rest) = SIM_TOML.split_at(SIM_TOML.find("[[axis]]").unwrap());
-    let mut blocks: Vec<&str> = rest.split("[[axis]]").filter(|b| !b.trim().is_empty()).collect();
+    let mut blocks: Vec<&str> = rest
+        .split("[[axis]]")
+        .filter(|b| !b.trim().is_empty())
+        .collect();
     assert_eq!(blocks.len(), 3);
     blocks.reverse();
-    let reordered = format!("{head}{}", blocks.iter().map(|b| format!("[[axis]]{b}\n")).collect::<String>());
+    let reordered = format!(
+        "{head}{}",
+        blocks
+            .iter()
+            .map(|b| format!("[[axis]]{b}\n"))
+            .collect::<String>()
+    );
 
     let a = Config::from_toml_str(SIM_TOML).unwrap();
     let b = Config::from_toml_str(&reordered).unwrap();
@@ -229,7 +394,10 @@ fn hash_independent_of_axis_order_in_config() {
     let cb = from_config(&b);
     assert_eq!(ca, cb);
     for (x, y) in ca.iter().zip(cb.iter()) {
-        assert_eq!(calibration_hash(&a.rig_id, x), calibration_hash(&b.rig_id, y));
+        assert_eq!(
+            calibration_hash(&a.rig_id, x),
+            calibration_hash(&b.rig_id, y)
+        );
     }
 }
 
@@ -242,9 +410,18 @@ fn from_config_indexes_by_axis_id_and_copies_fields() {
     let cals = from_config(&cfg);
     for (i, cal) in cals.iter().enumerate() {
         assert_eq!(cal.axis_id.index(), i);
-        let a = cfg.axis(cal.axis_id).expect("validated config has every axis");
+        let a = cfg
+            .axis(cal.axis_id)
+            .expect("validated config has every axis");
         assert_eq!(cal, &AxisCalibration::from_config(a));
-        assert_eq!(cal.count_at, [a.count_at_virtual_0, a.count_at_virtual_512, a.count_at_virtual_1023]);
+        assert_eq!(
+            cal.count_at,
+            [
+                a.count_at_virtual_0,
+                a.count_at_virtual_512,
+                a.count_at_virtual_1023
+            ]
+        );
         assert_eq!(cal.soft_min_count, a.soft_min_count);
         assert_eq!(cal.decel_zone_count, a.decel_zone_count);
         assert_eq!(cal.operator_marked_valid, a.calibration_valid);

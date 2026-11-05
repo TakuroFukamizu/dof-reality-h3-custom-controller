@@ -39,7 +39,12 @@ fn fill(ring: &mut StatusRing, t0: Instant, n: usize, period: Duration) -> Insta
     let mut t = t0;
     for k in 0..n {
         t = t0 + period * k as u32;
-        ring.push(TraceSample::new(t, &status(k as i32, 0), Some(k as i32 + 5), None));
+        ring.push(TraceSample::new(
+            t,
+            &status(k as i32, 0),
+            Some(k as i32 + 5),
+            None,
+        ));
     }
     t
 }
@@ -56,7 +61,11 @@ fn ring_is_fixed_capacity_and_overwrites_oldest() {
     fill(&mut ring, t0, 10, Duration::from_millis(20));
     assert_eq!(ring.len(), 4);
     let got: Vec<i32> = ring.iter_newest_first().map(|s| s.actual_count).collect();
-    assert_eq!(got, vec![9, 8, 7, 6], "wrapped: newest first, oldest overwritten");
+    assert_eq!(
+        got,
+        vec![9, 8, 7, 6],
+        "wrapped: newest first, oldest overwritten"
+    );
 }
 
 #[test]

@@ -60,7 +60,11 @@ pub fn derive(
     let soft_min = mech_min + decel;
     let soft_max = mech_max - decel;
     // Virtual position increases from the P end (count 0) toward the N end.
-    let (cv0, cv1023) = if n >= 0 { (soft_min, soft_max) } else { (soft_max, soft_min) };
+    let (cv0, cv1023) = if n >= 0 {
+        (soft_min, soft_max)
+    } else {
+        (soft_max, soft_min)
+    };
     let to_i32 = |name: &str, v: i64| {
         i32::try_from(v).map_err(|_| format!("{axis_id}: {name} {v} does not fit in i32"))
     };
@@ -152,7 +156,11 @@ fn parse_key_line(line: &str) -> Option<KeyLine<'_>> {
     }
     let eq = line.find('=')?;
     let key = line[..eq].trim();
-    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return None; // quoted / dotted keys are not rewritten
     }
     let rest = &line[eq + 1..];
@@ -225,20 +233,44 @@ pub fn rewrite_toml(text: &str, axes: &[AxisExport]) -> Result<Rewrite, String> 
             .collect();
         let (start, end) = match found.as_slice() {
             [b] => *b,
-            [] => return Err(format!("no [[axis]] block with axis_id = {}", ax.axis_id.get())),
-            _ => return Err(format!("[[axis]] axis_id = {} appears more than once", ax.axis_id.get())),
+            [] => {
+                return Err(format!(
+                    "no [[axis]] block with axis_id = {}",
+                    ax.axis_id.get()
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "[[axis]] axis_id = {} appears more than once",
+                    ax.axis_id.get()
+                ))
+            }
         };
         for key in REWRITTEN_KEYS {
-            let Some(new) = ax.value_of(key) else { continue };
+            let Some(new) = ax.value_of(key) else {
+                continue;
+            };
             let hits: Vec<usize> = (start..end)
                 .filter(|&i| parse_key_line(lines[i]).is_some_and(|k| k.key == key))
                 .collect();
             let i = match hits.as_slice() {
                 [i] => *i,
-                [] => return Err(format!("axis {}: key {key} not found in its [[axis]] block", ax.axis_id.get())),
-                _ => return Err(format!("axis {}: key {key} appears more than once", ax.axis_id.get())),
+                [] => {
+                    return Err(format!(
+                        "axis {}: key {key} not found in its [[axis]] block",
+                        ax.axis_id.get()
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "axis {}: key {key} appears more than once",
+                        ax.axis_id.get()
+                    ))
+                }
             };
-            let Some(k) = parse_key_line(lines[i]) else { continue };
+            let Some(k) = parse_key_line(lines[i]) else {
+                continue;
+            };
             let eol = if lines[i].ends_with("\r\n") {
                 "\r\n"
             } else if lines[i].ends_with('\n') {
@@ -273,8 +305,12 @@ pub fn rewrite_toml(text: &str, axes: &[AxisExport]) -> Result<Rewrite, String> 
 /// Header comment for the exported file.
 pub fn header(timestamp: &str, source: &str, axes: &[AxisExport], replaced: &[Replaced]) -> String {
     let mut h = String::new();
-    h.push_str("# h3-control-server が校正結果から書き出した設定（POST /v1/calibration/export）。\n");
-    h.push_str(&format!("# 書き出し: {timestamp}（UTC）。元の設定: {source}\n"));
+    h.push_str(
+        "# h3-control-server が校正結果から書き出した設定（POST /v1/calibration/export）。\n",
+    );
+    h.push_str(&format!(
+        "# 書き出し: {timestamp}（UTC）。元の設定: {source}\n"
+    ));
     h.push_str("# calibration_valid は false のまま。値を確認し、hardware-bringup.md §5.5 の手順で true にすること。\n");
     for a in axes {
         h.push_str(&format!(
@@ -296,7 +332,13 @@ pub fn header(timestamp: &str, source: &str, axes: &[AxisExport], replaced: &[Re
         ));
     }
     for r in replaced.iter().filter(|r| r.old != r.new) {
-        h.push_str(&format!("#   axis {} {}: {} -> {}\n", r.axis_id.get(), r.key, r.old, r.new));
+        h.push_str(&format!(
+            "#   axis {} {}: {} -> {}\n",
+            r.axis_id.get(),
+            r.key,
+            r.old,
+            r.new
+        ));
     }
     h.push('\n');
     h
@@ -307,15 +349,28 @@ pub fn header(timestamp: &str, source: &str, axes: &[AxisExport], replaced: &[Re
 pub fn file_name(rig_id: &str, timestamp: &str) -> String {
     let safe: String = rig_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe = if safe.is_empty() { "rig".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "rig".to_string()
+    } else {
+        safe
+    };
     format!("{safe}.calibration-{timestamp}.toml")
 }
 
 /// `YYYYmmdd-HHMMSS` of `t` in UTC (the server has no time-zone database).
 pub fn utc_timestamp(t: SystemTime) -> String {
-    let secs = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -346,14 +401,23 @@ mod tests {
     fn timestamp_is_utc_civil() {
         assert_eq!(utc_timestamp(UNIX_EPOCH), "19700101-000000");
         // 2026-11-01T05:30:12Z
-        assert_eq!(utc_timestamp(UNIX_EPOCH + Duration::from_secs(1_793_511_012)), "20261101-053012");
+        assert_eq!(
+            utc_timestamp(UNIX_EPOCH + Duration::from_secs(1_793_511_012)),
+            "20261101-053012"
+        );
         // 2000-02-29T23:59:59Z (leap day).
-        assert_eq!(utc_timestamp(UNIX_EPOCH + Duration::from_secs(951_868_799)), "20000229-235959");
+        assert_eq!(
+            utc_timestamp(UNIX_EPOCH + Duration::from_secs(951_868_799)),
+            "20000229-235959"
+        );
     }
 
     #[test]
     fn file_name_has_no_path_separators() {
-        assert_eq!(file_name("h3/bringup 01", "20261101-000000"), "h3_bringup_01.calibration-20261101-000000.toml");
+        assert_eq!(
+            file_name("h3/bringup 01", "20261101-000000"),
+            "h3_bringup_01.calibration-20261101-000000.toml"
+        );
         assert_eq!(file_name("", "t"), "rig.calibration-t.toml");
     }
 
