@@ -1,6 +1,6 @@
 //! config: loading and structural validation.
 
-use h3cs::config::{BackendConfig, Config, ConfigError, LimitsConfig};
+use h3cs::config::{BackendConfig, Config, ConfigError, LimitsConfig, PortList};
 use h3cs::types::{AxisId, DeviceId};
 use std::path::Path;
 
@@ -212,6 +212,78 @@ fn limits_rules() {
     assert_eq!((d.following_error_limit_count, d.overspeed_count_s), (800, 9000));
 }
 
+#[test]
+fn governor_section_defaults_and_rejects_bad_thresholds() {
+    let cfg = sim();
+    assert_eq!(cfg.governor, h3cs::governor::GovernorConfig::default());
+    let mut bad = cfg.clone();
+    bad.governor.fe_hard = cfg.limits.following_error_limit_count;
+    assert_invalid(&bad, "governor.fe_hard");
+    bad = cfg.clone();
+    bad.governor.fe_release = bad.governor.fe_start;
+    assert_invalid(&bad, "governor.fe_release");
+    bad = cfg.clone();
+    bad.governor.s_min = 0.0;
+    assert_invalid(&bad, "governor.s_min");
+    bad.governor.s_min = 1.0;
+    bad.governor.down_rate = 0.0;
+    assert_invalid(&bad, "governor.down_rate");
+    let text = std::fs::read_to_string(SIM).unwrap();
+    let with = format!("{text}\n[governor]\nfe_start = 100\nfe_hard = 180\nfe_release = 40\n");
+    let loaded = Config::from_toml_str(&with).unwrap();
+    assert_eq!((loaded.governor.fe_release, loaded.governor.fe_start, loaded.governor.fe_hard), (40, 100, 180));
+    assert_eq!(loaded.governor.s_min, h3cs::governor::GovernorConfig::default().s_min);
+    assert!(loaded.governor.thresholds_explicit);
+    assert_eq!(loaded.governor.no_progress_ms, 1500);
+}
+
+#[test]
+fn governor_scales_factory_defaults_when_the_following_error_limit_is_small() {
+    let text = std::fs::read_to_string(SIM).unwrap();
+    let low = text.replacen(
+        "following_error_limit_count = 800",
+        "following_error_limit_count = 200",
+        1,
+    );
+    let cfg = Config::from_toml_str(&low).unwrap();
+    assert!(!cfg.governor.thresholds_explicit);
+    assert_eq!(
+        (cfg.governor.fe_release, cfg.governor.fe_start, cfg.governor.fe_hard),
+        (30, 60, 100)
+    );
+    assert_eq!(cfg.governor.no_progress_ms, 1500);
+
+    // 無効なら順序を見ない。明示の fe_hard は縮めない。
+    let off = format!("{low}\n[governor]\nenabled = false\nfe_hard = 500\n");
+    let cfg = Config::from_toml_str(&off).unwrap();
+    assert!(!cfg.governor.enabled);
+    assert!(cfg.governor.thresholds_explicit);
+    assert_eq!(cfg.governor.fe_hard, 500);
+
+    // 工場値と同じ数でも書いたら明示。limit 200 では fe_hard が通らない。
+    let explicit = format!("{low}\n[governor]\nfe_start = 120\nfe_hard = 200\nfe_release = 60\n");
+    match Config::from_toml_str(&explicit) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("governor.fe_hard"), "{m}"),
+        other => panic!("expected invalid fe_hard, got {other:?}"),
+    }
+
+    let stalled = format!("{text}\n[governor]\nno_progress_ms = 0\n");
+    match Config::from_toml_str(&stalled) {
+        Err(ConfigError::Invalid(m)) => assert!(m.contains("governor.no_progress_ms"), "{m}"),
+        other => panic!("expected invalid no_progress_ms, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_bringup_accepts_default_governor() {
+    // 節が無い実機設定。既定の fe_hard が following_error_limit_count 未満であること。
+    let live = concat!(env!("CARGO_MANIFEST_DIR"), "/config/h3-bringup-01-live-20261102.toml");
+    let cfg = Config::load(Path::new(live)).unwrap_or_else(|e| panic!("{live}: {e}"));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.governor, h3cs::governor::GovernorConfig::default());
+    assert!(cfg.limits.following_error_limit_count > cfg.governor.fe_hard);
+}
+
 /// Issue #15 H2: `max_vel / max_acc` must fit in 0.8 x the shorter stop
 /// timeout, for the initial set and for the firmware ceilings.
 #[test]
@@ -335,9 +407,55 @@ fn server_and_backend_zero_values_rejected() {
 
     let mut ex = Config::load(Path::new(EXAMPLE)).unwrap();
     if let BackendConfig::Serial(b) = &mut ex.backend {
-        b.ports.clear();
+        b.ports = PortList::Named(vec![]);
     }
     assert_invalid(&ex, "backend.ports");
+}
+
+const BRINGUP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bringup.toml");
+
+fn serial_ports(cfg: &Config) -> &PortList {
+    match &cfg.backend {
+        BackendConfig::Serial(b) => &b.ports,
+        _ => panic!("not a serial backend"),
+    }
+}
+
+#[test]
+fn ports_auto_or_list() {
+    // bringup.toml finds its units by USB serial number.
+    let bringup = Config::load(Path::new(BRINGUP)).unwrap();
+    assert_eq!(serial_ports(&bringup), &PortList::Auto);
+    // A list still works, and round-trips through TOML either way.
+    let ex = Config::load(Path::new(EXAMPLE)).unwrap();
+    assert!(matches!(serial_ports(&ex), PortList::Named(v) if v.len() == 3));
+    for cfg in [&bringup, &ex] {
+        let text = toml::to_string(cfg).unwrap();
+        let mut back = Config::from_toml_str(&text).unwrap();
+        // Serialization always writes fe_*, so the round trip reads them as explicit.
+        back.governor.thresholds_explicit = cfg.governor.thresholds_explicit;
+        assert_eq!(&back, cfg);
+    }
+    // Any other word is a parse error naming the choices.
+    let text = std::fs::read_to_string(BRINGUP).unwrap();
+    let bad = text.replacen("\nports = \"auto\"\n", "\nports = \"/dev/cu.usbmodem14101\"\n", 1);
+    assert_ne!(bad, text);
+    match Config::from_toml_str(&bad) {
+        Err(ConfigError::Parse(e)) => assert!(e.to_string().contains("\"auto\" or a list"), "{e}"),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn ports_auto_needs_a_device_id_on_every_real_axis() {
+    let mut cfg = Config::load(Path::new(BRINGUP)).unwrap();
+    cfg.axes.iter_mut().find(|a| a.axis_id == AxisId::new(2).unwrap()).unwrap().device_id = DeviceId(0);
+    assert_invalid(&cfg, "needs a device_id on [[axis]] axis_id = 2");
+    // A simulated axis is not looked for, so it needs none.
+    if let BackendConfig::Serial(b) = &mut cfg.backend {
+        b.sim_axes = vec![AxisId::new(2).unwrap()];
+    }
+    cfg.validate().unwrap();
 }
 
 #[test]
@@ -499,7 +617,8 @@ fn serial_sim_axes_validation() {
     let bad = h3cs::config::Config::from_toml_str(&with("sim_axes = [4]"));
     assert!(bad.is_err(), "axis 4 does not exist");
     // No ports at all is fine only when every axis is simulated.
-    let no_ports = base.replacen("ports = [", "ports = [] # [", 1);
+    let no_ports = base.replacen("\nports = \"auto\"\n", "\nports = []\n", 1);
+    assert_ne!(no_ports, base);
     assert!(h3cs::config::Config::from_toml_str(&no_ports).is_err());
     assert!(h3cs::config::Config::from_toml_str(&no_ports.replacen("baud = 115200", "baud = 115200\nsim_axes = [1, 2, 3]", 1)).is_ok());
 }

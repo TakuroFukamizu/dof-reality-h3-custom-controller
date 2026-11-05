@@ -38,7 +38,7 @@ struct V1Tuning {
   int duty_max = V1_DUTY_MAX;
   int stall_duty = V1_STALL_DUTY;
   int stall_duty_ratio_percent = V1_STALL_DUTY_RATIO_PERCENT;  // ENCODER_FAULT のしきい値 = max(stall_duty, duty_max × これ / 100)
-  uint32_t stall_ms = STALL_MS;
+  uint32_t stall_ms = V1_STALL_MS;
   uint32_t stall_boost_ms = V1_STALL_BOOST_MS;        // 停止ブーストの窓（0 で無効）
   uint32_t stall_boost_max_ms = V1_STALL_BOOST_MAX_MS;  // 対象のまま動かずにこれを超えたら ENCODER_FAULT（0 で時間の上限なし。頭打ちの上限は残る）
   int32_t stall_boost_min_move = V1_STALL_BOOST_MIN_MOVE;
@@ -79,6 +79,7 @@ struct V1Tuning {
   double ff_b_down_permille_per_count_s = V1_FF_B_DOWN_PERMILLE_PER_COUNT_S;
   int32_t ff_taper_count_s = V1_FF_TAPER_COUNT_S;
   int32_t hold_enter = V1_HOLD_ENTER_COUNT;   // 保持に入る |誤差|（r6）
+  int32_t stationary_fault_min_err = V1_STATIONARY_FAULT_MIN_ERR;  // 静止 2 s の監視で FAULT にしない |誤差| の上限（0 で従来どおり）
   int32_t hold_exit = V1_HOLD_EXIT_COUNT;     // 保持から出る |誤差|（r6）
   int breakaway_up_permille = V1_BREAKAWAY_UP_PERMILLE;
   int breakaway_down_permille = V1_BREAKAWAY_DOWN_PERMILLE;
@@ -778,6 +779,11 @@ class V1Axis {
   double control_target_ = 0.0;
   double frame_max_vel_ = 0.0;
   double frame_max_acc_ = 0.0;
+  // SET_LIMITS の stop_acc。0 は未設定（制御された停止は CONFIG の max_acc）。
+  // 系統の切り替えでは消さない（Duty の tuning と同じ。再起動で 0 に戻る）。
+  uint16_t stop_acc_count_s2_ = 0;
+  // STOPPING に入ったときに決める減速度 [count/s²]。制御された停止は stop_acc（未設定なら CONFIG）、異常停止はフレーム（begin_stop）。
+  double stopping_amax_ = 0.0;
   V1PlayoutBuffer playout_{};  // Issue #45: ACTIVE で受けた目標（受信時刻つき）。START・hold_here で空にする
   V1PlayoutFit playout_fit_{};  // 直近の tick の軌道の推定（計器・テスト用）
   V1PlayoutClock playout_clock_{};  // Issue #45: 有効な SET_POSITION 全部（HOLDING 中も）の (seq, 受信時刻) から時刻を付け直す
@@ -832,6 +838,7 @@ class V1Axis {
   bool boost_eligible_ = false;      // 前の tick で対象だった
   bool boost_window_running_ = false;
   int8_t boost_err_sign_ = 0;        // 直近に評価した誤差の符号（反転で 0 に戻す）
+  int64_t boost_err_abs_ = 0;        // 直近に評価した |誤差|（静止 2 s の監視で、小さな誤差なら FAULT にしない。2026-11-03 20:11）
   uint64_t boost_window_start_us_ = 0;
   uint64_t boost_active_since_us_ = 0;  // 対象になってから（動けば取り直す）。stall_boost_max_ms の起点
   int64_t boost_anchor_raw_ = 0;     // 窓の開始時のカウント
@@ -1116,6 +1123,15 @@ class V1Axis {
     tuning.ff_count_s_per_percent = l.ff_count_s_per_percent;
     tuning.deadband = l.deadband_count;
     tuning.deadband_out = l.deadband_out_count;
+    // 0 は未設定のまま。非 0 は絶対上限でクランプする（拒否はしない）。
+    // 減速中でも保存だけする。いまの stopping_amax_ は入口で決めた値のまま（次の停止から効く）。
+    if (l.stop_acc_count_s2 == 0) {
+      stop_acc_count_s2_ = 0;
+    } else {
+      uint32_t a = l.stop_acc_count_s2;
+      if (a > V1_ABS_MAX_ACC_COUNT_S2) a = V1_ABS_MAX_ACC_COUNT_S2;
+      stop_acc_count_s2_ = static_cast<uint16_t>(a);
+    }
     return v1::ack_reason::NONE;
   }
 
@@ -1382,6 +1398,19 @@ class V1Axis {
     state_ = v1::state::STOPPING;
     stop_kind_ = kind;
     stopping_started_us_ = now;
+    // 入口で減速度を決める。制御された停止（CONTROLLED_STOP・valid_for 期限・DISARM）は
+    // SET_LIMITS の stop_acc（操作者の max_acc。0 は未設定で CONFIG の max_acc）。
+    // 直前の SET_POSITION がガバナで下げた値は使わない。
+    // 異常停止（COMMAND_TIMEOUT）は従来どおり最後のフレーム（0 は CONFIG、下限 V1_MIN_DECEL）。
+    // すでに STOPPING の途中で Fault に変わるときはここを通らないので、入口の減速度を保つ。
+    if (kind == StopKind::Fault) {
+      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
+      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
+      stopping_amax_ = amax;
+    } else {
+      const uint32_t op = stop_acc_count_s2_;
+      stopping_amax_ = op > 0 ? static_cast<double>(op) : static_cast<double>(config_.max_acc_count_s2);
+    }
   }
 
   // 減速してからラッチする異常（COMMAND_TIMEOUT）。止まっていれば即ラッチ。
@@ -1389,7 +1418,8 @@ class V1Axis {
     if (setpoint_vel_ == 0.0) {
       latch_fault(code, now);
     } else if (state_ == v1::state::STOPPING) {
-      stop_kind_ = StopKind::Fault;  // 減速の開始時刻はそのまま（stop_timeout の起点を保つ）
+      // 減速の開始時刻と減速度は入口のまま（stop_timeout の起点を保つ。制御停止の途中でフレーム加速度に戻さない）
+      stop_kind_ = StopKind::Fault;
       stop_fault_code_ = code;
     } else {
       begin_stop(StopKind::Fault, now);
@@ -1565,12 +1595,8 @@ class V1Axis {
       setpoint_ = p < lo ? lo : (p > hi ? hi : p);
       setpoint_vel_ = v;
     } else if (state_ == v1::state::STOPPING) {
-      // 減速は最後に適用したフレームの max_acc で（CONFIG には絶対上限が入るので、そちらでは 40000 count/s² の急減速になる。
-      // motion-limits 設計 §4.4）。frame_max_acc_ は START で CONFIG の値から初期化され SET_POSITION ごとに更新されるが、
-      // フレームが max_acc = 0 を運ぶと 0 になり減速できないので、そのときだけ CONFIG の値に戻す。
-      // PR #49 レビュー P1b: ごく小さい max_acc（1 など）でも止まれるよう V1_MIN_DECEL_COUNT_S2 を下限にする
-      double amax = frame_max_acc_ > 0.0 ? frame_max_acc_ : static_cast<double>(config_.max_acc_count_s2);
-      if (amax < static_cast<double>(V1_MIN_DECEL_COUNT_S2)) amax = static_cast<double>(V1_MIN_DECEL_COUNT_S2);
+      // 減速度は begin_stop で決めた値（制御された停止は stop_acc、未設定なら CONFIG。異常停止だけフレーム）。
+      const double amax = stopping_amax_;
       const double dv = amax * dt;
       double v = setpoint_vel_;
       if (fabs(v) <= dv) {
@@ -2161,6 +2187,7 @@ class V1Axis {
     const bool in_hold = tuning.ff_directional && duty_state_.in_band;
     const bool eligible = setpoint_vel_ == 0.0 && err_abs > gate && brake_release_cmd_ && !in_hold;
     if (!eligible) { reset_stall_boost(); return; }
+    boost_err_abs_ = err_abs;
     const int8_t err_sign = err > 0 ? 1 : -1;
     if (!boost_eligible_ || err_sign != boost_err_sign_) {
       reset_stall_boost();
@@ -2201,6 +2228,13 @@ class V1Axis {
       // Issue #25 r6: 床が無いので上乗せもしない。静止 2 s の監視（対象のまま stall_boost_min_move 未満しか進まない →
       // ENCODER_FAULT）だけを残す。時計を戻すのは上の「動いた」だけで、動き出しパルス（update_breakaway）は戻さない。
       stall_boost_ = 0;
+      // 2026-11-03 20:11 #2: 人の荷重で、目標の 14 count 手前から最後を持ち上げられず（出力約 10 %）、2 s で ENCODER_FAULT になった。
+      // 操作者の判断で検出を緩める: |誤差| ≤ stationary_fault_min_err（既定 20）のままなら異常にせず、監視の時計だけ取り直す。
+      // 押し続ける出力は小さい誤差ぶん（kp × 20 ＋ 積分）に限られる。誤差がそれを超えたまま動かなければ従来どおり 2 s で FAULT
+      if (timed_out && boost_err_abs_ <= tuning.stationary_fault_min_err) {
+        boost_active_since_us_ = now;
+        return;
+      }
       if (timed_out && !encoder_fault_check_disabled()) latch_fault(v1::fault::ENCODER_FAULT, now);
       return;
     }
@@ -2282,6 +2316,7 @@ class V1Axis {
     m.limits.ff_count_s_per_percent = static_cast<uint16_t>(tuning.ff_count_s_per_percent);
     m.limits.deadband_count = static_cast<uint16_t>(tuning.deadband);
     m.limits.deadband_out_count = static_cast<uint16_t>(tuning.deadband_out);
+    m.limits.stop_acc_count_s2 = stop_acc_count_s2_;  // 0 は未設定のまま返す
     m.limits.abs_max_vel_count_s = V1_ABS_MAX_VEL_COUNT_S;
     m.limits.abs_max_acc_count_s2 = V1_ABS_MAX_ACC_COUNT_S2;
     push(m);

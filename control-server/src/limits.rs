@@ -148,6 +148,19 @@ pub fn min_acc_for_stop(max_vel_count_s: u32, deadline: Duration) -> u32 {
     }
 }
 
+/// Largest `max_vel_count_s` that stops at `max_acc` within `deadline`
+/// (`floor(acc × deadline)`). Inverse of [`min_acc_for_stop`]; [`clamp`]
+/// uses it when the acceleration ceiling cannot meet the bound, and the
+/// supervisor uses it while a higher `stop_acc` is still unconfirmed.
+pub fn max_vel_for_stop(max_acc_count_s2: u32, deadline: Duration) -> u32 {
+    let v = (f64::from(max_acc_count_s2) * deadline.as_secs_f64()).floor();
+    if v.is_finite() && v >= 0.0 {
+        v.min(f64::from(u32::MAX)) as u32
+    } else {
+        0
+    }
+}
+
 /// Absolute ceilings one MCU reported (LIMITS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FwAbsolute {
@@ -370,8 +383,7 @@ pub fn clamp(requested: &MotionLimits, c: &Ceilings, op: &OperatorCap, stop_dead
                 max_acc_count_s2 = c.max_acc_count_s2;
                 stop.push(LimitedField::MaxAccCountS2);
             }
-            let v = (f64::from(c.max_acc_count_s2) * stop_deadline.as_secs_f64()).floor();
-            let v = if v.is_finite() && v >= 0.0 { v.min(f64::from(u32::MAX)) as u32 } else { 0 };
+            let v = max_vel_for_stop(c.max_acc_count_s2, stop_deadline);
             if v < max_vel_count_s {
                 max_vel_count_s = v;
                 stop.push(LimitedField::MaxVelCountS);
@@ -490,11 +502,25 @@ pub struct FwTuning {
     pub ff_count_s_per_percent: u16,
     pub deadband_count: u16,
     pub deadband_out_count: u16,
+    /// Controlled-stop deceleration: the operator `max_acc` of the set this
+    /// tuning was built from, clamped to the firmware ceiling. Not a duty
+    /// field — see [`FwTuning::same_duty`].
+    pub stop_acc_count_s2: u16,
+}
+
+/// Operator `max_acc` for the SET_LIMITS `stop_acc` field. The firmware
+/// ceiling fits in the u16 (40000 < 65535). 0 would mean "unset" on the MCU,
+/// so a real limit is never sent as 0 (`max_acc` is at least 1 after clamp).
+fn stop_acc_wire(max_acc: u32) -> u16 {
+    let capped = max_acc.min(fw_absolute::MAX_ACC_COUNT_S2).min(u32::from(u16::MAX));
+    u16::try_from(capped).unwrap_or(u16::MAX)
 }
 
 impl FwTuning {
     /// `effective.duty_max_percent` with the operator-only values from the
     /// config. `duty_min` never exceeds `duty_max` (the MCU would reject it).
+    /// `stop_acc_count_s2` is `effective.max_acc_count_s2` (already ceiling-
+    /// clamped and stop-time-raised).
     pub fn new(cfg: &LimitsConfig, effective: &MotionLimits) -> Self {
         Self {
             duty_max_percent: effective.duty_max_percent,
@@ -503,7 +529,20 @@ impl FwTuning {
             ff_count_s_per_percent: cfg.ff_count_s_per_percent,
             deadband_count: cfg.deadband_count,
             deadband_out_count: cfg.deadband_out_count,
+            stop_acc_count_s2: stop_acc_wire(effective.max_acc_count_s2),
         }
+    }
+
+    /// Duty / Kp / FF / deadband only. Acceleration is the controlled-stop
+    /// rate and has its own confirmation (`LIMITS.stop_acc`), not this
+    /// comparison. Issue #15 M3 still waits on the duty cap.
+    pub fn same_duty(self, other: Self) -> bool {
+        self.duty_max_percent == other.duty_max_percent
+            && self.duty_min_percent == other.duty_min_percent
+            && self.kp_percent_per_100 == other.kp_percent_per_100
+            && self.ff_count_s_per_percent == other.ff_count_s_per_percent
+            && self.deadband_count == other.deadband_count
+            && self.deadband_out_count == other.deadband_out_count
     }
 
     pub fn to_msg(self, request_id: u32) -> SetLimits {
@@ -515,6 +554,7 @@ impl FwTuning {
             ff_count_s_per_percent: self.ff_count_s_per_percent,
             deadband_count: self.deadband_count,
             deadband_out_count: self.deadband_out_count,
+            stop_acc_count_s2: self.stop_acc_count_s2,
         }
     }
 }
@@ -540,9 +580,14 @@ pub struct MotionLimitsSnapshot {
     pub limited: Vec<LimitedField>,
     /// Why (`ceiling_clamped` / `operator_limited` / `stop_time_limited`).
     pub reasons: Vec<LimitReason>,
-    /// The clamped request changes the firmware tuning (duty cap) and not
-    /// every connected axis has ACKed that SET_LIMITS yet: `effective` keeps
-    /// the confirmed set (only lowered components are taken at once).
+    /// The clamped request changes the duty cap or the stop rate, and not
+    /// every connected axis has confirmed it yet. `effective` keeps the
+    /// confirmed duty cap (only lowered gain and velocity are taken at
+    /// once). Acceleration may rise only after every axis has echoed that
+    /// `stop_acc`; a lower rate applies only while it stays at or below the
+    /// echoed stop deceleration. While the planner's acceleration is still
+    /// below the requested rate, velocity is also held to
+    /// `max_vel_for_stop` of that acceleration.
     pub pending: bool,
 }
 
@@ -625,6 +670,10 @@ mod tests {
         assert_eq!(min_acc_for_stop(6000, DEADLINE), 5000);
         assert_eq!(min_acc_for_stop(0, DEADLINE), 0);
         assert_eq!(min_acc_for_stop(600, Duration::ZERO), u32::MAX);
+        assert_eq!(max_vel_for_stop(500, DEADLINE), 600);
+        assert_eq!(max_vel_for_stop(1000, DEADLINE), 1200);
+        assert_eq!(max_vel_for_stop(0, DEADLINE), 0);
+        assert!(min_acc_for_stop(max_vel_for_stop(500, DEADLINE), DEADLINE) <= 500);
     }
 
     #[test]
@@ -753,6 +802,14 @@ mod tests {
         let e = MotionLimits { max_gain: 0.5, max_vel_count_s: 3000, max_acc_count_s2: 15000, duty_max_percent: 5 };
         let t = FwTuning::new(&cfg, &e);
         assert_eq!((t.duty_max_percent, t.duty_min_percent), (5, 5));
-        assert_eq!(t.to_msg(9).request_id, 9);
+        assert_eq!(t.stop_acc_count_s2, 15000);
+        let msg = t.to_msg(9);
+        assert_eq!(msg.request_id, 9);
+        assert_eq!(msg.stop_acc_count_s2, 15000);
+        let capped = FwTuning::new(
+            &cfg,
+            &MotionLimits { max_acc_count_s2: 99_999, ..e },
+        );
+        assert_eq!(capped.stop_acc_count_s2, 40000);
     }
 }

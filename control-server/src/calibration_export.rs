@@ -24,6 +24,7 @@
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::AxisConfig;
 use crate::supervisor::CalibrationResult;
 use crate::types::{AxisId, Counts, DeviceId};
 
@@ -79,6 +80,104 @@ pub fn derive(
         count_at_virtual_512: r.neutral_count,
         count_at_virtual_1023: to_i32("count_at_virtual_1023", cv1023)?,
     })
+}
+
+/// Margins of an axis's virtual end points inside its soft window, measured
+/// on the configuration in force: `p` at the virtual end on the P-end side
+/// (count 0), `n` at the other. `p_to_n`: virtual 0 is on the P-end side
+/// (the `derive` convention); false when the operator swapped
+/// `count_at_virtual_0` / `1023` to reverse the direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Margins {
+    pub p: Counts,
+    pub n: Counts,
+    pub p_to_n: bool,
+}
+
+impl Margins {
+    /// From a (validated) axis configuration. The live config keeps
+    /// `count_at_virtual_0 / 1023` 350 counts inside the soft limits
+    /// (Issue #34 / PR #38); this is what a hot apply / export keeps.
+    pub fn of(a: &AxisConfig) -> Self {
+        let (c0, c512, c1023) = (a.count_at_virtual_0, a.count_at_virtual_512, a.count_at_virtual_1023);
+        // Margin of each virtual end to the soft limit on its own side.
+        let (m0, m1023) = if c0 < c512 {
+            (c0.saturating_sub(a.soft_min_count), a.soft_max_count.saturating_sub(c1023))
+        } else {
+            (a.soft_max_count.saturating_sub(c0), c1023.saturating_sub(a.soft_min_count))
+        };
+        // P end = count 0 (protocol §1.2): the virtual end nearer to 0.
+        let p_to_n = c0.unsigned_abs() <= c1023.unsigned_abs();
+        let (p, n) = if p_to_n { (m0, m1023) } else { (m1023, m0) };
+        Self { p: p.max(0), n: n.max(0), p_to_n }
+    }
+}
+
+/// [`derive`], then move the virtual end points inside the new soft window by
+/// `current`'s [`Margins`] and keep its direction. `Err` when the margins do
+/// not fit the new window (the end points would reach the neutral) or the
+/// arithmetic leaves i32.
+pub fn derive_keeping(
+    current: &AxisConfig,
+    device_id: DeviceId,
+    r: &CalibrationResult,
+) -> Result<AxisExport, String> {
+    let mut e = derive(current.axis_id, device_id, current.decel_zone_count, r)?;
+    let m = Margins::of(current);
+    let axis_id = current.axis_id;
+    let n = i64::from(r.n_end_count);
+    // Soft limit on the P-end side and on the N-end side.
+    let (sp, sn) = if n >= 0 {
+        (i64::from(e.soft_min_count), i64::from(e.soft_max_count))
+    } else {
+        (i64::from(e.soft_max_count), i64::from(e.soft_min_count))
+    };
+    let toward_n = if n >= 0 { 1 } else { -1 };
+    let cp = sp + toward_n * i64::from(m.p);
+    let cn = sn - toward_n * i64::from(m.n);
+    let neutral = i64::from(e.count_at_virtual_512);
+    let inside = |c: i64| (sp.min(sn)..=sp.max(sn)).contains(&c);
+    // Strictly P end → neutral → N end, as measured (never crossed).
+    let ordered = if n >= 0 { cp < neutral && neutral < cn } else { cp > neutral && neutral > cn };
+    if !inside(cp) || !inside(cn) || !ordered {
+        return Err(format!(
+            "{axis_id}: the margins of the configuration in force (P side {}, N side {}) do not fit the measured \
+             soft window [{}, {}] around neutral {neutral}",
+            m.p, m.n, e.soft_min_count, e.soft_max_count
+        ));
+    }
+    let to_i32 = |name: &str, v: i64| i32::try_from(v).map_err(|_| format!("{axis_id}: {name} {v} does not fit in i32"));
+    let (c0, c1023) = if m.p_to_n { (cp, cn) } else { (cn, cp) };
+    e.count_at_virtual_0 = to_i32("count_at_virtual_0", c0)?;
+    e.count_at_virtual_1023 = to_i32("count_at_virtual_1023", c1023)?;
+    Ok(e)
+}
+
+impl AxisExport {
+    /// The `[[axis]]` values of this export as `key = value` text (for
+    /// [`rewrite_axis_values`]); `calibration_valid` as given.
+    pub fn values(&self, calibration_valid: bool) -> Vec<(&'static str, String)> {
+        REWRITTEN_KEYS
+            .iter()
+            .filter_map(|k| {
+                let v = if *k == "calibration_valid" { calibration_valid.to_string() } else { self.value_of(k)? };
+                Some((*k, v))
+            })
+            .collect()
+    }
+
+    /// Apply the exported values to an axis configuration.
+    pub fn apply_to(&self, a: &mut AxisConfig) {
+        a.device_id = self.device_id;
+        a.count_at_virtual_0 = self.count_at_virtual_0;
+        a.count_at_virtual_512 = self.count_at_virtual_512;
+        a.count_at_virtual_1023 = self.count_at_virtual_1023;
+        a.mechanical_min_count = self.mechanical_min_count;
+        a.mechanical_max_count = self.mechanical_max_count;
+        a.soft_min_count = self.soft_min_count;
+        a.soft_max_count = self.soft_max_count;
+        a.decel_zone_count = self.decel_zone_count;
+    }
 }
 
 /// One replaced `key = value` line.
@@ -189,6 +288,15 @@ fn parse_key_line(line: &str) -> Option<KeyLine<'_>> {
 /// `text` (line by line; everything else, comments included, is kept). Every
 /// key in [`REWRITTEN_KEYS`] must exist once in each updated block.
 pub fn rewrite_toml(text: &str, axes: &[AxisExport]) -> Result<Rewrite, String> {
+    let edits: Vec<(AxisId, Vec<(&'static str, String)>)> =
+        axes.iter().map(|a| (a.axis_id, a.values(false))).collect();
+    rewrite_axis_values(text, &edits)
+}
+
+/// Replace `key = value` lines inside the `[[axis]]` blocks of `text` (line by
+/// line; everything else, comments included, is kept). Each key must exist
+/// once in its axis's block.
+pub fn rewrite_axis_values(text: &str, edits: &[(AxisId, Vec<(&'static str, String)>)]) -> Result<Rewrite, String> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     // Block = (first line index after the header, one past the last line).
     let mut blocks: Vec<(usize, usize)> = Vec::new();
@@ -217,26 +325,27 @@ pub fn rewrite_toml(text: &str, axes: &[AxisExport]) -> Result<Rewrite, String> 
     };
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let mut replaced = Vec::new();
-    for ax in axes {
+    for (axis_id, values) in edits {
+        let axis_id = *axis_id;
         let found: Vec<(usize, usize)> = blocks
             .iter()
             .copied()
-            .filter(|b| axis_of_block(*b) == Some(ax.axis_id))
+            .filter(|b| axis_of_block(*b) == Some(axis_id))
             .collect();
         let (start, end) = match found.as_slice() {
             [b] => *b,
-            [] => return Err(format!("no [[axis]] block with axis_id = {}", ax.axis_id.get())),
-            _ => return Err(format!("[[axis]] axis_id = {} appears more than once", ax.axis_id.get())),
+            [] => return Err(format!("no [[axis]] block with axis_id = {}", axis_id.get())),
+            _ => return Err(format!("[[axis]] axis_id = {} appears more than once", axis_id.get())),
         };
-        for key in REWRITTEN_KEYS {
-            let Some(new) = ax.value_of(key) else { continue };
+        for (key, new) in values {
+            let (key, new) = (*key, new.clone());
             let hits: Vec<usize> = (start..end)
                 .filter(|&i| parse_key_line(lines[i]).is_some_and(|k| k.key == key))
                 .collect();
             let i = match hits.as_slice() {
                 [i] => *i,
-                [] => return Err(format!("axis {}: key {key} not found in its [[axis]] block", ax.axis_id.get())),
-                _ => return Err(format!("axis {}: key {key} appears more than once", ax.axis_id.get())),
+                [] => return Err(format!("axis {}: key {key} not found in its [[axis]] block", axis_id.get())),
+                _ => return Err(format!("axis {}: key {key} appears more than once", axis_id.get())),
             };
             let Some(k) = parse_key_line(lines[i]) else { continue };
             let eol = if lines[i].ends_with("\r\n") {
@@ -257,7 +366,7 @@ pub fn rewrite_toml(text: &str, axes: &[AxisExport]) -> Result<Rewrite, String> 
             let comment = k.comment.trim_end_matches(['\r', '\n']);
             out[i] = format!("{}{pad}{new}{gap}{comment}{eol}", k.head);
             replaced.push(Replaced {
-                axis_id: ax.axis_id,
+                axis_id,
                 key,
                 old: k.value.to_string(),
                 new,

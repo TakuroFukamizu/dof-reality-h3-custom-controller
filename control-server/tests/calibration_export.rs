@@ -150,3 +150,56 @@ decel_zone_count = 1\n";
 fn file_name_uses_rig_id_and_timestamp() {
     assert_eq!(file_name("h3-bringup-01", "20261101-053012"), "h3-bringup-01.calibration-20261101-053012.toml");
 }
+
+const LIVE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/h3-bringup-01-live-20261102.toml");
+
+#[test]
+fn derive_keeping_preserves_the_live_350_margin_and_the_direction() {
+    use h3cs::calibration_export::{derive_keeping, Margins};
+    let live = Config::load(std::path::Path::new(LIVE)).unwrap();
+    let a1 = live.axis(ax(1)).unwrap();
+    assert_eq!(Margins::of(a1), Margins { p: 350, n: 350, p_to_n: true });
+    let e = derive_keeping(a1, a1.device_id, &ok(5560, 2780, 1)).unwrap();
+    assert_eq!((e.mechanical_min_count, e.mechanical_max_count, e.soft_min_count, e.soft_max_count), (0, 5560, 50, 5510));
+    assert_eq!((e.count_at_virtual_0, e.count_at_virtual_512, e.count_at_virtual_1023), (400, 2780, 5160));
+    // Plain derive would have put the end points on the soft limits.
+    let plain = derive(ax(1), a1.device_id, 50, &ok(5560, 2780, 1)).unwrap();
+    assert_eq!((plain.count_at_virtual_0, plain.count_at_virtual_1023), (50, 5510));
+
+    // Operator-reversed direction is kept, with each side's margin.
+    let mut rev = a1.clone();
+    rev.count_at_virtual_0 = 5106; // soft_max − 400
+    rev.count_at_virtual_1023 = 400; // soft_min + 350
+    assert_eq!(Margins::of(&rev), Margins { p: 350, n: 400, p_to_n: false });
+    let e = derive_keeping(&rev, rev.device_id, &ok(5560, 2780, 1)).unwrap();
+    assert_eq!((e.count_at_virtual_0, e.count_at_virtual_1023), (5110, 400));
+
+    // sign −1: margins measured the same way from the P end (0).
+    let e = derive_keeping(a1, a1.device_id, &ok(-6000, -3000, -1)).unwrap();
+    assert_eq!((e.soft_min_count, e.soft_max_count), (-5950, -50));
+    assert_eq!((e.count_at_virtual_0, e.count_at_virtual_512, e.count_at_virtual_1023), (-400, -3000, -5600));
+
+    // Margins that do not fit the measured window are an error, not a crossing.
+    assert!(derive_keeping(a1, a1.device_id, &ok(800, 400, 1)).is_err());
+    // Crossed margins that would still be "monotonic" the other way round.
+    let mut wide = a1.clone();
+    wide.count_at_virtual_0 = wide.soft_min_count + 600;
+    wide.count_at_virtual_1023 = wide.soft_max_count - 600;
+    assert!(derive_keeping(&wide, wide.device_id, &ok(1000, 500, 1)).is_err(), "600 + 600 inside [50, 950] around 500");
+    assert!(derive_keeping(&wide, wide.device_id, &ok(-1000, -500, -1)).is_err());
+}
+
+#[test]
+fn rewrite_axis_values_replaces_only_the_given_keys() {
+    use h3cs::calibration_export::rewrite_axis_values;
+    let text = std::fs::read_to_string(LIVE).unwrap();
+    let rw = rewrite_axis_values(&text, &[(ax(2), vec![("calibration_valid", "false".into())])]).unwrap();
+    let changed: Vec<(&str, &str)> =
+        text.lines().zip(rw.text.lines()).filter(|(a, b)| a != b).collect();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0].1, "calibration_valid = false   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸");
+    let cfg = Config::from_toml_str(&rw.text).unwrap();
+    assert!(!cfg.axis(ax(2)).unwrap().calibration_valid);
+    assert!(cfg.axis(ax(1)).unwrap().calibration_valid);
+    assert!(rewrite_axis_values(&text, &[(ax(2), vec![("no_such_key", "1".into())])]).is_err());
+}

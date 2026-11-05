@@ -2205,6 +2205,7 @@ fn set_limits(request_id: u32, duty_max: u8, duty_min: u8) -> HostMsg {
         ff_count_s_per_percent: 100,
         deadband_count: 10,
         deadband_out_count: 20,
+        stop_acc_count_s2: 0,
     })
 }
 
@@ -2245,6 +2246,7 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     assert_eq!((l[0].duty_max_percent, l[0].duty_min_percent, l[0].kp_percent_per_100), (60, 60, 2));
     assert_eq!((l[0].ff_count_s_per_percent, l[0].deadband_count, l[0].deadband_out_count), (100, 10, 20));
     assert_eq!((l[0].abs_duty_max_percent, l[0].abs_max_vel_count_s, l[0].abs_max_acc_count_s2), (60, 6000, 40000));
+    assert_eq!(l[0].stop_acc_count_s2, 0, "unset stop_acc is echoed as 0");
     assert_eq!(l[0].boot_id, h.sim.status().boot_id);
     assert_eq!(h.sim.tuning().duty_max_percent, 60);
     // ACTIVE: still accepted.
@@ -2258,6 +2260,14 @@ fn set_limits_is_accepted_in_any_state_clamped_and_answered_with_limits() {
     let out = h.send(set_limits(12, 40, 3));
     assert_eq!(acks(&out)[0].result, AckResult::Duplicate);
     assert!(limits_of(&out).is_empty());
+    // 65535 is stored and echoed as the absolute ceiling, not the request.
+    let mut msg = set_limits(13, 40, 3);
+    let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+    limits.stop_acc_count_s2 = 65535;
+    let out = h.send(msg);
+    accepted(acks(&out)[0]);
+    assert_eq!(limits_of(&out)[0].stop_acc_count_s2, 40000);
+    assert_eq!(h.sim.stop_acc_count_s2(), 40000);
 }
 
 #[test]
@@ -2276,6 +2286,7 @@ fn set_limits_invalid_params_and_fault_gate() {
             ff_count_s_per_percent: 0, // ff 0
             deadband_count: 10,
             deadband_out_count: 20,
+            stop_acc_count_s2: 20000, // must not be stored on reject
         }),
         HostMsg::SetLimits(SetLimits {
             request_id: 5,
@@ -2285,6 +2296,7 @@ fn set_limits_invalid_params_and_fault_gate() {
             ff_count_s_per_percent: 100,
             deadband_count: 30, // out < in
             deadband_out_count: 20,
+            stop_acc_count_s2: 6000,
         }),
     ];
     for m in cases {
@@ -2292,6 +2304,7 @@ fn set_limits_invalid_params_and_fault_gate() {
         rejected(acks(&out)[0], AckReason::InvalidParam);
         assert!(limits_of(&out).is_empty());
         assert_eq!(h.sim.tuning(), before);
+        assert_eq!(h.sim.stop_acc_count_s2(), 0, "a rejected SET_LIMITS does not store stop_acc");
     }
     rejected(acks(&h.send(set_limits(0, 40, 3)))[0], AckReason::InvalidParam);
     // Faulted: FAULT_ACTIVE like every other command.
@@ -2320,39 +2333,123 @@ fn config_velocity_and_acceleration_are_clamped_to_the_absolute_ceilings() {
 }
 
 #[test]
-fn stopping_decelerates_with_the_last_frames_acceleration() {
-    // The same stop from the same speed: a frame max_acc of 2000 takes far
-    // longer to settle than the CONFIG ceiling would (design §4.4).
-    fn stop_time_ms(frame_acc: u32) -> u64 {
+fn controlled_stop_decelerates_at_config_max_acc() {
+    // CONFIG max_acc is 20000. A frame of 1250 and a frame equal to CONFIG
+    // both stop at that rate. The 1250 case would take ~1 s if the frame won.
+    fn stop_time_ms(frame_acc: u32, drive_ticks: u32) -> u64 {
         let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
         h.reach_active();
-        // Accelerate toward a far target with the frame's limits (1.2 s: the
-        // slow case reaches its 2000 count/s plateau, 600 counts of travel).
-        for _ in 0..120 {
-            let mut m = h.set_position_msg(2600);
+        for _ in 0..drive_ticks {
+            let mut m = h.set_position_msg(2700);
             m.max_vel_count_s = 2000;
             m.max_acc_count_s2 = frame_acc;
             h.send(HostMsg::SetPosition(m));
             h.idle(10);
         }
-        assert_eq!(h.state(), McuState::Active);
+        assert_eq!(h.state(), McuState::Active, "frame_acc {frame_acc}");
         accepted(h.stop());
-        // SET_POSITION keeps flowing during the stop (lease), as the PC does.
         let mut ms = 0;
         while h.state() == McuState::Stopping && ms < 3000 {
-            let mut m = h.set_position_msg(2600);
+            let mut m = h.set_position_msg(2700);
             m.max_vel_count_s = 2000;
             m.max_acc_count_s2 = frame_acc;
             h.send(HostMsg::SetPosition(m));
             h.idle(10);
             ms += 10;
         }
-        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc}");
+        assert_eq!(h.state(), McuState::Holding, "frame_acc {frame_acc} after {ms} ms");
         ms
     }
-    let slow = stop_time_ms(2000);
-    let fast = stop_time_ms(40000);
-    // 2000 count/s at 2000 count/s² ≈ 1 s; at 40000 count/s² = 50 ms (one 10 ms poll ≥ 10 ms).
-    assert!((800..=1300).contains(&slow), "slow {slow} ms");
-    assert!(fast <= 200, "fast {fast} ms");
+    // 1.0 s at 1250 count/s² → 1250 count/s. CONFIG 20000 stops that in 62.5 ms
+    // (the 10 ms poll reports 70). The frame's own rate would take 1 s.
+    let reduced = stop_time_ms(1250, 100);
+    assert!((50..=100).contains(&reduced), "frame 1250 stopped in {reduced} ms");
+    // Frame == CONFIG. 0.4 s reaches the 2000 count/s cap and is still short of
+    // the target. 2000 / 20000 = 100 ms, the same rate as before this rule.
+    let same = stop_time_ms(20000, 40);
+    assert!((80..=130).contains(&same), "frame == CONFIG stopped in {same} ms");
+}
+
+/// CONFIG carries the firmware ceiling (40000). The operator's ungoverned
+/// max_acc rides in SET_LIMITS `stop_acc` and is what a controlled stop uses,
+/// including after a later SET_LIMITS. A governed frame (1250) does not.
+#[test]
+fn controlled_stop_uses_operator_stop_acc_not_the_config_ceiling() {
+    fn prep(stop_acc: u16) -> Harness {
+        let mut h = Harness::new(SimParams { plant_max_vel_count_s: 100_000.0, ..SimParams::default() });
+        let mut c = config(EPOCH);
+        c.max_acc_count_s2 = 40000;
+        c.command_timeout_ms = 500;
+        c.stop_timeout_ms = 5000;
+        assert_eq!(h.config_with(c).result, AckResult::Accepted);
+        let mut msg = set_limits(1, 40, 3);
+        let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+        limits.stop_acc_count_s2 = stop_acc;
+        let out = h.send(msg);
+        assert_eq!(out[0].msg_type(), msg_type::ACK);
+        let expect = if stop_acc == 0 { 0 } else { stop_acc.min(40_000) };
+        assert_eq!(limits_of(&out).last().map(|l| l.stop_acc_count_s2), Some(expect));
+        assert_eq!(h.arm().result, AckResult::Accepted);
+        let here = h.sim.actual_count();
+        h.drive(60, here);
+        assert_eq!(h.state(), McuState::Holding);
+        h.set_position(here);
+        assert_eq!(h.start().result, AckResult::Accepted);
+        assert_eq!(h.state(), McuState::Active);
+        h
+    }
+    /// 10 ms of STOPPING, after a drive that stays in acceleration.
+    fn dv_after(h: &mut Harness, frame_acc: u32, drive_ms: u64) -> f64 {
+        for i in 0..drive_ms {
+            if i % 10 == 0 {
+                let mut m = h.set_position_msg(2700);
+                m.max_vel_count_s = 2000;
+                m.max_acc_count_s2 = frame_acc;
+                h.send(HostMsg::SetPosition(m));
+            }
+            h.now += MS;
+            let out = h.sim.tick(h.now);
+            h.out.extend(out);
+        }
+        assert_eq!(h.state(), McuState::Active);
+        assert!(h.sim.setpoint_vel() > 400.0, "vel {}", h.sim.setpoint_vel());
+        assert_eq!(h.stop().result, AckResult::Accepted);
+        assert_eq!(h.state(), McuState::Stopping);
+        let v0 = h.sim.setpoint_vel();
+        h.now += 10 * MS;
+        let _ = h.sim.tick(h.now);
+        (v0 - h.sim.setpoint_vel()).abs()
+    }
+
+    let mut h = prep(20000);
+    assert_eq!(h.sim.config().unwrap().max_acc_count_s2, 40000);
+    assert_eq!(h.sim.stop_acc_count_s2(), 20000);
+    let dv = dv_after(&mut h, 1250, 800);
+    assert!((190.0..210.0).contains(&dv), "operator 20000, frame 1250: dv {dv}");
+    // A SET_LIMITS during the stop is stored but does not change this stop.
+    let mut msg = set_limits(2, 40, 3);
+    let HostMsg::SetLimits(limits) = &mut msg else { unreachable!() };
+    limits.stop_acc_count_s2 = 6000;
+    let out = h.send(msg);
+    assert_eq!(acks(&out)[0].result, AckResult::Accepted);
+    assert_eq!(limits_of(&out)[0].stop_acc_count_s2, 6000);
+    assert_eq!(h.sim.stop_acc_count_s2(), 6000);
+    let v0 = h.sim.setpoint_vel();
+    h.now += 10 * MS;
+    let _ = h.sim.tick(h.now);
+    let still = (v0 - h.sim.setpoint_vel()).abs();
+    assert!((190.0..210.0).contains(&still), "in-progress stop stays at 20000: dv {still}");
+
+    // Next stop, after the new rate is stored: 6000 count/s² → 60 count/s in 10 ms.
+    while h.state() == McuState::Stopping {
+        h.set_position(2700);
+        h.idle(10);
+        assert!(h.now < 5_000_000, "did not finish the first stop");
+    }
+    assert_eq!(h.state(), McuState::Holding);
+    let here = h.sim.actual_count();
+    h.set_position(here);
+    assert_eq!(h.start().result, AckResult::Accepted);
+    let dv = dv_after(&mut h, 1250, 800);
+    assert!((50.0..70.0).contains(&dv), "runtime 6000, frame 1250: dv {dv}");
 }

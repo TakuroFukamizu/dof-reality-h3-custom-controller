@@ -377,6 +377,20 @@ impl Rig {
         }
     }
 
+    /// Deliver only sim `i`'s captured SET_LIMITS. The others stay held.
+    fn release_held_axis(&mut self, i: usize) {
+        let us = self.us();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.held).into_iter().partition(|(j, _)| *j == i);
+        self.held = rest;
+        for (j, m) in mine {
+            if self.linked[j] {
+                let r = self.mcus[j].handle(&m, us);
+                self.feed(j, r);
+            }
+        }
+    }
+
     fn run_until(&mut self, max_ms: u64, pred: impl Fn(&Rig) -> bool) -> bool {
         for _ in 0..max_ms / 10 {
             if pred(self) {
@@ -1567,35 +1581,44 @@ fn center_moves_to_neutral_at_reduced_speed_then_holds() {
 
 /// 2026-11-01 on hardware: CENTER reported `center_reached` with axis 2 still
 /// 280 counts below neutral (gravity-loaded, position loop saturated at
-/// duty_min). The setpoint had arrived; the mechanism had not. The move must
-/// be judged on measured position and fault when an axis cannot get there.
+/// duty_min). The setpoint had arrived; the mechanism had not. A stall that
+/// the governor is already slowing for does not wait out `center_reach_timeout`:
+/// the measured position never moves, so the server issues the coordinated
+/// stop (`governor_no_progress`) and, because the axis still is not at rest,
+/// the stop then faults. `center_reached` is not emitted.
 #[test]
 fn center_waits_for_measured_position_and_faults_on_a_stalled_axis() {
     let cfg = sim_cfg();
     let cal = calibration::from_config(&cfg);
-    // 150 counts short: inside following_error_limit (800), so only the new
-    // measured-position check can end the move.
+    // 150 counts short: inside following_error_limit (800), so the MCU does
+    // not FOLLOWING_ERROR. The server ends the move.
     let mut r = Rig::with(cfg.clone(), |i, p| p.initial_count = cal[i].neutral_count() - 150);
     r.holding();
     r.mcus[1].set_stall(true); // axis 2's plant does not move at all
     r.sup.drain_events();
     r.admin(AdminCmd::Center).unwrap();
     r.wait_state(RigState::Active, 500);
-    // 150 counts at max_vel × 0.25 takes about 1.2 s; the planner and the
-    // setpoints are at neutral long before 3 s, but axis 2 is not.
-    r.run_ms(3000);
-    assert_eq!(r.sup.state(), RigState::Active, "centered reported with axis2 at {}", r.mcus[1].actual_count());
-    assert_eq!(r.sup.active_source(), Some(ActiveSource::Center));
+    let t_active = r.now;
+    r.wait_state(RigState::Stopping, 4000);
+    let waited = r.now.saturating_duration_since(t_active);
+    // FE has to reach fe_start and sat_ms before the 1500 ms no-progress window.
+    assert!(waited >= Duration::from_millis(cfg.governor.no_progress_ms), "{waited:?}");
+    assert!(waited <= Duration::from_millis(cfg.governor.no_progress_ms + 1000), "{waited:?}");
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
     let (ev, _) = r.sup.drain_events();
+    assert!(ev.iter().any(|e| e.kind == "governor_no_progress"), "{ev:?}");
     assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
     assert!((r.mcus[0].actual_count() - cal[0].neutral_count()).abs() <= 3);
     assert_eq!(r.mcus[1].actual_count(), cal[1].neutral_count() - 150);
+    assert!(r.sup.snapshot(r.now).limits.contains(&LimitReason::GovernorNoProgress));
+    assert!(r.sup.snapshot(r.now).axes.iter().all(|a| a.referenced));
 
-    r.wait_state(RigState::FaultLatched, cfg.timing.center_reach_timeout_ms + 2000);
+    r.wait_state(RigState::FaultLatched, cfg.timing.stop_settle_timeout_ms + 2000);
     assert_eq!(r.sup.fault(), Some(&RigFault::StopTimeout));
     let rec = r.sup.fault_history().last().unwrap();
     let detail = rec.detail.clone().unwrap_or_default();
-    assert!(detail.starts_with("center: axis2"), "{detail}");
+    assert!(detail.contains("deceleration did not settle"), "{detail}");
+    assert!(detail.contains("axis2"), "{detail}");
     let (ev, _) = r.sup.drain_events();
     assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
 }
@@ -1613,9 +1636,14 @@ fn center_completes_when_measured_position_catches_up() {
     r.sup.drain_events();
     r.admin(AdminCmd::Center).unwrap();
     r.wait_state(RigState::Active, 500);
-    r.run_ms(2000);
-    assert_eq!(r.sup.state(), RigState::Active);
-    r.mcus[1].set_stall(false); // the load lets go before the timeout
+    // Inside the no-progress window: the setpoint can already be home while
+    // axis 2 is still short, and that must not complete the centre.
+    r.run_ms(800);
+    assert_eq!(r.sup.state(), RigState::Active, "{:?}", r.sup.fault());
+    assert_eq!(r.mcus[1].actual_count(), cal[1].neutral_count() - 150);
+    let (ev, _) = r.sup.drain_events();
+    assert!(ev.iter().all(|e| e.kind != "center_reached"), "{ev:?}");
+    r.mcus[1].set_stall(false); // the load lets go before no-progress fires
     r.wait_state(RigState::Holding, cfg.timing.center_reach_timeout_ms);
     assert!(r.sup.fault().is_none());
     let (ev, _) = r.sup.drain_events();
@@ -1770,11 +1798,19 @@ fn snapshot_json_shape() {
         "physical_estop",
         "telemetry",
         "motion_limits",
+        "governor",
+        "operator_hold",
+        "unregistered_units",
+        "config_path",
     ];
     let mut got = keys.clone();
     got.sort_unstable();
     want.sort_unstable();
     assert_eq!(got, want);
+    assert_eq!(v["governor"]["scale"], 1.0);
+    assert_eq!(v["governor"]["active"], false);
+    assert!(v["governor"]["axis"].is_null());
+    assert!(v["governor"]["reason"].is_null());
     assert_eq!(v["rig_state"], "ACTIVE");
     assert_eq!(v["active_source"], "game");
     assert_eq!(v["armed"], true);
@@ -1798,6 +1834,7 @@ fn snapshot_json_shape() {
         "claimants",
         "reference_stale",
         "calibration_stale",
+        "config_stroke",
         "boot_id",
         "mcu_state",
         "fault_code",
@@ -3012,6 +3049,8 @@ fn limits_are_distributed_once_and_follow_runtime_changes() {
         .unwrap();
     assert_eq!((sl.duty_max_percent, sl.duty_min_percent, sl.kp_percent_per_100), (40, 3, 2));
     assert_eq!((sl.ff_count_s_per_percent, sl.deadband_count, sl.deadband_out_count), (100, 10, 20));
+    // sim.toml's operator max_acc, not the CONFIG ceiling (40000).
+    assert_eq!(sl.stop_acc_count_s2, 15000);
     let c = r
         .sent
         .iter()
@@ -3049,6 +3088,14 @@ fn limits_are_distributed_once_and_follow_runtime_changes() {
     });
     r.run_ms(200);
     assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    let sl = r.sent[mark..]
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::SetLimits(l) => Some(*l),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sl.stop_acc_count_s2, 40000, "ceiling clamp of 50000");
     let snap = r.sup.snapshot(r.now);
     assert_eq!(
         snap.motion_limits.effective,
@@ -3057,16 +3104,167 @@ fn limits_are_distributed_once_and_follow_runtime_changes() {
     assert_eq!(snap.motion_limits.limited.len(), 4);
     for m in r.mcus.iter() {
         assert_eq!(m.tuning().duty_max_percent, 60);
+        assert_eq!(m.stop_acc_count_s2(), 40000);
     }
     // Nothing more while the request stays the same.
     let mark = r.sent.len();
     r.run_ms(500);
     assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
-    // A change that does not touch the firmware tuning sends nothing to the MCUs.
+    // Velocity does not touch the firmware tuning, so it sends nothing.
+    // Gain is the same. An acceleration-only lower is at or below the echoed
+    // stop rate, so the planner may use it at once. SET_LIMITS still goes
+    // out, and pending stays until every LIMITS echoes that stop_acc.
     r.sup.set_requested_limits(MotionLimits { max_vel_count_s: 2000, ..r.sup.effective_limits() });
     r.run_ms(200);
     assert_eq!(r.count(mark, msg_type::SET_LIMITS), [0, 0, 0]);
     assert_eq!(r.sup.effective_limits().max_vel_count_s, 2000);
+    let mark = r.sent.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 8000, ..r.sup.effective_limits() });
+    r.run_ms(200);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    let sl = r.sent[mark..]
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::SetLimits(l) => Some(*l),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sl.stop_acc_count_s2, 8000);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 8000);
+    for a in &snap.axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 8000);
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 8000);
+    }
+}
+
+const FAR_POSE: Pose = Pose { pitch: 1.0, roll: 1.0, yaw: 0.0 };
+
+/// `|dv|` over the 10 ms step after CONTROLLED_STOP is applied, on the axis
+/// that was moving fastest when the stop latched. `Rig::step` integrates the
+/// MCU before delivering admin, so the first step only latches the rate.
+fn stop_dv(r: &mut Rig) -> (f64, f64) {
+    r.admin(AdminCmd::Stop).unwrap();
+    r.step();
+    let v0: [f64; 3] = std::array::from_fn(|i| r.mcus[i].setpoint_vel());
+    r.step();
+    let i = (0..3).max_by(|&a, &b| v0[a].abs().total_cmp(&v0[b].abs())).unwrap();
+    let v1 = r.mcus[i].setpoint_vel();
+    (v0[i], (v0[i] - v1).abs())
+}
+
+fn arm_and_start(r: &mut Rig, pose: Pose, gain: f64) {
+    r.set_game(Some((pose, gain)));
+    r.run_ms(30);
+    r.admin(AdminCmd::Arm).unwrap();
+    r.wait_state(RigState::Holding, 2000);
+    r.admin(AdminCmd::Start).unwrap();
+    r.wait_state(RigState::Active, 1000);
+}
+
+/// CONFIG stays the firmware ceiling. A controlled stop decelerates at the
+/// operator's ungoverned max_acc (SET_LIMITS stop_acc): 20000, then 6000
+/// after POST /v1/limits, and still 20000 when ACTIVE frames are governed
+/// down to 1250.
+#[test]
+fn controlled_stop_decelerates_at_the_operator_max_acc() {
+    let mut cfg = sim_cfg();
+    cfg.limits.max_acc_count_s2 = 20000;
+    cfg.game.start_max_offset_count = 3000;
+    cfg.governor.no_progress_ms = 10_000;
+    let want = expected_counts(&cfg, FAR_POSE, 0.5);
+    assert!(want[0].abs() > 800, "axis 1 target {want:?}");
+    let mut r = Rig::new(cfg);
+    r.ready();
+    let sl = r
+        .sent
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::SetLimits(l) => Some(*l),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sl.stop_acc_count_s2, 20000);
+    let c = r
+        .sent
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::Config(c) => Some(*c),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(c.max_acc_count_s2, 40000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 20000);
+    }
+
+    arm_and_start(&mut r, FAR_POSE, 0.5);
+    r.run_ms(200);
+    let (v0, dv) = stop_dv(&mut r);
+    assert!(v0.abs() > 300.0, "v0 {v0}");
+    assert!((180.0..220.0).contains(&dv), "operator 20000: v0 {v0} dv {dv}");
+    r.wait_state(RigState::BrakedDisarmed, 6000);
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+
+    let mark = r.sent.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 6000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    assert_eq!(r.count(mark, msg_type::SET_LIMITS), [1, 1, 1]);
+    let sl = r.sent[mark..]
+        .iter()
+        .find_map(|(_, _, m)| match m {
+            HostMsg::SetLimits(l) => Some(*l),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sl.stop_acc_count_s2, 6000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 6000);
+    }
+    arm_and_start(&mut r, FAR_POSE, 0.5);
+    r.run_ms(200);
+    let (v0, dv) = stop_dv(&mut r);
+    assert!(v0.abs() > 100.0, "v0 {v0}");
+    assert!((50.0..70.0).contains(&dv), "runtime 6000: v0 {v0} dv {dv}");
+    r.wait_state(RigState::BrakedDisarmed, 6000);
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+
+    r.sup.set_requested_limits(MotionLimits {
+        max_vel_count_s: 1500,
+        max_acc_count_s2: 20000,
+        ..r.sup.effective_limits()
+    });
+    assert!(r.run_until(500, |r| {
+        !r.sup.snapshot(r.now).motion_limits.pending && r.mcus.iter().all(|m| m.stop_acc_count_s2() == 20000)
+    }));
+    r.mcus[0].set_stall(true);
+    arm_and_start(&mut r, FAR_POSE, 0.5);
+    let reached = r.run_until(3000, |r| (r.sup.snapshot(r.now).governor.scale - 0.25).abs() < 1e-6);
+    assert!(
+        reached,
+        "scale {} fault {:?} states {:?} vels {:?}",
+        r.sup.snapshot(r.now).governor.scale,
+        r.sup.fault(),
+        r.mcu_states(),
+        r.mcus.iter().map(|m| m.setpoint_vel()).collect::<Vec<_>>()
+    );
+    let (_, st, sp) = r.setpos.last().unwrap();
+    assert_eq!(*st, RigState::Active);
+    assert_eq!(sp[0].max_acc_count_s2, 1250, "governed frame before the stop");
+    assert_eq!(sp[0].max_vel_count_s, 375);
+    let (v0, dv) = stop_dv(&mut r);
+    assert!(v0.abs() > 250.0, "v0 {v0}");
+    assert!((180.0..220.0).contains(&dv), "governed frame still stops at 20000: v0 {v0} dv {dv}");
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 20000);
+    }
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
 }
 
 #[test]
@@ -3174,6 +3372,7 @@ fn arm_is_blocked_until_set_limits_is_acked() {
         }
     }
     assert!(!has(&sup.blockers(now), "limits_unconfirmed"), "{:?}", sup.blockers(now));
+    assert!(!has(&sup.blockers(now), "stop_acc_unconfirmed"), "{:?}", sup.blockers(now));
     // An unanswered SET_LIMITS is re-sent after the ACK timeout; the blocker stays meanwhile.
     let later = now + ACK_TIMEOUT + LIMITS_RETRY + Duration::from_millis(50);
     sup.set_requested_limits(MotionLimits { duty_max_percent: 30, ..sup.effective_limits() });
@@ -3223,7 +3422,291 @@ fn set_limits_acked_but_limits_report_lost_is_resent_with_a_new_request_id() {
         }
     }
     assert!(!has(&sup.blockers(t2), "limits_unconfirmed"), "{:?}", sup.blockers(t2));
+    assert!(!has(&sup.blockers(t2), "stop_acc_unconfirmed"), "{:?}", sup.blockers(t2));
     assert!(sup.snapshot(t2).axes[0].fw_limits.is_some());
+}
+
+/// A lost SET_LIMITS must not let the planner assume a stop the MCU has not
+/// confirmed. A lower rate applies at once (the MCU is still at least that
+/// hard). A raise applies only after every axis echoes it.
+#[test]
+fn lost_set_limits_keeps_the_old_stop_acc_and_a_raise_waits_for_every_echo() {
+    let mut r = Rig::new(sim_cfg());
+    r.active(POSE_A, 0.3);
+    assert!(!has(&r.blockers(), "stop_acc_unconfirmed"), "{:?}", r.blockers());
+    assert_eq!(r.sup.effective_limits().max_acc_count_s2, 15000);
+    for a in &r.sup.snapshot(r.now).axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 15000);
+    }
+
+    r.hold_set_limits = [true; 3];
+    let mark_sp = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 6000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    assert!(r.setpos.len() > mark_sp);
+    for (_, _, sp) in &r.setpos[mark_sp..] {
+        for k in 0..3 {
+            assert_eq!(sp[k].max_acc_count_s2, 6000);
+        }
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 15000, "the SET_LIMITS never arrived");
+    }
+    for a in &snap.axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 15000);
+    }
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 6000);
+    }
+
+    r.hold_set_limits = [true; 3];
+    let mark_sp = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 20000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000, "a raise waits");
+    for (_, _, sp) in &r.setpos[mark_sp..] {
+        assert_eq!(sp[0].max_acc_count_s2, 6000);
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 6000);
+    }
+
+    r.release_held_axis(0);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "one axis is not enough");
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 6000);
+    assert_eq!(r.mcus[0].stop_acc_count_s2(), 20000);
+    assert_eq!(r.mcus[1].stop_acc_count_s2(), 6000);
+    assert_eq!(r.mcus[2].stop_acc_count_s2(), 6000);
+    assert_eq!(snap.axes[0].fw_limits.unwrap().stop_acc_count_s2, 20000);
+    assert_eq!(snap.axes[1].fw_limits.unwrap().stop_acc_count_s2, 6000);
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
+    let (_, _, sp) = r.setpos.last().unwrap();
+    assert_eq!(sp[0].max_acc_count_s2, 20000);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 20000);
+    }
+}
+
+/// Confirmed 600/500, then 1200/20000 with SET_LIMITS dropped. The new
+/// velocity must not ride on the old stop rate: effective speed stays within
+/// `max_vel_for_stop(500)`, and the sim finishes the stop inside
+/// `mcu_stop_timeout_ms`.
+#[test]
+fn dropped_acc_raise_caps_velocity_to_the_stop_deadline() {
+    let mut r = Rig::new(sim_cfg());
+    let home = Pose { pitch: 0.0, roll: 0.0, yaw: 0.0 };
+    r.active(home, 0.5);
+    r.sup.set_requested_limits(MotionLimits {
+        max_vel_count_s: 600,
+        max_acc_count_s2: 500,
+        ..r.sup.effective_limits()
+    });
+    assert!(r.run_until(500, |r| {
+        let s = r.sup.snapshot(r.now).motion_limits;
+        !s.pending
+            && s.effective.max_vel_count_s == 600
+            && s.effective.max_acc_count_s2 == 500
+            && r.mcus.iter().all(|m| m.stop_acc_count_s2() == 500)
+    }));
+
+    r.hold_set_limits = [true; 3];
+    let mark = r.setpos.len();
+    r.sup.set_requested_limits(MotionLimits {
+        max_vel_count_s: 1200,
+        max_acc_count_s2: 20000,
+        ..r.sup.effective_limits()
+    });
+    r.run_ms(50);
+    let deadline = h3cs::limits::stop_deadline(&r.cfg.timing);
+    let cap = h3cs::limits::max_vel_for_stop(500, deadline);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.requested.max_vel_count_s, 1200);
+    assert_eq!(snap.motion_limits.requested.max_acc_count_s2, 20000);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 500);
+    assert!(
+        snap.motion_limits.effective.max_vel_count_s <= cap,
+        "effective {} cap {cap}",
+        snap.motion_limits.effective.max_vel_count_s
+    );
+    assert!(snap.motion_limits.effective.max_vel_count_s < 1200);
+    assert!(r.setpos.len() > mark);
+    for (_, _, sp) in &r.setpos[mark..] {
+        for k in 0..3 {
+            assert!(sp[k].max_vel_count_s <= cap, "frame vel {}", sp[k].max_vel_count_s);
+            assert_eq!(sp[k].max_acc_count_s2, 500);
+        }
+    }
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 500, "SET_LIMITS was dropped");
+    }
+
+    r.set_game(Some((FAR_POSE, 0.5)));
+    let fast = r.run_until(4000, |r| r.mcus[0].setpoint_vel().abs() >= f64::from(cap) * 0.8);
+    assert!(
+        fast,
+        "never reached speed near the cap: {:?}",
+        r.mcus.iter().map(|m| m.setpoint_vel()).collect::<Vec<_>>()
+    );
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+    assert_eq!(r.sup.effective_limits().max_acc_count_s2, 500);
+    assert!(r.sup.effective_limits().max_vel_count_s <= cap);
+    for m in r.mcus.iter() {
+        assert_eq!(m.stop_acc_count_s2(), 500);
+    }
+
+    let t_stop = r.now;
+    r.admin(AdminCmd::Stop).unwrap();
+    let timeout = u64::from(r.cfg.timing.mcu_stop_timeout_ms);
+    let settled = r.run_until(timeout, |r| {
+        r.mcus.iter().all(|m| m.state() != McuState::Stopping && m.state() != McuState::Active)
+    });
+    assert!(
+        settled,
+        "still moving after {timeout} ms: states {:?} fault {:?} vels {:?}",
+        r.mcu_states(),
+        r.sup.fault(),
+        r.mcus.iter().map(|m| m.setpoint_vel()).collect::<Vec<_>>()
+    );
+    assert!(r.now - t_stop <= Duration::from_millis(timeout), "{:?}", r.now - t_stop);
+    assert!(r.sup.fault().is_none(), "{:?}", r.sup.fault());
+    assert!(r.mcus.iter().all(|m| m.state() != McuState::Fault), "{:?}", r.mcu_states());
+
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(30);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_vel_count_s, 1200);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
+}
+
+/// Old firmware ACKs SET_LIMITS and sends LIMITS with stop_acc 0. That is not
+/// `limits_unconfirmed` (the report arrived) and it blocks ARM.
+#[test]
+fn old_firmware_without_a_stop_acc_echo_blocks_arm() {
+    let mut r = Rig::new(sim_cfg());
+    for m in r.mcus.iter_mut() {
+        m.set_echo_stop_acc(false);
+    }
+    r.connect_all();
+    r.run_ms(200);
+    let b = r.blockers();
+    for n in 1..=3 {
+        assert!(has(&b, &format!("stop_acc_unconfirmed: axis{n}")), "{b:?}");
+        assert!(!has(&b, &format!("limits_unconfirmed: axis{n}")), "{b:?}");
+    }
+    assert_ne!(r.sup.state(), RigState::ReadyToArm);
+    let err = r.admin(AdminCmd::Arm).unwrap_err();
+    assert_eq!(err.error, admin_error::NOT_READY);
+    assert!(has(&err.blockers, "stop_acc_unconfirmed: axis1"), "{:?}", err.blockers);
+    assert_eq!(r.count(0, msg_type::SET_LIMITS), [1, 1, 1], "retry waits LIMITS_RETRY");
+}
+
+/// ACK plus a LIMITS whose stop_acc is 0, or some other value, is
+/// `stop_acc_unconfirmed` and not the "not received yet" blocker.
+#[test]
+fn stop_acc_echo_zero_or_mismatch_is_its_own_blocker() {
+    fn blockers_for(mutate: impl Fn(&mut h3cs::protocol::Limits)) -> Vec<String> {
+        let cfg = sim_cfg();
+        let mut sup = Supervisor::new(&cfg);
+        let mut mcu = SimMcu::new(SimParams { device_id: cfg.axes[0].device_id, ..SimParams::default() });
+        let now = Instant::now();
+        let Some(McuMsg::Hello(hello)) = mcu.handle(&HostMsg::HelloReq { request_id: 1 }, 1).into_iter().next() else {
+            panic!("no hello");
+        };
+        sup.on_link_event(LinkEvent::Identified { axis: ax(1), hello, port: "sim:1".into() }, now);
+        sup.on_link_event(LinkEvent::Status { axis: ax(1), status: mcu.status(), received_at: now }, now);
+        let out = sup.tick(now, 0.01, None);
+        let [HostMsg::Config(c), HostMsg::SetLimits(l)] = out.admin_msgs[0].as_slice() else {
+            panic!("{:?}", out.admin_msgs);
+        };
+        let ack = Ack {
+            request_id: c.request_id,
+            acked_type: msg_type::CONFIG,
+            result: AckResult::Accepted,
+            reason: AckReason::None,
+        };
+        sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now);
+        let configured = mcu.handle(&HostMsg::Config(*c), 2);
+        let status = configured
+            .iter()
+            .find_map(|m| match m { McuMsg::Status(s) => Some(*s), _ => None })
+            .unwrap_or(mcu.status());
+        sup.on_link_event(LinkEvent::Status { axis: ax(1), status, received_at: now }, now);
+        for m in mcu.handle(&HostMsg::SetLimits(*l), 3) {
+            match m {
+                McuMsg::Ack(ack) => sup.on_link_event(LinkEvent::Ack { axis: ax(1), ack }, now),
+                McuMsg::Limits(mut limits) => {
+                    mutate(&mut limits);
+                    sup.on_link_event(LinkEvent::Limits { axis: ax(1), limits }, now);
+                }
+                _ => {}
+            }
+        }
+        sup.blockers(now)
+    }
+
+    let cases: [fn(&mut h3cs::protocol::Limits); 2] = [
+        |l| l.stop_acc_count_s2 = 0,
+        |l| l.stop_acc_count_s2 = 1,
+    ];
+    for mutate in cases {
+        let b = blockers_for(mutate);
+        assert!(has(&b, "stop_acc_unconfirmed: axis1"), "{b:?}");
+        assert!(!has(&b, "limits_unconfirmed: axis1"), "{b:?}");
+    }
+}
+
+/// `[limits] allow_legacy_stop_acc` accepts a 0 echo. A raise still waits
+/// until every axis has ACKed the new rate (the 0 echo then counts).
+#[test]
+fn legacy_stop_acc_echo_allows_arm_and_a_raise_only_after_every_ack() {
+    let mut cfg = sim_cfg();
+    cfg.limits.allow_legacy_stop_acc = true;
+    let mut r = Rig::new(cfg);
+    for m in r.mcus.iter_mut() {
+        m.set_echo_stop_acc(false);
+    }
+    r.ready();
+    assert!(!has(&r.blockers(), "stop_acc_unconfirmed"), "{:?}", r.blockers());
+    assert!(!has(&r.blockers(), "limits_unconfirmed"), "{:?}", r.blockers());
+    for a in &r.sup.snapshot(r.now).axes {
+        assert_eq!(a.fw_limits.unwrap().stop_acc_count_s2, 0);
+    }
+    r.admin(AdminCmd::Arm).unwrap();
+
+    r.hold_set_limits = [true; 3];
+    r.sup.set_requested_limits(MotionLimits { max_acc_count_s2: 20000, ..r.sup.effective_limits() });
+    r.run_ms(50);
+    let snap = r.sup.snapshot(r.now);
+    assert!(snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 15000);
+    r.hold_set_limits = [false; 3];
+    r.release_held();
+    r.run_ms(20);
+    let snap = r.sup.snapshot(r.now);
+    assert!(!snap.motion_limits.pending, "{:?}", snap.motion_limits);
+    assert_eq!(snap.motion_limits.effective.max_acc_count_s2, 20000);
 }
 
 // ------------------------------------------------------------------ Issue #15 H2 / M3 / M4

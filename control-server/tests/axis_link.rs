@@ -657,6 +657,83 @@ async fn admin_messages_are_written_before_set_position() {
     );
 }
 
+/// CONTROLLED_STOP is an ordinary admin frame. It is written even when no
+/// SET_POSITION has been published, and a pending SET_POSITION does not go
+/// out ahead of it.
+#[tokio::test(start_paused = true)]
+async fn controlled_stop_is_written_without_waiting_for_set_position() {
+    let stop = HostMsg::ControlledStop {
+        request_id: 9,
+        session_epoch: 7,
+        reason: 1,
+    };
+
+    // No SET_POSITION at all: the stop is still written.
+    {
+        let (tx, mut rx) = events();
+        let (peer, link) = peer_link(
+            PeerOpts {
+                hello: Some(hello(dev(1), 5)),
+                ..PeerOpts::default()
+            },
+            "p",
+            tx,
+        );
+        wait_identified(&mut rx, "p").await;
+        link.send_admin(stop).unwrap();
+        sleep(Duration::from_millis(30)).await;
+        let msgs: Vec<HostMsg> = peer
+            .log()
+            .into_iter()
+            .filter(|m| !matches!(m, HostMsg::HelloReq { .. }))
+            .collect();
+        assert!(
+            matches!(msgs.as_slice(), [HostMsg::ControlledStop { request_id: 9, .. }]),
+            "{msgs:?}"
+        );
+    }
+
+    // Both pending, no yield between them. Admin wins, so the stop is first.
+    {
+        let (tx, mut rx) = events();
+        let (peer, link) = peer_link(
+            PeerOpts {
+                hello: Some(hello(dev(1), 5)),
+                ..PeerOpts::default()
+            },
+            "p",
+            tx,
+        );
+        wait_identified(&mut rx, "p").await;
+        let mut governed = setpos(7, 1);
+        governed.max_vel_count_s = 300;
+        governed.max_acc_count_s2 = 1250;
+        governed.target_count = 10;
+        link.set_position(governed).unwrap();
+        link.send_admin(stop).unwrap();
+        sleep(Duration::from_millis(30)).await;
+        let msgs: Vec<HostMsg> = peer
+            .log()
+            .into_iter()
+            .filter(|m| !matches!(m, HostMsg::HelloReq { .. }))
+            .collect();
+        assert!(
+            matches!(
+                msgs.first(),
+                Some(HostMsg::ControlledStop { request_id: 9, .. })
+            ),
+            "stop waited for SET_POSITION: {msgs:?}"
+        );
+        match msgs.get(1) {
+            Some(HostMsg::SetPosition(sp)) => {
+                assert_eq!(sp.max_acc_count_s2, 1250);
+                assert_eq!(sp.max_vel_count_s, 300);
+            }
+            other => panic!("frame after stop: {other:?}"),
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn set_position_on_admin_queue_is_refused() {
     let (tx, mut rx) = events();

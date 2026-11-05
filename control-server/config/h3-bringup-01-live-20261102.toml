@@ -5,7 +5,7 @@
 # - #3（ヨー）は 11-02 夕方にエンコーダ（コードホイール）を仮復旧し、本物の軸に戻した（校正 6205/3102、6206/3103。Issue #9）
 # - このリグは [game].swap_pitch_roll = true（PR #21、操作者が実機で確認）
 # - 仮想位置の端はソフトリミットから 350 count 内側（Issue #34 / PR #38）
-# - ポートは 1C:DB = /dev/cu.usbmodem114501（#1、主電源担当）、68:EE = /dev/cu.usbmodem114101（#2）、30:ED = /dev/cu.usbmodem114301（#3）（11-03 朝。ハブの差し替えで変わる）。ハブの差し替えで変わるので
+# - ポートは 1C:DB = /dev/cu.usbmodem111501（#1、主電源担当）、68:EE = /dev/cu.usbmodem111101（#2）、30:ED = /dev/cu.usbmodem111301（#3）（11-03 19:xx。ハブの差し替えで変わる）。ハブの差し替えで変わるので
 #   ioreg の USB Serial Number で確認すること（hardware-bringup.md §1.1）
 # - 校正後はサーバーの再起動が要る（calibration_stale）。校正値はこのファイルの値と毎回ほぼ一致（#1 5555〜5556 / 2777〜2778、#2 5508〜5509 / 2754、#3 6205〜6206 / 3102〜3103）
 # ===========================================================================
@@ -94,7 +94,7 @@ invert_yaw = false
 max_gain = 1.0                  # 11-02: 向きの確認済み。全開でソフトリミット内の端まで（余裕 150 count）
 max_vel_count_s = 1200           # 11-02 15:3x 展示用（無人のステップ試験で FE ≤ 9、端まで SOFT_LIMIT なし）。旧 600。 1.5 回転/s。従来 env の HOME（10 %）より遅い
 max_acc_count_s2 = 20000         # 11-03 17:50 展示用に 6000 → 20000（ヨーの衝撃を強くするため。無人で端寄り 4 Hz 揺れ・±1 ステップとも FAULT なし、端の行き過ぎ ≤ 5 count、FE ≤ 19）。旧 6000、その前 2000
-duty_max_percent = 20            # 実測 20 % ≈ 1900 count/s（2026-10-31）
+duty_max_percent = 50            # 11-03 18:3x 操作者の判断で 20 → 50（人を持ち上げる切り返しで 20 % に張り付き FOLLOWING_ERROR、17:58 / 18:01 の #2）。19:50〜20:07 の乗車で最大 36 %、FAULT なし（runs/hw_20261103.md）。旧 20
 # 初期値だけ（SET_LIMITS で配る。実行時には変えない）
 duty_min_percent = 9             # 11-02: 7〜8 % では #2 が動かず、9 % で動き出した実測から
 kp_percent_per_100 = 50          # 11-02 16:0x hw-r10a-test に戻す（kp 50 のつなぎ）。r10 統合版（保持の学習・段階的な力の上げ・駐車）は kp 30 から（Codex）。15:10 のつなぎは: 乗員の荷重で戻れない（誤差 29 で 8.7 % 頭打ち）→ 50（誤差 29 で 14.5 %）。旧 30。 11-02 昼: r9（方向別 FF ＋ PI ＋ 減衰、hw-r9-cal-20261102）は kp 30 前提。旧: 11-02: 2 だと 9 % に達する前に誤差 400 で FOLLOWING_ERROR になるため
@@ -113,7 +113,7 @@ kind = "serial"
 #   他の装置を開くとその装置がリセットされることがある）。個体の対応は ioreg の USB Serial Number で確認する
 # （hardware-bringup.md §3）。ポート名は物理ポート依存で、個体の識別には使えない。軸の割当は各 CoreS3 で
 # 選んだ系統（HELLO / STATUS の selected_axis）で決まり、この並び順には依存しない。
-ports = ["/dev/cu.usbmodem114501", "/dev/cu.usbmodem114101", "/dev/cu.usbmodem114301"]  # 11-03 朝（ioreg で確認）  # 11-02 18:0x 再接続で 145xx/141xx/143xx から変わった（ioreg で確認）  # 11-02 17:0x ハブ上流の差し直しで 115xx/111xx/113xx から変わった（ioreg で確認）  # 1C:DB(#1) / 68:EE(#2) / 30:ED(#3)。11-02 夕方: #3 のエンコーダ（コードホイール）を仮復旧  # 1C:DB(#1) / 68:EE(#2)。#3 は 24V 未接続のため模擬軸
+ports = "auto"   # 11-05 夜: USB のシリアル番号（= MAC）が下の device_id と一致するポートだけを開く（PR #59 / #81、実機で確認）。ポート名の書き換えは不要
 baud = 115200
 # 実機が足りないときは、その軸を模擬軸で代替できる（例: sim_axes = [3]。その軸の ports は書かない）。
 # 模擬軸は目標に完全に追従するので、その軸の pose を中立に保てば動かない扱いになる。その軸の校正値は
@@ -137,12 +137,12 @@ name = "右手前リフト (motor #1)"
 #   向き（仮想 0→1023 が上か下か）は §7 で低ゲインで確認する。逆なら count_at_virtual_0 と 1023 の値を入れ替えて再起動
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 2778     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
-count_at_virtual_1023 = 5156    # soft_max − 350
+count_at_virtual_512 = 2777     # = stroke / 2（従来 env の neutral と同じ。2026-10-31 の読み値 5551 / 2775）
+count_at_virtual_1023 = 5155    # soft_max − 350
 mechanical_min_count = 0        # 従来 env の HOME で当てた P 端
-mechanical_max_count = 5556     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
+mechanical_max_count = 5555     # 従来 env の UPPER / CAL で当てた N 端（= stroke。CAL ごとに ±20 程度ぶれる: 5551 / 5553 / 5556 の記録）
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5506           # mechanical_max − decel_zone
+soft_max_count = 5505           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
@@ -155,12 +155,12 @@ name = "左リフト (motor #2)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目。軸 1 の値をコピーして済ませない（architecture.md §6）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 2753     # = stroke / 2
-count_at_virtual_1023 = 5107    # soft_max − 350
+count_at_virtual_512 = 2754     # = stroke / 2
+count_at_virtual_1023 = 5108    # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 5507
+mechanical_max_count = 5508
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5457           # mechanical_max − decel_zone
+soft_max_count = 5458           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
@@ -175,10 +175,10 @@ name = "後部ヨー (motor #3)"
 # !!! true にする前の確認は軸 1 と同じ 4 項目（向きは yaw を入れて右か左か）
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
-count_at_virtual_512 = 3103  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
-count_at_virtual_1023 = 5806  # soft_max − 350
+count_at_virtual_512 = 3102  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
+count_at_virtual_1023 = 5804  # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 6206  # 11-02 夕方の CAL
+mechanical_max_count = 6204  # 11-02 夕方の CAL
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 6156  # mechanical_max − decel_zone
+soft_max_count = 6154  # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count

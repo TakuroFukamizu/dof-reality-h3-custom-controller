@@ -115,7 +115,7 @@ async fn foreign_origin_is_forbidden() {
     let (st, _) = call(&s.app, req("GET", "/v1/motion", &[("origin", "null")], "")).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     // The embedded pages too (a foreign page must not read them).
-    for p in ["/", "/joystick"] {
+    for p in ["/", "/joystick", "/console", "/console/setup"] {
         let (st, body) = call(&s.app, req("GET", p, &[("origin", "http://evil.example")], "")).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(body["error"], "forbidden_origin", "{p}");
@@ -558,7 +558,7 @@ const STATUS_KEYS: &[&str] = &[
     "protocol", "rig_state", "armed", "active_source", "calibration_valid", "fault", "fault_history",
     "blockers", "session", "requested_pose", "requested_gain", "effective_gain", "limits",
     "virtual_targets", "target_counts", "session_epoch", "group_frame_id", "axes", "axis_conflict", "measured_angles",
-    "physical_estop", "telemetry", "motion_limits",
+    "physical_estop", "telemetry", "motion_limits", "governor",
 ];
 const AXIS_KEYS: &[&str] = &[
     "axis_id", "name", "connected", "port", "device_id", "expected_device_id", "assignment", "claimants",
@@ -583,6 +583,7 @@ fn check_status_shape(v: &Value) {
     }
     assert_keys(&v["session"], SESSION_KEYS, "session");
     assert_keys(&v["telemetry"], TELEMETRY_KEYS, "telemetry");
+    assert_keys(&v["governor"], &["scale", "active", "axis", "reason"], "governor");
     assert_keys(
         &v["motion_limits"],
         &["effective", "requested", "ceiling", "defaults", "operator_max", "game_fields", "limited", "reasons", "pending"],
@@ -1120,15 +1121,16 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     assert_eq!((axes[0]["soft_min_count"].as_i64(), axes[0]["soft_max_count"].as_i64()), (Some(300), Some(5700)));
     assert_eq!(
         (axes[0]["count_at_virtual_0"].as_i64(), axes[0]["count_at_virtual_512"].as_i64(), axes[0]["count_at_virtual_1023"].as_i64()),
-        (Some(300), Some(3000), Some(5700))
+        (Some(600), Some(3000), Some(5400)),
+        "the end points keep sim.toml's 300-count margin inside the soft limits"
     );
     assert_eq!(axes[1]["axis_id"], 3);
     assert_eq!(axes[1]["device_id"], "513130eda00b2040");
     assert_eq!((axes[1]["mechanical_min_count"].as_i64(), axes[1]["mechanical_max_count"].as_i64()), (Some(-6138), Some(0)));
     assert_eq!(
         (axes[1]["count_at_virtual_0"].as_i64(), axes[1]["count_at_virtual_512"].as_i64(), axes[1]["count_at_virtual_1023"].as_i64()),
-        (Some(-300), Some(-3069), Some(-5838)),
-        "sign −1: virtual still grows from the P end (0) toward the N end"
+        (Some(-500), Some(-3069), Some(-5638)),
+        "sign −1: virtual still grows from the P end (0) toward the N end; margin 200 kept"
     );
 
     // The file is a valid config with those numbers, the untouched axis, the
@@ -1145,13 +1147,14 @@ async fn calibration_export_writes_next_to_the_config_and_never_overwrites() {
     assert_eq!(a1.device_id, h3cs::types::DeviceId(0x5131_1cdb_d4ba_8d58));
     assert!(!a1.calibration_valid);
     assert_eq!((a1.mechanical_min_count, a1.mechanical_max_count, a1.soft_min_count, a1.soft_max_count), (0, 6000, 300, 5700));
-    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (300, 3000, 5700));
+    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (600, 3000, 5400));
     assert_eq!(a1.decel_zone_count, 300);
     let a2 = out.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap();
     assert_eq!(a2, cfg.axis(h3cs::types::AxisId::new(2).unwrap()).unwrap(), "FAILED axis left as it was");
     let a3 = out.axis(h3cs::types::AxisId::new(3).unwrap()).unwrap();
     assert_eq!((a3.mechanical_min_count, a3.mechanical_max_count, a3.soft_min_count, a3.soft_max_count), (-6138, 0, -5838, -300));
-    assert_eq!((a3.count_at_virtual_0, a3.count_at_virtual_512, a3.count_at_virtual_1023), (-300, -3069, -5838));
+    assert_eq!((a3.count_at_virtual_0, a3.count_at_virtual_512, a3.count_at_virtual_1023), (-500, -3069, -5638));
+    assert_eq!(body["margins_not_kept"], serde_json::json!([]));
     assert!(!a3.calibration_valid);
     // Everything but the axis values is the running config.
     assert_eq!(out.rig_id, cfg.rig_id);
@@ -1430,4 +1433,29 @@ async fn limits_message_is_rejected_during_an_axis_conflict() {
     assert_eq!((ack["accepted"].as_bool(), ack["reason"].as_str()), (Some(false), Some("axis_conflict")));
     let v = http(addr, "GET", "/v1/limits", &[], None).await.json();
     assert_eq!(v["requested"]["max_gain"], 0.5, "not applied");
+}
+
+#[tokio::test]
+async fn operator_console_is_served_and_self_contained() {
+    let s = stub(sim_cfg(), Some(ok_reply));
+    for path in ["/console", "/console/setup"] {
+        let resp = s.app.clone().oneshot(req("GET", path, &[], "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), api::CONSOLE_PAGE);
+    }
+    for needle in ["src=\"http", "href=\"http", "https://", "@import"] {
+        assert!(!api::CONSOLE_PAGE.contains(needle), "external resource in the console: {needle}");
+    }
+    // Reads status / events; the operator header goes on every request; the new APIs are used
+    // only when the server reports them (operator_hold present).
+    for needle in ["/v1/status", "/v1/events?after=", "X-H3-Operator", "/v1/fault/reset", "/v1/stop", "/v1/operator/hold",
+                   "/v1/calibration/apply", "/v1/units/assign", "confirmModal('校正しますか？'", "hasNewApi"] {
+        assert!(api::CONSOLE_PAGE.contains(needle), "missing in the console: {needle}");
+    }
+    // Loading the page sends nothing that moves the rig.
+    assert!(s.seen.lock().unwrap().is_empty());
 }

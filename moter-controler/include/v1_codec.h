@@ -456,6 +456,7 @@ struct SetLimits {
   uint16_t ff_count_s_per_percent; // > 0
   uint16_t deadband_count;
   uint16_t deadband_out_count;     // ≥ deadband_count
+  uint16_t stop_acc_count_s2;      // 制御された停止の減速度。0 = 未設定（CONFIG の max_acc）
 };
 #if V1_DIAG_BRAKE_TEST
 struct DiagStart {
@@ -550,6 +551,7 @@ struct Limits {
   uint16_t ff_count_s_per_percent;
   uint16_t deadband_count;
   uint16_t deadband_out_count;
+  uint16_t stop_acc_count_s2;      // 保存した停止減速度。0 = 未設定（旧ファームは 0 のまま）
   uint32_t abs_max_vel_count_s;    // 絶対上限（V1_ABS_MAX_VEL_COUNT_S）
   uint32_t abs_max_acc_count_s2;   // 絶対上限（V1_ABS_MAX_ACC_COUNT_S2）
 };
@@ -725,7 +727,7 @@ inline size_t encode_host_payload(const HostMsg& m, uint8_t* out, size_t cap) {
       put_u16(out + 8, l.ff_count_s_per_percent);
       put_u16(out + 10, l.deadband_count);
       put_u16(out + 12, l.deadband_out_count);
-      // 14: u16 reserved = 0
+      put_u16(out + 14, l.stop_acc_count_s2);
       break;
     }
 #if V1_DIAG_BRAKE_TEST
@@ -844,7 +846,7 @@ inline size_t encode_mcu_payload(const McuMsg& m, uint8_t* out, size_t cap) {
       put_u16(out + 8, l.ff_count_s_per_percent);
       put_u16(out + 10, l.deadband_count);
       put_u16(out + 12, l.deadband_out_count);
-      // 14: u16 reserved = 0
+      put_u16(out + 14, l.stop_acc_count_s2);  // 保存した停止減速度。0 = 未設定
       put_u32(out + 16, l.abs_max_vel_count_s);
       put_u32(out + 20, l.abs_max_acc_count_s2);
       break;
@@ -988,7 +990,8 @@ inline bool decode_host_payload(uint8_t type, const uint8_t* p, size_t n, HostMs
       l.ff_count_s_per_percent = get_u16(p + 8);
       l.deadband_count = get_u16(p + 10);
       l.deadband_out_count = get_u16(p + 12);
-      break;  // 7・14 の予約は読まない
+      l.stop_acc_count_s2 = get_u16(p + 14);
+      break;  // 7 の予約は読まない
     }
 #if V1_DIAG_BRAKE_TEST
     case msg::DIAG_START: {
@@ -1107,9 +1110,10 @@ inline bool decode_mcu_payload(uint8_t type, const uint8_t* p, size_t n, McuMsg*
       l.ff_count_s_per_percent = get_u16(p + 8);
       l.deadband_count = get_u16(p + 10);
       l.deadband_out_count = get_u16(p + 12);
+      l.stop_acc_count_s2 = get_u16(p + 14);  // 旧ファームは 0
       l.abs_max_vel_count_s = get_u32(p + 16);
       l.abs_max_acc_count_s2 = get_u32(p + 20);
-      break;  // 14 の予約は読まない
+      break;
     }
 #if V1_DIAG_BRAKE_TEST
     case msg::DIAG_RESULT: {
