@@ -84,10 +84,12 @@ frame:         header(4) payload(N) crc(2)
 PWM = 0 を位置保持と見なさない。`HOLDING` は位置制御で支えている状態。
 
 **HOLDING のブレーキ保持**（ファーム `V1_HOLD_BRAKE`、既定 1。0 で従来どおりブレーキ解除のまま位置制御）: 席に人が座ったまま HOLDING で待つと、位置ループが荷重による小さな沈みを補正し続けて座面が微振動する（#1 が荷重で逆駆動され、押し戻されるのを 2〜5 Hz で繰り返す）ため、HOLDING の間はブレーキを作動させて保持する。HOLDING の目標は動かない（SET_POSITION は ACTIVE でしか目標に反映されない）ので、ブレーキで保持して安全。プロトコルの変更はなく、STATUS の `BRAKE_RELEASE_CMD` が HOLDING の間 0 になるだけ。
-- HOLDING に入るとき（ARMING 完了・STOPPING の停止後）に作動指令（`BRAKE_RELEASE_CMD` = 0）。作動の完了までの時間は未測定なので、`hold_brake_support_ms`（300、`V1_HOLD_BRAKE_SUPPORT_MS`。暫定）の間は位置ループを通常どおり回して沈みを防ぐ。その後は Duty 0 で、ループの積分・状態も捨てる。
+- HOLDING に入った時点ではブレーキは解除のまま通常の位置制御（静止待ち）。機構がまだ動いている・遅れているうちに作動させない。**実測の静止**（`|velocity| ≤ settled_meas_vel`（`V1_SETTLED_MEAS_VEL_COUNT_S` 10 count/s、既存の整定判定と同じ 100 ms 窓の実測速度）かつ `|target − actual| ≤ hold_brake_slip_count`）が `settled_ms`（`V1_SETTLED_MS` 200 ms）続いてから作動指令（`BRAKE_RELEASE_CMD` = 0）。条件が崩れれば数え直し、静止しなければ従来どおりブレーキ解除のまま。
+- 作動の完了までの時間は未測定なので、作動指令から `hold_brake_support_ms`（300、`V1_HOLD_BRAKE_SUPPORT_MS`。暫定）の間は位置ループを通常どおり回して沈みを防ぐ。その後は Duty 0 で、ループの積分・状態も捨てる。
 - 作動後に実位置が保持位置から `hold_brake_slip_count`（20、`V1_HOLD_BRAKE_SLIP_COUNT`）count を超えてずれたら、異常にはせずブレーキを解除して位置制御へ戻る（その HOLDING の間は作動に戻らない）。
+- フェーズ（ファーム内部）: 0 なし / 1 静止待ち / 2 作動待ち（支え）/ 3 作動中（Duty 0）/ 4 ずれて解除。
 - START（HOLDING → ACTIVE。中立への移動 `/v1/center` も同じ）は、受理した呼び出しの中で解除指令を出す（ソフトウェアの待ちは足さない）。DISARM・FAULT は従来どおりブレーキ作動のまま。COMMAND_TIMEOUT など期限・保護の監視は HOLDING のブレーキ作動中も変わらない。
-- ブレーキ解除指令中だけ動く検出（動き出しパルス・停止ブースト・無パルス判定）は、作動指令中は静かになる。START で解除した時点から窓を数え直す。
+- ブレーキ解除指令中だけ動く検出（動き出しパルス・停止ブースト・無パルス判定）は、作動指令中は静かになる。START で解除した時点から窓を数え直す。さらに、ブレーキ保持の機能が出した解除（作動待ち・作動中からの START、ずれによる解除）の後は `hold_brake_release_grace_ms`（150、`V1_HOLD_BRAKE_RELEASE_GRACE_MS`。暫定。ブレーキが物理的に外れるまでの時間は未測定）の間、動き出しパルスと停止ブーストだけを出さない（通常の P・FF・減衰の位置制御は解除の tick から動く。FOLLOWING_ERROR などの保護は変えない）。静止待ち中の START（ブレーキ未作動）には猶予なし。
 
 ### 3.2 異常コード `fault_code`（u16）
 
@@ -222,7 +224,7 @@ DISARMED --CALIBRATE(1)--> CALIBRATING --(終了手順。成功・失敗・中�
 - USB 再接続・CDC の再オープンで自動 ARM・自動 START しない。NVS に ARM 状態を保存しない。
 - DISARM による減速（ACTIVE / STOPPING からの DISARM）は lease の対象外。PC が SET_POSITION を止めても COMMAND_TIMEOUT にせず、停止後 DISARMING → DISARMED へ進む（`stop_timeout_ms` を超えたら STOP_TIMEOUT）。
 - `valid_for_ms` の期限切れで ACTIVE → STOPPING → HOLDING に落ちた後は、遅れて届いた SET_POSITION では動き出さない。再開には START が要る。
-- ARMING の順序: PWM 0 のまま主電源 ON 指令（電源担当軸のみ）→ `POWER_SETTLE_MS` → 実位置がソフトリミット外ならブレーキを解除せず FAULT(SOFT_LIMIT) → 現在位置を保持目標にして位置制御開始 → ブレーキ解除給電 → `BRAKE_RELEASE_WAIT_MS` → HOLDING。HOLDING に入った tick でブレーキ作動指令（ブレーキ保持が有効なとき。§3 の「HOLDING のブレーキ保持」）。START で即解除。
+- ARMING の順序: PWM 0 のまま主電源 ON 指令（電源担当軸のみ）→ `POWER_SETTLE_MS` → 実位置がソフトリミット外ならブレーキを解除せず FAULT(SOFT_LIMIT) → 現在位置を保持目標にして位置制御開始 → ブレーキ解除給電 → `BRAKE_RELEASE_WAIT_MS` → HOLDING。HOLDING に入った後、実測の静止が続いたらブレーキ作動指令（ブレーキ保持が有効なとき。§3 の「HOLDING のブレーキ保持」）。START で即解除。
 - 主電源（G2）は **電源担当軸だけ** が操作する。それ以外の軸は CONFIG の `role_flags` bit0 = 0 で G2 を操作しない。
 - **位置ループ r6（Issue #25、2026-11-02、Codex 設計コンサル。`config.h` `V1_FF_DIRECTIONAL` 既定 1、`-DV1_FF_DIRECTIONAL=0` で下の r5 までの経路に戻る。実機未確認）**: `Duty = FF_d(軌道速度) + kp × 誤差 / 100 + I`。走行中に床（`duty_min`）は無く、1〜5 % の生の値がそのまま permille で出る。`|Duty|` は `duty_max` で 1 回だけ飽和、四捨五入も 1 回（I は小数のまま）。
   - **方向別 FF**: d = 軌道速度の向き（「上」= カウント増）、w = min(|v| / `V1_FF_TAPER_COUNT_S` 30, 1)、`u_ff = w × a_d + b_d × v`、v = 0 なら 0。係数は `config.h` の `V1_FF_A_UP_PERMILLE` 46 / `V1_FF_B_UP_PERMILLE_PER_COUNT_S` 0.10 / `V1_FF_A_DOWN_PERMILLE` −7（符号付きの切片。下向きは負のまま足す）/ `V1_FF_B_DOWN_PERMILLE_PER_COUNT_S` 0.107（permille、permille/(count/s)。#1 の一定速度ランプ ±99〜±593 count/s の定常 Duty の直線回帰。上 u ≈ 4.6 % + 0.0099 %·v、下 u ≈ −0.74 % + 0.0107 %·v。重力バイアス ≈ +1.9 %、クーロン ≈ 2.7 %）。例: +300 count/s → 7.6 %、−300 → −3.9 %、+600 → 10.6 %、−600 → −7.1 %、+15 → 2.45 %（テーパ）。反転時に切片が一気に反転しないよう 30 count/s でテーパ。**SET_LIMITS の `ff_count_s_per_percent` は受理して LIMITS で返すが、位置ループでは使わない。**

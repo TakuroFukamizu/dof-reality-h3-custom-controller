@@ -308,6 +308,10 @@ constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電
 #ifndef V1_HOLD_BRAKE_SUPPORT_MS
 #define V1_HOLD_BRAKE_SUPPORT_MS 300
 #endif
+// ブレーキ解除指令（START・ずれによる解除）から物理的に外れるまで、動き出しパルスと停止ブーストを出さない時間（未測定、仮に 150 ms）
+#ifndef V1_HOLD_BRAKE_RELEASE_GRACE_MS
+#define V1_HOLD_BRAKE_RELEASE_GRACE_MS 150
+#endif
 #ifndef V1_HOLD_BRAKE_SLIP_COUNT
 #define V1_HOLD_BRAKE_SLIP_COUNT 20  // ブレーキ作動後に保持位置からこれを超えてずれたら解除して位置制御へ戻る（異常にはしない）
 #endif
