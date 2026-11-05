@@ -64,6 +64,19 @@
 //!   when the server was not started from a file, 500 `invalid_result` when
 //!   the produced file does not validate (nothing is written then). None of
 //!   the three is in [`lan_allowed`].
+//! - Operator console (DESIGN.md §7, §11.1): `POST /v1/operator/hold` (no
+//!   token, not rate limited: it is a stop) sets the shared hold flag, then
+//!   runs the ordinary Stop; `POST /v1/operator/release` (token) clears it.
+//!   While held, `/v1/arm`, `/v1/start` and `/v1/fault/reset` without
+//!   `X-H3-Operator: 1` get 409 `operator_hold` (checked here, not by the
+//!   supervisor, so rig_state and the operator's own ARM are unaffected).
+//!   The console is same-origin, so the custom header needs no CORS
+//!   preflight (there is no CORS layer: a page on another origin could not
+//!   send it). Hot apply (`/v1/calibration/apply`, `/declare`,
+//!   `/v1/units/assign`, token + rate limit) runs in its own task so a
+//!   client going away cannot leave the file written without the swap:
+//!   file first ([`crate::config_edit`]), then `AdminCmd::ReplaceAxis`; if
+//!   the supervisor refuses, the file is restored from its backup.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
