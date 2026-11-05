@@ -156,11 +156,11 @@ name = "左リフト (motor #2)"
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
 count_at_virtual_512 = 2754     # = stroke / 2
-count_at_virtual_1023 = 5108    # soft_max − 350
+count_at_virtual_1023 = 5109    # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 5508
+mechanical_max_count = 5509
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 5458           # mechanical_max − decel_zone
+soft_max_count = 5459           # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
 
 # ---------------------------------------------------------------------------
@@ -176,9 +176,9 @@ name = "後部ヨー (motor #3)"
 calibration_valid = true   # #1 / #2: 2026-11-01 の /v1/calibrate の結果。#3 は模擬軸
 count_at_virtual_0 = 400        # soft_min + 350（11-02: 下端で 152 count 以上行き過ぎた。Issue #34 / PR #38）
 count_at_virtual_512 = 3102  # 11-02 夕方の CAL（コードホイール仮復旧後 6205/3102、6206/3103）
-count_at_virtual_1023 = 5804  # soft_max − 350
+count_at_virtual_1023 = 5805  # soft_max − 350
 mechanical_min_count = 0
-mechanical_max_count = 6204  # 11-02 夕方の CAL
+mechanical_max_count = 6205  # 11-02 夕方の CAL
 soft_min_count = 50             # mechanical_min + decel_zone
-soft_max_count = 6154  # mechanical_max − decel_zone
+soft_max_count = 6155  # mechanical_max − decel_zone
 decel_zone_count = 50         # ソフトリミットは実測端から 50 count
