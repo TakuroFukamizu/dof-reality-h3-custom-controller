@@ -297,6 +297,11 @@ pub enum AdminCmd {
     Calibrate { axes: Vec<AxisId> },
     /// CALIBRATE(0) to every calibrating axis.
     CalibrateCancel,
+    /// Hot apply (operator console): swap axis `axis`'s configuration (the
+    /// API has already written it to the config file). Refused unless
+    /// disarmed and nothing calibrating. `hash` = `calibration_hash` of the
+    /// new geometry (the supervisor has no rig_id). `what` names the edit.
+    ReplaceAxis { axis: AxisId, axis_cfg: Box<crate::config::AxisConfig>, hash: u32, what: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2364,7 +2369,87 @@ impl Supervisor {
             }
             AdminCmd::Calibrate { axes } => self.cmd_calibrate(&axes, now),
             AdminCmd::CalibrateCancel => Ok(self.cmd_calibrate_cancel(now)),
+            AdminCmd::ReplaceAxis { axis, axis_cfg, hash, what } => {
+                self.cmd_replace_axis(axis, &axis_cfg, hash, what, now)
+            }
         }
+    }
+
+    /// Whether a hot apply may change the configuration now: not armed (no
+    /// ARM in progress, nothing moving or stopping), no FAULT_RESET in
+    /// flight, no axis calibrating or with a CALIBRATE outstanding.
+    pub fn config_edit_allowed(&self) -> Result<(), AdminError> {
+        match self.phase {
+            Phase::Idle(_) | Phase::Fault { reset: None } => {}
+            Phase::Fault { reset: Some(_) } => {
+                return Err(AdminError::new(admin_error::RESET_IN_PROGRESS, vec!["fault reset in progress".into()]))
+            }
+            _ => {
+                return Err(AdminError::new(
+                    admin_error::NOT_DISARMED,
+                    vec![format!("rig_state: {}", rig_state_name(self.state()))],
+                ))
+            }
+        }
+        let busy: Vec<String> = (0..AXIS_COUNT)
+            .filter(|&i| self.axes[i].connected && (self.axes[i].calibrating() || self.axes[i].cal_pending))
+            .map(|i| format!("calibrating: axis{}", i + 1))
+            .collect();
+        if busy.is_empty() {
+            Ok(())
+        } else {
+            Err(AdminError::new(admin_error::CALIBRATING, busy))
+        }
+    }
+
+    fn cmd_replace_axis(
+        &mut self,
+        axis: AxisId,
+        a: &crate::config::AxisConfig,
+        hash: u32,
+        what: &'static str,
+        now: Instant,
+    ) -> Result<Option<String>, AdminError> {
+        self.config_edit_allowed()?;
+        let i = axis.index();
+        let new_cal = AxisCalibration::from_config(a);
+        let summary = |cal: &AxisCalibration, dev: DeviceId, valid: bool, hash: u32| {
+            serde_json::json!({
+                "device_id": dev, "calibration_valid": valid, "calibration_hash": hash,
+                "count_at": cal.count_at,
+                "mechanical": [cal.mechanical_min_count, cal.mechanical_max_count],
+                "soft": [cal.soft_min_count, cal.soft_max_count],
+            })
+        };
+        let before = summary(&self.cal[i], self.device_ids[i], self.operator_valid[i], self.hashes[i]);
+        let after = summary(&new_cal, a.device_id, a.calibration_valid, hash);
+        self.device_ids[i] = a.device_id;
+        self.operator_valid[i] = a.calibration_valid;
+        self.cal_error[i] = new_cal.validate().err().map(|e| e.to_string());
+        self.cal[i] = new_cal;
+        let geometry_changed = self.hashes[i] != hash;
+        self.hashes[i] = hash;
+        // The geometry in force is the measured one again (or the operator
+        // declared / reassigned it): the recalibration mark is answered.
+        if what == "calibration" {
+            self.calibration_stale[i] = None;
+        }
+        if geometry_changed {
+            // reconcile_config sends CONFIG with the new geometry on the next
+            // tick; an in-flight CONFIG carries the old one and is forgotten.
+            let t = &mut self.axes[i];
+            t.configured_epoch = None;
+            t.config_retry_at = None;
+            t.config_rejected = None;
+            self.pending
+                .retain(|_, p| !(p.axis == i && p.msg_type == protocol::msg_type::CONFIG));
+        }
+        self.event(
+            now,
+            "config_applied",
+            serde_json::json!({"axis": axis, "what": what, "before": before, "after": after}),
+        );
+        Ok(None)
     }
 
     /// Refuse an admin command while any axis is CALIBRATING.

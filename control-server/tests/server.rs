@@ -1393,3 +1393,194 @@ async fn operator_header_passes_the_same_origin_check() {
     assert_eq!(r.status, 200, "{r:?}");
     srv.shutdown().await;
 }
+
+// ------------------------------------------------------------------ hot apply (console)
+
+/// sim.toml's sections with three hand-made axes (unreferenced sims with end
+/// stops ±500: stroke 1000, neutral 500 after calibration):
+/// - axis 1: margin 350 inside the soft limits (like the live config),
+///   decel 50, stroke 5556 → not within ±30 of 1000;
+/// - axis 2: stroke 1020 (within ±30), calibration_valid = true, margins 100 / 120;
+/// - axis 3: stroke 2000, calibration_valid = false, margin 100.
+fn hot_cfg_text() -> String {
+    let sim = std::fs::read_to_string(SIM).unwrap();
+    let head = &sim[..sim.find("[[axis]]").unwrap()];
+    let head = head
+        .replace("start_referenced = true", "start_referenced = false")
+        .replace("end_min_count = -3000", "end_min_count = -500")
+        .replace("end_max_count = 3000", "end_max_count = 500");
+    let axis = |id: u8, valid: bool, c: [i32; 3], mech: [i32; 2], soft: [i32; 2], decel: i32| {
+        format!(
+            "[[axis]]\naxis_id = {id}\ndevice_id = \"513100000000000{id}\"   # 照合用\nname = \"axis {id}\"\n\
+             calibration_valid = {valid}   # 宣言\ncount_at_virtual_0 = {}        # soft_min + margin\n\
+             count_at_virtual_512 = {}\ncount_at_virtual_1023 = {}\nmechanical_min_count = {}\n\
+             mechanical_max_count = {}\nsoft_min_count = {}\nsoft_max_count = {}\ndecel_zone_count = {decel}\n\n",
+            c[0], c[1], c[2], mech[0], mech[1], soft[0], soft[1]
+        )
+    };
+    format!(
+        "{head}{}{}{}",
+        axis(1, true, [-1950, 0, 1950], [-2742, 2814], [-2300, 2300], 50),
+        axis(2, true, [-100, 0, 100], [-500, 520], [-200, 220], 300),
+        axis(3, false, [-500, 0, 500], [-1000, 1000], [-600, 600], 300),
+    )
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("h3cs-server-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+async fn post(srv: &h3cs::server::RunningServer, path: &str, body: &str) -> Resp {
+    let auth = bearer();
+    http(srv.local_addr, "POST", path, &[("Authorization", &auth), ("X-H3-Operator", "1")], Some(body)).await
+}
+
+async fn calibrate_all(srv: &h3cs::server::RunningServer) {
+    let r = post(srv, "/v1/calibrate", "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(srv, 8 * S, "all CAL_RESULT OK", |s| {
+        s.axes.iter().all(|a| {
+            a.calibration.as_ref().is_some_and(|c| c.result == h3cs::protocol::CalResultCode::Ok)
+                && a.referenced
+                && a.mcu_state == Some(McuState::Disarmed)
+                && a.calibration_stale
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn calibration_apply_keeps_margins_persists_with_backup_and_arms_without_restart() {
+    let dir = scratch("apply");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let srv = start_sim_with_path(cfg, Some(path.clone())).await;
+    let st = wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    assert_eq!(st.config_path.as_deref(), Some(path.to_str().unwrap()));
+    assert_eq!(st.axes.iter().map(|a| a.config_stroke).collect::<Vec<_>>(), [5556, 1020, 2000]);
+
+    // Nothing measured yet.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("no_calibration_result")), "{r:?}");
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":4}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("bad_axis")), "{r:?}");
+
+    // While calibrating: refused.
+    let r = post(&srv, "/v1/calibrate", "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    wait_status(&srv, 2 * S, "CALIBRATING", |s| s.axes.iter().any(|a| a.mcu_state == Some(McuState::Calibrating))).await;
+    let r = post(&srv, "/v1/calibration/declare", r#"{"axis":3}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("calibrating")), "{r:?}");
+    wait_status(&srv, 8 * S, "all CAL_RESULT OK", |s| {
+        s.axes.iter().all(|a| a.calibration.is_some() && a.calibration_stale && a.mcu_state == Some(McuState::Disarmed))
+    })
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "nothing written so far");
+
+    // Axis 1: margin 350 kept; stroke 1000 vs 5556 → declaration dropped.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let b = r.json();
+    assert_eq!((b["ok"].as_bool(), b["axis"].as_u64(), b["stroke"].as_i64(), b["prev_stroke"].as_i64()), (Some(true), Some(1), Some(1000), Some(5556)));
+    assert_eq!((b["within_tolerance"].as_bool(), b["calibration_valid"].as_bool()), (Some(false), Some(false)));
+    assert_eq!(b["path"].as_str(), path.to_str());
+    let backup = std::path::PathBuf::from(b["backup"].as_str().unwrap());
+    assert_eq!(backup.parent(), Some(dir.as_path()));
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), text, "backup is the file before the apply");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("count_at_virtual_0 = 400        # soft_min + margin"), "value replaced, comment kept: {written}");
+    let a1 = Config::load(&path).unwrap().axes[0].clone();
+    assert_eq!((a1.mechanical_min_count, a1.mechanical_max_count, a1.soft_min_count, a1.soft_max_count), (0, 1000, 50, 950));
+    assert_eq!((a1.count_at_virtual_0, a1.count_at_virtual_512, a1.count_at_virtual_1023), (400, 500, 600));
+    assert!(!a1.calibration_valid);
+    let st = wait_status(&srv, S, "axis 1 no longer stale", |s| !s.axes[0].calibration_stale).await;
+    assert_eq!(st.axes[0].config_stroke, 1000);
+    assert!(st.axes[1].calibration_stale && st.axes[2].calibration_stale);
+
+    // Axis 2: same unit, 1000 vs 1020 → within ±30, declaration inherited.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":2}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!((r.json()["within_tolerance"].as_bool(), r.json()["calibration_valid"].as_bool()), (Some(true), Some(true)));
+    assert_ne!(r.json()["backup"], b["backup"], "a second backup in the same second gets its own name");
+    // Axis 3: 1000 vs 2000 → not within; it was not declared anyway.
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":3}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!((r.json()["within_tolerance"].as_bool(), r.json()["calibration_valid"].as_bool()), (Some(false), Some(false)));
+    let out = Config::load(&path).unwrap();
+    assert_eq!((out.axes[1].count_at_virtual_0, out.axes[1].count_at_virtual_1023), (400, 580), "axis 2 margins 100 / 120");
+    assert!(out.axes[1].calibration_valid);
+
+    // Only the declarations of axes 1 and 3 stand between the rig and ARM.
+    let st = wait_status(&srv, S, "stale cleared", |s| blocker_codes(s) == ["calibration_invalid"]).await;
+    assert_eq!(st.blockers.len(), 2, "{:?}", st.blockers);
+    for axis in [1, 3] {
+        let r = post(&srv, "/v1/calibration/declare", &format!(r#"{{"axis":{axis}}}"#)).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(r.json()["calibration_valid"], true);
+    }
+    assert!(Config::load(&path).unwrap().axes.iter().all(|a| a.calibration_valid));
+    let st = wait_state(&srv, RigState::ReadyToArm, 3 * S).await;
+    assert!(st.calibration_valid);
+    assert!(st.axes.iter().all(|a| a.configured), "CONFIG resent with the new geometry");
+    let r = post(&srv, "/v1/arm", "").await;
+    assert_eq!(r.status, 200, "ARM without a restart: {r:?}");
+    wait_state(&srv, RigState::Holding, 3 * S).await;
+
+    // Armed: every edit is refused and the file stays.
+    let before = std::fs::read_to_string(&path).unwrap();
+    for (route, body) in [
+        ("/v1/calibration/apply", r#"{"axis":1}"#),
+        ("/v1/calibration/declare", r#"{"axis":1}"#),
+        ("/v1/units/assign", r#"{"axis":1,"device_id":"5131000000000009","confirm_suffix":"0009"}"#),
+    ] {
+        let r = post(&srv, route, body).await;
+        assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("not_disarmed")), "{route}: {r:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    let ev = http(srv.local_addr, "GET", "/v1/events?n=1000", &[], None).await.json();
+    let applied = ev["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "config_applied").count();
+    assert_eq!(applied, 5);
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn calibration_apply_that_cannot_write_leaves_memory_and_file_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("applyfail");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let srv = start_sim_with_path(Config::from_toml_str(&text).unwrap(), Some(path.clone())).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected && a.mcu_state == Some(McuState::Disarmed))).await;
+    calibrate_all(&srv).await;
+    let before = srv.status();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = post(&srv, "/v1/calibration/apply", r#"{"axis":1}"#).await;
+    let r2 = post(&srv, "/v1/calibration/declare", r#"{"axis":3}"#).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!((r.status, r.json()["error"].as_str()), (500, Some("write_failed")), "{r:?}");
+    assert_eq!((r2.status, r2.json()["error"].as_str()), (500, Some("write_failed")), "{r2:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = srv.status();
+    for (b, a) in before.axes.iter().zip(&after.axes) {
+        assert!(a.calibration_stale, "axis {}", a.axis_id);
+        assert_eq!((a.config_stroke, a.expected_device_id), (b.config_stroke, b.expected_device_id));
+    }
+    assert_eq!(blocker_codes(&after), blocker_codes(&before));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup or temp file left");
+    // Without a config file: 500 no_config_path.
+    srv.shutdown().await;
+    let srv = start_sim(Config::from_toml_str(&text).unwrap()).await;
+    let r = post(&srv, "/v1/calibration/declare", r#"{"axis":1}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (500, Some("no_config_path")), "{r:?}");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
