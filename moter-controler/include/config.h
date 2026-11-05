@@ -305,8 +305,9 @@ constexpr uint32_t BRAKE_APPLY_WAIT_MS = 300;   // DISARMING: ブレーキ給電
 #ifndef V1_HOLD_BRAKE
 #define V1_HOLD_BRAKE 1
 #endif
+// 2026-11-06 空席の実測: 作動指令から 40 ms 以内に効き（カウントが止まる）、#2 では効く瞬間に 6〜34 count ずれる（ブレーキの食い込み）
 #ifndef V1_HOLD_BRAKE_SUPPORT_MS
-#define V1_HOLD_BRAKE_SUPPORT_MS 300
+#define V1_HOLD_BRAKE_SUPPORT_MS 100
 #endif
 // ブレーキ解除指令（START・ずれによる解除）から物理的に外れるまで、動き出しパルスと停止ブーストを出さない時間（未測定、仮に 150 ms）
 #ifndef V1_HOLD_BRAKE_RELEASE_GRACE_MS
