@@ -1576,13 +1576,14 @@ inline void test_encoder_fault_on_no_pulses_while_driving() {
   h.set_position(0);
   Harness::accepted(h.start());
   h.stall = true;  // カウントが止まる
+  h.pos_max_vel = 1500;  // 可動範囲 ±2700 の中で V1_STALL_MS（1.2 s）より長く目標が動き続ける速さ（端に着くと判定が回らない）
   // 軌道が動き出してフィードフォワードが |duty| ≥ しきい値 15 %（max(10, duty_max 20 × 75 %)。Issue #15 M2）に届いてから
   // V1_STALL_MS（600 ms）で異常（max_vel 4000 → 上限 20 % で頭打ち）
   CHECK(h.ax.encoder_fault_duty_threshold_permille() == 150);
   h.drive(150, 20000);
   CHECK(h.ax.state() == st::ACTIVE);
   CHECK(h.ax.duty_permille() != 0);
-  h.drive(550, 20000);  // V1_STALL_MS 600
+  h.drive(V1_STALL_MS - 50, 20000);  // V1_STALL_MS
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
   CHECK(h.ax.duty_permille() == 0);
   // FAULT_RESET は通るが POSITION_REFERENCED が消える
@@ -1644,7 +1645,8 @@ inline void test_static_hold_error_at_min_duty_is_not_encoder_fault() {
   CHECK(h.ax.referenced());
   // 軌道が動き出せば従来どおり無パルスで ENCODER_FAULT（既存の test_encoder_fault_on_no_pulses_while_driving と同じ経路）
   Harness::accepted(h.start());
-  h.drive(700, h.ax.actual_count() + 20000);
+  h.pos_max_vel = 1500;  // 可動範囲の端に着く前に V1_STALL_MS が満ちる速さ
+  h.drive(V1_STALL_MS + 100, h.ax.actual_count() + 20000);
   CHECK(h.ax.state() == st::FAULT && h.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
@@ -3653,8 +3655,8 @@ inline void test_track_assist_does_not_block_following_error_or_moving_stall_fau
   const uint64_t gt0 = g.now;
   g.drive(160, gstart + 5000);
   CHECK(g.ax.state() == st::ACTIVE && g.ax.duty_terms().assist_on && g.ax.duty_permille() <= -90);
-  for (int i = 0; i < 70 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
-  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= 900 * MS);  // 誤差 150 まで ≈ 0.25 s ＋ 無パルス 200 ms
+  for (int i = 0; i < 70 + static_cast<int>(V1_STALL_MS) / 10 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.now - gt0 <= (300 + V1_STALL_MS) * MS);  // 誤差 150 まで ≈ 0.25 s ＋ 無パルス V1_STALL_MS
   CHECK(g.ax.fault_code() == fc::ENCODER_FAULT);
 }
 
@@ -4023,8 +4025,8 @@ inline void test_r6_following_error_and_moving_stall_fault_unchanged() {
   const uint64_t gt0 = g.now;
   g.drive(60, gstart + 5000);
   CHECK(g.ax.duty_permille() <= -106 && g.ax.state() == st::ACTIVE);  // FF 106 ＋ P
-  for (int i = 0; i < 110 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
-  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= 1000 * MS);  // V1_STALL_MS 600 ＋ しきい値に届くまで
+  for (int i = 0; i < 110 + static_cast<int>(V1_STALL_MS) / 10 && g.ax.state() != st::FAULT; ++i) g.drive(10, gstart + 5000);
+  CHECK(g.ax.state() == st::FAULT && g.ax.fault_code() == fc::ENCODER_FAULT && g.now - gt0 <= (400 + V1_STALL_MS) * MS);  // V1_STALL_MS ＋ しきい値に届くまで
 }
 
 // PR #33 Codex P1: 遅い軌道（25 count/s）に 8 count 遅れて付いていく（100 ms に 2〜3 count）だけでは動き出しパルスを打たない。
@@ -4506,13 +4508,13 @@ inline void test_r9_axis_hold_zero_and_protections_unchanged() {
     g.pos_max_vel = 600;
     const int32_t s0 = g.ax.actual_count();
     const uint64_t t0 = g.now;
-    for (int i = 0; i < 140 && g.ax.state() != st::FAULT; ++i) g.drive(10, s0 + 5000);
+    for (int i = 0; i < 140 + static_cast<int>(V1_STALL_MS) / 10 && g.ax.state() != st::FAULT; ++i) g.drive(10, s0 + 5000);
     *fault_after_ms = (g.now - t0) / MS;
     *code = g.ax.fault_code();
   };
   stuck_enc(0.0, &t_r8, &c_r8);
   stuck_enc(V1_VEL_KD_PERMILLE_PER_COUNT_S, &t_r9, &c_r9);
-  CHECK(c_r8 == fc::ENCODER_FAULT && c_r9 == fc::ENCODER_FAULT && t_r9 <= t_r8 && t_r9 + 100 >= t_r8 && t_r8 <= 1000);  // V1_STALL_MS 600
+  CHECK(c_r8 == fc::ENCODER_FAULT && c_r9 == fc::ENCODER_FAULT && t_r9 <= t_r8 && t_r9 + 100 >= t_r8 && t_r8 <= 400 + V1_STALL_MS);  // V1_STALL_MS ＋ しきい値に届くまで
   // 静止 2 s の監視: 静止目標で誤差 10 のまま進まない → 2 s で ENCODER_FAULT（v_fast 0・軌道 0 なので u_d 0）
   Harness k;
   r9_holding(k);
