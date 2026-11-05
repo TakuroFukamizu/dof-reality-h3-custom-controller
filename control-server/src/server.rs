@@ -80,7 +80,7 @@ use crate::protocol::HostMsg;
 use crate::limits::{self as motion_limits, MotionLimits, SharedLimits};
 use crate::session::{AcceptedPose, PoseIntake};
 use crate::sim_axis::{sim_detached, SimHandle, SimParams};
-use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput};
+use crate::supervisor::{AdminCmd, AdminError, LinkEvent, StatusSnapshot, Supervisor, TickOutput, UnregisteredUnit};
 use crate::telemetry::{lock_events, shared_event_log, Telemetry, TelemetrySummary};
 use crate::types::{AxisId, DeviceId, RigState};
 
@@ -262,6 +262,7 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
     // `links_tx` from a port task that reopens it when it closes.
     let links = Vec::new();
     let mut sims = Vec::new();
+    let (unregistered_tx, unregistered_rx) = watch::channel(Vec::<UnregisteredUnit>::new());
     let mut port_tasks = Vec::new();
     // One simulated unit for axis `a` on `port` (sim backend, or a serial
     // backend's `sim_axes`). The model lives in the port task; `sims` keeps
@@ -304,6 +305,13 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
                 spawn_sim(a, &serial.sim, format!("sim:{}", id.get()));
             }
             sims.sort_by_key(|(a, _)| *a);
+            port_tasks.push(tokio::spawn(unregistered_scan_task(
+                ports.clone(),
+                serial.clone(),
+                cfg_rx.clone(),
+                unregistered_tx,
+                shutdown_rx.clone(),
+            )));
             match &serial.ports {
                 PortList::Named(names) => {
                     for port in names {
@@ -356,6 +364,7 @@ pub async fn start(mut cfg: Config, opts: ServerOptions) -> Result<RunningServer
         last_state: RigState::Offline,
         last_pose_seq: None,
         operator_hold: operator_hold.clone(),
+        unregistered: unregistered_rx,
         config_path: opts.config_path.as_ref().map(|p| p.display().to_string()),
     };
     let control = {
@@ -477,6 +486,8 @@ struct ControlLoop {
     last_pose_seq: Option<u64>,
     /// Operator stop flag (set / cleared by the API).
     operator_hold: Arc<std::sync::atomic::AtomicBool>,
+    /// Latest `unregistered_units` from the scan task (serial backend).
+    unregistered: watch::Receiver<Vec<UnregisteredUnit>>,
     config_path: Option<String>,
 }
 
@@ -712,6 +723,7 @@ impl ControlLoop {
             snap.blockers.push("operator_hold: operator stop in force; release it from the operator console".into());
         }
         snap.config_path = self.config_path.clone();
+        snap.unregistered_units = self.unregistered.borrow().clone();
         self.status_tx.send_replace(Arc::new(snap));
     }
 }
@@ -900,6 +912,41 @@ async fn serial_discovery_task(
     // is closed). `RunningServer::shutdown` aborts this task after the
     // control loop has stopped; dropping the JoinSet then aborts the rest.
     while tasks.join_next().await.is_some() {}
+}
+
+/// Serial backend: every [`DISCOVERY_PERIOD`], the CoreS3-looking USB ports
+/// whose serial matches no configured `device_id` (status
+/// `unregistered_units`, the unit swap list). Enumeration only (on a blocking
+/// thread), never opens; works for named ports too.
+async fn unregistered_scan_task(
+    ports: Arc<dyn SerialPorts>,
+    serial: SerialBackendConfig,
+    cfg: watch::Receiver<Arc<Config>>,
+    out: watch::Sender<Vec<UnregisteredUnit>>,
+    shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let listed = listed_ports(&ports).await;
+        let wanted: Vec<DeviceId> = wanted_units(&cfg.borrow(), &serial).into_iter().map(|(_, d)| d).collect();
+        let units: Vec<UnregisteredUnit> = port_discovery::unmatched_units(&listed, &wanted)
+            .into_iter()
+            .map(|(port, usb_serial)| UnregisteredUnit {
+                device_id: port_discovery::device_id_from_usb_serial(&usb_serial),
+                port,
+                usb_serial,
+            })
+            .collect();
+        out.send_if_modified(|v| {
+            let changed = *v != units;
+            if changed {
+                *v = units;
+            }
+            changed
+        });
+        if sleep_or_shutdown(DISCOVERY_PERIOD, &shutdown).await {
+            return;
+        }
+    }
 }
 
 /// `ports = "auto"`: (axis, device_id) of the non-simulated axes with an id.

@@ -1584,3 +1584,93 @@ async fn calibration_apply_that_cannot_write_leaves_memory_and_file_unchanged() 
     srv.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------------ unit swap (console)
+
+const NEW_UNIT: h3cs::types::DeviceId = h3cs::types::DeviceId(0x5131_00aa_bbcc_8d58);
+
+#[tokio::test]
+async fn units_assign_swaps_the_device_id_and_ports_auto_follows_it() {
+    let dir = scratch("assign");
+    let path = dir.join("rig.toml");
+    let cfg = auto_cfg();
+    std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+    let usb = rig_usb();
+    let ports: std::sync::Arc<dyn h3cs::server::SerialPorts> = usb.clone();
+    let srv = server::start(
+        cfg,
+        ServerOptions {
+            admin_token: Some(TOKEN.into()),
+            bind_override: Some("127.0.0.1:0".parse().unwrap()),
+            config_path: Some(path.clone()),
+            serial_ports: Some(ports),
+        },
+    )
+    .await
+    .expect("server start");
+    wait_state(&srv, RigState::ReadyToArm, 5 * S).await;
+    // The spare is plugged in: listed as unregistered, never opened.
+    const P4: &str = "/dev/cu.usbmodem14701";
+    usb.plug(P4, fake_usb::unit(NEW_UNIT, NEW_UNIT, 2));
+    let st = wait_status(&srv, 3 * S, "spare listed", |s| s.unregistered_units.iter().any(|u| u.port == P4)).await;
+    let spare = st.unregistered_units.iter().find(|u| u.port == P4).unwrap();
+    assert_eq!((spare.usb_serial.as_str(), spare.device_id), ("00:AA:BB:CC:8D:58", Some(NEW_UNIT)));
+    assert!(st.unregistered_units.iter().any(|u| u.port == "/dev/cu.usbmodem2101" && u.device_id == Some(FOREIGN)));
+    assert!(!st.unregistered_units.iter().any(|u| u.port.starts_with("/dev/tty.") || u.port == P1));
+    assert_eq!(usb.opens_of(P4), 0);
+
+    // The suffix shown on the unit's screen must match.
+    let body = |suffix: &str| format!(r#"{{"axis":2,"device_id":"{NEW_UNIT}","confirm_suffix":"{suffix}"}}"#);
+    let r = post(&srv, "/v1/units/assign", &body("8D59")).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("confirm_mismatch")), "{r:?}");
+    let r = post(&srv, "/v1/units/assign", &format!(r#"{{"axis":2,"device_id":"{}","confirm_suffix":"0a01"}}"#, ID[0])).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("device_in_use")), "{r:?}");
+    assert_eq!(usb.opens_of(P4), 0);
+    // The broken unit is pulled first (as the console's steps say).
+    let old2 = usb.unplug(P2);
+    let r = post(&srv, "/v1/units/assign", &body("8d58")).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let b = r.json();
+    assert_eq!((b["device_id"].as_str(), b["previous_device_id"].as_str()), (Some(NEW_UNIT.to_string().as_str()), Some(ID[1].to_string().as_str())));
+    assert_eq!(b["calibration_valid"], false);
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved.axes[1].device_id, NEW_UNIT);
+    assert!(!saved.axes[1].calibration_valid);
+
+    // Discovery now opens the spare for axis 2; the declaration is gone.
+    let st = wait_status(&srv, 5 * S, "axis 2 on the spare", |s| axis_port(s, 2).as_deref() == Some(P4)).await;
+    assert_eq!(st.axes[1].expected_device_id, NEW_UNIT);
+    assert_eq!(usb.opens_of(P4), 1);
+    let st = wait_status(&srv, 2 * S, "spare no longer unregistered", |s| !s.unregistered_units.iter().any(|u| u.port == P4)).await;
+    assert!(st.blockers.iter().any(|b| b == "calibration_invalid: axis2 calibration_valid = false"), "{:?}", st.blockers);
+    assert!(!st.blockers.iter().any(|b| b.starts_with("axis_device_mismatch")), "{:?}", st.blockers);
+
+    // The old unit plugged back in is no longer ours: never reopened.
+    usb.plug(P2, old2);
+    wait_status(&srv, 3 * S, "old unit unregistered", |s| s.unregistered_units.iter().any(|u| u.port == P2)).await;
+    tokio::time::sleep(h3cs::server::SERIAL_RETRY + h3cs::server::DISCOVERY_PERIOD).await;
+    assert_eq!(usb.opens_of(P2), 1, "{:?}", usb.opened());
+    assert_eq!(axis_port(&srv.status(), 2).as_deref(), Some(P4));
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn units_assign_with_named_ports_changes_only_the_cross_check() {
+    let dir = scratch("assign-sim");
+    let path = dir.join("rig.toml");
+    let text = hot_cfg_text();
+    std::fs::write(&path, &text).unwrap();
+    let srv = start_sim_with_path(Config::from_toml_str(&text).unwrap(), Some(path.clone())).await;
+    wait_status(&srv, 3 * S, "connected", |s| s.axes.iter().all(|a| a.connected)).await;
+    let r = post(&srv, "/v1/units/assign", r#"{"axis":3,"device_id":"0","confirm_suffix":"0000"}"#).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (400, Some("bad_device_id")), "{r:?}");
+    let r = post(&srv, "/v1/units/assign", r#"{"axis":3,"device_id":"5131000000000abc","confirm_suffix":"0ABC"}"#).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let st = wait_status(&srv, S, "mismatch", |s| s.blockers.iter().any(|b| b.starts_with("axis_device_mismatch: axis3"))).await;
+    assert_eq!(st.axes[2].expected_device_id, h3cs::types::DeviceId(0x5131_0000_0000_0abc));
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("device_id = \"5131000000000abc\"   # 照合用"), "{written}");
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
