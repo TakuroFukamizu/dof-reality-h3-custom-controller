@@ -265,7 +265,8 @@ td.num{text-align:right}
     <button class="btn-red" id="a-reset">異常をリセット</button>
     <button class="btn-warn hide" id="a-release">オペレーター停止を解除</button>
   </div>
-  <div class="note">動かす操作（中立へ・ARM）は、確認の画面が出ます。</div>
+  <div class="note">動かす操作（中立へ・ARM）は、確認の画面が出ます。停止中に「中立へ戻す」を押すと、ARM してから中立へ動きます。</div>
+  <div class="note" id="a-center-note"></div>
   <div class="result" id="a-result"></div>
 </section>
 <section class="sec">
@@ -742,7 +743,37 @@ $('estop').addEventListener('click', async () => {
     show($('act-result'), await api('POST', '/v1/stop'), '停止しました（ゲームが動かし直すことがあります）');
   }
 });
-withConfirm($('a-center'), '中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', 'CENTER', async () => show($('a-result'), await api('POST', '/v1/center'), '中立へ戻しています'));
+// 中立へ: HOLDING ならそのまま、停止中（READY_TO_ARM / BRAKED_DISARMED）なら ARM して HOLDING を待ってから中立へ
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let centerBusy = false;
+async function centerFlow() {
+  const el = $('a-result');
+  centerBusy = true; renderActions();
+  try {
+    if (S && S.rig_state !== 'HOLDING') {
+      el.classList.remove('err'); el.textContent = 'ARM しています…';
+      const ra = await api('POST', '/v1/arm');
+      if (!ra.ok) { show(el, ra); return; }
+      let ok = false;
+      for (const t0 = Date.now(); Date.now() - t0 < 10000;) {
+        await sleep(200);
+        await pollStatus();
+        if (S && S.rig_state === 'HOLDING') { ok = true; break; }
+        if (S && S.rig_state === 'FAULT_LATCHED') { el.classList.add('err'); el.textContent = 'ARM に失敗しました（異常停止）。異常をリセットしてください'; return; }
+      }
+      if (!ok) { el.classList.add('err'); el.textContent = 'ARM が 10 秒たっても完了しません。状態を確かめてください（' + (S ? S.rig_state : '不明') + '）'; return; }
+      el.textContent = '中立へ戻しています';
+    }
+    show(el, await api('POST', '/v1/center'), '中立へ戻しています');
+  } finally { centerBusy = false; renderActions(); }
+}
+$('a-center').addEventListener('click', async () => {
+  const stopped = !(S && S.rig_state === 'HOLDING');
+  const ok = stopped
+    ? await confirmModal('ARM して中立へ戻しますか？', ['ARM（ブレーキが外れる）のあと、座席が中立の高さまで動きます', '座席に人が乗っていない', '座席のまわりに人や物がない'], 'ARM して中立へ戻す', 'CENTER')
+    : await confirmModal('中立へ戻しますか？', ['座席が中立の高さまで動きます', '座席のまわりに人や物がない'], '中立へ戻す', 'CENTER');
+  if (ok) await centerFlow();
+});
 withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
 $('a-disarm').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'));
 $('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
@@ -750,7 +781,19 @@ $('a-release').addEventListener('click', async () => show($('a-result'), await a
 function renderActions() {
   $('a-release').classList.toggle('hide', !(S && S.operator_hold));
   $('a-reset').disabled = !(S && S.rig_state === 'FAULT_LATCHED');
-  $('a-arm').disabled = !(S && S.rig_state === 'READY_TO_ARM') || !!(S && S.operator_hold);
+  const st = S && !lost() ? S.rig_state : null;
+  const stopped = st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED';
+  // コンソールの要求は X-H3-Operator でオペレーター停止を越えられる。停止中の ARM もここから出す
+  $('a-arm').disabled = !stopped || centerBusy;
+  let why = '';
+  if (centerBusy) why = '';
+  else if (!st) why = 'サーバーから状態が届いていません';
+  else if (st === 'ACTIVE') why = S.active_source === 'center' ? 'すでに中立へ動いています' : 'ゲーム走行中は使えません';
+  else if (st === 'FAULT_LATCHED') why = '異常を先にリセットしてください';
+  else if (!stopped && st !== 'HOLDING') why = `今は使えません（${st}）`;
+  $('a-center').disabled = !!why || centerBusy;
+  $('a-center').title = why;
+  $('a-center-note').textContent = why ? '中立へ戻せません: ' + why : '';
   $('a-arm').classList.toggle('armed', !!(S && S.armed));
 }
 
