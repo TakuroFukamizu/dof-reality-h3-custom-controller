@@ -304,19 +304,20 @@ const TOKEN_KEY = 'h3cs.admin_token';
 try { $('token').value = sessionStorage.getItem(TOKEN_KEY) || ''; } catch (_) {}
 $('token').addEventListener('input', () => { try { sessionStorage.setItem(TOKEN_KEY, $('token').value); } catch (_) {} });
 
-async function api(method, path, body, timeoutMs) {
+async function api(method, path, body, timeoutMs, extSignal) {
   const headers = {'X-H3-Operator': '1'};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const t = $('token').value.trim();
   if (t) headers['Authorization'] = 'Bearer ' + t;
   let resp, text;
-  const ac = timeoutMs ? new AbortController() : null;
-  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : null;
+  const ac = timeoutMs || extSignal ? new AbortController() : null;
+  if (extSignal) { if (extSignal.aborted) ac.abort(); else extSignal.addEventListener('abort', () => ac.abort()); }
+  const timer = timeoutMs ? setTimeout(() => ac.abort(), timeoutMs) : null;
   try {
     resp = await fetch(path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', signal: ac ? ac.signal : undefined});
     text = await resp.text();
   } catch (e) {
-    return {ok: false, status: 0, json: null, text: ac && ac.signal.aborted ? `応答がありません（${timeoutMs / 1000} 秒でタイムアウト）` : 'サーバーに届きません: ' + e};
+    return {ok: false, status: 0, json: null, text: ac && ac.signal.aborted ? (timeoutMs ? `応答がありません（${timeoutMs / 1000} 秒でタイムアウト）` : '中止しました') : 'サーバーに届きません: ' + e};
   } finally { if (timer) clearTimeout(timer); }
   let json = null; try { json = JSON.parse(text); } catch (_) {}
   return {ok: resp.ok, status: resp.status, json, text};
@@ -435,12 +436,12 @@ let S = null, lastOk = 0, nowMs = null;
 let evAfter = 0, events = [];
 
 async function pollStatus() {
-  const r = await api('GET', '/v1/status');
+  const r = await api('GET', '/v1/status', undefined, 3000);
   if (r.ok && r.json) { S = r.json; lastOk = Date.now(); }
   render();
 }
 async function pollEvents() {
-  const r = await api('GET', `/v1/events?after=${evAfter}&n=200`);
+  const r = await api('GET', `/v1/events?after=${evAfter}&n=200`, undefined, 3000);
   if (r.ok && r.json) {
     nowMs = r.json.now_ms;
     for (const e of r.json.events) { events.push(e); evAfter = Math.max(evAfter, e.id); }
@@ -734,6 +735,7 @@ function renderSession() {
 async function faultReset() { show($('act-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'); }
 async function release() { show($('act-result'), await api('POST', '/v1/operator/release'), 'オペレーター停止を解除しました'); }
 $('estop').addEventListener('click', async () => {
+  cancelFlow('非常停止');
   // 新しい API があればオペレーター停止（ゲームが勝手に動かし直さない）、なければ従来の stop
   // オペレーター停止は応答が 503 でも立っていることがある。結果は status.operator_hold で判断する
   if (hasNewApi()) {
@@ -749,51 +751,70 @@ $('estop').addEventListener('click', async () => {
 // オペレーター停止 → ARM → HOLDING を待つ → 中立へ。押した時の状態（mode）で確認した内容に縛る
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const REQ_MS = 3000, FLOW_MS = 10000;
-let centerBusy = false, flowTok = 0;
+let centerBusy = false, flowTok = 0, flowAc = null;
 const centerMode = st => st === 'HOLDING' ? 'center' : (st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED') ? 'arm' : null;
 function flowFail(el, r) {  // 失敗の表示。サーバーの blockers も出す
   show(el, r);
   const bl = r.json && r.json.blockers;
   if (bl && bl.length) el.textContent += ' [' + [...new Set(bl.map(blockerText))].slice(0, 4).join(' / ') + ']';
 }
+function cancelFlow(why) {  // 非常停止・DISARM を押した瞬間に同期で呼ぶ。以降の ARM / 中立は送らない
+  if (!centerBusy) return;
+  flowTok++; centerBusy = false;
+  if (flowAc) flowAc.abort();  // まだ送っていない要求は取り消す
+  const el = $('a-result'); el.classList.add('err'); el.textContent = `${why}のため「中立へ戻す」を中止しました`;
+  renderActions();
+}
 function flowStop(el, msg) { el.classList.add('err'); el.textContent = msg; }
 async function centerFlow(mode) {
   const el = $('a-result'), tok = ++flowTok;
-  const fresh = async () => { const r = await api('GET', '/v1/status', undefined, REQ_MS); return tok === flowTok ? r : null; };
+  const sig = (flowAc = new AbortController()).signal;
+  const live = () => tok === flowTok;  // 非常停止・DISARM・新しいフローで false になる
+  const fresh = async () => { const r = await api('GET', '/v1/status', undefined, REQ_MS, sig); return live() ? r : null; };
   centerBusy = true; renderActions();
   try {
     el.classList.remove('err'); el.textContent = '状態を確かめています…';
     const r0 = await fresh();
-    if (!r0 || !r0.ok || !r0.json) { flowFail(el, r0 || {ok: false, status: 0, json: null, text: ''}); return; }
+    if (!r0) return;
+    if (!r0.ok || !r0.json) { flowFail(el, r0); return; }
     if (centerMode(r0.json.rig_state) !== mode) { flowStop(el, '状態が変わりました（' + r0.json.rig_state + '）。もう一度押してください'); return; }
     if (mode === 'arm') {
       // ゲームが ARM・START・異常リセットしないよう、先にオペレーター停止。停止中の rig への Stop は何もしない
       el.textContent = 'オペレーター停止しています…';
-      const rh = await api('POST', '/v1/operator/hold', undefined, REQ_MS);
+      if (!live()) return;
+      const rh = await api('POST', '/v1/operator/hold', undefined, REQ_MS, sig);
+      if (!live()) return;
       if (!rh.ok) { flowFail(el, rh); return; }
       el.textContent = 'ARM しています…';
-      const ra = await api('POST', '/v1/arm', undefined, REQ_MS);
+      const deadline = Date.now() + FLOW_MS;
+      if (!live()) return;
+      const ra = await api('POST', '/v1/arm', undefined, REQ_MS, sig);
+      if (!live()) return;
       if (!ra.ok) { flowFail(el, ra); return; }
       let ok = false;
-      for (const t0 = Date.now(); Date.now() - t0 < FLOW_MS;) {
+      while (Date.now() < deadline) {
         await sleep(200);
+        if (!live()) return;
         const r = await fresh();
         if (!r) return;
         if (!r.ok || !r.json) { flowFail(el, r); return; }
         S = r.json; lastOk = Date.now(); render();
+        if (r.json.operator_hold !== true) { flowStop(el, 'オペレーター停止が外れたため中止しました。中立へは動かしていません'); return; }
         const st = r.json.rig_state;
+        if (Date.now() >= deadline) break;
         if (st === 'HOLDING') { ok = true; break; }
         if (st !== 'ARMING') { flowStop(el, 'ARM が完了せず中止しました（' + st + '）。オペレーター停止のままです'); return; }
       }
       if (!ok) { flowStop(el, `ARM が ${FLOW_MS / 1000} 秒たっても完了しません。中立へは動かしていません。オペレーター停止のままです`); return; }
-      if (tok !== flowTok) return;
       el.textContent = '中立へ戻しています';
     }
-    const rc = await api('POST', '/v1/center', undefined, REQ_MS);
+    if (!live()) return;
+    const rc = await api('POST', '/v1/center', undefined, REQ_MS, sig);
+    if (!live()) return;
     if (!rc.ok) { flowFail(el, rc); return; }
     el.classList.remove('err');
     el.textContent = mode === 'arm' ? '中立へ戻しています。オペレーター停止のままです。中立に着いたら DISARM → オペレーター停止を解除' : '中立へ戻しています';
-  } finally { if (tok === flowTok) { centerBusy = false; renderActions(); } }
+  } finally { if (live()) { centerBusy = false; renderActions(); } }
 }
 $('a-center').addEventListener('click', async () => {
   const mode = centerMode(S && !lost() ? S.rig_state : null);
@@ -804,11 +825,12 @@ $('a-center').addEventListener('click', async () => {
   if (ok) await centerFlow(mode);
 });
 withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
-$('a-disarm').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'));
+$('a-disarm').addEventListener('click', async () => { cancelFlow('DISARM'); show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'); });
 $('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
 $('a-release').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/operator/release'), '解除しました'));
 function renderActions() {
   $('a-release').classList.toggle('hide', !(S && S.operator_hold));
+  $('a-release').disabled = centerBusy;  // フロー中に解除するとゲームが割り込める
   $('a-reset').disabled = !(S && S.rig_state === 'FAULT_LATCHED');
   const st = S && !lost() ? S.rig_state : null;
   const stopped = st === 'READY_TO_ARM' || st === 'BRAKED_DISARMED';
@@ -878,6 +900,7 @@ $('ev-all').addEventListener('change', renderLog);
 let busyS = false, busyE = false;
 setInterval(async () => { if (busyS) return; busyS = true; try { await pollStatus(); } finally { busyS = false; } }, 200);
 setInterval(async () => { if (busyE) return; busyE = true; try { await pollEvents(); } finally { busyE = false; } }, 1000);
+setInterval(render, 500);  // 取得が詰まっても「途絶」の表示は自分で更新する
 pollStatus(); pollEvents();
 </script>
 </body>
