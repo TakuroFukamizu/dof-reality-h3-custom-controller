@@ -483,7 +483,7 @@ function renderMonitor() {
   } else if (S.operator_hold) {
     band(b, v, w, 'hold', 'OPERATOR HOLD', 'オペレーター停止中', '画面の非常停止で止めています。解除するまで、ゲームからの ARM・START・異常リセットは断ります。<span class="code">operator_hold</span>');
     stepList = ['来場者と座席のまわりの安全を確かめる', '「オペレーター停止を解除」を押す', 'ゲームを再開する'];
-    primary = {label: 'オペレーター停止を解除', run: release};
+    primary = {label: 'オペレーター停止を解除', run: () => release()};
   } else if (S.rig_state === 'FAULT_LATCHED') {
     const f = faultText(S.fault);
     band(b, v, w, 'fault', 'RIG STATE / FAULT_LATCHED', '異常停止', `${esc(f.what)}<span class="code">${esc(f.code)}</span>`);
@@ -523,7 +523,7 @@ function renderMonitor() {
   } else rec.classList.add('hide');
 
   steps.innerHTML = stepList.map(s => `<li>${esc(s)}</li>`).join('');
-  if (primary) { prim.textContent = primary.label; prim.onclick = primary.run; prim.classList.remove('hide'); }
+  if (primary) { prim.textContent = primary.label; prim.onclick = primary.run; prim.classList.remove('hide'); prim.disabled = centerBusy && primary.label === 'オペレーター停止を解除'; }
   else prim.classList.add('hide');
 
   // 3 軸
@@ -733,7 +733,12 @@ function renderSession() {
 
 // ------------------------------------------------------------ 6 操作
 async function faultReset() { show($('act-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'); }
-async function release() { show($('act-result'), await api('POST', '/v1/operator/release'), 'オペレーター停止を解除しました'); }
+// 解除はここ 1 か所。「中立へ戻す」のフロー中はゲームが割り込めてしまうので断る
+async function release(el, okText) {
+  el = el && el.classList ? el : $('act-result');
+  if (centerBusy) { el.classList.add('err'); el.textContent = '「中立へ戻す」の実行中は解除できません。終わってから押してください'; return; }
+  show(el, await api('POST', '/v1/operator/release'), okText || 'オペレーター停止を解除しました');
+}
 $('estop').addEventListener('click', async () => {
   cancelFlow('非常停止');
   // 新しい API があればオペレーター停止（ゲームが勝手に動かし直さない）、なければ従来の stop
@@ -827,7 +832,7 @@ $('a-center').addEventListener('click', async () => {
 withConfirm($('a-arm'), 'ARM しますか？', ['ブレーキが外れ、今の位置で保持します', '乗っている人がいるなら、非常停止の係がついている'], 'ARM する', 'ARM', async () => show($('a-result'), await api('POST', '/v1/arm'), 'ARM しました'));
 $('a-disarm').addEventListener('click', async () => { cancelFlow('DISARM'); show($('a-result'), await api('POST', '/v1/disarm'), 'DISARM しました'); });
 $('a-reset').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/fault/reset'), '異常をリセットしました'));
-$('a-release').addEventListener('click', async () => show($('a-result'), await api('POST', '/v1/operator/release'), '解除しました'));
+$('a-release').addEventListener('click', () => release($('a-result'), '解除しました'));
 function renderActions() {
   $('a-release').classList.toggle('hide', !(S && S.operator_hold));
   $('a-release').disabled = centerBusy;  // フロー中に解除するとゲームが割り込める
