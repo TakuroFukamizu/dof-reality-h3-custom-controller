@@ -168,7 +168,7 @@ fn derive_keeping_preserves_the_live_350_margin_and_the_direction() {
 
     // Operator-reversed direction is kept, with each side's margin.
     let mut rev = a1.clone();
-    rev.count_at_virtual_0 = 5106; // soft_max − 400
+    rev.count_at_virtual_0 = rev.soft_max_count - 400; // soft_max − 400（ライブ設定の値から。校正の反映で soft_max は変わる）
     rev.count_at_virtual_1023 = 400; // soft_min + 350
     assert_eq!(Margins::of(&rev), Margins { p: 350, n: 400, p_to_n: false });
     let e = derive_keeping(&rev, rev.device_id, &ok(5560, 2780, 1)).unwrap();
