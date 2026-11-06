@@ -1456,6 +1456,9 @@ async fn operator_console_is_served_and_self_contained() {
                    "/v1/calibration/apply", "/v1/units/assign", "confirmModal('校正しますか？'", "hasNewApi"] {
         assert!(api::CONSOLE_PAGE.contains(needle), "missing in the console: {needle}");
     }
+    // ARM is not gated on operator_hold (the console bypasses it) and is offered from BRAKED_DISARMED.
+    assert!(!api::CONSOLE_PAGE.contains("|| !!(S && S.operator_hold)"), "ARM gated on operator_hold");
+    assert!(api::CONSOLE_PAGE.contains("'BRAKED_DISARMED'"));
     // Loading the page sends nothing that moves the rig.
     assert!(s.seen.lock().unwrap().is_empty());
 }
